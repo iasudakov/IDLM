@@ -597,9 +597,29 @@ def get_dataset(dataset_name,
     filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped{eos_tag}.dat'
   _path = os.path.join(cache_dir, filename)
   
-  if utils.fsspec_exists(_path):
+  _abs_path = os.path.abspath(_path)
+  _exists = utils.fsspec_exists(_path)
+  print(
+    f'[get_dataset] looking for cached data:\n'
+    f'    dataset_name = {dataset_name!r}, mode = {mode!r}\n'
+    f'    cache_dir    = {cache_dir!r}\n'
+    f'    filename     = {filename!r}\n'
+    f'    full path    = {_path}\n'
+    f'    resolved     = {_abs_path}\n'
+    f'    cwd          = {os.getcwd()}\n'
+    f'    FOUND        = {_exists}',
+    flush=True,
+  )
+  if _exists:
+    print(f'[get_dataset] FOUND cached data -> loading from disk: {_abs_path}',
+          flush=True)
     LOGGER.info(f'Loading data from: {_path}')
     return datasets.load_from_disk(_path).with_format('torch')
+  print(
+    f'[get_dataset] ABSENT: no cached data at {_abs_path}\n'
+    f'              -> will DOWNLOAD + RE-TOKENIZE from scratch (slow, needs net + disk).',
+    flush=True,
+  )
   LOGGER.info(f'Generating new data at: {_path}')
   LOGGER.info(f'{streaming=}')  
 
