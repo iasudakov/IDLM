@@ -1,0 +1,11 @@
+# Stream training metrics to the underdeep experiment tracker instead of
+# TensorBoard (mirrors Halton-MaskGIT/main.py). A run is created -- or resumed
+# from `underdeep_metadata.pt` under `save_dir` when resuming training -- and
+# scalar metrics are streamed live. No-ops if the `underdeep` package is
+# unavailable. Switch back to TensorBoard with `logger=tensorboard`.
+_target_: underdeep_logger.UnderdeepLogger
+experiment: generative-models/idlm
+name: ${algo.name}
+save_dir: ${checkpointing.save_dir}
+resume: ${checkpointing.resume_from_ckpt}
+force_new_run: false

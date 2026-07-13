@@ -1,0 +1,4 @@
+# TensorBoard logger (previous default). Select with `logger=tensorboard`.
+_target_: lightning.pytorch.loggers.TensorBoardLogger
+save_dir: ${cwd:}/tb_logs
+name: ${algo.name}
