@@ -1,7 +1,7 @@
 train: openwebtext
 valid: wikitext103
 tokenizer_name_or_path: gpt2
-cache_dir: ""
+cache_dir: /slot/sandbox/d/in/script/0_script_unpacked/code/cache_dir
 wrap: True
 streaming: False
 insert_train_eos: True
