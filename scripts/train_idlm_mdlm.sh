@@ -22,4 +22,5 @@ python -u -m main \
   trainer.val_check_interval=1500 \
   trainer.limit_val_batches=0.01 \
   sampling.predictor=ancestral_cache \
-  logger.force_new_run=true
+  logger.force_new_run=true \
+  data.cache_dir='${hydra:runtime.cwd}/data'
