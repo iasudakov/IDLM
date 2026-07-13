@@ -218,13 +218,6 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       self.total_loss_student = 0
       self.total_loss_fake = 0
       self.f_loss_ar = []
-      # Warmup: number of fake-model iterations to run before the first
-      # generator step, so the fake critic matches the (frozen) student before
-      # adversarial training. Not persisted across resumes (like the other
-      # scheduling counters here).
-      self.fake_warmup_iters = getattr(
-        self.config.adversarial_distill, 'fake_warmup_iters', 0)
-      self._warmup_fake_remaining = self.fake_warmup_iters
 
   def configure_optimizers(self):
     if self.config.adversarial_distill.is_distill:
@@ -516,32 +509,15 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self.total_loss_student = 0
         self.f_loss_ar.clear()
       elif finish_iter:
+        self.fake_iter += 1
         self.f_loss_ar.append(self.total_loss_fake)
         self.total_loss_fake = 0
-        if self._warmup_fake_remaining > 0:
-          # Warmup phase: keep training only the fake model to match the frozen
-          # student. Never switch to a generator step and don't advance the
-          # normal fake/generator counter.
-          self._warmup_fake_remaining -= 1
+        if self.fake_iter == self.fake_frequency:
+          self.is_generator_step = True
           self.fake_iter = 0
-          self.log_dict(
-              {"fake_warmup_loss": torch.stack(self.f_loss_ar).mean(),
-               "fake_warmup_remaining": float(self._warmup_fake_remaining)},
-              prog_bar=True,
-              on_step=True,
-              on_epoch=False,
-              sync_dist=True,
-          )
-          self.f_loss_ar.clear()
-          scheduler_fake.step()
-        else:
-          self.fake_iter += 1
-          if self.fake_iter == self.fake_frequency:
-            self.is_generator_step = True
-            self.fake_iter = 0
-            utils.activate_model(self.backbone)
-            utils.freeze_model(self.fake_model)
-            optimizer_student.zero_grad()
+          utils.activate_model(self.backbone)
+          utils.freeze_model(self.fake_model)
+          optimizer_student.zero_grad()
 
     else:
       return super().training_step(batch, batch_idx)

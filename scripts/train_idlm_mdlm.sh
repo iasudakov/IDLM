@@ -19,6 +19,8 @@ python -u -m main \
   sampling.steps=32 \
   sampling.predictor='ancestral_cache' \
   optim.lr=1e-6 \
+  adversarial_distill.fake_lr=1e-4 \
+  adversarial_distill.fake_frequency=1 \
   trainer.val_check_interval=1500 \
   trainer.limit_val_batches=0.01 \
   sampling.predictor=ancestral_cache \

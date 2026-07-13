@@ -22,10 +22,6 @@ adversarial_distill:
   # Autoregressive teacher (and fake-model initialisation) for MDLM_with_AR.
   # A HF hub id or a local dir with the owt-ar config.json / pytorch_model.bin.
   ar_model_path: kuleshov-group/owt-ar
-  # Number of fake-model-only iterations to run at the start of training (before
-  # any generator update), so the fake critic matches the frozen student. 0
-  # disables the warmup.
-  fake_warmup_iters: 0
   # Learning rate for the fake critic. It must adapt to the student's
   # distribution, so it should not share the (usually tiny) generator optim.lr.
   # null falls back to optim.lr.
