@@ -19,22 +19,26 @@ adversarial_distill:
   accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   fake_frequency: 1
   gradient_clipping_val: 1.0
+  # Critic family: 'ar' = autoregressive owt-ar teacher/fake; 'diffusion' =
+  # copies of the masked-diffusion student as teacher/fake (original IDLM).
+  critic_type: ar
   # Autoregressive teacher (and fake-model initialisation) for MDLM_with_AR.
   # A HF hub id or a local dir with the owt-ar config.json / pytorch_model.bin.
   ar_model_path: kuleshov-group/owt-ar
-  # Learning rate for the fake critic. It must adapt to the student's
-  # distribution, so it should not share the (usually tiny) generator optim.lr.
-  # null falls back to optim.lr.
-  fake_lr: 1e-4
+  # Learning rate for the fake critic. null => fall back to optim.lr (original
+  # IDLM: fake and student share optim.lr). Set e.g. 1e-4 to give the critic a
+  # larger, separate LR (two-time-scale).
+  fake_lr: null
   # Weight of the auxiliary->teacher regularizer in the fake-model loss
   # (D-MMD Eq. 12, second term): CE(teacher || fake) on the student's samples.
   # Anchors the fake critic to the teacher, stabilizing the min-max without
-  # changing the fixed point. 0 => original fake loss (hard NLL only).
-  fake_teacher_weight: 1.0
+  # changing the fixed point. 0 => original IDLM fake loss (no anchor term).
+  fake_teacher_weight: 0.0
   # Generator input-noise conditioning (D-MMD Sec. 6.5). Dimensionality of the
   # per-token Gaussian noise projected into the student's embedding residual so
-  # the masked generator can stay diverse instead of collapsing. 0 => disabled.
-  noise_dim: 128
+  # the masked generator can stay diverse instead of collapsing. 0 => disabled
+  # (original IDLM).
+  noise_dim: 0
 
 loader:
   global_batch_size: 512

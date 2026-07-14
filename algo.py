@@ -249,20 +249,33 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
     if self.is_adversarial_distill:
       self.automatic_optimization = False
-      ar_model_path = getattr(
-        self.config.adversarial_distill, 'ar_model_path',
-        'kuleshov-group/owt-ar')
-      # Frozen AR teacher: the pretrained data-distribution model.
-      self.teacher = _load_owt_ar_backbone(ar_model_path)
-      utils.freeze_model(self.teacher)
+      # Critic type: 'ar' uses autoregressive (owt-ar) teacher/fake; 'diffusion'
+      # uses copies of the masked-diffusion student as critics (original IDLM).
+      self.critic_type = getattr(
+        self.config.adversarial_distill, 'critic_type', 'ar')
+      assert self.critic_type in ('ar', 'diffusion'), (
+        f'Unknown adversarial_distill.critic_type: {self.critic_type}')
 
-      # Trainable AR "fake" model, initialised from the same owt-ar weights.
-      self.fake_model = _load_owt_ar_backbone(ar_model_path)
+      if self.critic_type == 'ar':
+        ar_model_path = getattr(
+          self.config.adversarial_distill, 'ar_model_path',
+          'kuleshov-group/owt-ar')
+        # Frozen AR teacher: the pretrained data-distribution model.
+        self.teacher = _load_owt_ar_backbone(ar_model_path)
+        # Trainable AR "fake" model, from the same owt-ar weights.
+        self.fake_model = _load_owt_ar_backbone(ar_model_path)
+      else:
+        # Original IDLM: teacher/fake are diffusion denoisers, copied from the
+        # (raw, un-noise-conditioned) student before it is wrapped below.
+        self.teacher = copy.deepcopy(self.backbone)
+        self.fake_model = copy.deepcopy(self.backbone)
+      utils.freeze_model(self.teacher)
       utils.activate_model(self.fake_model)
 
       # Optional generator input-noise conditioning (D-MMD Sec. 6.5): wrap the
       # student backbone so a learned Gaussian-noise projection is injected into
-      # the embedding residual. Done before (re)building the EMA/optimizer so the
+      # the embedding residual. Done AFTER copying the diffusion critics (so they
+      # stay noise-free) and before (re)building the EMA/optimizer so the
       # projection is tracked/trained like the rest of the backbone.
       noise_dim = getattr(self.config.adversarial_distill, 'noise_dim', 0)
       if noise_dim and noise_dim > 0:
@@ -389,8 +402,10 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self.ema_fake.load_state_dict(ema_fake_state)
 
   def on_save_checkpoint(self, checkpoint):
-    if self.is_adversarial_distill:
-      # The frozen teacher is always reloaded from owt-ar; don't persist it.
+    if self.is_adversarial_distill and self.critic_type == 'ar':
+      # The frozen AR teacher is reloaded from owt-ar; don't persist it. The
+      # diffusion teacher is a frozen copy of the pretrained student (not
+      # reloadable from a fixed path), so it must stay in the checkpoint.
       checkpoint['state_dict'] = collections.OrderedDict(
         (k, v) for k, v in checkpoint['state_dict'].items()
         if not k.startswith('teacher.'))
@@ -484,7 +499,36 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       return loss.sum(-1) / denom
     return loss.sum(-1)
 
+  def q_xt_with_probs(self, student_probs, alpha_t, x0=None, valid_tokens=None):
+    """Diffuse a (soft) student distribution to noise level t for the diffusion
+    critic (masked diffusion). Verbatim from the original MDLM implementation."""
+    mask_probs = torch.zeros_like(student_probs)
+    mask_probs[:, :, self.mask_index] = 1
+    noise_probs = alpha_t[:, :, None] * student_probs + (1 - alpha_t[:, :, None])*(mask_probs)
+    if x0 is not None and valid_tokens is not None:
+      noise_probs = self._preserve_prompt_probs(noise_probs, x0, valid_tokens)
+    return noise_probs
+
+  def nll_per_token_with_probs(self, log_x_theta, xt, x0, alpha_t,
+                    dalpha_t, low_var=False, valid_tokens=None):
+    """Soft weighted cross-entropy for the diffusion critic. Verbatim from the
+    original MDLM implementation (`x0` is the target distribution)."""
+    del xt
+    loss = (x0 * log_x_theta).sum(-1)
+    loss = loss * dalpha_t / (1 - alpha_t)
+    if valid_tokens is not None:
+      loss = loss * valid_tokens
+      denom = valid_tokens.sum(-1).clamp_min(1)
+      return loss.sum(-1) / denom
+    return loss.sum(-1)
+
   def generator_loss(self, x0, valid_tokens, current_accumulation_step):
+    if self.critic_type == 'diffusion':
+      return self._generator_loss_diffusion(
+        x0, valid_tokens, current_accumulation_step)
+    return self._generator_loss_ar(x0, valid_tokens, current_accumulation_step)
+
+  def _generator_loss_ar(self, x0, valid_tokens, current_accumulation_step):
     # Differentiable student distribution over the (clean) generated sequence.
     student_probs = self.multistep_generation(
       x0, valid_tokens, current_accumulation_step)
@@ -505,6 +549,37 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       fake_logprobs, student_probs, valid_tokens)
     return teacher_loss - fake_loss
 
+  def _generator_loss_diffusion(self, x0, valid_tokens,
+                                current_accumulation_step):
+    # Original IDLM (diffusion critic). Verbatim from the `MDLM` implementation.
+    student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
+
+    t = self._sample_t(x0.shape[0], current_accumulation_step)
+    dalpha_t, alpha_t = self.noise(t)
+    alpha_t = alpha_t.unsqueeze(-1)
+    assert alpha_t.ndim == 2
+    sigma = self._sigma_from_alphat(alpha_t)
+    sigma = self._process_sigma(sigma)
+
+    probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
+    xt = trainer_base.sample_categorical(probs_xt)
+    xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
+
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+      model_output_teacher = self.teacher(xt, sigma)
+    logits_teacher = self._process_model_output(model_output=model_output_teacher, xt=xt, sigma=sigma)
+    teacher_loss = self.nll_per_token_with_probs(logits_teacher, xt, student_probs,
+                                alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                valid_tokens=valid_tokens)
+
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+      model_output_fake = self.fake_model(xt, sigma)
+    logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
+    fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs,
+                                alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                valid_tokens=valid_tokens)
+    return teacher_loss - fake_loss
+
   def _reduce_token_loss(self, per_token_loss, valid_tokens):
     """Reduce a (batch, length - 1) per-token loss to (batch,).
 
@@ -518,6 +593,12 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     return per_token_loss.sum(-1)
 
   def fake_loss(self, x0, valid_tokens, current_accumulation_step):
+    if self.critic_type == 'diffusion':
+      return self._fake_loss_diffusion(
+        x0, valid_tokens, current_accumulation_step)
+    return self._fake_loss_ar(x0, valid_tokens, current_accumulation_step)
+
+  def _fake_loss_ar(self, x0, valid_tokens, current_accumulation_step):
     # Auxiliary/fake objective (D-MMD Eq. 12). Fit the fake AR critic to the
     # student's samples AND anchor it to the frozen teacher; the anchor
     # stabilizes the min-max and keeps the critic from drifting into a
@@ -542,6 +623,40 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       loss = loss + self.fake_teacher_weight * self._reduce_token_loss(
         teacher_ce, valid_tokens)
     return loss
+
+  def _fake_loss_diffusion(self, x0, valid_tokens, current_accumulation_step):
+    # Original IDLM (diffusion critic). Verbatim from the `MDLM` implementation.
+    with torch.no_grad():
+      student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
+
+    t = self._sample_t(x0.shape[0], current_accumulation_step)
+    dalpha_t, alpha_t = self.noise(t)
+    alpha_t = alpha_t.unsqueeze(-1)
+    assert alpha_t.ndim == 2
+    sigma = self._sigma_from_alphat(alpha_t)
+    sigma = self._process_sigma(sigma)
+    probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
+    xt = trainer_base.sample_categorical(probs_xt)
+    xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
+
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+      model_output_fake = self.fake_model(xt, sigma)
+    logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
+    fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs,
+                                alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                valid_tokens=valid_tokens)
+
+    # Optional aux->teacher anchor (D-MMD Eq. 12, second term). Disabled by
+    # default (fake_teacher_weight=0), so the above matches the original MDLM.
+    if self.fake_teacher_weight > 0:
+      with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float32):
+        teacher_probs = self._process_model_output(
+          model_output=self.teacher(xt, sigma), xt=xt, sigma=sigma).exp()
+      anchor = self.nll_per_token_with_probs(logits_fake, xt, teacher_probs,
+                                alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                valid_tokens=valid_tokens)
+      fake_loss = fake_loss + self.fake_teacher_weight * anchor
+    return fake_loss
 
   def training_step(self, batch, batch_idx):
     if self.config.adversarial_distill.is_distill:
