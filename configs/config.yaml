@@ -22,6 +22,10 @@ adversarial_distill:
   # Critic family: 'ar' = autoregressive owt-ar teacher/fake; 'diffusion' =
   # copies of the masked-diffusion student as teacher/fake (original IDLM).
   critic_type: ar
+  # Whether to use the trainable fake critic. False disables the fake model
+  # entirely (not created, no fake steps) and trains the generator with only the
+  # teacher term, i.e. generator loss = teacher_loss (no min-max).
+  use_fake: True
   # Autoregressive teacher (and fake-model initialisation) for MDLM_with_AR.
   # A HF hub id or a local dir with the owt-ar config.json / pytorch_model.bin.
   ar_model_path: kuleshov-group/owt-ar

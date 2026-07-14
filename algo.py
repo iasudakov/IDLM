@@ -256,6 +256,11 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       assert self.critic_type in ('ar', 'diffusion'), (
         f'Unknown adversarial_distill.critic_type: {self.critic_type}')
 
+      # Whether to use the trainable fake critic at all. If False, the fake
+      # model is not created and the generator is trained with only the teacher
+      # term (no min-max, no fake steps).
+      self.use_fake = getattr(self.config.adversarial_distill, 'use_fake', True)
+
       if self.critic_type == 'ar':
         ar_model_path = getattr(
           self.config.adversarial_distill, 'ar_model_path',
@@ -263,14 +268,17 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         # Frozen AR teacher: the pretrained data-distribution model.
         self.teacher = _load_owt_ar_backbone(ar_model_path)
         # Trainable AR "fake" model, from the same owt-ar weights.
-        self.fake_model = _load_owt_ar_backbone(ar_model_path)
+        self.fake_model = (
+          _load_owt_ar_backbone(ar_model_path) if self.use_fake else None)
       else:
         # Original IDLM: teacher/fake are diffusion denoisers, copied from the
         # (raw, un-noise-conditioned) student before it is wrapped below.
         self.teacher = copy.deepcopy(self.backbone)
-        self.fake_model = copy.deepcopy(self.backbone)
+        self.fake_model = (
+          copy.deepcopy(self.backbone) if self.use_fake else None)
       utils.freeze_model(self.teacher)
-      utils.activate_model(self.fake_model)
+      if self.use_fake:
+        utils.activate_model(self.fake_model)
 
       # Optional generator input-noise conditioning (D-MMD Sec. 6.5): wrap the
       # student backbone so a learned Gaussian-noise projection is injected into
@@ -282,22 +290,25 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self.backbone = _wrap_backbone_with_noise(
           self.backbone, noise_dim, self.config.model.hidden_size)
       utils.activate_model(self.backbone)
+      self.ema_fake = None
       if self.ema is not None:
         del self.ema
         self.ema = models.ema.ExponentialMovingAverage(
           self.backbone.parameters(),
           decay=self.config.training.ema)
 
-        self.ema_fake = models.ema.ExponentialMovingAverage(
-          self.fake_model.parameters(),
-          decay=self.config.training.ema)
+        if self.use_fake:
+          self.ema_fake = models.ema.ExponentialMovingAverage(
+            self.fake_model.parameters(),
+            decay=self.config.training.ema)
       self.training_step_counter = 0
-      self.accum_batches = self.config.adversarial_distill.accum_batches 
+      self.accum_batches = self.config.adversarial_distill.accum_batches
       self._fake_accum_counter = 0
       self._student_accum_counter = 0
       self.fake_frequency = self.config.adversarial_distill.fake_frequency
       self.fake_iter = 0
-      self.is_generator_step = False
+      # With no fake critic, every step is a generator step.
+      self.is_generator_step = not self.use_fake
       self.total_loss_student = 0
       self.total_loss_fake = 0
       self.f_loss_ar = []
@@ -316,6 +327,14 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         eps=self.config.optim.eps,
         weight_decay=self.config.optim.weight_decay)
 
+      scheduler_student = hydra.utils.instantiate(
+        self.config.lr_scheduler, optimizer=optimizer_student)
+      scheduler_student_dict = {'scheduler': scheduler_student, 'name': 'trainer/lr'}
+
+      if not self.use_fake:
+        # No fake critic: a single student optimizer.
+        return [optimizer_student], [scheduler_student_dict]
+
       # The fake critic adapts to the student's distribution and needs a real
       # learning rate; it should not share the (often tiny) generator LR.
       fake_lr = getattr(self.config.adversarial_distill, 'fake_lr', None)
@@ -328,10 +347,6 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
               self.config.optim.beta2),
         eps=self.config.optim.eps,
         weight_decay=self.config.optim.weight_decay)
-
-      scheduler_student = hydra.utils.instantiate(
-        self.config.lr_scheduler, optimizer=optimizer_student)
-      scheduler_student_dict = {'scheduler': scheduler_student, 'name': 'trainer/lr'}
 
       scheduler_fake = hydra.utils.instantiate(
         self.config.lr_scheduler, optimizer=optimizer_fake)
@@ -363,9 +378,15 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
 
   def on_train_start(self):
     if self.is_adversarial_distill:
-      self.ema_fake.move_shadow_params_to_device(self.device)
-      utils.activate_model(self.fake_model)
-      utils.freeze_model(self.backbone)
+      if self.use_fake:
+        # Fake-first schedule: start on a fake step (student frozen).
+        self.ema_fake.move_shadow_params_to_device(self.device)
+        utils.activate_model(self.fake_model)
+        utils.freeze_model(self.backbone)
+      else:
+        # No fake critic: the student trains every step.
+        utils.activate_model(self.backbone)
+        self.is_generator_step = True
     super().on_train_start()
 
   def _sync_submodule_state(self, state_dict, prefix, module):
@@ -391,7 +412,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     if self.is_adversarial_distill:
       state_dict = collections.OrderedDict(checkpoint['state_dict'])
       self._sync_submodule_state(state_dict, 'teacher', self.teacher)
-      self._sync_submodule_state(state_dict, 'fake_model', self.fake_model)
+      if self.fake_model is not None:
+        self._sync_submodule_state(state_dict, 'fake_model', self.fake_model)
       checkpoint['state_dict'] = state_dict
     super().on_load_checkpoint(checkpoint)
     if self.is_adversarial_distill and self.ema_fake is not None:
@@ -541,10 +563,13 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     # constants and gradients reach the student only through `student_probs`.
     with torch.no_grad():
       teacher_logprobs = self._ar_logprobs(self.teacher, x_gen)
-      fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
-
     teacher_loss = self._ar_cross_entropy(
       teacher_logprobs, student_probs, valid_tokens)
+    if not self.use_fake:
+      return teacher_loss
+
+    with torch.no_grad():
+      fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
     fake_loss = self._ar_cross_entropy(
       fake_logprobs, student_probs, valid_tokens)
     return teacher_loss - fake_loss
@@ -571,6 +596,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     teacher_loss = self.nll_per_token_with_probs(logits_teacher, xt, student_probs,
                                 alpha_t=alpha_t, dalpha_t=dalpha_t,
                                 valid_tokens=valid_tokens)
+    if not self.use_fake:
+      return teacher_loss
 
     with torch.cuda.amp.autocast(dtype=torch.float32):
       model_output_fake = self.fake_model(xt, sigma)
@@ -658,16 +685,48 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       fake_loss = fake_loss + self.fake_teacher_weight * anchor
     return fake_loss
 
+  def _generator_only_step(self, input_tokens, valid_tokens,
+                           current_accumulation_step):
+    # No fake critic: every step trains the student on the (teacher-only)
+    # generator loss.
+    optimizer_student = self.optimizers()
+    scheduler_student = self.lr_schedulers()
+    self.toggle_optimizer(optimizer_student)
+    g_loss = self.generator_loss(
+      input_tokens, valid_tokens, current_accumulation_step)
+    g_loss = g_loss.mean() / self.accum_batches
+    self.manual_backward(g_loss)
+    self.untoggle_optimizer(optimizer_student)
+
+    self._student_accum_counter += 1
+    self.total_loss_student += g_loss.detach()
+    if self._student_accum_counter == self.accum_batches:
+      self._student_accum_counter = 0
+      optimizer_student.step()
+      self.ema.update(self.backbone.parameters())
+      optimizer_student.zero_grad()
+      _maybe_save_periodic_checkpoint(self)
+      self.log_dict(
+        {"student_loss": self.total_loss_student},
+        prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
+      scheduler_student.step()
+      self.total_loss_student = 0
+
   def training_step(self, batch, batch_idx):
     if self.config.adversarial_distill.is_distill:
-      optimizer_student, optimizer_fake = self.optimizers()
-      scheduler_student, scheduler_fake = self.lr_schedulers()
       current_accumulation_step = (batch_idx % self.accum_batches)
-      finish_iter = False
 
-      (input_tokens, output_tokens, valid_tokens) = self._process_model_input(batch['input_ids'], 
+      (input_tokens, output_tokens, valid_tokens) = self._process_model_input(batch['input_ids'],
                                                                               batch['attention_mask'])
       valid_tokens = _conditional_valid_tokens(self.config, valid_tokens)
+
+      if not self.use_fake:
+        return self._generator_only_step(
+          input_tokens, valid_tokens, current_accumulation_step)
+
+      optimizer_student, optimizer_fake = self.optimizers()
+      scheduler_student, scheduler_fake = self.lr_schedulers()
+      finish_iter = False
       if self.is_generator_step:
         self.toggle_optimizer(optimizer_student)
         g_loss = self.generator_loss(input_tokens, valid_tokens, current_accumulation_step)
