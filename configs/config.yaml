@@ -26,6 +26,11 @@ adversarial_distill:
   # distribution, so it should not share the (usually tiny) generator optim.lr.
   # null falls back to optim.lr.
   fake_lr: 1e-4
+  # Weight of the auxiliary->teacher regularizer in the fake-model loss
+  # (D-MMD Eq. 12, second term): CE(teacher || fake) on the student's samples.
+  # Anchors the fake critic to the teacher, stabilizing the min-max without
+  # changing the fixed point. 0 => original fake loss (hard NLL only).
+  fake_teacher_weight: 1.0
 
 loader:
   global_batch_size: 512

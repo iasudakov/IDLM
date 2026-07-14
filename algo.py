@@ -213,11 +213,15 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       self._fake_accum_counter = 0
       self._student_accum_counter = 0
       self.fake_frequency = self.config.adversarial_distill.fake_frequency
-      self.fake_iter = 0 
+      self.fake_iter = 0
       self.is_generator_step = False
       self.total_loss_student = 0
       self.total_loss_fake = 0
       self.f_loss_ar = []
+      # Weight of the auxiliary->teacher regularizer in the fake loss (D-MMD
+      # Eq. 12). 0 => original fake loss (hard NLL on student samples only).
+      self.fake_teacher_weight = getattr(
+        self.config.adversarial_distill, 'fake_teacher_weight', 0.0)
 
   def configure_optimizers(self):
     if self.config.adversarial_distill.is_distill:
@@ -431,11 +435,25 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       fake_logprobs, student_probs, valid_tokens)
     return teacher_loss - fake_loss
 
+  def _reduce_token_loss(self, per_token_loss, valid_tokens):
+    """Reduce a (batch, length - 1) per-token loss to (batch,).
+
+    Matches _ar_nll / _ar_cross_entropy: masked token-mean when valid_tokens is
+    given (using positions 1..L-1), otherwise a plain sum over positions.
+    """
+    if valid_tokens is not None:
+      valid = valid_tokens[:, 1:]
+      per_token_loss = per_token_loss * valid
+      return per_token_loss.sum(-1) / valid.sum(-1).clamp_min(1)
+    return per_token_loss.sum(-1)
+
   def fake_loss(self, x0, valid_tokens, current_accumulation_step):
-    # Sample a (detached) hard student sequence, then fit the fake AR model to
-    # it with standard next-token NLL. (The generator step still scores the
-    # fake critic against the soft `student_probs`, which is where the
-    # differentiable DMD gradient lives.)
+    # Auxiliary/fake objective (D-MMD Eq. 12). Fit the fake AR critic to the
+    # student's samples AND anchor it to the frozen teacher; the anchor
+    # stabilizes the min-max and keeps the critic from drifting into a
+    # degenerate state (it does not change the fixed point). The generator step
+    # still scores the fake against the soft `student_probs` (the differentiable
+    # DMD gradient path).
     with torch.no_grad():
       student_probs = self.multistep_generation(
         x0, valid_tokens, current_accumulation_step)
@@ -443,7 +461,17 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
 
     fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
-    return self._ar_nll(fake_logprobs, x_gen, valid_tokens)
+    # Term 1: CE(x | fake) -- standard next-token NLL on the hard student sample.
+    loss = self._ar_nll(fake_logprobs, x_gen, valid_tokens)
+    # Term 2: CE(teacher || fake) -- anchor the fake to the teacher's next-token
+    # distribution on the same context.
+    if self.fake_teacher_weight > 0:
+      with torch.no_grad():
+        teacher_probs = self._ar_logprobs(self.teacher, x_gen).exp()
+      teacher_ce = -(teacher_probs * fake_logprobs).sum(-1)  # (batch, length-1)
+      loss = loss + self.fake_teacher_weight * self._reduce_token_loss(
+        teacher_ce, valid_tokens)
+    return loss
 
   def training_step(self, batch, batch_idx):
     if self.config.adversarial_distill.is_distill:
