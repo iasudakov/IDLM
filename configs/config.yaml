@@ -31,6 +31,10 @@ adversarial_distill:
   # Anchors the fake critic to the teacher, stabilizing the min-max without
   # changing the fixed point. 0 => original fake loss (hard NLL only).
   fake_teacher_weight: 1.0
+  # Generator input-noise conditioning (D-MMD Sec. 6.5). Dimensionality of the
+  # per-token Gaussian noise projected into the student's embedding residual so
+  # the masked generator can stay diverse instead of collapsing. 0 => disabled.
+  noise_dim: 128
 
 loader:
   global_batch_size: 512

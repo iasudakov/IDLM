@@ -166,6 +166,67 @@ def _load_owt_ar_backbone(model_id_or_path):
   return model
 
 
+class _NoiseConditionedBackbone(torch.nn.Module):
+  """Wraps a denoiser backbone and injects a learned projection of per-token
+  Gaussian noise into the token-embedding residual (D-MMD Sec. 6.5).
+
+  A masked-diffusion generator is otherwise a deterministic function of its
+  (masked) input, so the moment-matching objective can only be minimised by
+  collapsing its output distribution -- which destroys sample diversity. An
+  input noise source lets the generator stay diverse while sharpening its
+  factorised output. Fresh noise is drawn on every forward pass and added to
+  the embedding via a forward hook, so it is applied uniformly across training
+  (`multistep_generation`) and sampling (`generate_samples`).
+  """
+
+  def __init__(self, backbone, embed_module, noise_dim, hidden_size):
+    super().__init__()
+    self.backbone = backbone
+    self.noise_dim = noise_dim
+    self.noise_proj = torch.nn.Linear(noise_dim, hidden_size)
+    # Small init so the projected noise starts at ~ the embedding scale (giving
+    # an immediate stochasticity source even at a tiny generator LR), bias 0.
+    torch.nn.init.normal_(
+      self.noise_proj.weight, std=0.02 / (noise_dim ** 0.5))
+    torch.nn.init.zeros_(self.noise_proj.bias)
+    self._noise = None
+    embed_module.register_forward_hook(self._add_noise)
+
+  def _add_noise(self, module, inputs, output):
+    if self._noise is None:
+      return output
+    return output + self.noise_proj(self._noise).to(output.dtype)
+
+  def forward(self, xt, sigma=None, *args, **kwargs):
+    self._noise = torch.randn(
+      xt.shape[0], xt.shape[1], self.noise_dim,
+      device=xt.device, dtype=torch.float32)
+    try:
+      return self.backbone(xt, sigma, *args, **kwargs)
+    finally:
+      self._noise = None
+
+
+def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden):
+  """Locate the token-embedding module of `backbone` and wrap it so a learned
+  Gaussian-noise projection is added to the embedding residual."""
+  embed_module = None
+  for name, module in backbone.named_modules():
+    if name.endswith('vocab_embed'):
+      embed_module = module
+      break
+  assert embed_module is not None, (
+    'Could not locate a `vocab_embed` module for noise conditioning.')
+  if hasattr(embed_module, 'embedding'):
+    hidden_size = embed_module.embedding.shape[-1]
+  elif hasattr(embed_module, 'embedding_dim'):
+    hidden_size = embed_module.embedding_dim
+  else:
+    hidden_size = default_hidden
+  return _NoiseConditionedBackbone(
+    backbone, embed_module, noise_dim, hidden_size)
+
+
 class MDLM_with_AR(trainer_base.AbsorbingState):
   """MDLM student distilled with *autoregressive* teacher / fake critics.
 
@@ -198,6 +259,15 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       # Trainable AR "fake" model, initialised from the same owt-ar weights.
       self.fake_model = _load_owt_ar_backbone(ar_model_path)
       utils.activate_model(self.fake_model)
+
+      # Optional generator input-noise conditioning (D-MMD Sec. 6.5): wrap the
+      # student backbone so a learned Gaussian-noise projection is injected into
+      # the embedding residual. Done before (re)building the EMA/optimizer so the
+      # projection is tracked/trained like the rest of the backbone.
+      noise_dim = getattr(self.config.adversarial_distill, 'noise_dim', 0)
+      if noise_dim and noise_dim > 0:
+        self.backbone = _wrap_backbone_with_noise(
+          self.backbone, noise_dim, self.config.model.hidden_size)
       utils.activate_model(self.backbone)
       if self.ema is not None:
         del self.ema
