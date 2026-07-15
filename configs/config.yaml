@@ -18,6 +18,7 @@ adversarial_distill:
   is_distill: False
   accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   fake_frequency: 1
+  generator_num_noised_samples: 1
   gradient_clipping_val: 1.0
   # Critic family: 'ar' = autoregressive owt-ar teacher/fake; 'diffusion' =
   # copies of the masked-diffusion student as teacher/fake (original IDLM).

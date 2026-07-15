@@ -579,32 +579,49 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     # Original IDLM (diffusion critic). Verbatim from the `MDLM` implementation.
     student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
 
-    t = self._sample_t(x0.shape[0], current_accumulation_step)
-    dalpha_t, alpha_t = self.noise(t)
-    alpha_t = alpha_t.unsqueeze(-1)
-    assert alpha_t.ndim == 2
-    sigma = self._sigma_from_alphat(alpha_t)
-    sigma = self._process_sigma(sigma)
+    num_noised_samples = getattr(self.config.adversarial_distill, 'generator_num_noised_samples', 1)
 
-    probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
-    xt = trainer_base.sample_categorical(probs_xt)
-    xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
+    teacher_loss_total = 0.0
+    fake_loss_total = 0.0
 
-    with torch.cuda.amp.autocast(dtype=torch.float32):
-      model_output_teacher = self.teacher(xt, sigma)
-    logits_teacher = self._process_model_output(model_output=model_output_teacher, xt=xt, sigma=sigma)
-    teacher_loss = self.nll_per_token_with_probs(logits_teacher, xt, student_probs,
-                                alpha_t=alpha_t, dalpha_t=dalpha_t,
-                                valid_tokens=valid_tokens)
+    for _ in range(num_noised_samples):
+
+      t = self._sample_t(x0.shape[0], current_accumulation_step)
+      dalpha_t, alpha_t = self.noise(t)
+      alpha_t = alpha_t.unsqueeze(-1)
+      assert alpha_t.ndim == 2
+      sigma = self._sigma_from_alphat(alpha_t)
+      sigma = self._process_sigma(sigma)
+
+      probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
+      xt = trainer_base.sample_categorical(probs_xt)
+      xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
+
+      with torch.cuda.amp.autocast(dtype=torch.float32):
+        model_output_teacher = self.teacher(xt, sigma)
+      logits_teacher = self._process_model_output(model_output=model_output_teacher, xt=xt, sigma=sigma)
+      teacher_loss = self.nll_per_token_with_probs(logits_teacher, xt, student_probs,
+                                  alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                  valid_tokens=valid_tokens)
+      
+      teacher_loss_total = teacher_loss_total + teacher_loss
+
+      if self.use_fake:
+        with torch.cuda.amp.autocast(dtype=torch.float32):
+          model_output_fake = self.fake_model(xt, sigma)
+        logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
+        fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs,
+                                    alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                    valid_tokens=valid_tokens)
+
+        fake_loss_total = fake_loss_total + fake_loss
+
+    teacher_loss = teacher_loss_total / num_noised_samples
+    fake_loss = fake_loss_total / num_noised_samples
+      
     if not self.use_fake:
       return teacher_loss
-
-    with torch.cuda.amp.autocast(dtype=torch.float32):
-      model_output_fake = self.fake_model(xt, sigma)
-    logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
-    fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs,
-                                alpha_t=alpha_t, dalpha_t=dalpha_t,
-                                valid_tokens=valid_tokens)
+    
     return teacher_loss - fake_loss
 
   def _reduce_token_loss(self, per_token_loss, valid_tokens):
