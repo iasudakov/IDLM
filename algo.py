@@ -934,7 +934,10 @@ class MDLM_with_DMMD(MDLM_with_AR):
     ``alpha_s`` shaped (B, 1) to match `self.noise` usage elsewhere."""
     k = getattr(self.config.adversarial_distill, 'dmmd_num_steps', 16)
     delta_t = torch.rand_like(t) / k
-    s = (t - delta_t).clamp(min=0.0, max=1.0)
+    # Floor s at sampling_eps (as `_sample_t` does): the loss weight
+    # dalpha_s / (1 - alpha_s) diverges as s -> 0 (alpha_s -> 1), so an
+    # unclamped s produces inf/NaN gradients that collapse the student.
+    s = (t - delta_t).clamp(min=self.sampling_eps, max=1.0)
     dalpha_s, alpha_s = self.noise(s)
     alpha_s = alpha_s.unsqueeze(-1)
     return dalpha_s, alpha_s
