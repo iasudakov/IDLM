@@ -44,6 +44,11 @@ adversarial_distill:
   # the masked generator can stay diverse instead of collapsing. 0 => disabled
   # (original IDLM).
   noise_dim: 0
+  # Number of sampling steps k for the D-MMD posterior scheme (algo=mdlm_dmmd,
+  # MDLM_with_DMMD). The critic time s is drawn one step below the generation
+  # time t via delta_t ~ U(0, 1/k), so the critic latent z_s ~ q(z_s | z_t, x).
+  # Ignored by the original IDLM re-noising path (algo=mdlm).
+  dmmd_num_steps: 32
 
 loader:
   global_batch_size: 512
