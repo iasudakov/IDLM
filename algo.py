@@ -167,8 +167,10 @@ def _load_owt_ar_backbone(model_id_or_path):
 
 
 class _NoiseConditionedBackbone(torch.nn.Module):
-  """Wraps a denoiser backbone and injects a learned projection of per-token
-  Gaussian noise into the token-embedding residual (D-MMD Sec. 6.5).
+  """Wraps a denoiser backbone and injects a learned projection of Gaussian
+  noise into the token-embedding residual (D-MMD Sec. 6.5). By default the
+  noise is drawn independently per token position; with `shared_noise` a single
+  vector per sample is broadcast across all embeddings (same noise everywhere).
 
   A masked-diffusion generator is otherwise a deterministic function of its
   (masked) input, so the moment-matching objective can only be minimised by
@@ -179,10 +181,14 @@ class _NoiseConditionedBackbone(torch.nn.Module):
   (`multistep_generation`) and sampling (`generate_samples`).
   """
 
-  def __init__(self, backbone, embed_module, noise_dim, hidden_size):
+  def __init__(self, backbone, embed_module, noise_dim, hidden_size,
+               shared_noise=False):
     super().__init__()
     self.backbone = backbone
     self.noise_dim = noise_dim
+    # True => one Gaussian vector per sample, broadcast across every token
+    # embedding; False => an independent vector per token position.
+    self.shared_noise = shared_noise
     self.noise_proj = torch.nn.Linear(noise_dim, hidden_size)
     # Small init so the projected noise starts at ~ the embedding scale (giving
     # an immediate stochasticity source even at a tiny generator LR), bias 0.
@@ -195,11 +201,13 @@ class _NoiseConditionedBackbone(torch.nn.Module):
   def _add_noise(self, module, inputs, output):
     if self._noise is None:
       return output
+    # Shared noise has length 1 and broadcasts over the position axis.
     return output + self.noise_proj(self._noise).to(output.dtype)
 
   def forward(self, xt, sigma=None, *args, **kwargs):
+    length = 1 if self.shared_noise else xt.shape[1]
     self._noise = torch.randn(
-      xt.shape[0], xt.shape[1], self.noise_dim,
+      xt.shape[0], length, self.noise_dim,
       device=xt.device, dtype=torch.float32)
     try:
       return self.backbone(xt, sigma, *args, **kwargs)
@@ -207,7 +215,8 @@ class _NoiseConditionedBackbone(torch.nn.Module):
       self._noise = None
 
 
-def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden):
+def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden,
+                              shared_noise=False):
   """Locate the token-embedding module of `backbone` and wrap it so a learned
   Gaussian-noise projection is added to the embedding residual."""
   embed_module = None
@@ -224,7 +233,8 @@ def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden):
   else:
     hidden_size = default_hidden
   return _NoiseConditionedBackbone(
-    backbone, embed_module, noise_dim, hidden_size)
+    backbone, embed_module, noise_dim, hidden_size,
+    shared_noise=shared_noise)
 
 
 class MDLM_with_AR(trainer_base.AbsorbingState):
@@ -287,8 +297,11 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       # projection is tracked/trained like the rest of the backbone.
       noise_dim = getattr(self.config.adversarial_distill, 'noise_dim', 0)
       if noise_dim and noise_dim > 0:
+        noise_shared = getattr(
+          self.config.adversarial_distill, 'noise_shared', False)
         self.backbone = _wrap_backbone_with_noise(
-          self.backbone, noise_dim, self.config.model.hidden_size)
+          self.backbone, noise_dim, self.config.model.hidden_size,
+          shared_noise=noise_shared)
       utils.activate_model(self.backbone)
       self.ema_fake = None
       if self.ema is not None:
@@ -317,10 +330,26 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       self.fake_teacher_weight = getattr(
         self.config.adversarial_distill, 'fake_teacher_weight', 0.0)
 
+  def _student_param_groups(self):
+    """Student optimizer parameter groups. If the backbone is noise-conditioned
+    and `adversarial_distill.noise_lr` is set, the learned noise-projection
+    matrix gets its own learning rate; every other parameter uses optim.lr."""
+    base_lr = self.config.optim.lr
+    noise_lr = getattr(self.config.adversarial_distill, 'noise_lr', None)
+    if noise_lr is None or not hasattr(self.backbone, 'noise_proj'):
+      return [{'params': list(self.backbone.parameters()), 'lr': base_lr}]
+    noise_params = list(self.backbone.noise_proj.parameters())
+    noise_ids = {id(p) for p in noise_params}
+    other_params = [p for p in self.backbone.parameters()
+                    if id(p) not in noise_ids]
+    return [
+      {'params': other_params, 'lr': base_lr},
+      {'params': noise_params, 'lr': noise_lr}]
+
   def configure_optimizers(self):
     if self.config.adversarial_distill.is_distill:
       optimizer_student = torch.optim.AdamW(
-        self.backbone.parameters(),
+        self._student_param_groups(),
         lr=self.config.optim.lr,
         betas=(self.config.optim.beta1,
               self.config.optim.beta2),

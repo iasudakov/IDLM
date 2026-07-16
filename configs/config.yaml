@@ -44,6 +44,13 @@ adversarial_distill:
   # the masked generator can stay diverse instead of collapsing. 0 => disabled
   # (original IDLM).
   noise_dim: 0
+  # Granularity of the above noise conditioning. False (default) draws an
+  # independent Gaussian per token position; True broadcasts one per-sample
+  # vector across all token embeddings (same noise for every position).
+  noise_shared: False
+  # Separate learning rate for the learned noise-projection matrix. null => it
+  # trains at optim.lr like the rest of the student. Only used when noise_dim>0.
+  noise_lr: null
   # Number of sampling steps k for the D-MMD posterior scheme (algo=mdlm_dmmd,
   # MDLM_with_DMMD). The critic time s is drawn one step below the generation
   # time t via delta_t ~ U(0, 1/k), so the critic latent z_s ~ q(z_s | z_t, x).
