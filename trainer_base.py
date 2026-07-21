@@ -94,7 +94,10 @@ class TrainerBase(L.LightningModule):
       gen_ppl_eval_model_name_or_path=\
         self.config.eval.gen_ppl_eval_model_name_or_path,
       eval_ppl_batch_size=\
-        self.config.eval.perplexity_batch_size)
+        self.config.eval.perplexity_batch_size,
+      compute_gm=self.config.eval.get('compute_gm', False),
+      gm_eval_model_name_or_path=self.config.eval.get(
+        'gm_eval_model_name_or_path', 'gpt2'))
 
     if self.config.training.ema > 0:
       self.ema = models.ema.ExponentialMovingAverage(
@@ -280,11 +283,20 @@ class TrainerBase(L.LightningModule):
   def on_validation_epoch_start(self):
     self.metrics.reset()
     self._eval_mode()
+    # Buffer for GM data batches (decoded to text; see on_validation_epoch_end).
+    self._gm_data_texts = []
     assert self.metrics.valid_nlls.nll.mean_value == 0
     assert self.metrics.valid_nlls.nll.weight == 0
 
   def validation_step(self, batch, batch_idx):
     del batch_idx
+    # GPT-2 Gradient Moment needs *data* samples to pair with generated ones.
+    # Buffer the first `gm_num_batches` val batches as text (not tensors, which
+    # would be inference tensors and unusable in the autograd pass GM needs).
+    if self.metrics.gm is not None and len(
+        self._gm_data_texts) < self.config.eval.get('gm_num_batches', 4):
+      self._gm_data_texts.append(
+        self.tokenizer.batch_decode(batch['input_ids']))
     losses = self._loss(batch['input_ids'],
                         batch['attention_mask'])
     self.metrics.update_valid(losses.nlls, losses.prior_loss,
@@ -299,17 +311,24 @@ class TrainerBase(L.LightningModule):
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples):
       samples, text_samples = None, None
-      for _ in range(
+      for _sb in range(
         self.config.sampling.num_sample_batches):
         samples = self.generate_samples(
           num_samples=self.config.loader.eval_batch_size)
-        
+
         self.metrics.record_entropy(samples)
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
         if self.config.eval.compute_generative_perplexity:
           self.metrics.record_generative_perplexity(
             text_samples, self.num_tokens, self.device)
+        # GPT-2 Gradient Moment: pair this generated batch with a buffered data
+        # batch (needs trainer.inference_mode=false so autograd is available).
+        if (self.metrics.gm is not None
+            and _sb < len(self._gm_data_texts)):
+          self.metrics.gm.accumulate(
+            text_samples, self._gm_data_texts[_sb],
+            self.num_tokens, self.device)
       if text_samples is not None:
         if self.trainer.global_rank == 0 and hasattr(
           self.trainer.logger, 'log_table'):
@@ -328,6 +347,13 @@ class TrainerBase(L.LightningModule):
                    sync_dist=True)
           self.log('val/sample_entropy',
                    self.metrics.sample_entropy.compute(),
+                   on_epoch=True,
+                   on_step=False,
+                   sync_dist=True)
+        if self.metrics.gm is not None:
+          self.log('val/gm',
+                   torch.tensor(self.metrics.gm.compute(),
+                                device=self.device),
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)

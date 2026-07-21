@@ -733,6 +733,26 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       fake_loss = fake_loss + self.fake_teacher_weight * anchor
     return fake_loss
 
+  def _clip_gradients(self, parameters, name):
+    """Clip gradients in the manual-optimization loop.
+
+    With ``automatic_optimization=False`` Lightning does NOT apply
+    ``trainer.gradient_clip_val``, so the adversarial min-max would otherwise
+    take unclipped steps -- combined with the diffusion weight
+    ``w(s) = dalpha_s / (1 - alpha_s)`` (huge near ``s -> eps``) this makes the
+    generator/critic losses diverge (student_loss -> -inf, fake_loss -> +inf,
+    entropy -> 0). Clip the accumulated gradient to
+    ``adversarial_distill.gradient_clipping_val`` (<= 0 or None disables) right
+    before ``optimizer.step()`` and log the pre-clip norm for monitoring.
+    """
+    clip_val = getattr(
+      self.config.adversarial_distill, 'gradient_clipping_val', None)
+    if clip_val is None or clip_val <= 0:
+      return
+    norm = torch.nn.utils.clip_grad_norm_(parameters, clip_val)
+    self.log(name, norm, on_step=True, on_epoch=False,
+             prog_bar=False, sync_dist=True)
+
   def _generator_only_step(self, input_tokens, valid_tokens,
                            current_accumulation_step):
     # No fake critic: every step trains the student on the (teacher-only)
@@ -750,6 +770,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     self.total_loss_student += g_loss.detach()
     if self._student_accum_counter == self.accum_batches:
       self._student_accum_counter = 0
+      self._clip_gradients(self.backbone.parameters(), 'grad_norm_student')
       optimizer_student.step()
       self.ema.update(self.backbone.parameters())
       optimizer_student.zero_grad()
@@ -787,7 +808,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self._student_accum_counter += 1
         self.total_loss_student += g_loss.detach()
         if self._student_accum_counter == self.accum_batches:
-          self._student_accum_counter = 0 
+          self._student_accum_counter = 0
+          self._clip_gradients(self.backbone.parameters(), 'grad_norm_student')
           optimizer_student.step()
           self.ema.update(self.backbone.parameters())
           optimizer_student.zero_grad()
@@ -803,7 +825,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self._fake_accum_counter += 1
         self.total_loss_fake += f_loss.detach()
         if self._fake_accum_counter == self.accum_batches:
-          self._fake_accum_counter = 0 
+          self._fake_accum_counter = 0
+          self._clip_gradients(self.fake_model.parameters(), 'grad_norm_fake')
           optimizer_fake.step()
           self.ema_fake.update(self.fake_model.parameters())
           optimizer_fake.zero_grad()

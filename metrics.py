@@ -64,9 +64,133 @@ class Perplexity(NLL):
     return torch.exp(self.mean_value / self.weight)
 
 
+class GradientMoment:
+  """GPT-2 Gradient Moment (GM), D-MMD paper Eq. 13/14.
+
+  ``GM = || E_g[grad_theta log p_LLM(x)] - E_q[grad_theta log p_LLM(x)] ||^2``,
+  a distribution-distance metric where ``g`` = generated samples, ``q`` = data
+  and ``p_LLM`` is a frozen reference LM (GPT-2). GM = 0 iff the two sample sets
+  are indistinguishable to the reference model's loss-gradient; larger means
+  further from the data. Unlike generative perplexity it is not gamed by mode
+  collapse (a collapsed generator scores *low* ppl but *high* GM).
+
+  Unbiased U-statistic estimator over M paired (gen, data) batches. With
+  ``d_m = grad(gen_m) - grad(data_m)`` (reference-model parameter gradients of
+  the mean-per-sequence log-likelihood):
+
+      GM ~= ( ||sum_m d_m||^2 - sum_m ||d_m||^2 ) / ( M (M-1) )   (needs M >= 2)
+
+  because ``E[d_i . d_j] = ||E_g - E_q||^2`` for independent i != j. Only the
+  running sum ``S = sum_m d_m`` (one gradient-shaped structure) and the scalar
+  ``Q = sum_m ||d_m||^2`` are kept. The sign of the gradient cancels in ``d_m``.
+  """
+
+  def __init__(self, model_name_or_path='gpt2') -> None:
+    self.model_name_or_path = model_name_or_path
+    self.model = transformers.AutoModelForCausalLM.from_pretrained(
+      model_name_or_path)
+    self.model.eval()  # disable dropout; parameters still require grad
+    for p in self.model.parameters():
+      p.requires_grad_(True)
+    self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+      model_name_or_path)
+    if self.tokenizer.pad_token is None:
+      self.tokenizer.pad_token = self.tokenizer.eos_token
+      self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+    self.device = 'cpu'
+    self._S = None   # dict: param name -> running sum of d_m
+    self._Q = 0.0    # scalar: sum_m ||d_m||^2
+    self._M = 0      # number of accumulated batches
+
+  def to(self, *args, **kwargs):
+    self.model = self.model.to(*args, **kwargs)
+    for a in args:
+      if isinstance(a, (str, torch.device)):
+        self.device = a
+    if 'device' in kwargs and kwargs['device'] is not None:
+      self.device = kwargs['device']
+    return self
+
+  def reset(self) -> None:
+    self._S = None
+    self._Q = 0.0
+    self._M = 0
+
+  def _tokenize(self, texts, max_length, device):
+    enc = self.tokenizer(
+      texts, return_tensors='pt', return_token_type_ids=False,
+      return_attention_mask=True, truncation=True, padding=True,
+      max_length=max_length)
+    return enc['input_ids'].to(device), enc['attention_mask'].to(device)
+
+  def _grad(self, texts, max_length, device):
+    """Reference-model parameter gradient of the mean-per-sequence
+    log-likelihood on ``texts``. Returns ``{param_name: grad tensor}``."""
+    input_ids, attn_mask = self._tokenize(texts, max_length, device)
+    self.model.zero_grad(set_to_none=True)
+    logits = self.model(input_ids, attention_mask=attn_mask).logits
+    logits = logits[:, :-1, :]
+    targets = input_ids[:, 1:]
+    tok_mask = attn_mask[:, 1:].to(logits.dtype)
+    nll = F.cross_entropy(
+      logits.reshape(-1, logits.shape[-1]), targets.reshape(-1),
+      reduction='none').reshape(targets.shape)
+    # gradient of the mean-per-token NLL (the standard LM loss; length-robust so
+    # a generated batch with early EOS isn't scored differently just for being
+    # shorter). Sign is irrelevant -- it cancels in d_m = grad(gen) - grad(data).
+    loss = (nll * tok_mask).sum() / tok_mask.sum().clamp_min(1.0)
+    loss.backward()
+    return {n: p.grad.detach().clone()
+            for n, p in self.model.named_parameters()
+            if p.grad is not None}
+
+  @torch.enable_grad()
+  def accumulate(self, gen_texts, data_texts, max_length, device) -> None:
+    """Add one paired (generated, data) batch to the GM estimate."""
+    self.to(device)
+    try:
+      a = self._grad(gen_texts, max_length, device)
+      b = self._grad(data_texts, max_length, device)
+    except RuntimeError as e:
+      m = str(e).lower()
+      # Under Lightning validation's default inference_mode, the loss has no
+      # grad_fn so backward fails with a "does not require grad" / inference
+      # message. Surface an actionable hint instead of the cryptic error.
+      if ('inference' in m or 'does not require grad' in m
+          or 'grad_fn' in m):
+        raise RuntimeError(
+          'GradientMoment needs gradients but the reference-model forward could '
+          'not build an autograd graph -- Lightning validation runs under '
+          'inference_mode by default. Re-run with `trainer.inference_mode=false` '
+          '(required whenever eval.compute_gm=true).') from e
+      raise
+    q_m = 0.0
+    if self._S is None:
+      self._S = {}
+      for n in a:
+        d = a[n] - b[n]
+        self._S[n] = d
+        q_m += (d * d).sum().item()
+    else:
+      for n in a:
+        d = a[n] - b[n]
+        self._S[n] += d
+        q_m += (d * d).sum().item()
+    self._Q += q_m
+    self._M += 1
+
+  def compute(self) -> float:
+    if self._M < 2:
+      return 0.0
+    s_norm_sq = sum((v * v).sum().item() for v in self._S.values())
+    return (s_norm_sq - self._Q) / (self._M * (self._M - 1))
+
+
 class Metrics:
   def __init__(self, gen_ppl_eval_model_name_or_path=None,
-               eval_ppl_batch_size=None) -> None:
+               eval_ppl_batch_size=None,
+               compute_gm=False,
+               gm_eval_model_name_or_path='gpt2') -> None:
     metrics = torchmetrics.MetricCollection({
         'nll': NLL(), 'bpd': BPD(), 'ppl': Perplexity()})
     metrics.set_dtype(torch.float64)
@@ -77,6 +201,8 @@ class Metrics:
     self.gen_ppl = Perplexity()
     self.sample_entropy = torchmetrics.aggregation.MeanMetric()
     self.eval_ppl_batch_size = eval_ppl_batch_size
+    self.gm = (GradientMoment(gm_eval_model_name_or_path)
+               if compute_gm else None)
     self.gen_ppl_eval_model_name_or_path = gen_ppl_eval_model_name_or_path
     self.tokenizer = transformers.AutoTokenizer.\
       from_pretrained(gen_ppl_eval_model_name_or_path)
@@ -91,6 +217,8 @@ class Metrics:
     self.train_aux = self.train_aux.to(*args, **kwargs)
     self.valid_nlls = self.valid_nlls.to(*args, **kwargs)
     self.valid_aux = self.valid_aux.to(*args, **kwargs)
+    if self.gm is not None:
+      self.gm.to(*args, **kwargs)
 
   def reset(self):
     self.gen_ppl.reset()
@@ -99,6 +227,8 @@ class Metrics:
     self.train_aux.reset()
     self.valid_nlls.reset()
     self.valid_aux.reset()
+    if self.gm is not None:
+      self.gm.reset()
 
   def update_train(self, nll, aux_loss, num_tokens):
     self.train_nlls.update(nll, num_tokens)
