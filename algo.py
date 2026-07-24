@@ -919,108 +919,212 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     return model_output.exp()
 
 
-class MDLM_with_DMMD(MDLM_with_AR):
-  """Masked-diffusion distillation with the D-MMD critic scheme.
+class MDLM_DMMD(MDLM_with_AR):
+  """MDLM distilled with the Discrete Moment-Matching (D-MMD) recipe of
+  Hoogeboom et al., "Beyond Single Tokens" (arXiv:2603.20155).
 
-  Identical to `MDLM_with_AR` (critic_type='diffusion') except for *how the
-  critic's noisy input is built*. IDLM re-diffuses the student's clean output
-  at an independent noise level; D-MMD (Hoogeboom et al., 2026, Algorithm 1)
-  instead samples a hard completion ``x ~ Cat(x_hat_eta(z_t))`` and draws the
-  critic latent from the true posterior ``z_s ~ q(z_s | z_t, x)`` one step
-  (``delta_t ~ U(0, 1/k)``) below the generation time ``t`` (so ``s < t``).
-  The teacher / fake denoisers are evaluated at ``z_s`` and weighted by
-  ``w(s)``. See the IDLM-vs-D-MMD remark in the paper's Sec. 6.4.
+  This subclasses `MDLM_with_AR` and inherits *all* of its machinery unchanged
+  (optimizers, EMA, checkpointing, the fake/generator min-max schedule, the AR
+  critic, generator input-noise conditioning, samplers, ...). It only replaces
+  the diffusion-critic loss to add two features from the paper, each independently
+  toggleable so their effect on training can be compared:
 
-  Only the diffusion-critic path changes; init, optimizers, the alternating
-  min-max schedule, checkpointing, EMA and optional generator input-noise
-  conditioning are all inherited unchanged. Use with
-  ``adversarial_distill.critic_type='diffusion'`` (optional knob:
-  ``adversarial_distill.dmmd_num_steps`` = k, default 16).
+  1. Mask sampling scheme -- `adversarial_distill.dmmd_mask_sampling`:
+     * 'posterior' ("s", D-MMD Algorithm 1, default): couple two times `s < t`,
+       generate the student prediction `x_hat_eta(z_t)` at the *noisier* latent
+       `z_t`, sample a hard `x ~ Cat(x_hat_eta(z_t))`, and draw the *less-noisy*
+       critic latent from the masked-diffusion posterior `z_s ~ q(z_s | z_t, x)`
+       (revealing some masked positions toward `x`). The critic is scored at `z_s`
+       with weight `w(s)`. The step count `k` is `adversarial_distill.
+       dmmd_num_steps`; the critic time is one step below generation via
+       `delta_t ~ U(0, 1/k)`, `s = t - delta_t`.
+     * 'renoise' ("t", original IDLM `MDLM_with_AR`): generate `student_probs`,
+       then *re-noise* it back to an independent time `t` (`q_xt_with_probs`) and
+       score the critic at `t`. This is the parent's exact scheme (identical when
+       `generator_num_noised_samples == 1`), kept here so the two mask-sampling
+       strategies can be A/B-tested with everything else held fixed.
+     Aliases accepted: {'posterior','s','dmmd'} / {'renoise','t','idlm'}.
+
+  2. Top-p (nucleus) teacher distillation (D-MMD Sec. 3.3), applied in *both*
+     modes. To make the student mode-seek like a top-p sampler, the teacher
+     target is restricted to the top-p nucleus. Hard-masking out-of-nucleus
+     logits to a large negative value spikes the gradient reaching the student
+     (the paper reports divergence), so instead their logits are *lowered by a
+     constant* `Delta` (paper: `Delta = 2`):
+     `s_theta <- s_theta - (1 - mask_top-p) * Delta`. Set via
+     `adversarial_distill.top_p` (>= 1 disables) and `.top_p_delta`. Top-p also
+     applies to the AR critic's teacher; the posterior mask sampling is specific
+     to the diffusion critic.
   """
 
-  def _generate_with_state(self, x0, valid_tokens, current_accumulation_step):
-    """`multistep_generation`, additionally returning the generator latent
-    ``z_t`` and its signal level ``alpha_t`` needed by the D-MMD posterior."""
+  def __init__(self, config, tokenizer):
+    super().__init__(config, tokenizer)
+    ad = self.config.adversarial_distill
+    # Nucleus threshold for D-MMD Sec. 3.3 teacher-target top-p distillation.
+    # None or >= 1 disables it (teacher target left unchanged).
+    self.top_p = getattr(ad, 'top_p', 1.0)
+    if self.top_p is None:
+      self.top_p = 1.0
+    # Constant by which out-of-nucleus teacher logits are lowered (paper Delta=2).
+    self.top_p_delta = getattr(ad, 'top_p_delta', 2.0)
+    # Number of D-MMD sampling steps k; the critic time s is drawn one step below
+    # the generation time t via delta_t ~ U(0, 1/k) (posterior mode only).
+    self.dmmd_num_steps = getattr(ad, 'dmmd_num_steps', 32)
+    # Mask-sampling scheme: 'posterior' (D-MMD, critic at s) or 'renoise' (IDLM,
+    # critic at re-noised t). Normalized so 's'/'dmmd' and 't'/'idlm' also work.
+    mode = str(getattr(ad, 'dmmd_mask_sampling', 'posterior')).lower()
+    if mode in ('posterior', 's', 'dmmd'):
+      self.dmmd_mask_sampling = 'posterior'
+    elif mode in ('renoise', 't', 'idlm'):
+      self.dmmd_mask_sampling = 'renoise'
+    else:
+      raise ValueError(
+        f'Unknown adversarial_distill.dmmd_mask_sampling: {mode!r} '
+        "(expected one of 'posterior'/'s' or 'renoise'/'t').")
+
+  def _dmmd_sample_s(self, t):
+    """Critic time `s` one D-MMD step below the generation time `t`.
+
+    `delta_t ~ U(0, 1/k)` (k = `dmmd_num_steps`), `s = clamp(t - delta_t, eps)`.
+    `s <= t`, so `alpha_s >= alpha_t` -- `z_s` is a *less* noisy latent than
+    `z_t`, matching the reverse (denoising) direction of the posterior.
+    """
+    delta = torch.rand_like(t) / self.dmmd_num_steps
+    return (t - delta).clamp(min=self.sampling_eps)
+
+  def _dmmd_posterior(self, z_t, x_hard, alpha_t, alpha_s):
+    """Masked-diffusion posterior sample `z_s ~ q(z_s | z_t, x_hard)`.
+
+    Mirrors `AbsorbingState._ancestral_update` (a reverse step from `t` to `s`)
+    but conditions on the *hard* student sample `x_hard` instead of a soft model
+    prediction: positions already revealed in `z_t` are kept, and each still-
+    masked position is revealed to `x_hard` with probability
+    `(alpha_s - alpha_t) / (1 - alpha_t)`, otherwise stays masked.
+    """
+    reveal_prob = ((alpha_s - alpha_t) / (1 - alpha_t)).clamp(0.0, 1.0)
+    reveal = torch.rand(z_t.shape, device=z_t.device) < reveal_prob
+    newly_revealed = (z_t == self.mask_index) & reveal
+    return torch.where(newly_revealed, x_hard, z_t)
+
+  def _dmmd_generate(self, x0, valid_tokens, current_accumulation_step,
+                     detach_student):
+    """One critic draw, returning `(student_probs, crit_x, alpha, dalpha)`.
+
+    `student_probs` is the differentiable student prediction; `crit_x` is the
+    discrete latent fed to the teacher/fake critic, scored with weight from
+    `(alpha, dalpha)`. The latent is produced by the D-MMD posterior ('posterior'
+    mode) or by IDLM re-noising ('renoise' mode). When `detach_student` the
+    student forward pass is run under `no_grad` (fake / auxiliary step).
+    """
+    if self.dmmd_mask_sampling == 'renoise':
+      # IDLM: generate student_probs, then re-noise to an independent time t.
+      if detach_student:
+        with torch.no_grad():
+          student_probs = self.multistep_generation(
+            x0, valid_tokens, current_accumulation_step)
+      else:
+        student_probs = self.multistep_generation(
+          x0, valid_tokens, current_accumulation_step)
+      t = self._sample_t(x0.shape[0], current_accumulation_step)
+      dalpha_t, alpha_t = self.noise(t)
+      alpha_t = alpha_t.unsqueeze(-1)
+      assert alpha_t.ndim == 2
+      probs_xt = self.q_xt_with_probs(
+        student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
+      xt = trainer_base.sample_categorical(probs_xt)
+      xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
+      return student_probs, xt, alpha_t, dalpha_t
+
+    # D-MMD posterior (Algorithm 1): couple s < t and sample z_s from q(z_s|z_t,x).
     t = self._sample_t(x0.shape[0], current_accumulation_step)
+    s = self._dmmd_sample_s(t)
     _, alpha_t = self.noise(t)
-    alpha_t = alpha_t.unsqueeze(-1)
-    sigma = self._sigma_from_alphat(alpha_t)
-    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
-    log_x_theta = self.forward(xt, sigma=sigma)
-    student_probs = self._preserve_prompt_probs(
-      log_x_theta.exp(), x0, valid_tokens)
-    return student_probs, xt, alpha_t, t
-
-  def _sample_posterior_time(self, t):
-    """Sample a critic time ``s < t`` (``t = min(1, s + delta_t)``,
-    ``delta_t ~ U(0, 1/k)``) and return ``(dalpha_s, alpha_s)`` with
-    ``alpha_s`` shaped (B, 1) to match `self.noise` usage elsewhere."""
-    k = getattr(self.config.adversarial_distill, 'dmmd_num_steps', 16)
-    delta_t = torch.rand_like(t) / k
-    # Floor s at sampling_eps (as `_sample_t` does): the loss weight
-    # dalpha_s / (1 - alpha_s) diverges as s -> 0 (alpha_s -> 1), so an
-    # unclamped s produces inf/NaN gradients that collapse the student.
-    s = (t - delta_t).clamp(min=self.sampling_eps, max=1.0)
     dalpha_s, alpha_s = self.noise(s)
+    alpha_t = alpha_t.unsqueeze(-1)
     alpha_s = alpha_s.unsqueeze(-1)
-    return dalpha_s, alpha_s
+    assert alpha_t.ndim == 2 and alpha_s.ndim == 2
 
-  def _posterior_zs(self, xt_gen, x_gen, alpha_t, alpha_s, x0, valid_tokens):
-    """Draw ``z_s ~ q(z_s | z_t, x)`` for absorbing-state (masked) diffusion.
+    # Generate the student prediction at the (noisier) generation latent z_t.
+    z_t = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    sigma_t = self._sigma_from_alphat(alpha_t)
+    if detach_student:
+      with torch.no_grad():
+        student_probs = self.forward(z_t, sigma=sigma_t).exp()
+    else:
+      student_probs = self.forward(z_t, sigma=sigma_t).exp()
+    student_probs = self._preserve_prompt_probs(student_probs, x0, valid_tokens)
 
-    Tokens already revealed in ``z_t`` (=`xt_gen`) are kept; each still-masked
-    token is revealed to its ``x_gen`` value with probability
-    ``(alpha_s - alpha_t) / (1 - alpha_t)`` (``s < t`` so ``alpha_s > alpha_t``)
-    and stays masked otherwise. ``z_s`` is a hard (stop-grad) latent."""
-    masked = (xt_gen == self.mask_index)
-    denom = (1.0 - alpha_t).clamp_min(1e-6)
-    p_reveal = ((alpha_s - alpha_t) / denom).clamp(0.0, 1.0)      # (B, 1)
-    u = torch.rand(x_gen.shape, device=x_gen.device, dtype=p_reveal.dtype)
-    revealed = (~masked) | (masked & (u < p_reveal))
-    zs = torch.where(
-      revealed, x_gen, torch.full_like(x_gen, self.mask_index))
-    return self._preserve_prompt_tokens(zs, x0, valid_tokens)
+    # Hard student sample -> posterior "sampling of masks" to the critic latent.
+    x_hard = trainer_base.sample_categorical(student_probs.detach())
+    x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
+    z_s = self._dmmd_posterior(z_t, x_hard, alpha_t, alpha_s)
+    z_s = self._preserve_prompt_tokens(z_s, x0, valid_tokens)
+    return student_probs, z_s, alpha_s, dalpha_s
+
+  def _apply_top_p_to_teacher(self, teacher_log_probs):
+    """D-MMD Sec. 3.3 top-p distillation of the teacher target.
+
+    Lowers the log-probability of out-of-nucleus categories by `top_p_delta`
+    instead of hard-masking them to a large negative value (which would spike the
+    gradient reaching the student through its softmax Jacobian). No-op when
+    `top_p >= 1`. The nucleus is the smallest set whose cumulative probability
+    first exceeds `top_p` (top-1 always kept), matching the shift-by-one
+    semantics of `utils.top_k_top_p_filtering`. Following the paper we do not
+    renormalize; a per-position constant would not change the student gradient.
+    Safe on the one-hot revealed positions produced by `_process_model_output`
+    (their nucleus is the single revealed token, so they stay one-hot).
+    """
+    if self.top_p is None or self.top_p >= 1.0:
+      return teacher_log_probs
+    with torch.no_grad():
+      probs = teacher_log_probs.exp()
+      sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+      cum_probs = torch.cumsum(sorted_probs, dim=-1)
+      sorted_remove = cum_probs > self.top_p
+      # Keep the boundary category that first crosses top_p; always keep top-1.
+      sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+      sorted_remove[..., 0] = False
+      remove = torch.zeros_like(sorted_remove).scatter(
+        -1, sorted_idx, sorted_remove)
+    return teacher_log_probs - remove.to(teacher_log_probs.dtype) * self.top_p_delta
 
   def _generator_loss_diffusion(self, x0, valid_tokens,
                                 current_accumulation_step):
-    # D-MMD generator loss. Same `teacher_loss - fake_loss` (DMD) objective and
-    # the same MDLM weighted-CE `nll_per_token_with_probs` as IDLM; only the
-    # critic latent `zs` is drawn from the posterior q(z_s | z_t, x) instead of
-    # a fresh re-noising of `student_probs`.
-    student_probs, xt_gen, alpha_t, t = self._generate_with_state(
-      x0, valid_tokens, current_accumulation_step)
-
-    # Hard student completion; a (stop-grad) context for the critics.
-    x_gen = trainer_base.sample_categorical(student_probs.detach())
-    x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
-
+    # D-MMD generator loss (diffusion critic). Same weighted soft cross-entropy
+    # as the parent, but the critic latent comes from the selected mask-sampling
+    # scheme (D-MMD posterior or IDLM re-noising) and the teacher target is
+    # optionally top-p distilled.
     num_noised_samples = getattr(
       self.config.adversarial_distill, 'generator_num_noised_samples', 1)
+
     teacher_loss_total = 0.0
     fake_loss_total = 0.0
+
     for _ in range(num_noised_samples):
-      dalpha_s, alpha_s = self._sample_posterior_time(t)
-      sigma = self._sigma_from_alphat(alpha_s)
+      student_probs, crit_x, alpha, dalpha = self._dmmd_generate(
+        x0, valid_tokens, current_accumulation_step, detach_student=False)
+      sigma = self._sigma_from_alphat(alpha)
       sigma = self._process_sigma(sigma)
-      zs = self._posterior_zs(
-        xt_gen, x_gen, alpha_t, alpha_s, x0, valid_tokens)
 
       with torch.cuda.amp.autocast(dtype=torch.float32):
-        model_output_teacher = self.teacher(zs, sigma)
+        model_output_teacher = self.teacher(crit_x, sigma)
       logits_teacher = self._process_model_output(
-        model_output=model_output_teacher, xt=zs, sigma=sigma)
-      teacher_loss_total = teacher_loss_total + self.nll_per_token_with_probs(
-        logits_teacher, zs, student_probs,
-        alpha_t=alpha_s, dalpha_t=dalpha_s, valid_tokens=valid_tokens)
+        model_output=model_output_teacher, xt=crit_x, sigma=sigma)
+      logits_teacher = self._apply_top_p_to_teacher(logits_teacher)
+      teacher_loss = self.nll_per_token_with_probs(
+        logits_teacher, crit_x, student_probs,
+        alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens)
+      teacher_loss_total = teacher_loss_total + teacher_loss
 
       if self.use_fake:
         with torch.cuda.amp.autocast(dtype=torch.float32):
-          model_output_fake = self.fake_model(zs, sigma)
+          model_output_fake = self.fake_model(crit_x, sigma)
         logits_fake = self._process_model_output(
-          model_output=model_output_fake, xt=zs, sigma=sigma)
-        fake_loss_total = fake_loss_total + self.nll_per_token_with_probs(
-          logits_fake, zs, student_probs,
-          alpha_t=alpha_s, dalpha_t=dalpha_s, valid_tokens=valid_tokens)
+          model_output=model_output_fake, xt=crit_x, sigma=sigma)
+        fake_loss = self.nll_per_token_with_probs(
+          logits_fake, crit_x, student_probs,
+          alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens)
+        fake_loss_total = fake_loss_total + fake_loss
 
     teacher_loss = teacher_loss_total / num_noised_samples
     if not self.use_fake:
@@ -1029,38 +1133,60 @@ class MDLM_with_DMMD(MDLM_with_AR):
     return teacher_loss - fake_loss
 
   def _fake_loss_diffusion(self, x0, valid_tokens, current_accumulation_step):
-    # D-MMD auxiliary/fake loss: fit the fake denoiser to the student's (soft)
-    # distribution on the posterior latent z_s (soft target is valid for masked
-    # diffusion, paper Sec. 3.2). Optional teacher anchor (fake_teacher_weight
-    # > 0) matches the second term of D-MMD Eq. 12.
-    with torch.no_grad():
-      student_probs, xt_gen, alpha_t, t = self._generate_with_state(
-        x0, valid_tokens, current_accumulation_step)
-      x_gen = trainer_base.sample_categorical(student_probs)
-      x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
-
-    dalpha_s, alpha_s = self._sample_posterior_time(t)
-    sigma = self._sigma_from_alphat(alpha_s)
+    # D-MMD auxiliary/fake loss (diffusion critic). Fits the fake critic to the
+    # student's soft target at the critic latent (D-MMD Sec. 3.2 allows the soft
+    # target for masked diffusion). Keeps the optional aux->teacher anchor
+    # (fake_teacher_weight, D-MMD Eq. 12, second term).
+    student_probs, crit_x, alpha, dalpha = self._dmmd_generate(
+      x0, valid_tokens, current_accumulation_step, detach_student=True)
+    sigma = self._sigma_from_alphat(alpha)
     sigma = self._process_sigma(sigma)
-    zs = self._posterior_zs(xt_gen, x_gen, alpha_t, alpha_s, x0, valid_tokens)
 
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      model_output_fake = self.fake_model(zs, sigma)
+      model_output_fake = self.fake_model(crit_x, sigma)
     logits_fake = self._process_model_output(
-      model_output=model_output_fake, xt=zs, sigma=sigma)
+      model_output=model_output_fake, xt=crit_x, sigma=sigma)
     fake_loss = self.nll_per_token_with_probs(
-      logits_fake, zs, student_probs,
-      alpha_t=alpha_s, dalpha_t=dalpha_s, valid_tokens=valid_tokens)
+      logits_fake, crit_x, student_probs,
+      alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens)
 
     if self.fake_teacher_weight > 0:
       with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float32):
         teacher_probs = self._process_model_output(
-          model_output=self.teacher(zs, sigma), xt=zs, sigma=sigma).exp()
+          model_output=self.teacher(crit_x, sigma), xt=crit_x, sigma=sigma).exp()
       anchor = self.nll_per_token_with_probs(
-        logits_fake, zs, teacher_probs,
-        alpha_t=alpha_s, dalpha_t=dalpha_s, valid_tokens=valid_tokens)
+        logits_fake, crit_x, teacher_probs,
+        alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens)
       fake_loss = fake_loss + self.fake_teacher_weight * anchor
     return fake_loss
+
+  def _generator_loss_ar(self, x0, valid_tokens, current_accumulation_step):
+    # AR critic: identical to the parent, plus D-MMD Sec. 3.3 top-p distillation
+    # of the teacher's next-token log-probs. (The posterior mask sampling is
+    # diffusion-specific and does not apply to a full-sequence AR critic.)
+    student_probs = self.multistep_generation(
+      x0, valid_tokens, current_accumulation_step)
+
+    x_gen = trainer_base.sample_categorical(student_probs.detach())
+    x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
+
+    with torch.no_grad():
+      teacher_logprobs = self._ar_logprobs(self.teacher, x_gen)
+    teacher_logprobs = self._apply_top_p_to_teacher(teacher_logprobs)
+    teacher_loss = self._ar_cross_entropy(
+      teacher_logprobs, student_probs, valid_tokens)
+    if not self.use_fake:
+      return teacher_loss
+
+    with torch.no_grad():
+      fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
+    fake_loss = self._ar_cross_entropy(
+      fake_logprobs, student_probs, valid_tokens)
+    return teacher_loss - fake_loss
+
+
+# Backwards-compatible alias for the algo=mdlm_dmmd wiring in main.py.
+MDLM_with_DMMD = MDLM_DMMD
 
 
 # class MDLM(trainer_base.AbsorbingState):

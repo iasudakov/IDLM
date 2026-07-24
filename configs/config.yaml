@@ -56,6 +56,19 @@ adversarial_distill:
   # time t via delta_t ~ U(0, 1/k), so the critic latent z_s ~ q(z_s | z_t, x).
   # Ignored by the original IDLM re-noising path (algo=mdlm).
   dmmd_num_steps: 32
+  # Mask-sampling scheme for algo=mdlm_dmmd (MDLM_DMMD). 'posterior' ('s'):
+  # D-MMD Algorithm 1, critic latent z_s ~ q(z_s | z_t, x) at s = t - delta_t.
+  # 'renoise' ('t'): original IDLM, re-noise student_probs to an independent
+  # time t. Lets the two schemes be A/B-tested with everything else fixed.
+  dmmd_mask_sampling: posterior
+  # D-MMD Sec. 3.3 top-p (nucleus) teacher distillation (algo=mdlm_dmmd). The
+  # teacher target is restricted to the top-p nucleus so the student mode-seeks.
+  # >= 1 disables it (teacher target unchanged); the paper's best masked-text
+  # value is ~0.85. Applies in both dmmd_mask_sampling modes.
+  top_p: 1.0
+  # Constant Delta by which out-of-nucleus teacher logits are lowered instead of
+  # hard-masking (D-MMD Sec. 3.3, paper uses Delta=2). Avoids gradient spikes.
+  top_p_delta: 2.0
 
 loader:
   global_batch_size: 512
