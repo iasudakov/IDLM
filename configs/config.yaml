@@ -48,6 +48,13 @@ adversarial_distill:
   # independent Gaussian per token position; True broadcasts one per-sample
   # vector across all token embeddings (same noise for every position).
   noise_shared: False
+  # Initial size of the injected noise vector, as a multiple of the student
+  # embedding's own per-entry std (measured from the loaded checkpoint, so this
+  # is scale-free across backbones). 1.0 => the injection starts as large as the
+  # token identity itself; smaller values are a proportionally weaker
+  # perturbation. NOTE: the projection is only initialised here -- it is then
+  # trained, so watch `noise/snr` to see where it settles.
+  noise_scale: 1.0
   # Separate learning rate for the learned noise-projection matrix. null => it
   # trains at optim.lr like the rest of the student. Only used when noise_dim>0.
   noise_lr: null

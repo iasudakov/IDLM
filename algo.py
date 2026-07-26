@@ -166,6 +166,20 @@ def _load_owt_ar_backbone(model_id_or_path):
   return model
 
 
+def _embedding_std(embed_module):
+  """Per-entry std of a token-embedding module's weight matrix.
+
+  Used to calibrate the noise-conditioning init to the loaded checkpoint rather
+  than to a freshly-initialised backbone. Returns the DiT init scale (0.02) if
+  no weight can be located, so the behaviour degrades to the previous constant.
+  """
+  for attr in ('embedding', 'weight'):
+    w = getattr(embed_module, attr, None)
+    if isinstance(w, torch.Tensor) and w.numel() > 0:
+      return float(w.detach().float().std())
+  return 0.02
+
+
 class _NoiseConditionedBackbone(torch.nn.Module):
   """Wraps a denoiser backbone and injects a learned projection of Gaussian
   noise into the token-embedding residual (D-MMD Sec. 6.5). By default the
@@ -179,21 +193,35 @@ class _NoiseConditionedBackbone(torch.nn.Module):
   factorised output. Fresh noise is drawn on every forward pass and added to
   the embedding via a forward hook, so it is applied uniformly across training
   (`multistep_generation`) and sampling (`generate_samples`).
+
+  The projection is initialised so the injected vector matches the scale of the
+  *actual* embedding matrix (times `noise_scale`), measured from `embed_module`
+  at construction time. This matters when distilling a pretrained checkpoint: a
+  hardcoded init calibrated to a freshly-initialised DiT (`kaiming_uniform_`,
+  per-entry std ~= 0.021) is ~15x too small for `kuleshov-group/mdlm-owt`,
+  whose trained embedding has std ~= 0.309. At that scale two noise draws move
+  the student's output distribution by a total-variation distance of only
+  ~0.09, i.e. the generator is effectively noise-free and behaves like a run
+  with `noise_dim=0`.
   """
 
   def __init__(self, backbone, embed_module, noise_dim, hidden_size,
-               shared_noise=False):
+               shared_noise=False, noise_scale=1.0):
     super().__init__()
     self.backbone = backbone
     self.noise_dim = noise_dim
     # True => one Gaussian vector per sample, broadcast across every token
     # embedding; False => an independent vector per token position.
     self.shared_noise = shared_noise
+    self.noise_scale = noise_scale
     self.noise_proj = torch.nn.Linear(noise_dim, hidden_size)
-    # Small init so the projected noise starts at ~ the embedding scale (giving
-    # an immediate stochasticity source even at a tiny generator LR), bias 0.
+    # Match the embedding's own scale so the injected vector starts at
+    # `noise_scale` x the per-token embedding norm, whatever checkpoint was
+    # loaded. Falls back to the DiT init scale if the module exposes no weight.
+    embed_std = _embedding_std(embed_module)
     torch.nn.init.normal_(
-      self.noise_proj.weight, std=0.02 / (noise_dim ** 0.5))
+      self.noise_proj.weight,
+      std=noise_scale * embed_std / (noise_dim ** 0.5))
     torch.nn.init.zeros_(self.noise_proj.bias)
     self._noise = None
     embed_module.register_forward_hook(self._add_noise)
@@ -216,7 +244,7 @@ class _NoiseConditionedBackbone(torch.nn.Module):
 
 
 def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden,
-                              shared_noise=False):
+                              shared_noise=False, noise_scale=1.0):
   """Locate the token-embedding module of `backbone` and wrap it so a learned
   Gaussian-noise projection is added to the embedding residual."""
   embed_module = None
@@ -234,7 +262,7 @@ def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden,
     hidden_size = default_hidden
   return _NoiseConditionedBackbone(
     backbone, embed_module, noise_dim, hidden_size,
-    shared_noise=shared_noise)
+    shared_noise=shared_noise, noise_scale=noise_scale)
 
 
 class MDLM_with_AR(trainer_base.AbsorbingState):
@@ -257,6 +285,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     super().__init__(config, tokenizer)
     self._validate_configuration()
     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
+    # Resolved lazily by `_student_embed_std` for the noise diagnostics.
+    self._embed_module_cache = None
     if self.is_adversarial_distill:
       self.automatic_optimization = False
       # Critic type: 'ar' uses autoregressive (owt-ar) teacher/fake; 'diffusion'
@@ -299,9 +329,11 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       if noise_dim and noise_dim > 0:
         noise_shared = getattr(
           self.config.adversarial_distill, 'noise_shared', False)
+        noise_scale = getattr(
+          self.config.adversarial_distill, 'noise_scale', 1.0)
         self.backbone = _wrap_backbone_with_noise(
           self.backbone, noise_dim, self.config.model.hidden_size,
-          shared_noise=noise_shared)
+          shared_noise=noise_shared, noise_scale=noise_scale)
       utils.activate_model(self.backbone)
       self.ema_fake = None
       if self.ema is not None:
@@ -733,6 +765,52 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       fake_loss = fake_loss + self.fake_teacher_weight * anchor
     return fake_loss
 
+  def _noise_conditioning_stats(self):
+    """Diagnostics for the generator's input-noise conditioning, or `{}` when
+    it is disabled (`noise_dim=0`).
+
+    Logged every generator step so it is visible whether the student is
+    actually *using* the noise source or ignoring it:
+
+    * `noise/proj_norm` -- Frobenius norm of the learned projection. Flat means
+      the generator is not learning to use the noise; the run is then
+      equivalent to `noise_dim=0` regardless of `noise_lr`.
+    * `noise/inject_std` -- per-hidden-dim std of the injected vector,
+      `||W||_F / sqrt(hidden)` for unit-Gaussian input. Compare against
+      `noise/embed_std`.
+    * `noise/embed_std` -- per-entry std of the student's token embedding
+      (constant up to training drift), the scale the injection competes with.
+    * `noise/snr` -- ratio of the two. At ~0.06 the injection is a few-percent
+      perturbation that LayerNorm largely absorbs; ~1.0 means the noise is as
+      large as the token identity itself.
+    """
+    proj = getattr(self.backbone, 'noise_proj', None)
+    if proj is None:
+      return {}
+    with torch.no_grad():
+      w = proj.weight.detach().float()
+      proj_norm = w.norm()
+      # E[||Wz||^2] = ||W||_F^2 for z ~ N(0, I), spread over `hidden` dims.
+      inject_std = proj_norm / (w.shape[0] ** 0.5)
+      embed_std = self._student_embed_std()
+    return {
+      'noise/proj_norm': proj_norm,
+      'noise/inject_std': inject_std,
+      'noise/embed_std': torch.as_tensor(embed_std, device=w.device),
+      'noise/snr': inject_std / max(embed_std, 1e-12)}
+
+  def _student_embed_std(self):
+    """Per-entry std of the (possibly noise-wrapped) student's embedding."""
+    if self._embed_module_cache is None:
+      inner = getattr(self.backbone, 'backbone', self.backbone)
+      for name, module in inner.named_modules():
+        if name.endswith('vocab_embed'):
+          self._embed_module_cache = module
+          break
+    if self._embed_module_cache is None:
+      return 0.02
+    return _embedding_std(self._embed_module_cache)
+
   def _clip_gradients(self, parameters, name):
     """Clip gradients in the manual-optimization loop.
 
@@ -776,7 +854,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       optimizer_student.zero_grad()
       _maybe_save_periodic_checkpoint(self)
       self.log_dict(
-        {"student_loss": self.total_loss_student},
+        {"student_loss": self.total_loss_student,
+         **self._noise_conditioning_stats()},
         prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
       scheduler_student.step()
       self.total_loss_student = 0
@@ -841,7 +920,9 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         utils.freeze_model(self.backbone)
         optimizer_fake.zero_grad()
         self.log_dict(
-            {"student_loss": self.total_loss_student, "fake_loss": torch.stack(self.f_loss_ar).mean()},
+            {"student_loss": self.total_loss_student,
+             "fake_loss": torch.stack(self.f_loss_ar).mean(),
+             **self._noise_conditioning_stats()},
             prog_bar=True,
             on_step=True,
             on_epoch=False,
