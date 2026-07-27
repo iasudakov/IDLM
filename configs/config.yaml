@@ -48,13 +48,22 @@ adversarial_distill:
   # student's full soft distribution, i.e. the Rao-Blackwellisation of that
   # target: same expectation, no per-position sampling noise, and for the AR
   # critic exactly the quantity the generator step differentiates.
-  # Applies to both critic_type=ar and critic_type=diffusion; the latent /
-  # context the critic sees is the hard sample either way, so a soft-vs-hard A/B
-  # at fixed seed differs only in the target. Only the fake/auxiliary step is
-  # affected -- the generator always uses the soft path.
-  # NOTE (paper, same section): valid for *masked* diffusion only. Uniform
+  # null (default) => each critic keeps the default it was written with, so
+  # existing runs are unchanged: hard for critic_type=ar, soft for
+  # critic_type=diffusion. Set True/False explicitly to A/B it; the latent /
+  # context the critic sees is the hard sample either way, so at a fixed seed the
+  # two differ only in the target. Only the fake/auxiliary step is affected --
+  # the generator always uses the soft path.
+  # NOTE 1 (paper, same section): valid for *masked* diffusion only. Uniform
   # diffusion (algo=duo*) must train its auxiliary model on hard samples.
-  fake_soft_target: False
+  # NOTE 2: with the diffusion critic the *logged* `fake_loss` is not comparable
+  # across the two settings. `_process_model_output` pins already-revealed
+  # positions to a one-hot (`neg_infinity` elsewhere), which the hard target
+  # zeroes out but the soft target multiplies its off-token mass against, adding
+  # a term ~1e5x the real signal. It is a constant assignment, so it contributes
+  # no gradient -- training is unaffected, but compare `student_loss` /
+  # `val/gen_ppl` rather than `fake_loss` between the modes.
+  fake_soft_target: null
   # Weight of the auxiliary->teacher regularizer in the fake-model loss
   # (D-MMD Eq. 12, second term): CE(teacher || fake) on the student's samples.
   # Anchors the fake critic to the teacher, stabilizing the min-max without

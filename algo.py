@@ -367,8 +367,17 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       # diffusion critic between `student_probs` and one-hot `x_hard` (see
       # `_fake_diffusion_target`). Only the *fake/auxiliary* step is affected;
       # the generator always differentiates the soft path.
-      self.fake_soft_target = getattr(
-        self.config.adversarial_distill, 'fake_soft_target', False)
+      #
+      # `null` keeps each critic's own original default rather than imposing one
+      # on both, so no existing run changes behaviour: the AR critic was written
+      # with the hard next-token NLL, the diffusion critic with the soft target.
+      fake_soft_target = getattr(
+        self.config.adversarial_distill, 'fake_soft_target', None)
+      if fake_soft_target is None:
+        fake_soft_target = (self.critic_type == 'diffusion')
+      self.fake_soft_target = bool(fake_soft_target)
+      print(f'[adversarial_distill] critic_type={self.critic_type}, '
+            f'fake_soft_target={self.fake_soft_target}', flush=True)
 
   def _student_param_groups(self):
     """Student optimizer parameter groups. If the backbone is noise-conditioned
