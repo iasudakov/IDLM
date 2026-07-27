@@ -194,15 +194,27 @@ class _NoiseConditionedBackbone(torch.nn.Module):
   the embedding via a forward hook, so it is applied uniformly across training
   (`multistep_generation`) and sampling (`generate_samples`).
 
-  The projection is initialised so the injected vector matches the scale of the
-  *actual* embedding matrix (times `noise_scale`), measured from `embed_module`
-  at construction time. This matters when distilling a pretrained checkpoint: a
-  hardcoded init calibrated to a freshly-initialised DiT (`kaiming_uniform_`,
-  per-entry std ~= 0.021) is ~15x too small for `kuleshov-group/mdlm-owt`,
-  whose trained embedding has std ~= 0.309. At that scale two noise draws move
-  the student's output distribution by a total-variation distance of only
-  ~0.09, i.e. the generator is effectively noise-free and behaves like a run
-  with `noise_dim=0`.
+  The projection's *output* is rescaled by `embed_std / sqrt(noise_dim)`, a
+  constant measured from the *actual* embedding matrix of `embed_module` at
+  construction time. That makes the parameterization dimensionless: a unit-RMS
+  `W` injects a vector as large as the token identity, so `noise/snr ~= rms(W)`
+  and, under Adam (per-entry `|dW| ~= lr` per step), snr grows at ~`noise_lr`
+  per step whatever `noise_dim` or checkpoint is in use -- i.e. `noise_lr`
+  transfers. The constant adds no expressiveness (`c * (W z)` spans the same
+  functions as `W' z`); it fixes the units, which is what makes the *optimizer*
+  behave comparably across settings.
+
+  Calibrating to the loaded checkpoint matters when distilling: a hardcoded init
+  calibrated to a freshly-initialised DiT (`kaiming_uniform_`, per-entry std
+  ~= 0.021) is ~15x too small for `kuleshov-group/mdlm-owt`, whose trained
+  embedding has std ~= 0.309. At that scale two noise draws move the student's
+  output distribution by a total-variation distance of only ~0.09, i.e. the
+  generator is effectively noise-free and behaves like a run with `noise_dim=0`.
+  The mirror-image failure is a large init (snr ~= 10): the embedding residual
+  is then ~90% noise, the student cannot read its own masked context, and a
+  pretrained checkpoint has to spend thousands of steps just attenuating `W`
+  before distillation means anything. Hence the zero-init default -- see
+  `noise_scale` in `configs/config.yaml`.
   """
 
   def __init__(self, backbone, embed_module, noise_dim, hidden_size,
@@ -215,13 +227,31 @@ class _NoiseConditionedBackbone(torch.nn.Module):
     self.shared_noise = shared_noise
     self.noise_scale = noise_scale
     self.noise_proj = torch.nn.Linear(noise_dim, hidden_size)
-    # Match the embedding's own scale so the injected vector starts at
-    # `noise_scale` x the per-token embedding norm, whatever checkpoint was
-    # loaded. Falls back to the DiT init scale if the module exposes no weight.
+    # The projection output is rescaled by a constant measured once, here, from
+    # the *actual* embedding matrix, so a unit-RMS `W` injects a vector the size
+    # of the token identity: `snr == rms(W)`. Fixed at construction (the
+    # embedding drifts during training, and recomputing it per forward would
+    # both cost a reduction over the whole matrix and feed back into itself).
+    # Falls back to the DiT init scale if the module exposes no weight.
     embed_std = _embedding_std(embed_module)
-    torch.nn.init.normal_(
-      self.noise_proj.weight,
-      std=noise_scale * embed_std / (noise_dim ** 0.5))
+    # Non-persistent: recomputed from the embedding at every construction, so it
+    # adds no state_dict key (an old noise-conditioned checkpoint would
+    # otherwise fail Lightning's strict resume with a missing key) and it is not
+    # a parameter, so it stays out of `_student_param_groups` / weight decay.
+    self.register_buffer(
+      'noise_out_scale',
+      torch.tensor(embed_std / (noise_dim ** 0.5), dtype=torch.float32),
+      persistent=False)
+    # `noise_scale` is the initial RMS of `W`, i.e. the initial `noise/snr`.
+    # 0.0 (default) => zero-init: the wrapped student starts as an exact copy of
+    # the checkpoint's function and grows its noise usage only if the objective
+    # pays for it. The gradient into `W` is `noise_out_scale * g_out z^T`, which
+    # is non-zero because `z` is, so a zero start still trains (the standard
+    # zero-init residual branch, cf. AdaLN-zero / zero-convs / LoRA `B=0`).
+    if noise_scale:
+      torch.nn.init.normal_(self.noise_proj.weight, std=noise_scale)
+    else:
+      torch.nn.init.zeros_(self.noise_proj.weight)
     torch.nn.init.zeros_(self.noise_proj.bias)
     self._noise = None
     embed_module.register_forward_hook(self._add_noise)
@@ -230,7 +260,8 @@ class _NoiseConditionedBackbone(torch.nn.Module):
     if self._noise is None:
       return output
     # Shared noise has length 1 and broadcasts over the position axis.
-    return output + self.noise_proj(self._noise).to(output.dtype)
+    injected = self.noise_out_scale * self.noise_proj(self._noise)
+    return output + injected.to(output.dtype)
 
   def forward(self, xt, sigma=None, *args, **kwargs):
     length = 1 if self.shared_noise else xt.shape[1]
@@ -840,13 +871,17 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       the generator is not learning to use the noise; the run is then
       equivalent to `noise_dim=0` regardless of `noise_lr`.
     * `noise/inject_std` -- per-hidden-dim std of the injected vector,
-      `||W||_F / sqrt(hidden)` for unit-Gaussian input. Compare against
-      `noise/embed_std`.
+      `noise_out_scale * ||W||_F / sqrt(hidden)` for unit-Gaussian input. The
+      `noise_out_scale` factor is what `_add_noise` actually applies; dropping it
+      here would under-report the injection by `embed_std / sqrt(noise_dim)`
+      (~37x at `noise_dim=128` on mdlm-owt). Compare against `noise/embed_std`.
     * `noise/embed_std` -- per-entry std of the student's token embedding
       (constant up to training drift), the scale the injection competes with.
-    * `noise/snr` -- ratio of the two. At ~0.06 the injection is a few-percent
-      perturbation that LayerNorm largely absorbs; ~1.0 means the noise is as
-      large as the token identity itself.
+    * `noise/snr` -- ratio of the two, and with the output rescaling also just
+      `rms(W)`. At ~0.06 the injection is a few-percent perturbation that
+      LayerNorm largely absorbs; ~1.0 means the noise is as large as the token
+      identity itself; ~10 means the token identity is a tenth of the residual
+      and the student can barely read its own input.
     """
     proj = getattr(self.backbone, 'noise_proj', None)
     if proj is None:
@@ -854,8 +889,10 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     with torch.no_grad():
       w = proj.weight.detach().float()
       proj_norm = w.norm()
-      # E[||Wz||^2] = ||W||_F^2 for z ~ N(0, I), spread over `hidden` dims.
-      inject_std = proj_norm / (w.shape[0] ** 0.5)
+      # E[||Wz||^2] = ||W||_F^2 for z ~ N(0, I), spread over `hidden` dims,
+      # then the constant output rescaling `_add_noise` applies.
+      out_scale = float(getattr(self.backbone, 'noise_out_scale', 1.0))
+      inject_std = out_scale * proj_norm / (w.shape[0] ** 0.5)
       embed_std = self._student_embed_std()
     return {
       'noise/proj_norm': proj_norm,
