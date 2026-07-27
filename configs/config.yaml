@@ -42,13 +42,18 @@ adversarial_distill:
   # IDLM: fake and student share optim.lr). Set e.g. 1e-4 to give the critic a
   # larger, separate LR (two-time-scale).
   fake_lr: null
-  # Target used to fit the fake critic to the student (AR critic only; the
-  # diffusion critic is always fitted to the soft `student_probs`). False =>
-  # original IDLM: next-token NLL of the hard sampled sequence (one-hot target).
-  # True => cross-entropy against the student's full soft distribution, i.e. the
-  # same quantity the generator step differentiates, with the per-position
-  # sampling noise removed. The critic's *context* stays the hard sample either
-  # way, matching how it is evaluated in the generator step.
+  # Target used to fit the fake critic to the student (D-MMD Sec. 3.2 / the
+  # "Optional use soft target" line of Algorithm 1). False => the one-hot hard
+  # sample x ~ Cat(x_hat_eta(z_t)) the critic latent was drawn from. True => the
+  # student's full soft distribution, i.e. the Rao-Blackwellisation of that
+  # target: same expectation, no per-position sampling noise, and for the AR
+  # critic exactly the quantity the generator step differentiates.
+  # Applies to both critic_type=ar and critic_type=diffusion; the latent /
+  # context the critic sees is the hard sample either way, so a soft-vs-hard A/B
+  # at fixed seed differs only in the target. Only the fake/auxiliary step is
+  # affected -- the generator always uses the soft path.
+  # NOTE (paper, same section): valid for *masked* diffusion only. Uniform
+  # diffusion (algo=duo*) must train its auxiliary model on hard samples.
   fake_soft_target: False
   # Weight of the auxiliary->teacher regularizer in the fake-model loss
   # (D-MMD Eq. 12, second term): CE(teacher || fake) on the student's samples.

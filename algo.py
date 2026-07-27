@@ -361,9 +361,12 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       # Eq. 12). 0 => original fake loss (hard NLL on student samples only).
       self.fake_teacher_weight = getattr(
         self.config.adversarial_distill, 'fake_teacher_weight', 0.0)
-      # Fit the AR fake critic to the student's soft distribution instead of to
-      # the one-hot sampled tokens. No effect on the diffusion critic, which is
-      # already fitted to the soft `student_probs`.
+      # Fit the fake critic to the student's soft distribution instead of to the
+      # one-hot sampled tokens (D-MMD Sec. 3.2). Applies to both critic types:
+      # the AR critic switches between `_ar_cross_entropy` and `_ar_nll`, the
+      # diffusion critic between `student_probs` and one-hot `x_hard` (see
+      # `_fake_diffusion_target`). Only the *fake/auxiliary* step is affected;
+      # the generator always differentiates the soft path.
       self.fake_soft_target = getattr(
         self.config.adversarial_distill, 'fake_soft_target', False)
 
@@ -750,8 +753,30 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         teacher_ce, valid_tokens)
     return loss
 
+  def _fake_diffusion_target(self, student_probs, x_hard):
+    """Target the diffusion fake critic regresses onto (D-MMD Sec. 3.2).
+
+    `fake_soft_target=True` -> the student's soft prediction `x_hat_eta(z_t)`;
+    `False` -> the one-hot hard sample `x ~ Cat(x_hat_eta(z_t))` that the critic
+    latent was actually drawn from. For *masked* diffusion the paper states both
+    are valid ("it is therefore equally valid to use either the soft x_hat_eta or
+    the hard x"), because a masked `z_s` carries no information about `x` at the
+    masked positions; the soft target is just its Rao-Blackwellisation and has
+    lower variance. Note the caveat in the same section: for **uniform**
+    diffusion the auxiliary model must be trained on hard samples, so this switch
+    is masked-diffusion-only.
+
+    Returned as a distribution over the vocabulary either way, so both feed the
+    same weighted soft cross-entropy `nll_per_token_with_probs`.
+    """
+    if self.fake_soft_target:
+      return student_probs
+    return F.one_hot(
+      x_hard, num_classes=student_probs.shape[-1]).to(student_probs.dtype)
+
   def _fake_loss_diffusion(self, x0, valid_tokens, current_accumulation_step):
-    # Original IDLM (diffusion critic). Verbatim from the `MDLM` implementation.
+    # Original IDLM (diffusion critic), with the D-MMD Sec. 3.2 choice of hard
+    # vs. soft target exposed as `fake_soft_target`.
     with torch.no_grad():
       student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
 
@@ -761,14 +786,25 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
     sigma = self._process_sigma(sigma)
-    probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
-    xt = trainer_base.sample_categorical(probs_xt)
+    # Draw the hard student sample, then mask it to the critic latent. This is
+    # marginally identical to the original one-shot draw from
+    # `q_xt_with_probs(student_probs, alpha_t)` -- both give P(mask) = 1 - alpha_t
+    # and P(c) = alpha_t * student_probs_c -- but it exposes the `x_hard` the
+    # latent is coupled to, which the hard target needs. Doing it the same way in
+    # both modes keeps the latent identical across a soft/hard A/B at fixed seed,
+    # so the comparison isolates the target.
+    x_hard = trainer_base.sample_categorical(student_probs)
+    x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
+    xt = self.q_xt(x_hard, alpha_t, valid_tokens=valid_tokens)
     xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
 
     with torch.cuda.amp.autocast(dtype=torch.float32):
       model_output_fake = self.fake_model(xt, sigma)
     logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
-    fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs,
+    fake_loss = self.nll_per_token_with_probs(
+                                logits_fake, xt,
+                                self._fake_diffusion_target(
+                                  student_probs, x_hard),
                                 alpha_t=alpha_t, dalpha_t=dalpha_t,
                                 valid_tokens=valid_tokens)
 
@@ -1120,13 +1156,15 @@ class MDLM_DMMD(MDLM_with_AR):
 
   def _dmmd_generate(self, x0, valid_tokens, current_accumulation_step,
                      detach_student):
-    """One critic draw, returning `(student_probs, crit_x, alpha, dalpha)`.
+    """One critic draw: `(student_probs, crit_x, alpha, dalpha, x_hard)`.
 
     `student_probs` is the differentiable student prediction; `crit_x` is the
     discrete latent fed to the teacher/fake critic, scored with weight from
-    `(alpha, dalpha)`. The latent is produced by the D-MMD posterior ('posterior'
-    mode) or by IDLM re-noising ('renoise' mode). When `detach_student` the
-    student forward pass is run under `no_grad` (fake / auxiliary step).
+    `(alpha, dalpha)`; `x_hard ~ Cat(student_probs)` is the hard sample the
+    latent is coupled to (Algorithm 1's `x`), needed by the hard fake target.
+    The latent is produced by the D-MMD posterior ('posterior' mode) or by IDLM
+    re-noising ('renoise' mode). When `detach_student` the student forward pass
+    is run under `no_grad` (fake / auxiliary step).
     """
     if self.dmmd_mask_sampling == 'renoise':
       # IDLM: generate student_probs, then re-noise to an independent time t.
@@ -1141,11 +1179,14 @@ class MDLM_DMMD(MDLM_with_AR):
       dalpha_t, alpha_t = self.noise(t)
       alpha_t = alpha_t.unsqueeze(-1)
       assert alpha_t.ndim == 2
-      probs_xt = self.q_xt_with_probs(
-        student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
-      xt = trainer_base.sample_categorical(probs_xt)
+      # Hard sample then mask, rather than one draw from the mixture: same
+      # marginal, but exposes `x_hard` for the hard fake target (see
+      # `MDLM_with_AR._fake_loss_diffusion`).
+      x_hard = trainer_base.sample_categorical(student_probs.detach())
+      x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
+      xt = self.q_xt(x_hard, alpha_t, valid_tokens=valid_tokens)
       xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
-      return student_probs, xt, alpha_t, dalpha_t
+      return student_probs, xt, alpha_t, dalpha_t, x_hard
 
     # D-MMD posterior (Algorithm 1): couple s < t and sample z_s from q(z_s|z_t,x).
     t = self._sample_t(x0.shape[0], current_accumulation_step)
@@ -1171,7 +1212,7 @@ class MDLM_DMMD(MDLM_with_AR):
     x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
     z_s = self._dmmd_posterior(z_t, x_hard, alpha_t, alpha_s)
     z_s = self._preserve_prompt_tokens(z_s, x0, valid_tokens)
-    return student_probs, z_s, alpha_s, dalpha_s
+    return student_probs, z_s, alpha_s, dalpha_s, x_hard
 
   def _apply_top_p_to_teacher(self, teacher_log_probs):
     """D-MMD Sec. 3.3 top-p distillation of the teacher target.
@@ -1213,7 +1254,7 @@ class MDLM_DMMD(MDLM_with_AR):
     fake_loss_total = 0.0
 
     for _ in range(num_noised_samples):
-      student_probs, crit_x, alpha, dalpha = self._dmmd_generate(
+      student_probs, crit_x, alpha, dalpha, _ = self._dmmd_generate(
         x0, valid_tokens, current_accumulation_step, detach_student=False)
       sigma = self._sigma_from_alphat(alpha)
       sigma = self._process_sigma(sigma)
@@ -1245,11 +1286,12 @@ class MDLM_DMMD(MDLM_with_AR):
     return teacher_loss - fake_loss
 
   def _fake_loss_diffusion(self, x0, valid_tokens, current_accumulation_step):
-    # D-MMD auxiliary/fake loss (diffusion critic). Fits the fake critic to the
-    # student's soft target at the critic latent (D-MMD Sec. 3.2 allows the soft
-    # target for masked diffusion). Keeps the optional aux->teacher anchor
-    # (fake_teacher_weight, D-MMD Eq. 12, second term).
-    student_probs, crit_x, alpha, dalpha = self._dmmd_generate(
+    # D-MMD auxiliary/fake loss (diffusion critic). Fits the fake critic at the
+    # critic latent to either the student's soft prediction or the hard sample it
+    # was drawn from, per `fake_soft_target` (D-MMD Sec. 3.2 -- Algorithm 1's
+    # "Optional use soft target x <- x_hat_eta(z_t)"). Keeps the optional
+    # aux->teacher anchor (fake_teacher_weight, D-MMD Eq. 12, second term).
+    student_probs, crit_x, alpha, dalpha, x_hard = self._dmmd_generate(
       x0, valid_tokens, current_accumulation_step, detach_student=True)
     sigma = self._sigma_from_alphat(alpha)
     sigma = self._process_sigma(sigma)
@@ -1259,7 +1301,8 @@ class MDLM_DMMD(MDLM_with_AR):
     logits_fake = self._process_model_output(
       model_output=model_output_fake, xt=crit_x, sigma=sigma)
     fake_loss = self.nll_per_token_with_probs(
-      logits_fake, crit_x, student_probs,
+      logits_fake, crit_x,
+      self._fake_diffusion_target(student_probs, x_hard),
       alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens)
 
     if self.fake_teacher_weight > 0:
