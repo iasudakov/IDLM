@@ -361,6 +361,11 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       # Eq. 12). 0 => original fake loss (hard NLL on student samples only).
       self.fake_teacher_weight = getattr(
         self.config.adversarial_distill, 'fake_teacher_weight', 0.0)
+      # Fit the AR fake critic to the student's soft distribution instead of to
+      # the one-hot sampled tokens. No effect on the diffusion critic, which is
+      # already fitted to the soft `student_probs`.
+      self.fake_soft_target = getattr(
+        self.config.adversarial_distill, 'fake_soft_target', False)
 
   def _student_param_groups(self):
     """Student optimizer parameter groups. If the backbone is noise-conditioned
@@ -554,7 +559,10 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
 
     `target_probs[:, i]` (the student distribution over token `i`) is scored by
     `ar_logprobs[:, i - 1]` (`log p(token_i | token_{<i})`), so we drop the
-    first (contextless) position. Gradients flow only through `target_probs`.
+    first (contextless) position. Only one side carries gradient per call: in
+    the generator step the critic log-probs are constants and the gradient
+    reaches the student through `target_probs`; in the (soft-target) fake step
+    `target_probs` is detached and the gradient trains the critic.
     """
     target = target_probs[:, 1:, :]
     loss = -(target * ar_logprobs).sum(-1)  # (batch, length - 1)
@@ -719,8 +727,19 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
 
     fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
-    # Term 1: CE(x | fake) -- standard next-token NLL on the hard student sample.
-    loss = self._ar_nll(fake_logprobs, x_gen, valid_tokens)
+    # Term 1: fit the critic to the student's own distribution.
+    if self.fake_soft_target:
+      # CE(student_probs || fake): score *every* category by the student's
+      # probability rather than only the sampled one. Same expectation as the
+      # hard NLL below (x_gen ~ student_probs) but without the per-position
+      # sampling noise, and it is exactly the quantity the generator step
+      # differentiates -- so critic and generator optimize the same functional.
+      # The critic's context stays the hard sample `x_gen`, as it is in the
+      # generator step (an AR backbone consumes discrete ids).
+      loss = self._ar_cross_entropy(fake_logprobs, student_probs, valid_tokens)
+    else:
+      # CE(x | fake) -- standard next-token NLL on the hard student sample.
+      loss = self._ar_nll(fake_logprobs, x_gen, valid_tokens)
     # Term 2: CE(teacher || fake) -- anchor the fake to the teacher's next-token
     # distribution on the same context.
     if self.fake_teacher_weight > 0:
