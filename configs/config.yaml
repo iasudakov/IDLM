@@ -19,6 +19,14 @@ adversarial_distill:
   accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   fake_frequency: 1
   generator_num_noised_samples: 1
+  # Gradient clipping inside the manual-optimization (min-max) loop. Lightning
+  # does not apply `trainer.gradient_clip_val` when automatic_optimization is
+  # off, so this is the only clipping the adversarial steps get. Disabled by
+  # default; set to True to clip to `gradient_clipping_val`. The pre-clip
+  # gradient norm is logged (grad_norm_student / grad_norm_fake) either way.
+  use_gradient_clipping: False
+  # Max gradient norm used when `use_gradient_clipping` is True. null or <= 0
+  # also disables clipping.
   gradient_clipping_val: 1.0
   # Critic family: 'ar' = autoregressive owt-ar teacher/fake; 'diffusion' =
   # copies of the masked-diffusion student as teacher/fake (original IDLM).

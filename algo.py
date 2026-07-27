@@ -831,22 +831,34 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     return _embedding_std(self._embed_module_cache)
 
   def _clip_gradients(self, parameters, name):
-    """Clip gradients in the manual-optimization loop.
+    """Optionally clip gradients in the manual-optimization loop; log the norm.
 
     With ``automatic_optimization=False`` Lightning does NOT apply
-    ``trainer.gradient_clip_val``, so the adversarial min-max would otherwise
-    take unclipped steps -- combined with the diffusion weight
-    ``w(s) = dalpha_s / (1 - alpha_s)`` (huge near ``s -> eps``) this makes the
+    ``trainer.gradient_clip_val``, so this is the only clipping the adversarial
+    steps get. Unclipped steps combined with the diffusion weight
+    ``w(s) = dalpha_s / (1 - alpha_s)`` (huge near ``s -> eps``) can make the
     generator/critic losses diverge (student_loss -> -inf, fake_loss -> +inf,
-    entropy -> 0). Clip the accumulated gradient to
-    ``adversarial_distill.gradient_clipping_val`` (<= 0 or None disables) right
-    before ``optimizer.step()`` and log the pre-clip norm for monitoring.
+    entropy -> 0), so watch the logged norm when clipping is off.
+
+    Clipping is opt-in via ``adversarial_distill.use_gradient_clipping``
+    (default False); when enabled the accumulated gradient is clipped to
+    ``adversarial_distill.gradient_clipping_val`` (None or <= 0 also disables)
+    right before ``optimizer.step()``. The pre-clip norm is logged in both
+    cases, so disabling clipping does not cost the diagnostic.
     """
-    clip_val = getattr(
-      self.config.adversarial_distill, 'gradient_clipping_val', None)
-    if clip_val is None or clip_val <= 0:
+    parameters = [p for p in parameters if p.grad is not None]
+    if not parameters:
       return
-    norm = torch.nn.utils.clip_grad_norm_(parameters, clip_val)
+    ad = self.config.adversarial_distill
+    clip_val = getattr(ad, 'gradient_clipping_val', None)
+    if (getattr(ad, 'use_gradient_clipping', False)
+        and clip_val is not None and clip_val > 0):
+      norm = torch.nn.utils.clip_grad_norm_(parameters, clip_val)
+    else:
+      # Monitoring only: the same total norm `clip_grad_norm_` would report,
+      # with the gradients left untouched.
+      norm = torch.norm(torch.stack(
+        [p.grad.detach().norm(2) for p in parameters]), 2)
     self.log(name, norm, on_step=True, on_epoch=False,
              prog_bar=False, sync_dist=True)
 
