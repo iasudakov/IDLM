@@ -318,6 +318,11 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
     # Resolved lazily by `_student_embed_std` for the noise diagnostics.
     self._embed_module_cache = None
+    # Time weighting for the distillation losses (see
+    # `nll_per_token_with_probs`). Set outside the distill branch so the method
+    # never sees a missing attribute; 'elbo' keeps the original behaviour.
+    self.loss_weighting = self._normalize_loss_weighting(
+      getattr(self.config.adversarial_distill, 'loss_weighting', 'elbo'))
     if self.is_adversarial_distill:
       self.automatic_optimization = False
       # Critic type: 'ar' uses autoregressive (owt-ar) teacher/fake; 'diffusion'
@@ -408,7 +413,28 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         fake_soft_target = (self.critic_type == 'diffusion')
       self.fake_soft_target = bool(fake_soft_target)
       print(f'[adversarial_distill] critic_type={self.critic_type}, '
-            f'fake_soft_target={self.fake_soft_target}', flush=True)
+            f'fake_soft_target={self.fake_soft_target}, '
+            f'loss_weighting={self.loss_weighting}', flush=True)
+
+  @staticmethod
+  def _normalize_loss_weighting(value):
+    """Normalize `adversarial_distill.loss_weighting` to 'elbo' / 'none'.
+
+    `null` keeps the default ('elbo'), matching the rest of the config; use the
+    explicit string 'none' (or `false`) to switch the weighting off.
+    """
+    if value is None or value is True:
+      return 'elbo'
+    if value is False:
+      return 'none'
+    mode = str(value).lower()
+    if mode in ('elbo', 'mdlm', 'default', 'lambda'):
+      return 'elbo'
+    if mode in ('none', 'off', 'uniform', 'false'):
+      return 'none'
+    raise ValueError(
+      f'Unknown adversarial_distill.loss_weighting: {value!r} '
+      "(expected 'elbo' or 'none').")
 
   def _student_param_groups(self):
     """Student optimizer parameter groups. If the backbone is noise-conditioned
@@ -645,11 +671,34 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
 
   def nll_per_token_with_probs(self, log_x_theta, xt, x0, alpha_t,
                     dalpha_t, low_var=False, valid_tokens=None):
-    """Soft weighted cross-entropy for the diffusion critic. Verbatim from the
-    original MDLM implementation (`x0` is the target distribution)."""
+    """Soft time-weighted cross-entropy for the diffusion critic (`x0` is the
+    target distribution). This is the single place the D-MMD / IDLM weighting
+    function `w` enters the distillation losses -- it is called for the teacher
+    term, the fake term and the aux->teacher anchor, in both `MDLM_with_AR` and
+    `MDLM_DMMD`, so `adversarial_distill.loss_weighting` switches all of them
+    together.
+
+    * 'elbo' (default): `w = -alpha'/(1-alpha)`, the MDLM ELBO weight, i.e.
+      IDLM's `lambda_t` and a valid choice of D-MMD's `w(s)`. Under the
+      log-linear schedule this is `1/t` (evaluated at the critic time), ranging
+      from 1 at t=1 to ~1e3 at the `sampling_eps` floor, mean ~7.
+    * 'none': `w = 1`. Note the sign: the unweighted branch negates instead of
+      dropping the factor, because `dalpha` is negative and it is what makes the
+      weighted loss positive. Same fixed point either way (`w` multiplies the
+      teacher and fake terms alike, and `teacher - fake` vanishes when the fake
+      critic matches the teacher), so this only changes the effective per-time
+      learning rate -- and lowers the average gradient scale by ~7x, so
+      `optim.lr` / `adversarial_distill.fake_lr` may need raising to compensate.
+
+    Only the diffusion critic is affected. `critic_type='ar'` scores the clean
+    sequence with `_ar_cross_entropy`, which carries no diffusion time weight.
+    """
     del xt
     loss = (x0 * log_x_theta).sum(-1)
-    loss = loss * dalpha_t / (1 - alpha_t)
+    if self.loss_weighting == 'none':
+      loss = -loss
+    else:
+      loss = loss * dalpha_t / (1 - alpha_t)
     if valid_tokens is not None:
       loss = loss * valid_tokens
       denom = valid_tokens.sum(-1).clamp_min(1)
@@ -920,7 +969,9 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     steps get. Unclipped steps combined with the diffusion weight
     ``w(s) = dalpha_s / (1 - alpha_s)`` (huge near ``s -> eps``) can make the
     generator/critic losses diverge (student_loss -> -inf, fake_loss -> +inf,
-    entropy -> 0), so watch the logged norm when clipping is off.
+    entropy -> 0), so watch the logged norm when clipping is off. That spike is
+    exactly what ``adversarial_distill.loss_weighting='none'`` removes, so the
+    two knobs overlap: with the weighting off, clipping matters much less.
 
     Clipping is opt-in via ``adversarial_distill.use_gradient_clipping``
     (default False); when enabled the accumulated gradient is clipped to

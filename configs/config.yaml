@@ -69,6 +69,24 @@ adversarial_distill:
   # Anchors the fake critic to the teacher, stabilizing the min-max without
   # changing the fixed point. 0 => original IDLM fake loss (no anchor term).
   fake_teacher_weight: 0.0
+  # Diffusion time weighting `w` applied to every distillation cross-entropy
+  # (teacher term, fake term, aux->teacher anchor) for both algo=mdlm and
+  # algo=mdlm_dmmd. Only `critic_type=diffusion` is affected; the AR critic
+  # scores the clean sequence and carries no time weight.
+  # 'elbo' (default) => w = -alpha'/(1-alpha), the MDLM ELBO weight, which is
+  # both IDLM's lambda_t (its Eq. 1/7) and a valid choice of D-MMD's w(s)
+  # (Algorithm 1 leaves w free and never pins it down). Under the log-linear
+  # schedule this is 1/t at the critic time: 1 at t=1 up to ~1e3 at the
+  # training.sampling_eps floor, mean ~7.
+  # 'none' (or false) => w = 1, i.e. plain unweighted cross-entropy. The fixed
+  # point is unchanged (w scales the teacher and fake terms alike, and
+  # `teacher - fake` vanishes when the fake critic matches the teacher), so this
+  # is a pure optimization knob: it stops near-clean critic times (small s, where
+  # only a few positions are masked and 1/s explodes) from dominating the update,
+  # at the cost of ~7x smaller average gradients -- expect to raise optim.lr /
+  # fake_lr by roughly that factor for a like-for-like comparison. `null` keeps
+  # the default, as elsewhere in this config.
+  loss_weighting: elbo
   # Generator input-noise conditioning (D-MMD Sec. 6.5). Dimensionality of the
   # per-token Gaussian noise projected into the student's embedding residual so
   # the masked generator can stay diverse instead of collapsing. 0 => disabled
