@@ -412,9 +412,60 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       if fake_soft_target is None:
         fake_soft_target = (self.critic_type == 'diffusion')
       self.fake_soft_target = bool(fake_soft_target)
+      # Train/decode alignment: restrict the distillation losses to the
+      # positions a confidence-threshold sampler would actually commit
+      # (`sampling.predictor=confidence`). See `_confidence_loss_mask_for`.
+      # 'none' (default) keeps every existing run bit-for-bit.
+      self.confidence_loss_mask = self._normalize_confidence_loss_mask(
+        getattr(self.config.adversarial_distill,
+                'confidence_loss_mask', 'none'))
+      # Both default to the sampler's own knobs, so training filters on
+      # exactly the rule decoding will use; override to decouple them.
+      threshold = getattr(self.config.adversarial_distill,
+                          'confidence_loss_threshold', None)
+      self.confidence_loss_threshold = float(
+        self.config.sampling.get('confidence_threshold', 0.9)
+        if threshold is None else threshold)
+      min_k = getattr(self.config.adversarial_distill,
+                      'confidence_loss_min_k', None)
+      self.confidence_loss_min_k = int(
+        self.config.sampling.get('min_reveal', 1)
+        if min_k is None else min_k)
+      assert self.confidence_loss_min_k >= 1, (
+        'adversarial_distill.confidence_loss_min_k must be >= 1, '
+        'otherwise a step where nothing clears the threshold would '
+        'produce an all-zero loss.')
       print(f'[adversarial_distill] critic_type={self.critic_type}, '
             f'fake_soft_target={self.fake_soft_target}, '
-            f'loss_weighting={self.loss_weighting}', flush=True)
+            f'loss_weighting={self.loss_weighting}, '
+            f'confidence_loss_mask={self.confidence_loss_mask}'
+            + ('' if self.confidence_loss_mask == 'none' else
+               f' (threshold={self.confidence_loss_threshold}, '
+               f'min_k={self.confidence_loss_min_k})'), flush=True)
+
+  @staticmethod
+  def _normalize_confidence_loss_mask(value):
+    """Normalize `adversarial_distill.confidence_loss_mask`.
+
+    'none' (default) / 'generator' (mask the student's objective only,
+    leaving the critic to model every position) / 'both' (mask the fake
+    critic's objective too, so critic and generator are fit on the same
+    token set).
+    """
+    if value is None or value is False:
+      return 'none'
+    if value is True:
+      return 'generator'
+    mode = str(value).lower()
+    if mode in ('none', 'off', 'false'):
+      return 'none'
+    if mode in ('generator', 'student'):
+      return 'generator'
+    if mode in ('both', 'all'):
+      return 'both'
+    raise ValueError(
+      f'Unknown adversarial_distill.confidence_loss_mask: {value!r} '
+      "(expected 'none', 'generator' or 'both').")
 
   @staticmethod
   def _normalize_loss_weighting(value):
@@ -581,7 +632,15 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       return tokens
     return torch.where(valid_tokens.bool(), tokens, x0)
 
-  def multistep_generation(self, x0, valid_tokens, current_accumulation_step):
+  def multistep_generation(self, x0, valid_tokens,
+                           current_accumulation_step, return_xt=False):
+    """The student's one-shot prediction at a random noise level.
+
+    `return_xt` additionally hands back the masked latent the student
+    was conditioned on. Only `_confidence_loss_mask_for` needs it -- the
+    positions masked in `xt` are precisely the ones the student
+    predicted, and hence the only ones a sampler could commit.
+    """
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
@@ -592,7 +651,59 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
 
     log_x_theta = self.forward(xt, sigma=sigma)
     student_probs = log_x_theta.exp()
-    return self._preserve_prompt_probs(student_probs, x0, valid_tokens)
+    student_probs = self._preserve_prompt_probs(
+      student_probs, x0, valid_tokens)
+    if return_xt:
+      return student_probs, xt
+    return student_probs
+
+  def _confidence_loss_mask_for(self, student_probs, student_xt,
+                                valid_tokens, is_generator):
+    """Positions a confidence decoder would commit here, or `None`.
+
+    Exactly the rule `AbsorbingState._confidence_sampler` decodes with:
+    among the positions the student actually predicted (those masked in
+    its own input `student_xt`), keep the ones whose top probability
+    clears `confidence_loss_threshold`, and always at least
+    `confidence_loss_min_k` of them -- the top-k by probability -- so a
+    step where nothing clears the bar still trains on something.
+
+    The point is train/decode alignment. At sampling time these are the
+    only predictions that survive: everything below the bar is discarded
+    and re-predicted later at a less-masked latent, where the model sees
+    strictly more context. Supervising the discarded positions spends
+    the student on marginals no sample is ever drawn from -- and they
+    are the *hardest* positions, so they dominate the gradient while
+    contributing nothing to what the sampler actually emits.
+
+    Restricted to positions masked in `student_xt` for a concrete
+    reason, not just symmetry with the sampler: `_process_model_output`
+    pins already-revealed positions to a one-hot, so their probability
+    is exactly 1.0. They would clear any threshold and could fill the
+    top-k on their own, leaving a mask that selects almost nothing the
+    student can learn from (their `student_probs` is a constant and
+    carries no gradient).
+
+    Returns `None` when the option is off, so every reduction falls back
+    to its original behaviour bit-for-bit.
+    """
+    if self.confidence_loss_mask == 'none':
+      return None
+    if not is_generator and self.confidence_loss_mask != 'both':
+      return None
+    eligible = (student_xt == self.mask_index)
+    if valid_tokens is not None:
+      eligible = eligible & valid_tokens.bool()
+    # The student's confidence in its own top candidate, as at sampling
+    # time. Detached: this picks the loss support, it is not part of it.
+    prob = student_probs.detach().max(-1).values
+    prob = prob.masked_fill(~ eligible, - float('inf'))
+    num_keep = torch.clamp(
+      (prob >= self.confidence_loss_threshold).sum(-1),
+      min=self.confidence_loss_min_k).minimum(eligible.sum(-1))
+    ranks = prob.argsort(dim=-1, descending=True).argsort(dim=-1)
+    keep = (ranks < num_keep[:, None]) & eligible
+    return keep.to(student_probs.dtype)
 
   def _ar_logprobs(self, ar_backbone, tokens):
     """Per-position next-token log-probabilities from an AR backbone.
@@ -622,7 +733,42 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         value=self.neg_infinity)
     return log_probs
 
-  def _ar_cross_entropy(self, ar_logprobs, target_probs, valid_tokens):
+  def _reduce_positions(self, per_token_loss, valid_tokens,
+                        loss_mask=None):
+    """Reduce a (batch, positions) per-token loss over positions.
+
+    With `loss_mask=None` this is exactly what every caller did inline
+    before: a masked token-mean when `valid_tokens` is given, and a plain
+    sum over positions when it is None (the OWT case --
+    `_conditional_valid_tokens` only returns a mask for tiny_gsm).
+
+    `loss_mask` (0/1, same shape) restricts the loss to a subset of
+    positions -- the tokens a confidence-threshold decoder would commit,
+    see `_confidence_loss_mask_for`. It also becomes the denominator, so the
+    result is the average loss *over the committed tokens* and its scale
+    does not swing with how many of them there are. That matters here:
+    the committed count varies by orders of magnitude between steps (one
+    token when nothing clears the threshold, most of the sequence when
+    the student is confident), and a raw sum would hand the optimizer a
+    correspondingly variable step size.
+
+    NOTE this means enabling `loss_mask` changes the loss scale for runs
+    whose `valid_tokens` is None -- a sum over ~`model.length`
+    positions becomes a mean over the committed ones -- so `optim.lr` /
+    `adversarial_distill.fake_lr` need revisiting when switching it on.
+    """
+    if loss_mask is None:
+      if valid_tokens is None:
+        return per_token_loss.sum(-1)
+      per_token_loss = per_token_loss * valid_tokens
+      return per_token_loss.sum(-1) / valid_tokens.sum(-1).clamp_min(1)
+    weights = (loss_mask if valid_tokens is None
+               else loss_mask * valid_tokens)
+    per_token_loss = per_token_loss * weights
+    return per_token_loss.sum(-1) / weights.sum(-1).clamp_min(1)
+
+  def _ar_cross_entropy(self, ar_logprobs, target_probs, valid_tokens,
+                        loss_mask=None):
     """Token-averaged cross-entropy of the student distribution against an AR
     critic's next-token log-probabilities.
 
@@ -632,17 +778,18 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     the generator step the critic log-probs are constants and the gradient
     reaches the student through `target_probs`; in the (soft-target) fake step
     `target_probs` is detached and the gradient trains the critic.
+
+    `loss_mask` is a full-length (batch, length) mask and is sliced like
+    `valid_tokens`, so callers pass the same tensor to every reduction.
     """
     target = target_probs[:, 1:, :]
     loss = -(target * ar_logprobs).sum(-1)  # (batch, length - 1)
-    if valid_tokens is not None:
-      valid = valid_tokens[:, 1:]
-      loss = loss * valid
-      denom = valid.sum(-1).clamp_min(1)
-      return loss.sum(-1) / denom
-    return loss.sum(-1)
+    return self._reduce_positions(
+      loss,
+      None if valid_tokens is None else valid_tokens[:, 1:],
+      None if loss_mask is None else loss_mask[:, 1:])
 
-  def _ar_nll(self, ar_logprobs, tokens, valid_tokens):
+  def _ar_nll(self, ar_logprobs, tokens, valid_tokens, loss_mask=None):
     """Token-averaged NLL of the hard sampled sequence under an AR critic.
 
     Standard next-token cross-entropy: `ar_logprobs[:, i]` scores the sampled
@@ -652,12 +799,10 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     targets = tokens[:, 1:]
     loss = -ar_logprobs.gather(
       -1, targets[..., None]).squeeze(-1)  # (batch, length - 1)
-    if valid_tokens is not None:
-      valid = valid_tokens[:, 1:]
-      loss = loss * valid
-      denom = valid.sum(-1).clamp_min(1)
-      return loss.sum(-1) / denom
-    return loss.sum(-1)
+    return self._reduce_positions(
+      loss,
+      None if valid_tokens is None else valid_tokens[:, 1:],
+      None if loss_mask is None else loss_mask[:, 1:])
 
   def q_xt_with_probs(self, student_probs, alpha_t, x0=None, valid_tokens=None):
     """Diffuse a (soft) student distribution to noise level t for the diffusion
@@ -670,7 +815,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     return noise_probs
 
   def nll_per_token_with_probs(self, log_x_theta, xt, x0, alpha_t,
-                    dalpha_t, low_var=False, valid_tokens=None):
+                    dalpha_t, low_var=False, valid_tokens=None,
+                    loss_mask=None):
     """Soft time-weighted cross-entropy for the diffusion critic (`x0` is the
     target distribution). This is the single place the D-MMD / IDLM weighting
     function `w` enters the distillation losses -- it is called for the teacher
@@ -699,11 +845,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       loss = -loss
     else:
       loss = loss * dalpha_t / (1 - alpha_t)
-    if valid_tokens is not None:
-      loss = loss * valid_tokens
-      denom = valid_tokens.sum(-1).clamp_min(1)
-      return loss.sum(-1) / denom
-    return loss.sum(-1)
+    return self._reduce_positions(loss, valid_tokens, loss_mask)
 
   def generator_loss(self, x0, valid_tokens, current_accumulation_step):
     if self.critic_type == 'diffusion':
@@ -713,8 +855,12 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
 
   def _generator_loss_ar(self, x0, valid_tokens, current_accumulation_step):
     # Differentiable student distribution over the (clean) generated sequence.
-    student_probs = self.multistep_generation(
-      x0, valid_tokens, current_accumulation_step)
+    student_probs, student_xt = self.multistep_generation(
+      x0, valid_tokens, current_accumulation_step, return_xt=True)
+    # Optionally supervise only the tokens a confidence decoder would
+    # commit; `None` (the default) leaves the reduction untouched.
+    loss_mask = self._confidence_loss_mask_for(
+      student_probs, student_xt, valid_tokens, is_generator=True)
 
     # Discrete sequence fed as context to the AR critics (non-differentiable).
     x_gen = trainer_base.sample_categorical(student_probs.detach())
@@ -725,20 +871,23 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     with torch.no_grad():
       teacher_logprobs = self._ar_logprobs(self.teacher, x_gen)
     teacher_loss = self._ar_cross_entropy(
-      teacher_logprobs, student_probs, valid_tokens)
+      teacher_logprobs, student_probs, valid_tokens, loss_mask=loss_mask)
     if not self.use_fake:
       return teacher_loss
 
     with torch.no_grad():
       fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
     fake_loss = self._ar_cross_entropy(
-      fake_logprobs, student_probs, valid_tokens)
+      fake_logprobs, student_probs, valid_tokens, loss_mask=loss_mask)
     return teacher_loss - fake_loss
 
   def _generator_loss_diffusion(self, x0, valid_tokens,
                                 current_accumulation_step):
     # Original IDLM (diffusion critic). Verbatim from the `MDLM` implementation.
-    student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
+    student_probs, student_xt = self.multistep_generation(
+      x0, valid_tokens, current_accumulation_step, return_xt=True)
+    loss_mask = self._confidence_loss_mask_for(
+      student_probs, student_xt, valid_tokens, is_generator=True)
 
     num_noised_samples = getattr(self.config.adversarial_distill, 'generator_num_noised_samples', 1)
 
@@ -765,8 +914,9 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       logits_teacher = self._process_model_output(model_output=model_output_teacher, xt=xt, sigma=sigma)
       teacher_loss = self.nll_per_token_with_probs(logits_teacher, xt, student_probs,
                                   alpha_t=alpha_t, dalpha_t=dalpha_t,
-                                  valid_tokens=valid_tokens)
-      
+                                  valid_tokens=valid_tokens,
+                                  loss_mask=loss_mask)
+
       teacher_loss_total = teacher_loss_total + teacher_loss
 
       if self.use_fake:
@@ -775,7 +925,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
         fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs,
                                     alpha_t=alpha_t, dalpha_t=dalpha_t,
-                                    valid_tokens=valid_tokens)
+                                    valid_tokens=valid_tokens,
+                                    loss_mask=loss_mask)
 
         fake_loss_total = fake_loss_total + fake_loss
 
@@ -787,17 +938,17 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     
     return teacher_loss - fake_loss
 
-  def _reduce_token_loss(self, per_token_loss, valid_tokens):
+  def _reduce_token_loss(self, per_token_loss, valid_tokens,
+                         loss_mask=None):
     """Reduce a (batch, length - 1) per-token loss to (batch,).
 
     Matches _ar_nll / _ar_cross_entropy: masked token-mean when valid_tokens is
     given (using positions 1..L-1), otherwise a plain sum over positions.
     """
-    if valid_tokens is not None:
-      valid = valid_tokens[:, 1:]
-      per_token_loss = per_token_loss * valid
-      return per_token_loss.sum(-1) / valid.sum(-1).clamp_min(1)
-    return per_token_loss.sum(-1)
+    return self._reduce_positions(
+      per_token_loss,
+      None if valid_tokens is None else valid_tokens[:, 1:],
+      None if loss_mask is None else loss_mask[:, 1:])
 
   def fake_loss(self, x0, valid_tokens, current_accumulation_step):
     if self.critic_type == 'diffusion':
@@ -813,10 +964,12 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     # still scores the fake against the soft `student_probs` (the differentiable
     # DMD gradient path).
     with torch.no_grad():
-      student_probs = self.multistep_generation(
-        x0, valid_tokens, current_accumulation_step)
+      student_probs, student_xt = self.multistep_generation(
+        x0, valid_tokens, current_accumulation_step, return_xt=True)
       x_gen = trainer_base.sample_categorical(student_probs)
       x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
+    loss_mask = self._confidence_loss_mask_for(
+      student_probs, student_xt, valid_tokens, is_generator=False)
 
     fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
     # Term 1: fit the critic to the student's own distribution.
@@ -828,10 +981,12 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       # differentiates -- so critic and generator optimize the same functional.
       # The critic's context stays the hard sample `x_gen`, as it is in the
       # generator step (an AR backbone consumes discrete ids).
-      loss = self._ar_cross_entropy(fake_logprobs, student_probs, valid_tokens)
+      loss = self._ar_cross_entropy(
+        fake_logprobs, student_probs, valid_tokens, loss_mask=loss_mask)
     else:
       # CE(x | fake) -- standard next-token NLL on the hard student sample.
-      loss = self._ar_nll(fake_logprobs, x_gen, valid_tokens)
+      loss = self._ar_nll(
+        fake_logprobs, x_gen, valid_tokens, loss_mask=loss_mask)
     # Term 2: CE(teacher || fake) -- anchor the fake to the teacher's next-token
     # distribution on the same context.
     if self.fake_teacher_weight > 0:
@@ -839,7 +994,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         teacher_probs = self._ar_logprobs(self.teacher, x_gen).exp()
       teacher_ce = -(teacher_probs * fake_logprobs).sum(-1)  # (batch, length-1)
       loss = loss + self.fake_teacher_weight * self._reduce_token_loss(
-        teacher_ce, valid_tokens)
+        teacher_ce, valid_tokens, loss_mask=loss_mask)
     return loss
 
   def _fake_diffusion_target(self, student_probs, x_hard):
@@ -867,7 +1022,10 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     # Original IDLM (diffusion critic), with the D-MMD Sec. 3.2 choice of hard
     # vs. soft target exposed as `fake_soft_target`.
     with torch.no_grad():
-      student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
+      student_probs, student_xt = self.multistep_generation(
+        x0, valid_tokens, current_accumulation_step, return_xt=True)
+    loss_mask = self._confidence_loss_mask_for(
+      student_probs, student_xt, valid_tokens, is_generator=False)
 
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
@@ -895,7 +1053,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
                                 self._fake_diffusion_target(
                                   student_probs, x_hard),
                                 alpha_t=alpha_t, dalpha_t=dalpha_t,
-                                valid_tokens=valid_tokens)
+                                valid_tokens=valid_tokens,
+                                loss_mask=loss_mask)
 
     # Optional aux->teacher anchor (D-MMD Eq. 12, second term). Disabled by
     # default (fake_teacher_weight=0), so the above matches the original MDLM.
@@ -905,7 +1064,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
           model_output=self.teacher(xt, sigma), xt=xt, sigma=sigma).exp()
       anchor = self.nll_per_token_with_probs(logits_fake, xt, teacher_probs,
                                 alpha_t=alpha_t, dalpha_t=dalpha_t,
-                                valid_tokens=valid_tokens)
+                                valid_tokens=valid_tokens,
+                                loss_mask=loss_mask)
       fake_loss = fake_loss + self.fake_teacher_weight * anchor
     return fake_loss
 
@@ -1263,12 +1423,16 @@ class MDLM_DMMD(MDLM_with_AR):
 
   def _dmmd_generate(self, x0, valid_tokens, current_accumulation_step,
                      detach_student):
-    """One critic draw: `(student_probs, crit_x, alpha, dalpha, x_hard)`.
+    """One critic draw: `(student_probs, crit_x, alpha, dalpha, x_hard,
+    student_xt)`.
 
     `student_probs` is the differentiable student prediction; `crit_x` is the
     discrete latent fed to the teacher/fake critic, scored with weight from
     `(alpha, dalpha)`; `x_hard ~ Cat(student_probs)` is the hard sample the
-    latent is coupled to (Algorithm 1's `x`), needed by the hard fake target.
+    latent is coupled to (Algorithm 1's `x`), needed by the hard fake target;
+    `student_xt` is the latent the *student* was conditioned on (`z_t`, not the
+    critic's `z_s`), which `_confidence_loss_mask_for` needs to know which
+    positions the student actually predicted.
     The latent is produced by the D-MMD posterior ('posterior' mode) or by IDLM
     re-noising ('renoise' mode). When `detach_student` the student forward pass
     is run under `no_grad` (fake / auxiliary step).
@@ -1277,11 +1441,11 @@ class MDLM_DMMD(MDLM_with_AR):
       # IDLM: generate student_probs, then re-noise to an independent time t.
       if detach_student:
         with torch.no_grad():
-          student_probs = self.multistep_generation(
-            x0, valid_tokens, current_accumulation_step)
+          student_probs, student_xt = self.multistep_generation(
+            x0, valid_tokens, current_accumulation_step, return_xt=True)
       else:
-        student_probs = self.multistep_generation(
-          x0, valid_tokens, current_accumulation_step)
+        student_probs, student_xt = self.multistep_generation(
+          x0, valid_tokens, current_accumulation_step, return_xt=True)
       t = self._sample_t(x0.shape[0], current_accumulation_step)
       dalpha_t, alpha_t = self.noise(t)
       alpha_t = alpha_t.unsqueeze(-1)
@@ -1293,7 +1457,7 @@ class MDLM_DMMD(MDLM_with_AR):
       x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
       xt = self.q_xt(x_hard, alpha_t, valid_tokens=valid_tokens)
       xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
-      return student_probs, xt, alpha_t, dalpha_t, x_hard
+      return student_probs, xt, alpha_t, dalpha_t, x_hard, student_xt
 
     # D-MMD posterior (Algorithm 1): couple s < t and sample z_s from q(z_s|z_t,x).
     # `s ~ U(eps, 1)` is the critic time (`_sample_t` is just the repo's uniform
@@ -1323,7 +1487,7 @@ class MDLM_DMMD(MDLM_with_AR):
     x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
     z_s = self._dmmd_posterior(z_t, x_hard, alpha_t, alpha_s)
     z_s = self._preserve_prompt_tokens(z_s, x0, valid_tokens)
-    return student_probs, z_s, alpha_s, dalpha_s, x_hard
+    return student_probs, z_s, alpha_s, dalpha_s, x_hard, z_t
 
   def _apply_top_p_to_teacher(self, teacher_log_probs):
     """D-MMD Sec. 3.3 top-p distillation of the teacher target.
@@ -1365,8 +1529,11 @@ class MDLM_DMMD(MDLM_with_AR):
     fake_loss_total = 0.0
 
     for _ in range(num_noised_samples):
-      student_probs, crit_x, alpha, dalpha, _ = self._dmmd_generate(
-        x0, valid_tokens, current_accumulation_step, detach_student=False)
+      student_probs, crit_x, alpha, dalpha, _, student_xt = (
+        self._dmmd_generate(x0, valid_tokens, current_accumulation_step,
+                            detach_student=False))
+      loss_mask = self._confidence_loss_mask_for(
+        student_probs, student_xt, valid_tokens, is_generator=True)
       sigma = self._sigma_from_alphat(alpha)
       sigma = self._process_sigma(sigma)
 
@@ -1377,7 +1544,8 @@ class MDLM_DMMD(MDLM_with_AR):
       logits_teacher = self._apply_top_p_to_teacher(logits_teacher)
       teacher_loss = self.nll_per_token_with_probs(
         logits_teacher, crit_x, student_probs,
-        alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens)
+        alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens,
+        loss_mask=loss_mask)
       teacher_loss_total = teacher_loss_total + teacher_loss
 
       if self.use_fake:
@@ -1387,7 +1555,8 @@ class MDLM_DMMD(MDLM_with_AR):
           model_output=model_output_fake, xt=crit_x, sigma=sigma)
         fake_loss = self.nll_per_token_with_probs(
           logits_fake, crit_x, student_probs,
-          alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens)
+          alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens,
+          loss_mask=loss_mask)
         fake_loss_total = fake_loss_total + fake_loss
 
     teacher_loss = teacher_loss_total / num_noised_samples
@@ -1402,8 +1571,11 @@ class MDLM_DMMD(MDLM_with_AR):
     # was drawn from, per `fake_soft_target` (D-MMD Sec. 3.2 -- Algorithm 1's
     # "Optional use soft target x <- x_hat_eta(z_t)"). Keeps the optional
     # aux->teacher anchor (fake_teacher_weight, D-MMD Eq. 12, second term).
-    student_probs, crit_x, alpha, dalpha, x_hard = self._dmmd_generate(
-      x0, valid_tokens, current_accumulation_step, detach_student=True)
+    student_probs, crit_x, alpha, dalpha, x_hard, student_xt = (
+      self._dmmd_generate(x0, valid_tokens, current_accumulation_step,
+                          detach_student=True))
+    loss_mask = self._confidence_loss_mask_for(
+      student_probs, student_xt, valid_tokens, is_generator=False)
     sigma = self._sigma_from_alphat(alpha)
     sigma = self._process_sigma(sigma)
 
@@ -1414,7 +1586,8 @@ class MDLM_DMMD(MDLM_with_AR):
     fake_loss = self.nll_per_token_with_probs(
       logits_fake, crit_x,
       self._fake_diffusion_target(student_probs, x_hard),
-      alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens)
+      alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens,
+      loss_mask=loss_mask)
 
     if self.fake_teacher_weight > 0:
       with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float32):
@@ -1422,7 +1595,8 @@ class MDLM_DMMD(MDLM_with_AR):
           model_output=self.teacher(crit_x, sigma), xt=crit_x, sigma=sigma).exp()
       anchor = self.nll_per_token_with_probs(
         logits_fake, crit_x, teacher_probs,
-        alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens)
+        alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens,
+        loss_mask=loss_mask)
       fake_loss = fake_loss + self.fake_teacher_weight * anchor
     return fake_loss
 
@@ -1430,8 +1604,10 @@ class MDLM_DMMD(MDLM_with_AR):
     # AR critic: identical to the parent, plus D-MMD Sec. 3.3 top-p distillation
     # of the teacher's next-token log-probs. (The posterior mask sampling is
     # diffusion-specific and does not apply to a full-sequence AR critic.)
-    student_probs = self.multistep_generation(
-      x0, valid_tokens, current_accumulation_step)
+    student_probs, student_xt = self.multistep_generation(
+      x0, valid_tokens, current_accumulation_step, return_xt=True)
+    loss_mask = self._confidence_loss_mask_for(
+      student_probs, student_xt, valid_tokens, is_generator=True)
 
     x_gen = trainer_base.sample_categorical(student_probs.detach())
     x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
@@ -1440,14 +1616,14 @@ class MDLM_DMMD(MDLM_with_AR):
       teacher_logprobs = self._ar_logprobs(self.teacher, x_gen)
     teacher_logprobs = self._apply_top_p_to_teacher(teacher_logprobs)
     teacher_loss = self._ar_cross_entropy(
-      teacher_logprobs, student_probs, valid_tokens)
+      teacher_logprobs, student_probs, valid_tokens, loss_mask=loss_mask)
     if not self.use_fake:
       return teacher_loss
 
     with torch.no_grad():
       fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
     fake_loss = self._ar_cross_entropy(
-      fake_logprobs, student_probs, valid_tokens)
+      fake_logprobs, student_probs, valid_tokens, loss_mask=loss_mask)
     return teacher_loss - fake_loss
 
 

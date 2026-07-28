@@ -143,6 +143,29 @@ adversarial_distill:
   # Constant Delta by which out-of-nucleus teacher logits are lowered instead of
   # hard-masking (D-MMD Sec. 3.3, paper uses Delta=2). Avoids gradient spikes.
   top_p_delta: 2.0
+  # Train/decode alignment: restrict the distillation losses to the positions a
+  # confidence-threshold sampler would actually commit at this noise level --
+  # among the positions the student predicted (masked in its own input), those
+  # whose top probability clears the threshold, and always at least `min_k` of
+  # them. Everything below the bar is discarded at sampling time and re-predicted
+  # later with more context, so supervising it trains the student on marginals no
+  # sample is ever drawn from -- and those are the hardest positions, so they
+  # dominate the gradient while contributing nothing to what is emitted.
+  # 'none' (default) => original behaviour, bit-for-bit.
+  # 'generator' => mask the student's objective only; the fake critic keeps
+  #   modelling every position, so it stays an accurate critic off-support.
+  # 'both' => mask the fake critic's objective too, so critic and generator are
+  #   fit on the same token set.
+  # NOTE this changes the loss *scale*: the reduction becomes a mean over the
+  # committed tokens (see `_reduce_positions`), where an OWT run with no
+  # `valid_tokens` previously summed over all `model.length` positions. Revisit
+  # optim.lr / fake_lr when switching it on.
+  confidence_loss_mask: none
+  # Threshold and k for the above. null => inherit sampling.confidence_threshold
+  # / sampling.min_reveal, so training filters on exactly the rule decoding uses.
+  # Set explicitly only to decouple the two.
+  confidence_loss_threshold: null
+  confidence_loss_min_k: null
 
 loader:
   global_batch_size: 512
