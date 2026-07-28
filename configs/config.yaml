@@ -105,12 +105,15 @@ adversarial_distill:
   # embed_std (~37x at noise_dim=128 on mdlm-owt) faster.
   noise_lr: null
   # Number of sampling steps k for the D-MMD posterior scheme (algo=mdlm_dmmd,
-  # MDLM_with_DMMD). The critic time s is drawn one step below the generation
-  # time t via delta_t ~ U(0, 1/k), so the critic latent z_s ~ q(z_s | z_t, x).
+  # MDLM_with_DMMD). The generation time t is drawn one step above the uniform
+  # critic time s via delta_t ~ U(0, 1/k), t = min(1, s + delta_t), so the critic
+  # latent z_s ~ q(z_s | z_t, x). Smaller k => a bigger gap between s and t (more
+  # positions revealed per step) and more mass on the t = 1 atom, where the
+  # generator sees the near-fully-masked input it starts sampling from.
   # Ignored by the original IDLM re-noising path (algo=mdlm).
   dmmd_num_steps: 32
   # Mask-sampling scheme for algo=mdlm_dmmd (MDLM_DMMD). 'posterior' ('s'):
-  # D-MMD Algorithm 1, critic latent z_s ~ q(z_s | z_t, x) at s = t - delta_t.
+  # D-MMD Algorithm 1, critic latent z_s ~ q(z_s | z_t, x) at t = min(1, s+delta).
   # 'renoise' ('t'): original IDLM, re-noise student_probs to an independent
   # time t. Lets the two schemes be A/B-tested with everything else fixed.
   dmmd_mask_sampling: posterior

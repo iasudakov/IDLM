@@ -1130,8 +1130,8 @@ class MDLM_DMMD(MDLM_with_AR):
        critic latent from the masked-diffusion posterior `z_s ~ q(z_s | z_t, x)`
        (revealing some masked positions toward `x`). The critic is scored at `z_s`
        with weight `w(s)`. The step count `k` is `adversarial_distill.
-       dmmd_num_steps`; the critic time is one step below generation via
-       `delta_t ~ U(0, 1/k)`, `s = t - delta_t`.
+       dmmd_num_steps`; the two times are coupled as in Algorithm 1 --
+       `s ~ U(0, 1)`, `delta_t ~ U(0, 1/k)`, `t = min(1, s + delta_t)`.
      * 'renoise' ("t", original IDLM `MDLM_with_AR`): generate `student_probs`,
        then *re-noise* it back to an independent time `t` (`q_xt_with_probs`) and
        score the critic at `t`. This is the parent's exact scheme (identical when
@@ -1161,8 +1161,8 @@ class MDLM_DMMD(MDLM_with_AR):
       self.top_p = 1.0
     # Constant by which out-of-nucleus teacher logits are lowered (paper Delta=2).
     self.top_p_delta = getattr(ad, 'top_p_delta', 2.0)
-    # Number of D-MMD sampling steps k; the critic time s is drawn one step below
-    # the generation time t via delta_t ~ U(0, 1/k) (posterior mode only).
+    # Number of D-MMD sampling steps k; the generation time t is drawn one step
+    # above the uniform critic time s via delta_t ~ U(0, 1/k) (posterior only).
     self.dmmd_num_steps = getattr(ad, 'dmmd_num_steps', 32)
     # Mask-sampling scheme: 'posterior' (D-MMD, critic at s) or 'renoise' (IDLM,
     # critic at re-noised t). Normalized so 's'/'dmmd' and 't'/'idlm' also work.
@@ -1176,15 +1176,25 @@ class MDLM_DMMD(MDLM_with_AR):
         f'Unknown adversarial_distill.dmmd_mask_sampling: {mode!r} '
         "(expected one of 'posterior'/'s' or 'renoise'/'t').")
 
-  def _dmmd_sample_s(self, t):
-    """Critic time `s` one D-MMD step below the generation time `t`.
+  def _dmmd_sample_t(self, s):
+    """Generation time `t` one D-MMD step above the critic time `s`.
 
-    `delta_t ~ U(0, 1/k)` (k = `dmmd_num_steps`), `s = clamp(t - delta_t, eps)`.
-    `s <= t`, so `alpha_s >= alpha_t` -- `z_s` is a *less* noisy latent than
-    `z_t`, matching the reverse (denoising) direction of the posterior.
+    Algorithm 1's coupling: `delta_t ~ U(0, 1/k)` (k = `dmmd_num_steps`),
+    `t = min(1, s + delta_t)`. `t >= s`, so `alpha_t <= alpha_s` -- `z_s` is a
+    *less* noisy latent than `z_t`, matching the reverse (denoising) direction
+    of the posterior.
+
+    The paper draws the *critic* time uniformly and derives `t` from it, which
+    is the opposite of an earlier version of this method (uniform `t`, then
+    `s = t - delta_t`). It matters in two ways: the loss weight `w(s)` and the
+    critic's mask density are now driven by a genuinely uniform `s`, and the
+    clamp puts an atom of mass `1/(2k)` (~1.6% at k=32) on `t = 1`, i.e. the
+    generator is sometimes trained on the near-fully-masked input it starts
+    sampling from. Runs from before this change are therefore not exactly
+    comparable.
     """
-    delta = torch.rand_like(t) / self.dmmd_num_steps
-    return (t - delta).clamp(min=self.sampling_eps)
+    delta = torch.rand_like(s) / self.dmmd_num_steps
+    return (s + delta).clamp(max=1.0)
 
   def _dmmd_posterior(self, z_t, x_hard, alpha_t, alpha_s):
     """Masked-diffusion posterior sample `z_s ~ q(z_s | z_t, x_hard)`.
@@ -1235,8 +1245,12 @@ class MDLM_DMMD(MDLM_with_AR):
       return student_probs, xt, alpha_t, dalpha_t, x_hard
 
     # D-MMD posterior (Algorithm 1): couple s < t and sample z_s from q(z_s|z_t,x).
-    t = self._sample_t(x0.shape[0], current_accumulation_step)
-    s = self._dmmd_sample_s(t)
+    # `s ~ U(eps, 1)` is the critic time (`_sample_t` is just the repo's uniform
+    # draw, with antithetic sampling / global-batch chunking); `t` is one step
+    # above it. The `eps` floor is what keeps the `w(s) = -alpha'_s/(1-alpha_s)`
+    # weight bounded (~1e3 at s=eps).
+    s = self._sample_t(x0.shape[0], current_accumulation_step)
+    t = self._dmmd_sample_t(s)
     _, alpha_t = self.noise(t)
     dalpha_s, alpha_s = self.noise(s)
     alpha_t = alpha_t.unsqueeze(-1)
