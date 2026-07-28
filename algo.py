@@ -492,12 +492,12 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
 
   def _validate_configuration(self):
     # ancestral sampling isn't desirable because it's slow
-    assert self.sampler == 'ancestral_cache'
+    assert self.sampler in {'ancestral_cache', 'confidence'}
 
   def _process_model_output(self, model_output, xt, sigma):
     del sigma
     model_output[:, :, self.mask_index] += self.neg_infinity
-    
+
     # Normalize the model_output such that x.exp() is
     # a probability distribution over vocab_size.
     model_output = model_output - torch.logsumexp(

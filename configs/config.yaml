@@ -154,11 +154,28 @@ loader:
   pin_memory: True
 
 sampling:
-  predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic
+  predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic, confidence
   steps: 1000
   noise_removal: ancestral  # 'ancestral', 'greedy', 'none'
   use_float64: True
   p_nucleus: 1.0
+  # --- predictor: confidence (block-diffusion style decoding) ---
+  # Which positions to commit: every masked position whose predicted
+  # probability is >= `confidence_threshold`, at least `min_reveal` of
+  # them per step. `steps` is only a budget cap for this predictor, and
+  # a threshold > 1.0 gives plain top-`min_reveal`-per-step decoding.
+  confidence_threshold: 0.9
+  min_reveal: 1
+  block_size: 0  # 0 => decode the whole sequence at once (no semi-AR blocks)
+  # Which token to write there: softmax temperature on the proposed
+  # token only (the threshold above always sees the untempered
+  # probability). 0 => greedy argmax, as in every LLaDA / dInfer
+  # threshold decoder; 1.0 matches the ancestral sampler's categorical
+  # draw. NOTE at 0 an unconditional batch is deterministic, so all rows
+  # come out identical unless the student injects input noise
+  # (adversarial_distill.noise_dim > 0) -- use 1.0 to measure entropy /
+  # gen-ppl over a diverse batch.
+  temperature: 0.0
   num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
   num_sample_log: 2
   semi_ar: False
