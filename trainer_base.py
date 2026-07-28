@@ -525,6 +525,12 @@ class Diffusion(TrainerBase):
   def _ancestral_update(self, x, t, dt, p_x0, noise_removal_step):
     raise NotImplementedError
 
+  def _confidence_sampler(self, num_samples, num_steps, eps):
+    raise NotImplementedError(
+      'Confidence sampling is only defined for absorbing-state '
+      '(masked) diffusion; set sampling.predictor to a sampler '
+      'supported by this algo.')
+
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
                        eps=1e-5):
@@ -532,6 +538,9 @@ class Diffusion(TrainerBase):
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
+    if self.sampler == 'confidence':
+      return self._confidence_sampler(
+        num_samples, num_steps=num_steps, eps=eps)
     x = self.prior_sample(num_samples, self.num_tokens)
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
@@ -695,6 +704,160 @@ class AbsorbingState(Diffusion):
     
     copy_flag = (x != self.mask_index).to(x.dtype)
     return p_x0, copy_flag * x + (1 - copy_flag) * _x
+
+  def _denoise_x0(self, x):
+    """One denoiser call on the current partially-masked `x`.
+
+    Returns `(x0, prob)`: the proposed clean token at every position and
+    the probability the denoiser assigns to it. The time fed to the
+    network is read off `x` itself -- the fraction of positions still
+    masked is exactly `1 - alpha_t` under the absorbing forward process
+    -- rather than taken from a fixed grid, because confidence decoding
+    reveals a data-dependent number of tokens per step (and, with
+    blocks, leaves later blocks fully masked). For a model with
+    `algo.time_conditioning=False` (e.g. MDLM) `_process_sigma` zeroes
+    this out anyway.
+
+    The token is greedy by default (`sampling.temperature = 0`), as in
+    the LLaDA / dInfer threshold decoders: the confidence the threshold
+    tests is then `max_v p(v)`, a clean statement that this position's
+    conditional is already nearly deterministic, which is exactly what
+    licenses committing several positions in the same step. Sampling the
+    token instead can propose an off-mode candidate whose probability
+    then fails the threshold, so the position is deferred and re-drawn
+    -- temperature and the threshold work against each other.
+
+    A positive `sampling.temperature` switches to Gumbel-max, which is
+    the usual softmax temperature (`argmax(log p + T g)` has the same
+    argmax as `argmax(log p / T + g)`, i.e. a draw from
+    `softmax(log p_x0 / T)`); 1.0 is an exact categorical draw from
+    `p_x0`, the draw `sample_categorical` makes in the ancestral
+    sampler. That is worth paying for in *unconditional* generation:
+    with T=0 there is no prompt, `prior_sample` gives every row the same
+    all-mask input and the rest of this sampler is deterministic, so a
+    batch collapses to one identical sequence -- unless the student
+    injects input noise (`adversarial_distill.noise_dim > 0`), which
+    supplies the diversity itself.
+
+    `sampling.p_nucleus` additionally restricts the draw to the nucleus.
+    Both knobs affect only *which* token is proposed: the returned
+    probability is always read off the unmodified `p_x0`, so the
+    threshold in `_confidence_sampler` sees the model's real probability
+    and raising the temperature does not loosen it.
+    """
+    t = (x == self.mask_index).to(torch.float32).mean(
+      -1, keepdim=True).clamp(min=self.sampling_eps, max=1.0)
+    _, alpha_t = self.noise(t)
+    log_p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t))
+    logits = log_p_x0
+    if self.p_nucleus < 1:
+      # `top_k_top_p_filtering` writes in place; keep `log_p_x0` intact.
+      logits = utils.top_k_top_p_filtering(
+        logits.clone(), top_p=self.p_nucleus)
+    temperature = float(
+      self.config.sampling.get('temperature', 0.0))
+    if temperature > 0:
+      noise = torch.rand_like(logits)
+      gumbel = - torch.log(- torch.log(noise + 1e-10) + 1e-10)
+      x0 = (logits + temperature * gumbel).argmax(-1)
+    else:
+      x0 = logits.argmax(-1)
+    prob = log_p_x0.gather(-1, x0[..., None]).squeeze(-1).exp()
+    return x0, prob
+
+  @torch.no_grad()
+  def _confidence_sampler(self, num_samples, num_steps=None,
+                          eps=1e-5):
+    """Confidence-threshold decoding, as used by block-diffusion models.
+
+    The ancestral sampler (`_ancestral_update`) unmasks a *random*
+    subset of positions per step -- each masked position flips with
+    probability `(alpha_s - alpha_t) / (1 - alpha_t)` regardless of what
+    the denoiser thinks -- and it is the sampler the ELBO is derived
+    for. This one instead commits positions by the denoiser's own
+    probability, the MaskGIT / LLaDA / Fast-dLLM rule. It is not the
+    reverse of the forward masking process, so likelihood bounds no
+    longer apply, but it removes most of the factorised-independence
+    error at low step counts: the positions committed together are the
+    ones whose conditionals are already nearly deterministic, which is
+    exactly when treating them as independent is harmless.
+
+    Reveal rule, per row and per step: unmask **every** still-masked
+    position whose probability `p_x0[i, x0_i]` is `>=
+    sampling.confidence_threshold`, but **at least
+    `sampling.min_reveal` (k)** of them -- the top-k by probability --
+    so a step where nothing clears the bar still makes progress and the
+    loop cannot stall. The number of denoiser calls is therefore
+    data-dependent, not fixed: an easy sequence finishes in a handful
+    while a hard one falls back to ~`L / k` steps. A threshold above 1
+    gives pure top-k-per-step decoding; `min_reveal` = the block length
+    gives one-shot decoding.
+
+    Two knobs shape the schedule:
+
+    * `sampling.block_size` (0 => the whole sequence, i.e. no blocking)
+      decodes left-to-right one block at a time, finishing a block
+      before touching the next. That is the semi-autoregressive schedule
+      of block diffusion; with `block_size=1` it degenerates to pure
+      left-to-right AR decoding, and with the default it is LLaDA-style
+      whole-sequence confidence decoding.
+    * `num_steps` (`sampling.steps`) is only a **budget cap** here,
+      spread evenly over the blocks. Threshold decoding sets its own
+      pace, so the cap normally does not bind; if a block does hit it,
+      its remaining masks are revealed in one shot rather than leaving
+      mask tokens in the output.
+
+    Already-revealed tokens are never revisited, exactly as in the
+    ancestral sampler.
+    """
+    del eps
+    if num_steps is None:
+      num_steps = self.config.sampling.steps
+    block_size = int(
+      self.config.sampling.get('block_size', 0) or self.num_tokens)
+    assert self.num_tokens % block_size == 0, (
+      f'sampling.block_size={block_size} must divide the sequence '
+      f'length {self.num_tokens}.')
+    num_blocks = self.num_tokens // block_size
+    threshold = float(
+      self.config.sampling.get('confidence_threshold', 0.9))
+    min_reveal = int(self.config.sampling.get('min_reveal', 1))
+    assert min_reveal >= 1, (
+      'sampling.min_reveal must be >= 1, otherwise a step that clears '
+      'no position would leave the sampler stuck.')
+    # Budget cap per block; >= 1 so every block gets at least one call.
+    max_steps = max(1, num_steps // num_blocks)
+
+    x = self.prior_sample(num_samples, self.num_tokens)
+    for block in range(num_blocks):
+      lo, hi = block * block_size, (block + 1) * block_size
+      for step in range(max_steps):
+        block_masked = (x[:, lo:hi] == self.mask_index)
+        num_masked = block_masked.sum(-1)
+        if not bool(num_masked.any()):
+          break
+
+        x0, prob = self._denoise_x0(x)
+        # Only still-masked positions inside the active block compete.
+        eligible = torch.zeros_like(x, dtype=torch.bool)
+        eligible[:, lo:hi] = block_masked
+        prob = prob.masked_fill(~ eligible, - float('inf'))
+
+        # Everything over the bar, but never fewer than k and never
+        # more than what is actually left masked in this block.
+        num_reveal = torch.clamp(
+          (prob >= threshold).sum(-1),
+          min=min_reveal).minimum(num_masked)
+        if step == max_steps - 1:
+          # Budget exhausted: finish the block in one shot.
+          num_reveal = num_masked
+        # Per-row top-`num_reveal` via ranks (the count varies by row).
+        # Thresholding keeps exactly the highest-probability positions,
+        # so one ranked selection covers both branches of the rule.
+        ranks = prob.argsort(dim=-1, descending=True).argsort(dim=-1)
+        reveal = (ranks < num_reveal[:, None]) & eligible
+        x = torch.where(reveal, x0, x)
+    return x
 
   def _staggered_score(self, score, dsigma):
     score = score.clone()
