@@ -1,5 +1,6 @@
 import os
 import collections
+import contextlib
 import copy
 import pickle
 
@@ -254,7 +255,33 @@ class _NoiseConditionedBackbone(torch.nn.Module):
       torch.nn.init.zeros_(self.noise_proj.weight)
     torch.nn.init.zeros_(self.noise_proj.bias)
     self._noise = None
+    # When set (see `noise_stream`), the injected noise is drawn from this
+    # private RNG instead of the global one. Used by the noise-diversity probe
+    # to vary *only* the noise channel while every other source of sampling
+    # randomness replays identically.
+    self._noise_generator = None
     embed_module.register_forward_hook(self._add_noise)
+
+  @contextlib.contextmanager
+  def noise_stream(self, seed):
+    """Draw the injected noise from a private RNG seeded with `seed`.
+
+    Inside this context the noise is still redrawn on every forward pass, but
+    the whole *sequence* of draws is a deterministic function of `seed` and is
+    taken from a generator of its own, so it neither consumes nor is consumed
+    by the global RNG stream that drives the sampler's categorical draws.
+    That decoupling is what lets `TrainerBase.noise_diversity_report` hold the
+    decoding randomness fixed while varying the noise, and vice versa.
+    """
+    device = self.noise_proj.weight.device
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    previous = self._noise_generator
+    self._noise_generator = generator
+    try:
+      yield
+    finally:
+      self._noise_generator = previous
 
   def _add_noise(self, module, inputs, output):
     if self._noise is None:
@@ -267,7 +294,8 @@ class _NoiseConditionedBackbone(torch.nn.Module):
     length = 1 if self.shared_noise else xt.shape[1]
     self._noise = torch.randn(
       xt.shape[0], length, self.noise_dim,
-      device=xt.device, dtype=torch.float32)
+      device=xt.device, dtype=torch.float32,
+      generator=self._noise_generator)
     try:
       return self.backbone(xt, sigma, *args, **kwargs)
     finally:

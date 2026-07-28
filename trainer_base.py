@@ -1,4 +1,6 @@
+import contextlib
 import itertools
+import typing
 from dataclasses import dataclass
 
 import hydra.utils
@@ -46,6 +48,63 @@ def _unsqueeze(x, reference):
   return x.view(
     * x.shape,
     * ((1,) * (len(reference.shape) - len(x.shape))))
+
+
+@dataclass
+class NoiseDiversity:
+  """Result of `TrainerBase.noise_diversity_report`."""
+  metrics: typing.Dict[str, float]
+  # Decoded samples, `variants[k][b]` = row `b` under noise draw `k`, or None
+  # if they were not requested.
+  variants: typing.Optional[typing.List[typing.List[str]]]
+
+
+def _matched_agreement(stack):
+  """Mean positional token agreement between *matched rows* of different
+  replicates: mean over `k < j`, row `b` and position `l` of
+  `stack[k, b, l] == stack[j, b, l]`. 1.0 => the replicates are identical."""
+  num_replicates = stack.shape[0]
+  total, num_pairs = 0.0, 0
+  for i in range(num_replicates):
+    for j in range(i + 1, num_replicates):
+      total += (stack[i] == stack[j]).float().mean().item()
+      num_pairs += 1
+  return total / max(num_pairs, 1)
+
+
+def _independent_agreement(stack):
+  """Mean positional agreement between two *different rows* of the same
+  replicate, i.e. between fully independent samples. This is the chance-level
+  floor the matched-row agreements above should be read against: two unrelated
+  unconditional samples still agree wherever both emit a common token."""
+  batch_size = stack.shape[1]
+  if batch_size < 2:
+    return None
+  equal = (stack[:, :, None, :] == stack[:, None, :, :]).float().mean(-1)
+  rows, cols = torch.triu_indices(
+    batch_size, batch_size, offset=1, device=stack.device)
+  return equal[:, rows, cols].mean().item()
+
+
+def _distinct_per_position(stack):
+  """Mean number of distinct tokens a single position takes across the
+  replicates. 1.0 => every replicate wrote the same token everywhere;
+  `num_replicates` => a different token every time."""
+  ordered, _ = torch.sort(stack, dim=0)
+  return (1 + (ordered[1:] != ordered[:-1]).sum(0)).float().mean().item()
+
+
+def _unique_sequence_frac(stack):
+  """Fraction of the replicates of a row that are distinct sequences, averaged
+  over rows. 1/K => all replicates collapsed to one sequence; 1.0 => every
+  replicate produced a sequence not seen under any other noise draw."""
+  num_replicates = stack.shape[0]
+  equal = (stack[:, None] == stack[None, :]).all(-1)  # (K, K, B)
+  is_new = torch.ones(equal.shape[0], equal.shape[-1],
+                      dtype=torch.bool, device=stack.device)
+  for k in range(1, num_replicates):
+    is_new[k] = ~ equal[:k, k].any(0)
+  return (is_new.float().sum(0) / num_replicates).mean().item()
 
 
 class TrainerBase(L.LightningModule):
@@ -357,6 +416,27 @@ class TrainerBase(L.LightningModule):
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)
+    # How much of that diversity was the injected input noise? Independent of
+    # the block above (it generates its own, seed-controlled batches).
+    if ((self.config.eval.compute_perplexity_on_sanity
+         or not self.trainer.sanity_checking)
+        and self.config.eval.get('noise_diversity', False)):
+      diversity = self.noise_diversity_report(return_variants=True)
+      for name, value in diversity.metrics.items():
+        self.log(f'val/{name}',
+                 torch.tensor(value, device=self.device),
+                 on_epoch=True,
+                 on_step=False,
+                 sync_dist=True)
+      if (self.trainer.global_rank == 0
+          and hasattr(self.trainer.logger, 'log_table')):
+        # One row per noise draw, same decoding seed: the qualitative version
+        # of `noise_div/agree_noise`.
+        self.trainer.logger.log_table(
+          key=f'noise_variants@global_step{self.global_step}',
+          columns=['noise draw', 'sample'],
+          data=[[k, replicate[0]]
+                for k, replicate in enumerate(diversity.variants)])
     self._train_mode()
 
   def configure_optimizers(self):
@@ -389,6 +469,170 @@ class TrainerBase(L.LightningModule):
       eps=eps)
     self._train_mode()
     return samples
+
+  # --- Input-noise diversity probe -------------------------------------
+
+  @property
+  def has_noise_conditioning(self):
+    """Whether the backbone injects input noise (`noise_dim > 0`)."""
+    return hasattr(self.backbone, 'noise_stream')
+
+  @contextlib.contextmanager
+  def _noise_stream(self, seed):
+    """Pin the backbone's *input-noise* draws to a private RNG seeded with
+    `seed`. A no-op for backbones without noise conditioning, so the probe
+    below still runs there -- and correctly reports that varying the noise
+    changes nothing."""
+    stream = getattr(self.backbone, 'noise_stream', None)
+    if stream is None:
+      yield
+    else:
+      with stream(seed):
+        yield
+
+  @torch.no_grad()
+  def _sample_with_seeds(self, num_samples, decode_seed, noise_seed,
+                         num_steps=None):
+    """One batch of samples with *both* randomness sources pinned: the global
+    RNG (the sampler's categorical / Gumbel draws) to `decode_seed`, and the
+    injected input noise to `noise_seed`."""
+    torch.manual_seed(decode_seed)
+    if torch.cuda.is_available():
+      torch.cuda.manual_seed_all(decode_seed)
+    with self._noise_stream(noise_seed):
+      return self.generate_samples(num_samples=num_samples,
+                                   num_steps=num_steps)
+
+  @torch.no_grad()
+  def noise_diversity_report(self, num_samples=None, num_noises=None,
+                             num_steps=None, seed=None,
+                             decode_control=None, return_variants=False):
+    """How much of the model's sample diversity comes from the *input noise*?
+
+    A masked-diffusion generator has two sources of randomness: the sampler's
+    own categorical draws, and -- when `adversarial_distill.noise_dim > 0` --
+    the Gaussian noise injected into the embedding residual (D-MMD Sec. 6.5),
+    which exists precisely so the generator can stay diverse under a
+    moment-matching objective instead of collapsing. This probe separates the
+    two by generating the same batch several times with one source replayed
+    and the other varied:
+
+    * **noise arm** -- `num_noises` batches sharing one decoding seed, each
+      with a different noise seed. Matched rows differ *only* because of the
+      noise, so `agree_noise` (their mean positional token agreement) is 1.0
+      exactly when the noise channel is unused and falls as it starts to
+      matter.
+    * **decode arm** (control, `decode_control`) -- the mirror image:
+      `num_noises` batches sharing one noise seed with different decoding
+      seeds. `agree_decode` says how much diversity the sampler contributes on
+      its own. With `sampling.temperature=0` and the confidence predictor
+      decoding is deterministic, so this is 1.0 and *all* diversity is noise.
+    * **floor** -- different rows of one batch are fully independent samples,
+      and `agree_indep` is what their agreement happens to be (nonzero: two
+      unrelated texts share ' the', ',', ...). Both arms are reported against
+      it as `sensitivity = (1 - agree) / (1 - agree_indep)`: 0 => that source
+      contributes nothing, 1 => varying it alone decorrelates samples as much
+      as drawing an unrelated sample does.
+    * **replay check** -- one extra batch with *both* seeds equal to the noise
+      arm's first replicate. `agree_replay` must be ~1.0; anything lower means
+      generation is not bit-reproducible on this device and the other numbers
+      are correspondingly blurred, not evidence about the noise.
+
+    Also reported: `distinct_per_pos`, the mean number of distinct tokens a
+    position takes across the noise arm (1.0 .. `num_noises`), and
+    `uniq_seq_frac`, the fraction of a row's noise replicates that are
+    distinct sequences (`1/num_noises` .. 1.0) -- the coarse, readable version
+    of the same question.
+
+    Replaying a stream is exact for the ancestral predictors: they draw once
+    per step from the global RNG no matter what the noise did, so the noise
+    arm's decoding draws line up step for step. Two predictors can let a
+    replayed stream drift, which is worth knowing before reading a borderline
+    number: the confidence predictor takes a data-dependent number of steps,
+    so at `sampling.temperature > 0` the noise arm's Gumbel draws can
+    desynchronise, and `ancestral_cache` skips the denoiser call on a step
+    that reveals nothing, so the decode arm's *noise* draws can. Drift blurs
+    an arm towards the floor -- it inflates the measured contribution rather
+    than hiding one.
+
+    Costs `2 * num_noises + 1` sampling batches (`num_noises + 2` without the
+    control). The global RNG state is saved and restored, so calling this
+    during validation does not perturb the training stream.
+    """
+    eval_config = self.config.eval
+    if num_samples is None:
+      num_samples = (eval_config.get('noise_diversity_num_samples', None)
+                     or self.config.loader.eval_batch_size)
+    if num_noises is None:
+      num_noises = int(eval_config.get('noise_diversity_num_noises', 4))
+    if decode_control is None:
+      decode_control = bool(
+        eval_config.get('noise_diversity_decode_control', True))
+    if seed is None:
+      seed = int(eval_config.get('noise_diversity_seed', 0))
+    assert num_noises >= 2, (
+      f'eval.noise_diversity_num_noises must be >= 2 to compare noise '
+      f'draws against each other, got {num_noises}.')
+    # Each rank probes a different set of seeds, so the DDP-averaged numbers
+    # cover more draws instead of recomputing the same ones.
+    seed = int(seed) + 100003 * self.global_rank
+
+    # Validation runs inside inference mode by default, where a captured RNG
+    # state would itself be an inference tensor; take/restore it outside.
+    with torch.inference_mode(False):
+      cpu_rng_state = torch.random.get_rng_state().clone()
+      cuda_rng_states = (torch.cuda.get_rng_state_all()
+                         if torch.cuda.is_available() else None)
+    try:
+      # Same decoding seed everywhere, one noise seed per replicate.
+      noise_arm = torch.stack([
+        self._sample_with_seeds(
+          num_samples, decode_seed=seed, noise_seed=seed + 1 + k,
+          num_steps=num_steps)
+        for k in range(num_noises)])
+      # Both seeds repeated: must reproduce `noise_arm[0]` token for token.
+      replay = self._sample_with_seeds(
+        num_samples, decode_seed=seed, noise_seed=seed + 1,
+        num_steps=num_steps)
+      decode_arm = None
+      if decode_control:
+        # Mirror image: one noise seed, a different decoding seed each time.
+        decode_arm = torch.stack([
+          self._sample_with_seeds(
+            num_samples, decode_seed=seed + 1 + k, noise_seed=seed + 1,
+            num_steps=num_steps)
+          for k in range(num_noises)])
+    finally:
+      with torch.inference_mode(False):
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+          torch.cuda.set_rng_state_all(cuda_rng_states)
+
+    agree_noise = _matched_agreement(noise_arm)
+    agree_indep = _independent_agreement(noise_arm)
+    report = {
+      'noise_div/agree_noise': agree_noise,
+      'noise_div/agree_replay': (replay == noise_arm[0]).float().mean().item(),
+      'noise_div/distinct_per_pos': _distinct_per_position(noise_arm),
+      'noise_div/uniq_seq_frac': _unique_sequence_frac(noise_arm),
+      'noise_div/num_noises': float(num_noises)}
+    # A single-row batch has no independent pair to normalise against; the raw
+    # agreements are still meaningful, the ratios are simply unavailable.
+    span = None if agree_indep is None else max(1.0 - agree_indep, 1e-8)
+    if span is not None:
+      report['noise_div/agree_indep'] = agree_indep
+      report['noise_div/sensitivity'] = (1.0 - agree_noise) / span
+    if decode_arm is not None:
+      agree_decode = _matched_agreement(decode_arm)
+      report['noise_div/agree_decode'] = agree_decode
+      if span is not None:
+        report['noise_div/decode_sensitivity'] = (1.0 - agree_decode) / span
+
+    variants = None
+    if return_variants:
+      variants = [self.tokenizer.batch_decode(replicate)
+                  for replicate in noise_arm]
+    return NoiseDiversity(metrics=report, variants=variants)
 
   def _process_model_input(self, x0, valid_tokens):
     raise NotImplementedError

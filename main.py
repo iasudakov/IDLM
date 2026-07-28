@@ -170,6 +170,44 @@ def _generate_samples(diffusion_model, config, logger,
                'generated_seqs': all_samples}, f, indent=4)
   print('Samples saved at:', samples_path)
 
+
+def _noise_diversity_eval(diffusion_model, config, logger, tokenizer):
+  """Sample the same batch under several input-noise draws and report how much
+  the noise -- rather than the sampler -- is driving sample diversity."""
+  logger.info('Starting Noise Diversity Eval.')
+  model = _load_from_checkpoint(
+    diffusion_model=diffusion_model,
+    config=config,
+    tokenizer=tokenizer)
+  if config.eval.disable_ema:
+    logger.info('Disabling EMA.')
+    model.ema = None
+  if not model.has_noise_conditioning:
+    logger.warning(
+      'This model has no input-noise conditioning '
+      '(adversarial_distill.noise_dim = 0), so the noise arm is a replay of '
+      'one deterministic function: expect agree_noise = 1.0.')
+
+  model._eval_mode()
+  diversity = model.noise_diversity_report(
+    num_steps=config.sampling.steps, return_variants=True)
+  model._train_mode()
+
+  print('Noise diversity:')
+  for name, value in diversity.metrics.items():
+    print(f'  {name}: {value:.6f}')
+  # The same row under each noise draw, decoding randomness held fixed: what
+  # `agree_noise` is measuring, in readable form.
+  print('Row 0 under each noise draw:')
+  for k, replicate in enumerate(diversity.variants):
+    print(f'  [noise {k}] {replicate[0][:200]!r}')
+  report_path = config.eval.noise_diversity_path
+  with fsspec.open(report_path, 'w') as f:
+    json.dump({'metrics': diversity.metrics,
+               'noise_variants': diversity.variants}, f, indent=4)
+  print('Noise diversity report saved at:', report_path)
+
+
 def _eval_ppl(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Perplexity Eval.')
 
@@ -288,6 +326,8 @@ def main(config):
             'logger': logger}
   if config.mode == 'sample_eval':
     _generate_samples(**kwargs)
+  elif config.mode == 'noise_diversity_eval':
+    _noise_diversity_eval(**kwargs)
   elif config.mode == 'ppl_eval':
     _eval_ppl(**kwargs)
   else:

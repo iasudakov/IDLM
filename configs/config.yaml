@@ -10,7 +10,7 @@ defaults:
   - /algo: duo_base
   - /logger: underdeep
 
-mode: train  # train / ppl_eval / sample_eval
+mode: train  # train / ppl_eval / sample_eval / noise_diversity_eval
 debug: False
 seed: 1
 
@@ -229,6 +229,24 @@ eval:
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
   generate_samples: True
   generated_samples_path: ${cwd:}/samples.json
+  # --- Input-noise diversity probe (`mode=noise_diversity_eval`, or set this
+  # flag to also run it at every validation) ---
+  # Generates the same batch several times with the decoding randomness
+  # replayed and only the injected input noise (adversarial_distill.noise_dim)
+  # varied, and reports how much the samples move -- i.e. whether the noise
+  # channel the generator was given is actually buying diversity or is being
+  # ignored. Logged as val/noise_div/*; see
+  # `trainer_base.TrainerBase.noise_diversity_report` for what each number is.
+  # Costs `2 * num_noises + 1` extra sampling batches per validation.
+  noise_diversity: False
+  noise_diversity_num_noises: 4      # noise draws to compare (>= 2)
+  noise_diversity_num_samples: null  # null => loader.eval_batch_size
+  noise_diversity_seed: 0
+  # Also run the mirror-image control (one noise draw, several decoding seeds)
+  # so the noise contribution can be read against the sampler's own. Halve the
+  # cost by turning it off once you know what the sampler contributes.
+  noise_diversity_decode_control: True
+  noise_diversity_path: ${cwd:}/noise_diversity.json
 
 optim:
   weight_decay: 0
