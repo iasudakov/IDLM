@@ -108,12 +108,36 @@ adversarial_distill:
   # 1.0 => the injection starts as large as the token identity itself. Values
   # >> 1 (e.g. 10) mean the residual is mostly noise and the student cannot read
   # its own masked context until it has attenuated the projection.
-  # This is ONLY an init: the projection is trained, so the magnitude is
-  # learnable and `noise_lr` is the knob that actually controls it. Set a small
-  # non-zero value (0.1-0.3) only to guarantee the noise is exercised rather than
-  # left at zero because the reverse-KL objective never asked for it. Watch
-  # `noise/snr` and `noise/proj_norm` to see which happened.
+  # With `noise_warmup_steps > 0` (or `noise_hold_rms`) this is instead the
+  # snr the schedule ramps to / holds, and the zero start comes from the ramp.
+  # It must then be > 0: the objective cannot find a useful noise level on its
+  # own (see below), so leaving this at 0 schedules nothing.
+  # Otherwise this is ONLY an init and `noise_lr` is the knob that controls the
+  # magnitude thereafter. Watch `noise/snr` and `noise/proj_norm`.
   noise_scale: 0.0
+  # Steps over which the injected noise is ramped in, from a gain of 0 (the
+  # forward pass is then bit-identical to the loaded checkpoint) up to
+  # `noise_scale` -- linearly, in trainer global steps (student + fake updates,
+  # the x-axis the `noise/*` diagnostics are logged against). 0 => no ramp.
+  #
+  # This exists because a zero-init projection does NOT grow on its own and no
+  # `noise_lr` makes it: `W = 0` is an exact saddle, since the output does not
+  # depend on the noise there and so `E[dL/dW] = c E[g] E[z]^T = 0`. Only
+  # gradient noise moves it -- measured, snr reached 0.04 after 80k steps at
+  # noise_lr=1e-3, below even the ~`noise_lr * sqrt(T)` of an unbiased random
+  # walk. Meanwhile a `noise_scale=0.5` run decays to snr ~0.35 over the same
+  # 80k steps while scoring the *better* generative perplexity: the objective
+  # mildly prefers less noise than is good for sample quality. So the ramp is
+  # the way to have both the safe zero start (nothing destroyed at step 0, the
+  # reason to zero-init when distilling a pretrained checkpoint) and a noise
+  # level the objective would never have reached by itself.
+  noise_warmup_steps: 0
+  # Pin `rms(W)` to `noise_scale` for the whole run by normalising the projection
+  # in the forward pass, leaving only its *direction* learnable. Stops the slow
+  # erosion described above, so the snr you set is the snr you keep. Requires
+  # noise_scale > 0. False => the magnitude stays learnable (the historical
+  # behaviour) and `noise/snr` drifts wherever the objective takes it.
+  noise_hold_rms: False
   # Separate learning rate for the learned noise-projection matrix. null => it
   # trains at optim.lr like the rest of the student. Only used when noise_dim>0.
   # Under the rescaled parameterization above, Adam moves `noise/snr` by roughly
