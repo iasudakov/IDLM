@@ -69,6 +69,40 @@ adversarial_distill:
   # Anchors the fake critic to the teacher, stabilizing the min-max without
   # changing the fixed point. 0 => original IDLM fake loss (no anchor term).
   fake_teacher_weight: 0.0
+  # Log `student_entropy` next to student_loss / fake_loss on every generator
+  # step: the mean entropy (nats) of the student's own prediction
+  # p_eta(x0 | z_t) at the positions it actually predicted, read off the same
+  # tensor the generator loss differentiates (no extra forward pass). Purely a
+  # diagnostic -- it is detached and never added to the objective. It
+  # separates the two ways student_loss can fall: matching the teacher, or
+  # sharpening onto a few modes the critic likes. The latter shows up here as
+  # entropy heading toward 0. The training-time counterpart of
+  # `eval.compute_pred_entropy` (which reads the sampling trajectory instead).
+  log_student_entropy: True
+  # Weight of the entropy bonus in the generator objective:
+  #   g_loss = teacher_loss - fake_loss - entropy_weight * H
+  # where H is the same student entropy `log_student_entropy` reports,
+  # reduced over positions exactly like the two critic terms, so the weight
+  # trades off against them directly and does not need rescaling with
+  # `model.length`. Positive => push entropy UP, which is what fights the
+  # collapse this objective can drift into (the student can lower
+  # teacher_loss - fake_loss either by matching the teacher or by narrowing
+  # onto the modes both critics like). Negative sharpens instead.
+  # 0 (default) reproduces the previous objective exactly and builds nothing
+  # differentiable -- the diagnostic stays on either way.
+  # Enabling it costs one extra p-sized tensor (~1.6 GB at batch_size=8,
+  # model.length=1024, float32) retained until backward.
+  # CALIBRATION: with valid_tokens=None (OWT) `_reduce_positions` *sums* over
+  # positions, so the reduced H is ~(masked positions) x (nats/position) --
+  # order 1e3 at model.length=1024 -- while student_loss is a *difference* of
+  # two large critic terms and is numerically far smaller. Expect a useful
+  # weight around 1e-3..1e-2, not O(1). Don't guess: `entropy_bonus` is logged
+  # next to student_loss whenever this is non-zero and is exactly what gets
+  # subtracted, so set the weight so the bonus is a few percent of
+  # |student_loss|, then watch student_entropy move.
+  # The bonus is unbounded above, so an over-large weight has a trivial
+  # optimum at the uniform distribution and will walk the model to noise.
+  entropy_weight: 0.0
   # Diffusion time weighting `w` applied to every distillation cross-entropy
   # (teacher term, fake term, aux->teacher anchor) for both algo=mdlm and
   # algo=mdlm_dmmd. Only `critic_type=diffusion` is affected; the AR critic
@@ -250,6 +284,16 @@ eval:
   gm_eval_model_name_or_path: gpt2   # paper uses GPT-2 base for GM
   gm_num_batches: 4                  # M paired (gen,data) batches; needs >= 2
   compute_perplexity_on_sanity: False
+  # Mean entropy (nats) of the denoiser's *own* predictive distribution
+  # p_theta(x0 | x_t), averaged over every (denoiser call, still-masked
+  # position) pair of the sampling trajectory -- so the early, mostly-masked
+  # steps carry the most weight. Logged as val/pred_entropy.
+  # Complements val/sample_entropy (unigram entropy of the finished tokens):
+  # this one reads per-position confidence, so it is what drops when
+  # distillation or nucleus truncation sharpens the conditionals. Bounded by
+  # log(vocab_size) ~= 10.82. Free of extra forward passes -- it reduces the
+  # p_x0 the sampler already computed -- but set False to skip the reduction.
+  compute_pred_entropy: True
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
   generate_samples: True
   generated_samples_path: ${cwd:}/samples.json

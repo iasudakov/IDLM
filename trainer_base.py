@@ -306,6 +306,22 @@ class TrainerBase(L.LightningModule):
   def _process_model_output(self, model_output, xt, sigma):
     raise NotImplementedError
 
+  def _pred_entropy_mask(self, xt):
+    """Positions of `xt` whose predictive distribution is a genuine model
+    prediction (see `metrics.Metrics.record_pred_entropy`). None => all."""
+    del xt
+    return None
+
+  def _record_pred_entropy(self, dist, xt, log_input=False):
+    """Fold one denoiser call's predictive distribution into
+    `val/pred_entropy`. Called only from the samplers, so it costs a
+    reduction over an already-materialized tensor and no extra forward."""
+    if dist is None or not self.config.eval.get(
+        'compute_pred_entropy', True):
+      return
+    self.metrics.record_pred_entropy(
+      dist, mask=self._pred_entropy_mask(xt), log_input=log_input)
+
   def forward(self, xt, sigma):
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
@@ -406,6 +422,16 @@ class TrainerBase(L.LightningModule):
                    sync_dist=True)
           self.log('val/sample_entropy',
                    self.metrics.sample_entropy.compute(),
+                   on_epoch=True,
+                   on_step=False,
+                   sync_dist=True)
+        # Mean entropy of the denoiser's own conditionals over the sampling
+        # trajectory (nats; see metrics.record_pred_entropy). Accumulated by
+        # the samplers above, so it is only defined for samplers that expose
+        # `p_x0` -- `analytic` and DUO's ancestral update do not.
+        if float(self.metrics.pred_entropy.weight) > 0:
+          self.log('val/pred_entropy',
+                   self.metrics.pred_entropy.compute(),
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)
@@ -795,11 +821,19 @@ class Diffusion(TrainerBase):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ancestral':
-        _, x = self._ancestral_update(
+        p_x0, x_next = self._ancestral_update(
           x=x, t=t, dt=dt, p_x0=None)
+        self._record_pred_entropy(p_x0, x)
+        x = x_next
       elif self.sampler == 'ancestral_cache':
+        # Only a cache miss actually runs the denoiser; on a hit `p_x0` is
+        # last step's distribution and folding it in again would just
+        # reweight the average by how long each call happened to be reused.
+        is_fresh = p_x0_cache is None
         p_x0_cache, x_next = self._ancestral_update(
           x=x, t=t, dt=dt, p_x0=p_x0_cache)
+        if is_fresh:
+          self._record_pred_entropy(p_x0_cache, x)
         if (not torch.allclose(x_next, x)
             or self.time_conditioning):
           # Disable caching
@@ -814,12 +848,18 @@ class Diffusion(TrainerBase):
       if self.sampler == 'analytic':
         x = self._denoiser_update(x=x, t=t0)
       else:
-        _, x = self._ancestral_update(x=x, t=t0, dt=None,
+        is_fresh = p_x0_cache is None
+        p_x0, x_next = self._ancestral_update(x=x, t=t0, dt=None,
                                  p_x0=p_x0_cache,
                                  noise_removal_step=True)
+        if is_fresh:
+          self._record_pred_entropy(p_x0, x)
+        x = x_next
     elif self.config.sampling.noise_removal == 'greedy':
       sigma = self._sigma_from_alphat(self.noise(t0)[1])
-      x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
+      log_p_x0 = self.forward(xt=x, sigma=sigma)
+      self._record_pred_entropy(log_p_x0, x, log_input=True)
+      x = log_p_x0.argmax(dim=-1)
     return x
 
   @torch.no_grad
@@ -930,6 +970,12 @@ class AbsorbingState(Diffusion):
     return self.mask_index * torch.ones(
       * batch_dims, dtype=torch.int64, device=self.device)
 
+  def _pred_entropy_mask(self, xt):
+    # Revealed positions are pinned to a one-hot by `_process_model_output`,
+    # so their entropy is 0 by construction; only the masked positions carry
+    # an actual prediction.
+    return xt == self.mask_index
+
   def _ancestral_update(self, x, t, dt, p_x0=None,
                    noise_removal_step=False):
     _, alpha_t = self.noise(t)
@@ -993,6 +1039,7 @@ class AbsorbingState(Diffusion):
       -1, keepdim=True).clamp(min=self.sampling_eps, max=1.0)
     _, alpha_t = self.noise(t)
     log_p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t))
+    self._record_pred_entropy(log_p_x0, x, log_input=True)
     logits = log_p_x0
     if self.p_nucleus < 1:
       # `top_k_top_p_filtering` writes in place; keep `log_p_x0` intact.

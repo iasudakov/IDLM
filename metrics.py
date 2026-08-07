@@ -10,6 +10,58 @@ import transformers
 LOG2 = math.log(2)
 
 
+@torch.no_grad()
+def entropy_sum(dist, mask=None, log_input=False,
+                max_chunk_elems=1 << 24):
+  """Summed Shannon entropy (nats) of a batch of categorical distributions.
+
+  Returns ``(total, count)``: the sum of ``-sum_v p(v) log p(v)`` over the
+  counted positions as a 0-dim tensor on `dist`'s device (None when nothing
+  was counted), and how many positions that was. Kept as a sum rather than a
+  mean so callers can pool across calls with different position counts.
+
+  Args:
+    dist: ``(..., V)`` categorical distribution(s) from the model.
+    mask: optional bool tensor broadcastable to ``dist.shape[:-1]``; only
+      those positions are counted. For masked diffusion pass
+      ``xt == mask_index`` -- `_process_model_output` pins the already-
+      revealed positions to a one-hot, whose entropy is 0 by construction,
+      so including them measures how full the sequence is rather than how
+      confident the model is.
+    log_input: `dist` holds log-probabilities rather than probabilities.
+    max_chunk_elems: cap on the temporary allocated per chunk. The full
+      ``(B, L, V)`` tensor is ~1.6 GB at B=8, L=1024, V=50257, so the
+      reduction walks it in row blocks instead of materializing a
+      same-shape temporary. Masked-out rows are dropped before the math,
+      so a half-masked latent costs about half as much.
+  """
+  vocab_size = dist.shape[-1]
+  flat = dist.reshape(-1, vocab_size)
+  keep = None if mask is None else mask.reshape(-1)
+  rows_per_chunk = max(1, int(max_chunk_elems) // max(vocab_size, 1))
+  total = None
+  count = 0
+  for lo in range(0, flat.shape[0], rows_per_chunk):
+    chunk = flat[lo: lo + rows_per_chunk]
+    if keep is not None:
+      keep_chunk = keep[lo: lo + rows_per_chunk]
+      if not bool(keep_chunk.any()):
+        continue
+      chunk = chunk[keep_chunk]
+    chunk = chunk.detach().to(torch.float32)
+    if log_input:
+      # -sum p log p read off log-probs directly. `_process_model_output`
+      # writes a large finite `neg_infinity` rather than -inf, but clamp
+      # anyway so a true -inf gives 0 * -inf = 0 instead of NaN.
+      h = - (chunk.exp() * chunk.clamp_min(-1e30)).sum(-1)
+    else:
+      h = torch.special.entr(chunk).sum(-1)
+    chunk_total = h.sum()
+    total = chunk_total if total is None else total + chunk_total
+    count += h.numel()
+  return total, count
+
+
 class NLL(torchmetrics.aggregation.MeanMetric):
   def update(self,
              value:typing.Union[float, torch.Tensor],
@@ -200,6 +252,7 @@ class Metrics:
     self.valid_aux = BPD()
     self.gen_ppl = Perplexity()
     self.sample_entropy = torchmetrics.aggregation.MeanMetric()
+    self.pred_entropy = torchmetrics.aggregation.MeanMetric()
     self.eval_ppl_batch_size = eval_ppl_batch_size
     self.gm = (GradientMoment(gm_eval_model_name_or_path)
                if compute_gm else None)
@@ -213,6 +266,7 @@ class Metrics:
   def to(self, *args, **kwargs):
     self.gen_ppl = self.gen_ppl.to(*args, **kwargs)
     self.sample_entropy = self.sample_entropy.to(*args, **kwargs)
+    self.pred_entropy = self.pred_entropy.to(*args, **kwargs)
     self.train_nlls = self.train_nlls.to(*args, **kwargs)
     self.train_aux = self.train_aux.to(*args, **kwargs)
     self.valid_nlls = self.valid_nlls.to(*args, **kwargs)
@@ -223,6 +277,7 @@ class Metrics:
   def reset(self):
     self.gen_ppl.reset()
     self.sample_entropy.reset()
+    self.pred_entropy.reset()
     self.train_nlls.reset()
     self.train_aux.reset()
     self.valid_nlls.reset()
@@ -289,6 +344,40 @@ class Metrics:
       entropy = torch.special.entr(
         counts.float() / counts.sum()).sum().item()
       self.sample_entropy.update(entropy)
+
+  @torch.no_grad()
+  def record_pred_entropy(self, dist, mask=None, log_input=False,
+                          max_chunk_elems=1 << 24):
+    """Mean Shannon entropy (nats) of the *model's own* predictive
+    distribution: ``-sum_v p_theta(v) log p_theta(v)``, averaged over
+    positions. Successive calls accumulate a *position-weighted* mean, so
+    over a sampling trajectory the early, mostly-masked steps -- where the
+    model has the most positions to predict -- dominate.
+
+    This is the sibling of `record_entropy`, which measures the unigram
+    entropy of the token *counts* in a finished sample. That one can look
+    healthy while every individual conditional has collapsed to a spike;
+    this one reads the spike directly, so it is the number that moves when
+    distillation / nucleus truncation sharpens the denoiser. Range is
+    ``[0, log V]`` (``log 50257 ~= 10.82`` for GPT-2 BPE); low = confident /
+    near-deterministic conditionals, high = diffuse.
+
+    Args:
+      dist: ``(..., V)`` categorical distribution from the model.
+      mask: optional bool tensor broadcastable to ``dist.shape[:-1]``;
+        only those positions are counted. For masked diffusion pass
+        ``xt == mask_index`` -- `_process_model_output` pins the
+        already-revealed positions to a one-hot, whose entropy is 0 by
+        construction and would otherwise dominate the average as the
+        sampler fills the sequence in.
+      log_input: `dist` holds log-probabilities rather than probabilities.
+      max_chunk_elems: see `entropy_sum`.
+    """
+    total, count = entropy_sum(
+      dist, mask=mask, log_input=log_input,
+      max_chunk_elems=max_chunk_elems)
+    if count:
+      self.pred_entropy.update(total / count, count)
 
   @torch.no_grad()
   def record_generative_perplexity(

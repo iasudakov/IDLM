@@ -130,6 +130,7 @@ def _generate_samples(diffusion_model, config, logger,
     tokenizer=tokenizer)
   model.metrics.gen_ppl.reset()
   model.metrics.sample_entropy.reset()
+  model.metrics.pred_entropy.reset()
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
@@ -158,15 +159,20 @@ def _generate_samples(diffusion_model, config, logger,
       all_samples.extend(list(text_samples))
   generative_ppl = 0.
   entropy = 0.
+  pred_entropy = 0.
   if not config.sampling.semi_ar:
     generative_ppl = model.metrics.gen_ppl.compute().item()
     entropy = model.metrics.sample_entropy.compute().item()
     print('Generative perplexity:', generative_ppl)
     print('Sample entropy:', entropy)
+    if float(model.metrics.pred_entropy.weight) > 0:
+      pred_entropy = model.metrics.pred_entropy.compute().item()
+      print('Model predictive entropy:', pred_entropy)
   samples_path = config.eval.generated_samples_path
   with fsspec.open(samples_path, 'w') as f:
     json.dump({'generative_ppl': generative_ppl,
                'entropy': entropy,
+               'pred_entropy': pred_entropy,
                'generated_seqs': all_samples}, f, indent=4)
   print('Samples saved at:', samples_path)
 

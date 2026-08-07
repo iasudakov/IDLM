@@ -9,11 +9,26 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import metrics
 import trainer_base
 import utils
 import hydra.utils
 import models
 from ipdb import set_trace as debug
+
+
+# Floor under `p` inside `log` when differentiating the entropy. `p` holds exact
+# zeros (`_process_model_output` sends the mask logit to `neg_infinity`), and
+# `torch.special.entr` -- correct in the forward -- has gradient `-log(p) - 1`,
+# which is `+inf` there and turns into NaN the moment it meets `exp`'s backward.
+# `-(p * clamp_min(p, eps).log())` has the same value and the same gradient
+# `-log(p) - 1` wherever `p > eps`, and a finite 0 below it. Well above float32's
+# smallest normal (~1.2e-38), and the values it alters contribute < 1e-28 nats.
+_ENTROPY_EPS = 1e-30
+# Rows per chunk in the entropy reduction, as an element budget. The full
+# (B, L, V) tensor is ~1.6 GB at B=8, L=1024, V=50257; the transient product is
+# what this bounds.
+_ENTROPY_CHUNK_ELEMS = 1 << 24
 
 
 def _maybe_save_periodic_checkpoint(module):
@@ -510,6 +525,26 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       self.total_loss_student = 0
       self.total_loss_fake = 0
       self.f_loss_ar = []
+      # Running (sum, count) of the student's own predictive entropy over the
+      # generator micro-batches since the last logged step; see
+      # `_record_student_entropy`.
+      self.log_student_entropy = getattr(
+        self.config.adversarial_distill, 'log_student_entropy', True)
+      self._entropy_sum = None
+      self._entropy_count = 0
+      self._last_student_entropy = 0.0
+      # Weight of the entropy bonus in the generator objective; 0 => the
+      # entropy is a detached diagnostic only. See `generator_loss`.
+      self.entropy_weight = float(getattr(
+        self.config.adversarial_distill, 'entropy_weight', 0.0) or 0.0)
+      # Differentiable entropy of the *current* generator_loss call, summed
+      # over its `generator_num_noised_samples` draws.
+      self._entropy_term_sum = None
+      self._entropy_term_count = 0
+      # Detached running mean of the bonus actually subtracted, for the log.
+      self._entropy_bonus_sum = None
+      self._entropy_bonus_count = 0
+      self._last_entropy_bonus = 0.0
       # Weight of the auxiliary->teacher regularizer in the fake loss (D-MMD
       # Eq. 12). 0 => original fake loss (hard NLL on student samples only).
       self.fake_teacher_weight = getattr(
@@ -989,10 +1024,54 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     return self._reduce_positions(loss, valid_tokens, loss_mask)
 
   def generator_loss(self, x0, valid_tokens, current_accumulation_step):
+    """Generator objective, plus the optional entropy bonus.
+
+    ``g_loss = teacher_loss - fake_loss - entropy_weight * H``
+
+    `H` is the student's own predictive entropy (`_record_student_entropy`),
+    reduced over positions the same way the two critic terms are, so the
+    weight is a plain trade-off between them rather than something that has
+    to be rescaled with `model.length`.
+
+    The sign is a *bonus*: the loss is minimized, so a positive
+    `entropy_weight` pushes entropy up. That is the direction that fights
+    the failure mode of this objective -- the student can lower
+    `teacher_loss - fake_loss` either by matching the teacher or by
+    collapsing onto the few modes both critics score well, and only the
+    second one takes entropy down with it. A negative weight sharpens
+    instead, which is occasionally what you want when distilling toward a
+    low-temperature sampler. At 0 (the default) this is exactly the previous
+    objective and nothing differentiable is built.
+
+    Start an order of magnitude below the scale of `student_loss`: the bonus
+    is unbounded above (entropy maxes out at `log V ~= 10.8` per position,
+    but a uniform student is worthless), so too large a weight has a trivial
+    optimum and will walk the model to noise. Watch `student_entropy`
+    against the teacher's own level rather than pushing it as high as it
+    will go.
+    """
+    self._entropy_term_sum = None
+    self._entropy_term_count = 0
     if self.critic_type == 'diffusion':
-      return self._generator_loss_diffusion(
+      loss = self._generator_loss_diffusion(
         x0, valid_tokens, current_accumulation_step)
-    return self._generator_loss_ar(x0, valid_tokens, current_accumulation_step)
+    else:
+      loss = self._generator_loss_ar(
+        x0, valid_tokens, current_accumulation_step)
+    if self.entropy_weight != 0.0 and self._entropy_term_count:
+      # Mean over the `generator_num_noised_samples` draws, matching how the
+      # critic terms are averaged over them.
+      bonus = self.entropy_weight * (
+        self._entropy_term_sum / self._entropy_term_count)
+      loss = loss - bonus
+      applied = bonus.detach().mean()
+      self._entropy_bonus_sum = (
+        applied if self._entropy_bonus_sum is None
+        else self._entropy_bonus_sum + applied)
+      self._entropy_bonus_count += 1
+    self._entropy_term_sum = None
+    self._entropy_term_count = 0
+    return loss
 
   def _generator_loss_ar(self, x0, valid_tokens, current_accumulation_step):
     # Differentiable student distribution over the (clean) generated sequence.
@@ -1002,6 +1081,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     # commit; `None` (the default) leaves the reduction untouched.
     loss_mask = self._confidence_loss_mask_for(
       student_probs, student_xt, valid_tokens, is_generator=True)
+    self._record_student_entropy(
+      student_probs, student_xt, valid_tokens, loss_mask)
 
     # Discrete sequence fed as context to the AR critics (non-differentiable).
     x_gen = trainer_base.sample_categorical(student_probs.detach())
@@ -1029,6 +1110,8 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       x0, valid_tokens, current_accumulation_step, return_xt=True)
     loss_mask = self._confidence_loss_mask_for(
       student_probs, student_xt, valid_tokens, is_generator=True)
+    self._record_student_entropy(
+      student_probs, student_xt, valid_tokens, loss_mask)
 
     num_noised_samples = getattr(self.config.adversarial_distill, 'generator_num_noised_samples', 1)
 
@@ -1262,6 +1345,128 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       'noise/embed_std': torch.as_tensor(embed_std, device=raw.device),
       'noise/snr': inject_std / max(embed_std, 1e-12)}
 
+  def _student_entropy_per_position(self, student_probs):
+    """`(batch, length)` Shannon entropy (nats) of the student's prediction,
+    differentiable w.r.t. `student_probs`.
+
+    Written as ``-(p * clamp_min(p, eps).log()).sum(-1)`` rather than
+    `torch.special.entr` so the backward stays finite at the exact zeros the
+    distribution contains -- see `_ENTROPY_EPS`. Chunked over rows: `p` and
+    the log are each ~1.6 GB at the OWT shape, and this bounds the transient
+    product to `_ENTROPY_CHUNK_ELEMS`.
+
+    NOTE the log *is* retained for backward (one extra `p`-sized tensor for
+    the whole step), which is why the caller only builds this when
+    `entropy_weight != 0`; the diagnostic path uses the no-grad
+    `metrics.entropy_sum`, which keeps nothing.
+    """
+    vocab_size = student_probs.shape[-1]
+    flat = student_probs.reshape(-1, vocab_size)
+    rows_per_chunk = max(
+      1, _ENTROPY_CHUNK_ELEMS // max(vocab_size, 1))
+    parts = []
+    for lo in range(0, flat.shape[0], rows_per_chunk):
+      chunk = flat[lo: lo + rows_per_chunk]
+      parts.append(
+        - (chunk * chunk.clamp_min(_ENTROPY_EPS).log()).sum(-1))
+    return torch.cat(parts).view(student_probs.shape[:-1])
+
+  def _record_student_entropy(self, student_probs, student_xt,
+                              valid_tokens=None, loss_mask=None):
+    """Accumulate the entropy of the student's *own* prediction on this
+    micro-batch, for `student_entropy` in the step log.
+
+    ``H = -sum_v p_eta(v | z_t) log p_eta(v | z_t)`` in nats, averaged over
+    the positions the student actually predicted. It is read off the very
+    tensor the generator loss differentiates, so it is the training-time
+    counterpart of `val/pred_entropy` (which reads the sampling trajectory)
+    and needs no extra forward pass.
+
+    What it buys as a diagnostic is a direct view of the collapse the
+    min-max game can drift into -- `student_loss` falls both when the
+    student matches the teacher and when it sharpens onto a few modes the
+    critic happens to like, and those two look identical on the loss curve.
+    This separates them: sharpening shows up here as entropy heading toward
+    0 while `student_loss` still improves. Expect the frozen `mdlm-owt`
+    teacher's level at init and watch the gap, since the absolute value is
+    dominated by the noise level `t` the batch drew.
+
+    With `adversarial_distill.entropy_weight != 0` the same quantity is also
+    accumulated *with* its graph, reduced exactly like the critic losses
+    (`_reduce_positions` with this call's `valid_tokens` / `loss_mask`, so
+    the two are on one scale), and handed to `generator_loss` as a bonus
+    term. At weight 0 -- the default -- nothing differentiable is built and
+    this stays a detached readout.
+
+    Only positions masked in `student_xt` count: elsewhere
+    `_process_model_output` (and `_preserve_prompt_probs`) pin the
+    distribution to a one-hot whose entropy is 0 by construction, so
+    including them would track the sampled `t` rather than the model. Prompt
+    positions are already excluded -- `q_xt` masks nothing outside
+    `valid_tokens`.
+    """
+    want_term = self.entropy_weight != 0.0
+    if not (self.log_student_entropy or want_term):
+      return
+    predicted = (student_xt == self.mask_index)
+    if want_term:
+      per_position = self._student_entropy_per_position(student_probs)
+      per_position = per_position * predicted.to(per_position.dtype)
+      # Same reduction as the teacher / fake terms this is added to, so
+      # `entropy_weight` is in units of "nats of entropy per nat of critic
+      # cross-entropy" instead of depending on the sequence length.
+      term = self._reduce_positions(
+        per_position, valid_tokens, loss_mask=loss_mask)
+      self._entropy_term_sum = (
+        term if self._entropy_term_sum is None
+        else self._entropy_term_sum + term)
+      self._entropy_term_count += 1
+      total = per_position.detach().sum()
+      count = int(predicted.sum())
+    else:
+      total, count = metrics.entropy_sum(
+        student_probs, mask=predicted)
+    if not count:
+      return
+    self._entropy_sum = (
+      total if self._entropy_sum is None else self._entropy_sum + total)
+    self._entropy_count += count
+
+  def _student_entropy_stats(self):
+    """Pop the accumulated `student_entropy` for the step log, or `{}` when
+    the flag is off.
+
+    Position-weighted mean over every generator micro-batch (and every
+    `generator_num_noised_samples` draw) since the last logged step, so it
+    lines up with the `student_loss` printed beside it.
+
+    Whether the key is present depends only on the config flag, never on the
+    data: `log_dict` under DDP hangs if the ranks disagree on the key set,
+    and a window in which no rank ever saw a masked position -- possible in
+    principle, since `t` is random -- would otherwise be a rare deadlock
+    rather than a rare wrong number. In that case the previous value is
+    repeated.
+    """
+    stats = {}
+    if self.entropy_weight != 0.0:
+      # `entropy_weight * H` as actually subtracted from g_loss, batch-mean.
+      # The one number that says whether the weight is doing anything:
+      # compare it against `student_loss` printed beside it.
+      if self._entropy_bonus_count:
+        self._last_entropy_bonus = (
+          self._entropy_bonus_sum / self._entropy_bonus_count)
+        self._entropy_bonus_sum = None
+        self._entropy_bonus_count = 0
+      stats['entropy_bonus'] = self._last_entropy_bonus
+    if not self.log_student_entropy:
+      return stats
+    if self._entropy_count:
+      self._last_student_entropy = self._entropy_sum / self._entropy_count
+      self._entropy_sum = None
+      self._entropy_count = 0
+    stats['student_entropy'] = self._last_student_entropy
+    return stats
+
   def _student_embed_std(self):
     """Per-entry std of the (possibly noise-wrapped) student's embedding."""
     if self._embed_module_cache is None:
@@ -1332,6 +1537,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       _maybe_save_periodic_checkpoint(self)
       self.log_dict(
         {"student_loss": self.total_loss_student,
+         **self._student_entropy_stats(),
          **self._noise_conditioning_stats()},
         prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
       scheduler_student.step()
@@ -1399,6 +1605,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self.log_dict(
             {"student_loss": self.total_loss_student,
              "fake_loss": torch.stack(self.f_loss_ar).mean(),
+             **self._student_entropy_stats(),
              **self._noise_conditioning_stats()},
             prog_bar=True,
             on_step=True,
@@ -1687,6 +1894,8 @@ class MDLM_DMMD(MDLM_with_AR):
                             detach_student=False))
       loss_mask = self._confidence_loss_mask_for(
         student_probs, student_xt, valid_tokens, is_generator=True)
+      self._record_student_entropy(
+        student_probs, student_xt, valid_tokens, loss_mask)
       sigma = self._sigma_from_alphat(alpha)
       sigma = self._process_sigma(sigma)
 
@@ -1761,6 +1970,8 @@ class MDLM_DMMD(MDLM_with_AR):
       x0, valid_tokens, current_accumulation_step, return_xt=True)
     loss_mask = self._confidence_loss_mask_for(
       student_probs, student_xt, valid_tokens, is_generator=True)
+    self._record_student_entropy(
+      student_probs, student_xt, valid_tokens, loss_mask)
 
     x_gen = trainer_base.sample_categorical(student_probs.detach())
     x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
