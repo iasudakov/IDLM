@@ -115,6 +115,34 @@ class UnderdeepLogger(Logger):
       print('[underdeep] scalar log failed: {}'.format(e), flush=True)
 
   @rank_zero_only
+  def log_image(self, key, image, step=None):
+    """Log one image to the run, versioned by `step` like a scalar.
+
+    Lightning has no image hook of its own, so callers reach this the way
+    ``trainer_base`` already reaches ``log_table``: behind a
+    ``hasattr(logger, 'log_image')`` guard, which a logger without image
+    support (e.g. ``TensorBoardLogger``) simply fails, skipping the call.
+
+    Args:
+      key: image title; repeated calls under the same title become a
+        step-indexed series in the tracker, so a curve re-rendered every
+        validation can be scrubbed through.
+      image: ``numpy`` HWC array, ``PIL`` image, raw bytes, or a path to a
+        file on disk -- whatever ``underdeep.runs.data_types.UImage`` takes.
+      step: training step the image belongs to.
+    """
+    run = self.experiment
+    if run is None or image is None:
+      return
+    try:
+      if isinstance(image, str):
+        run.log_image(title=key, file_path=image, step=step)
+      else:
+        run.log_image(title=key, array=image, step=step)
+    except Exception as e:  # pragma: no cover - tracker best-effort
+      print('[underdeep] image log failed: {}'.format(e), flush=True)
+
+  @rank_zero_only
   def finalize(self, status):
     if self._run is None or self._finished:
       return

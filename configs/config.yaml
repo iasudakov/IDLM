@@ -297,6 +297,23 @@ eval:
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
   generate_samples: True
   generated_samples_path: ${cwd:}/samples.json
+  # --- Quality/diversity Pareto curve ---
+  # val/sample_entropy and val/gen_ppl plotted against each other rather than
+  # against the step: one point per validation, so the run traces the
+  # trade-off it is buying as it trains. Refreshed on exactly the schedule
+  # those two scalars are (every validation, same global step) and costs no
+  # extra sampling -- it reuses the numbers already computed. The point is
+  # appended to `pareto_path` and the re-rendered curve is logged as an image
+  # under `pareto_image_key` by loggers that support images (underdeep does;
+  # TensorBoard silently skips it). See `pareto_curve.py`, which also plots
+  # several runs' histories together offline:
+  #   python -m pareto_curve a/pareto_curve.jsonl b/pareto_curve.jsonl -o p.png
+  pareto_curve: True
+  # Under `checkpointing.save_dir`, not `${cwd:}`, so the history keeps
+  # accumulating across resumes of the same run -- same convention as the
+  # tracker's own `underdeep_metadata.pt`.
+  pareto_path: ${checkpointing.save_dir}/pareto_curve.jsonl
+  pareto_image_key: val/pareto
   # --- Input-noise diversity probe (`mode=noise_diversity_eval`, or set this
   # flag to also run it at every validation) ---
   # Generates the same batch several times with the decoding randomness

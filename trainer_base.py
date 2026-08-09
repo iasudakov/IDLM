@@ -13,6 +13,7 @@ import transformers
 import dataloader
 import metrics
 import models
+import pareto_curve
 import utils
 from ipdb import set_trace as debug
 
@@ -415,16 +416,22 @@ class TrainerBase(L.LightningModule):
             columns=['Generated Samples'],
             data=[[s] for s in text_samples])
         if self.config.eval.compute_generative_perplexity:
+          # Held in locals so the Pareto curve below reuses these values
+          # instead of calling `compute()` again -- under DDP that is a
+          # collective, and it has to run on every rank or not at all.
+          gen_ppl = self.metrics.gen_ppl.compute()
+          sample_entropy = self.metrics.sample_entropy.compute()
           self.log('val/gen_ppl',
-                   self.metrics.gen_ppl.compute(),
+                   gen_ppl,
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)
           self.log('val/sample_entropy',
-                   self.metrics.sample_entropy.compute(),
+                   sample_entropy,
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)
+          self._log_pareto_curve(sample_entropy, gen_ppl)
         # Mean entropy of the denoiser's own conditionals over the sampling
         # trajectory (nats; see metrics.record_pred_entropy). Accumulated by
         # the samplers above, so it is only defined for samplers that expose
@@ -464,6 +471,44 @@ class TrainerBase(L.LightningModule):
           data=[[k, replicate[0]]
                 for k, replicate in enumerate(diversity.variants)])
     self._train_mode()
+
+  def _log_pareto_curve(self, sample_entropy, gen_ppl):
+    """Extend the run's quality/diversity Pareto curve by one point.
+
+    Called from `on_validation_epoch_end` right after `val/gen_ppl` and
+    `val/sample_entropy` go out, with the very same two numbers, so the curve
+    is refreshed on exactly the schedule those scalars are -- once per
+    validation, at the same global step. The point is appended to
+    `eval.pareto_path` (a JSONL under `checkpointing.save_dir`, so it survives
+    resuming), the whole history is re-read and re-rendered, and the image is
+    logged under `eval.pareto_image_key`, which makes it a step-indexed series
+    in the tracker: scrubbing it replays the run walking its trade-off.
+
+    Free in GPU terms -- both numbers are already computed. Rank zero only, and
+    never fatal: a tracker or plotting failure must not take a training run
+    down with it, so everything here is caught and reported.
+    """
+    if not self.config.eval.get('pareto_curve', False):
+      return
+    if self.trainer.global_rank != 0 or self.trainer.sanity_checking:
+      return
+    try:
+      path = self.config.eval.get('pareto_path', None)
+      pareto_curve.append(
+        path,
+        step=self.global_step,
+        sample_entropy=float(sample_entropy),
+        gen_ppl=float(gen_ppl))
+      if not hasattr(self.trainer.logger, 'log_image'):
+        return
+      image = pareto_curve.render_history(
+        path, label=getattr(self.trainer.logger, 'name', None) or 'this run')
+      self.trainer.logger.log_image(
+        key=self.config.eval.get('pareto_image_key', 'val/pareto'),
+        image=image,
+        step=self.global_step)
+    except Exception as e:  # pragma: no cover - diagnostics are best-effort
+      print('[pareto] curve update failed: {}'.format(e), flush=True)
 
   def configure_optimizers(self):
     optimizer = torch.optim.AdamW(
