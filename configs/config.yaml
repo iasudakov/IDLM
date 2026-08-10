@@ -225,6 +225,100 @@ adversarial_distill:
   confidence_loss_threshold: null
   confidence_loss_min_k: null
 
+  # --- Trajectory-level RL distillation (algo=mdlm_rl, algo.MDLM_RL) --------
+  #
+  # Everything below is read only by `algo=mdlm_rl`. That algo optimizes the
+  # SAME reverse KL as D-MMD, but on samples from the student's own multi-step
+  # sampler instead of a one-shot draw from a data-derived latent: it rolls out
+  # the ancestral sampler from the all-mask prior, scores the finished sequence
+  # with the AR critics (`reward = log p_teacher(x) - log p_fake(x)`), and
+  # trains with REINFORCE on the trajectory's log-probability. It requires
+  # critic_type=ar (the diffusion critic has no tractable sequence log-density
+  # to reward with) and reuses top_p / top_p_delta / entropy_weight /
+  # fake_teacher_weight / fake_lr / fake_frequency / use_fake /
+  # use_gradient_clipping unchanged.
+  #
+  # Ignored by mdlm_rl: dmmd_* (the D-MMD mask-sampling scheme is specific to
+  # the diffusion critic), fake_soft_target (the critic is fit to hard
+  # trajectory samples, because its log-density is what the reward subtracts),
+  # confidence_loss_* , loss_weighting and generator_num_noised_samples.
+  #
+  # SCALE: every generator-side RL term is reduced to per-token nats, whereas
+  # the D-MMD losses are a *sum* over ~model.length positions on OWT. So
+  # `student_loss` is ~1e3x smaller here and optim.lr=1e-6 does NOT transfer --
+  # expect to raise it. `fake_lr` does transfer (the critic objective keeps its
+  # original units). Compare `grad_norm_student`, which both algos log.
+  #
+  # k: rollout length. The policy makes k+1 denoiser calls (the grid plus the
+  # terminal noise-removal step), exactly what generate_samples does, so this
+  # is also the step budget the student is being trained to decode at -- set
+  # sampling.steps to the same value to evaluate what was trained. Cost is
+  # linear in it: a generator micro-step is k+1 no-grad forwards plus
+  # rl_grad_steps with gradient.
+  rl_num_steps: 16
+  # M: how many of those k+1 steps are recomputed with gradient per update.
+  # Every position is revealed exactly once across the trajectory, so drawing M
+  # step indices uniformly without replacement and scaling by (k+1)/M is an
+  # unbiased estimate of the full sum -- M=1 is enough, and raising it trades
+  # forward/backward passes for variance.
+  #
+  # The LogLinear schedule reveals model.length/k positions per *grid* step in
+  # expectation, uniformly across the k of them, so the subsampling is much
+  # lower-variance than it looks. The exception is the terminal noise-removal
+  # step, which mops up whatever is still masked at t=eps: ~0.01 positions at
+  # model.length=1024. Drawing it (probability 1/(k+1), ~6% at k=16) therefore
+  # yields an exactly-zero gradient for that micro-step. That is unbiased, not
+  # a bug -- the step's true contribution really is ~0 -- and `rl/logp` logging
+  # exactly 0.0 is the tell. Raise M if losing ~6% of updates matters.
+  rl_grad_steps: 1
+  # Baseline subtracted from the reward, over the group of trajectories (they
+  # all start from the same all-mask prior, so they are i.i.d. and the group
+  # mean is a valid baseline -- GRPO with an empty prompt).
+  # 'leave_one_out' (default): mean of the *other* rewards, so the baseline is
+  #   independent of the row it is subtracted from and the estimator stays
+  #   unbiased. 'group_mean': plain GRPO. 'none': raw reward (unbiased, but
+  #   carries the reward's absolute scale into the gradient).
+  rl_baseline: leave_one_out
+  # 'std' divides the advantage by the group's reward std (GRPO), which makes
+  # the gradient scale independent of how peaked the critics are and hence of
+  # top_p / how far the fake critic has drifted. 'none' leaves it in nats.
+  rl_advantage_norm: std
+  # Trajectories per baseline group. 0 => the whole local rollout batch (i.e.
+  # loader.batch_size). A group of 1 has no baseline and contributes a zero
+  # advantage, so keep loader.batch_size >= 2.
+  #
+  # With rl_advantage_norm='std' the advantage is a z-score, so its magnitude
+  # says nothing about how far apart the rewards actually were -- only how the
+  # group ranks. At a group of 2 that degenerates completely: the advantage is
+  # exactly +-sqrt(2) on every step (visible as a pinned `rl/advantage_abs`),
+  # i.e. only the sign of the reward difference survives. Groups of >= 8 keep
+  # some magnitude information; use rl_advantage_norm='none' if you want the
+  # reward gap itself to drive the step size.
+  rl_group_size: 0
+  # Mix the D-MMD *pathwise* generator term back in, evaluated at one of the
+  # trajectory's own latents with the rolled-out sequence as AR context. 0
+  # (default) => pure policy gradient and nothing extra is built. The pathwise
+  # gradient is low-variance but biased toward the one-step conditional, so a
+  # small weight can stabilize early training. Costs two extra AR forwards.
+  rl_pathwise_weight: 0.0
+  # FIFO of finished rollouts the auxiliary critic is fit on. Generator steps
+  # fill it, fake steps draw from it, so a fake step costs no rollout. Only the
+  # sequences are stored (rl_buffer_size * loader.batch_size * model.length
+  # int64s). Larger => the critic sees a slightly staler mixture.
+  rl_buffer_size: 8
+  # Reuse one rollout for this many consecutive generator micro-steps. Setting
+  # it to `accum_batches` is *exactly* on-policy -- neither the student nor the
+  # critic takes an optimizer step inside an accumulation window -- and divides
+  # the rollout cost by that factor; the price is correlated gradients within
+  # the window. Beyond accum_batches it becomes off-policy and, with no
+  # importance ratio implemented, biased.
+  rl_rollout_reuse: 1
+  # Terminal time of the rollout's sampling grid. null => 1e-5, the default
+  # `TrainerBase.generate_samples` decodes with, so the trained policy is the
+  # evaluated one. NOTE this is deliberately not training.sampling_eps (1e-3),
+  # which floors the *training* time draw.
+  rl_eps: null
+
 loader:
   global_batch_size: 512
   eval_global_batch_size: ${.global_batch_size}

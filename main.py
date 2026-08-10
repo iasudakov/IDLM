@@ -397,6 +397,8 @@ def main(config):
     diffusion_model = algo.MDLM_with_AR
   elif config.algo.name == 'mdlm_dmmd':
     diffusion_model = algo.MDLM_with_DMMD
+  elif config.algo.name == 'mdlm_rl':
+    diffusion_model = algo.MDLM_RL
   elif config.algo.name == 'duo_base':
     diffusion_model = algo.DUO_BASE
   elif config.algo.name == 'd3pm':
