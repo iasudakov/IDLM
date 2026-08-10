@@ -121,6 +121,70 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     print('ids:', last)
 
 
+def _prepare_gm_data(model, config, logger, tokenizer):
+  """Validation batches, decoded to text, to pair with the generated ones for
+  the GPT-2 Gradient Moment -- or `[]` when GM is off or cannot be computed.
+
+  GM (D-MMD arXiv:2603.20155 Eq. 13/14, `metrics.GradientMoment`) is a distance
+  *between two distributions*: the reference model's loss-gradient is averaged
+  over our samples (`g`) and over real data (`q`), and the metric is the squared
+  norm of the difference. Generative perplexity needs no data, so
+  `mode=sample_eval` never loaded any; this pulls one validation batch per
+  generated batch from the same shuffled loader `mode=ppl_eval` uses
+  (`valid_seed=config.seed`), which also makes both sides of a pair
+  `loader.eval_batch_size` rows wide. Decoded to text because the reference
+  model re-tokenizes with its own tokenizer, exactly as gen-ppl does.
+
+  The number of pairs is `min(sampling.num_sample_batches, eval.gm_num_batches)`
+  -- the same `M` the validation path uses -- and is logged and written to the
+  report, since it is what the estimator's variance rides on.
+  """
+  if not config.eval.get('compute_gm', False):
+    return []
+  if model.metrics.gm is None:
+    logger.warning(
+      'eval.compute_gm is set but this model was built without a '
+      'GradientMoment; skipping GM.')
+    return []
+  if config.sampling.semi_ar:
+    # Same reason generative perplexity is skipped below: semi-AR samples are
+    # full of <|endoftext|> and need post-processing before a reference model
+    # can score them.
+    logger.warning('GM is not computed for semi-AR sampling.')
+    return []
+  num_pairs = min(config.sampling.num_sample_batches,
+                  config.eval.get('gm_num_batches', 4))
+  if num_pairs < 2:
+    # `GradientMoment.compute` needs two independent draws to form a cross-pair
+    # (a single `d_m . d_m` would estimate the norm plus its own variance).
+    logger.warning(
+      'GM needs at least 2 paired (generated, data) batches but only %d are '
+      'configured (min of sampling.num_sample_batches=%d and '
+      'eval.gm_num_batches=%d); skipping GM.',
+      num_pairs, config.sampling.num_sample_batches,
+      config.eval.get('gm_num_batches', 4))
+    return []
+  model.metrics.gm.reset()
+  _, valid_ds = dataloader.get_dataloaders(
+    config, tokenizer, skip_train=True, valid_seed=config.seed)
+  texts = []
+  for batch in valid_ds:
+    texts.append(valid_ds.tokenizer.batch_decode(batch['input_ids']))
+    if len(texts) == num_pairs:
+      break
+  if len(texts) < 2:
+    logger.warning(
+      'The validation set yielded only %d batch(es); skipping GM.',
+      len(texts))
+    return []
+  logger.info(
+    'GM: %d paired (generated, data) batches of %d sequences '
+    '(reference model: %s).',
+    len(texts), config.loader.eval_batch_size,
+    config.eval.get('gm_eval_model_name_or_path', 'gpt2'))
+  return texts
+
+
 def _generate_samples(diffusion_model, config, logger,
                       tokenizer):
   logger.info('Starting Sample Eval.')
@@ -134,10 +198,11 @@ def _generate_samples(diffusion_model, config, logger,
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
+  gm_data_texts = _prepare_gm_data(model, config, logger, tokenizer)
   stride_length = config.sampling.stride_length
   num_strides = config.sampling.num_strides
   all_samples = []
-  for _ in range(config.sampling.num_sample_batches):
+  for _sb in range(config.sampling.num_sample_batches):
     if config.sampling.semi_ar:
       _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample(
         stride_length=stride_length,
@@ -154,12 +219,25 @@ def _generate_samples(diffusion_model, config, logger,
         num_steps=config.sampling.steps)
       model.metrics.record_entropy(samples)
       text_samples = model.tokenizer.batch_decode(samples)
+      # `device=` by keyword: the third positional parameter is `retokenize`, so
+      # passing the device there left `device` at its 'cuda' default -- harmless
+      # while the model is on a GPU (a torch.device is truthy, so retokenization
+      # still happened) but a crash for a CPU eval.
       model.metrics.record_generative_perplexity(
-        text_samples, config.model.length, model.device)
+        text_samples, config.model.length, device=model.device)
       all_samples.extend(list(text_samples))
+      # GPT-2 GM: one (generated, data) pair per batch. Each pair contributes a
+      # gradient difference `d_m`; the estimator in `GradientMoment.compute`
+      # averages the `M (M - 1)` cross terms `d_i . d_j`, so this only needs the
+      # pairing to be independent across batches, not within one.
+      if _sb < len(gm_data_texts):
+        model.metrics.gm.accumulate(
+          text_samples, gm_data_texts[_sb], config.model.length,
+          model.device)
   generative_ppl = 0.
   entropy = 0.
   pred_entropy = 0.
+  gpt2_gm = None
   if not config.sampling.semi_ar:
     generative_ppl = model.metrics.gen_ppl.compute().item()
     entropy = model.metrics.sample_entropy.compute().item()
@@ -168,11 +246,19 @@ def _generate_samples(diffusion_model, config, logger,
     if float(model.metrics.pred_entropy.weight) > 0:
       pred_entropy = model.metrics.pred_entropy.compute().item()
       print('Model predictive entropy:', pred_entropy)
+    if gm_data_texts:
+      # Lower is better; 0 means the reference model cannot tell the samples
+      # from the data. Unlike generative perplexity it is not improved by mode
+      # collapse, which is the point of reporting it beside gen-ppl.
+      gpt2_gm = model.metrics.gm.compute()
+      print('GPT-2 gradient moment:', gpt2_gm)
   samples_path = config.eval.generated_samples_path
   with fsspec.open(samples_path, 'w') as f:
     json.dump({'generative_ppl': generative_ppl,
                'entropy': entropy,
                'pred_entropy': pred_entropy,
+               'gpt2_gm': gpt2_gm,
+               'gm_num_pairs': len(gm_data_texts),
                'generated_seqs': all_samples}, f, indent=4)
   print('Samples saved at:', samples_path)
 

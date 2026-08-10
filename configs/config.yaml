@@ -278,11 +278,22 @@ eval:
   compute_generative_perplexity: False
   perplexity_batch_size: 8
   # GPT-2 Gradient Moment (GM), D-MMD paper Eq. 13/14 -- the paper's headline
-  # metric (Table 5). Logged as val/gm. Requires `trainer.inference_mode=false`
-  # (GM needs gradients; Lightning validation is inference-mode by default).
+  # metric (Table 5). Measures the distance between the sample and data
+  # distributions through a frozen reference LM's loss-gradient, so (unlike
+  # generative perplexity) it does not reward mode collapse: 0 = the reference
+  # model cannot tell the samples from the data, larger = further away.
+  # Reported in two places:
+  #   * training / `mode=ppl_eval`: logged as val/gm. Requires
+  #     `trainer.inference_mode=false` (GM needs gradients; Lightning validation
+  #     is inference-mode by default).
+  #   * `mode=sample_eval`: printed and written to `generated_samples_path` as
+  #     `gpt2_gm`, paired against validation batches (no trainer flag needed).
   compute_gm: False
   gm_eval_model_name_or_path: gpt2   # paper uses GPT-2 base for GM
-  gm_num_batches: 4                  # M paired (gen,data) batches; needs >= 2
+  # M paired (gen,data) batches; needs >= 2. The estimator averages the M(M-1)
+  # cross terms, so raise it to cut variance -- in `mode=sample_eval` the
+  # effective M is min(this, sampling.num_sample_batches) and is printed.
+  gm_num_batches: 10
   compute_perplexity_on_sanity: False
   # Mean entropy (nats) of the denoiser's *own* predictive distribution
   # p_theta(x0 | x_t), averaged over every (denoiser call, still-masked
