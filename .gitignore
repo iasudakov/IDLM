@@ -169,3 +169,7 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
+
+# underdeep writes a local metric backup to the working directory, one file per
+# run uid, so these accumulate as runs are launched.
+batched-metrics-*.txt

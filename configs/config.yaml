@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor]
+  - /callbacks: [checkpoint_every_n_steps, checkpoint_archive, checkpoint_monitor, learning_rate_monitor]
   - /data: openwebtext
   - /model: small
   - /strategy: ddp
@@ -8,6 +8,7 @@ defaults:
   - /lr_scheduler: constant_warmup
   - /prior: none
   - /algo: duo_base
+  - /logger: underdeep
 
 mode: train  # train / ppl_eval / sample_eval
 
@@ -92,6 +93,10 @@ trainer:
   val_check_interval: 5000
   check_val_every_n_epoch: null  # Disable end-of-epoch validation. Instead, validate every trainer.val_check_interval steps.
 
+# Metric trackers. `wandb` below is duo's original one; the `/logger` group in
+# the defaults above adds a second (underdeep by default, `logger=tensorboard`
+# for TensorBoard, `~logger` for neither). Drop this block with `~wandb` to log
+# to the tracker from the group only.
 wandb:
   project: duo
   group: null
@@ -116,3 +121,17 @@ checkpointing:
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
+  # How often the rolling `last.ckpt` is rewritten (bounds what a crash costs).
+  save_every_n_steps: 500
+  # How often a step-named checkpoint is kept forever (`checkpoint_archive`).
+  archive_every_n_steps: 50_000
+  # Nirvana preemption transfer, as in `yrDiT/train.py`: the run directory is
+  # pulled back from the snapshot path at startup and pushed out again after
+  # checkpoint writes. `null` disables both; every transfer is a no-op off
+  # Nirvana anyway. Only useful when the run directory is stable across attempts,
+  # i.e. when `hydra.run.dir` / `save_dir` is set explicitly instead of being
+  # left at the default timestamped path.
+  nirvana_snapshot_dir: ${.save_dir}
+  # Publishing copies the whole run directory, so it is allowed to be rarer than
+  # the checkpoint write: <= 0 means push on every write.
+  snapshot_every_n_steps: ${.save_every_n_steps}

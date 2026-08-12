@@ -1,0 +1,13 @@
+# Stream training metrics to the underdeep experiment tracker (mirrors
+# `yrDiT/train.py`). A run is created -- or resumed from `underdeep_metadata.pt`
+# under `save_dir` when a preempted job restarts into the same run directory --
+# and scalar metrics are streamed live. No-ops if the `underdeep` package is
+# unavailable, so the same command trains anywhere.
+# Switch trackers with `logger=tensorboard`, or drop the tracker with `~logger`.
+_target_: underdeep_logger.UnderdeepLogger
+experiment: generative-models/idlm
+# Overridden per run, e.g. `logger.name=mdlm-owt`.
+name: ${algo.name}
+save_dir: ${checkpointing.save_dir}
+resume: ${checkpointing.resume_from_ckpt}
+force_new_run: false

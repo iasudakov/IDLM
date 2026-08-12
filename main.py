@@ -16,6 +16,8 @@ from tqdm import tqdm, trange
 
 import algo
 import dataloader
+import nirvana_utils
+import underdeep_logger  # noqa: F401  (registers `underdeep_logger.*` as a Hydra `_target_`)
 import utils
 
 omegaconf.OmegaConf.register_new_resolver(
@@ -90,6 +92,41 @@ def _print_batch(config, train_ds, valid_ds, tokenizer, k=64):
       print('ids:', last)
 
 
+def _build_loggers(config):
+  """Loggers the `Trainer` streams metrics to, or None for no logger.
+
+  Two independent sources: a `wandb` block (duo's original tracker) and the
+  `/logger` config group (underdeep by default, `logger=tensorboard` for
+  TensorBoard, `~logger` for neither). Both may be active at once; wandb is kept
+  first because `trainer.logger` -- which `trainer_base` reaches for its
+  wandb-only `log_table` calls -- is the first entry of the list.
+  """
+  loggers = []
+  if config.get('wandb', None) is not None:
+    loggers.append(L.pytorch.loggers.WandbLogger(
+      config=omegaconf.OmegaConf.to_object(config),
+      **config.wandb))
+  if config.get('logger', None) is not None:
+    loggers.append(hydra.utils.instantiate(config.logger))
+  return loggers or None
+
+
+@L.pytorch.utilities.rank_zero_only
+def _restore_nirvana_snapshot(config):
+  """Pull a preempted attempt's run directory back before anything reads it.
+
+  Must run before the `resume_ckpt_path` check below, otherwise the restored
+  `last.ckpt` (and the underdeep run id next to it) arrive too late to be used.
+  Off Nirvana this is a no-op. Note that it only helps when the run directory is
+  stable across attempts, i.e. when `hydra.run.dir` / `checkpointing.save_dir`
+  is set explicitly rather than left at the default timestamped path.
+  """
+  snapshot_dir = config.checkpointing.get('nirvana_snapshot_dir', None)
+  if snapshot_dir is None:
+    return
+  nirvana_utils.copy_snapshot_to_out(os.fspath(snapshot_dir))
+
+
 def _generate_samples(diffusion_model, config, logger,
                       tokenizer):
   logger.info('Starting Sample Eval.')
@@ -150,11 +187,6 @@ def _eval_ppl(diffusion_model, config, logger, tokenizer):
     logger.info('Disabling EMA.')
     model.ema = None
 
-  wandb_logger = None
-  if config.get('wandb', None) is not None:
-    wandb_logger = L.pytorch.loggers.WandbLogger(
-      config=omegaconf.OmegaConf.to_object(config),
-      ** config.wandb)
   callbacks = []
   if 'callbacks' in config:
     for _, callback in config.callbacks.items():
@@ -164,7 +196,7 @@ def _eval_ppl(diffusion_model, config, logger, tokenizer):
     default_root_dir=os.getcwd(),
     callbacks=callbacks,
     strategy=hydra.utils.instantiate(config.strategy),
-    logger=wandb_logger)
+    logger=_build_loggers(config))
   _, valid_ds = dataloader.get_dataloaders(
     config, tokenizer, skip_train=True, valid_seed=config.seed)
   trainer.validate(model, valid_ds)
@@ -172,11 +204,7 @@ def _eval_ppl(diffusion_model, config, logger, tokenizer):
 
 def _train(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Training.')
-  wandb_logger = None
-  if config.get('wandb', None) is not None:
-    wandb_logger = L.pytorch.loggers.WandbLogger(
-      config=omegaconf.OmegaConf.to_object(config),
-      **config.wandb)
+  _restore_nirvana_snapshot(config)
 
   if (config.checkpointing.resume_from_ckpt
       and config.checkpointing.resume_ckpt_path is not None
@@ -210,7 +238,7 @@ def _train(diffusion_model, config, logger, tokenizer):
     default_root_dir=os.getcwd(),
     callbacks=callbacks,
     strategy=hydra.utils.instantiate(config.strategy),
-    logger=wandb_logger)
+    logger=_build_loggers(config))
   trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
 
 

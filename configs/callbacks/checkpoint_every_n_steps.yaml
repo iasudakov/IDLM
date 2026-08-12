@@ -1,8 +1,17 @@
+# Rolling "latest" checkpoint -- yrDiT's `latest.pt`. Overwritten in place every
+# `checkpointing.save_every_n_steps` optimizer steps, so a crash costs at most
+# that many steps while only ever occupying one file. (Upstream duo set
+# `save_top_k: -1` here, keeping *every* one of them: ~2.5 GB per 500 steps for
+# model=small.) Step-named keepsakes are `checkpoint_archive`'s job.
+# After each write the run directory is pushed to the Nirvana snapshot path, a
+# no-op off Nirvana; see `utils.SnapshotModelCheckpoint`.
 checkpoint_every_n_steps:
-  _target_: lightning.pytorch.callbacks.ModelCheckpoint
-  save_top_k: -1 # Do not save any "best" models; this callback is being used to save every n train steps
+  _target_: utils.SnapshotModelCheckpoint
+  save_top_k: 0 # only `last.ckpt`; no monitored "best" models here
   save_last: True # save model as ${save_dir}/checkpoints/last.ckpt
   dirpath: ${checkpointing.save_dir}/checkpoints
   verbose: True
   auto_insert_metric_name: False
-  every_n_train_steps: 500
+  every_n_train_steps: ${checkpointing.save_every_n_steps}
+  snapshot_dir: ${checkpointing.nirvana_snapshot_dir}
+  snapshot_every_n_steps: ${checkpointing.snapshot_every_n_steps}

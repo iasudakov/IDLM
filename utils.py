@@ -20,6 +20,8 @@ from scipy.optimize import curve_fit
 from scipy.stats import norm
 from timm.scheduler import CosineLRScheduler
 
+import nirvana_utils
+
 
 def count_parameters(model):
   return sum(p.numel()
@@ -153,6 +155,53 @@ class GradientInspectionCallback(lightning.Callback):
         # and visualize mean, median, top-k
         pl_module.grad_accum_buffer.zero_()
         pl_module.grad_step = 0
+
+
+class SnapshotModelCheckpoint(
+    lightning.pytorch.callbacks.ModelCheckpoint):
+  """`ModelCheckpoint` that publishes the run directory to Nirvana after a write.
+
+  This is the transfer `yrDiT/train.py` performs right after saving a
+  checkpoint: the whole results directory is copied to the Nirvana snapshot
+  path (`nirvana_utils.copy_out_to_snapshot`), which is what lets a preempted
+  job restart into its own weights, optimizer, EMA and tracker run id. Off
+  Nirvana every transfer is a no-op, so the same callback runs anywhere.
+
+  Subclassing the checkpoint callback rather than adding a standalone one keeps
+  the two events ordered. Lightning runs all `Checkpoint` callbacks at the end
+  of the callback list, so a separate callback firing on the same step would
+  publish *before* the checkpoint was written, i.e. snapshot the previous one.
+  Here the push happens inside the call that wrote the file.
+
+  Args:
+    snapshot_dir: run directory to publish, normally
+      `checkpointing.save_dir` (the parent of `dirpath`, so the snapshot also
+      carries the config, the hydra logs and `underdeep_metadata.pt`). None
+      disables the push.
+    snapshot_every_n_steps: only publish when `trainer.global_step` is a
+      multiple of this. Publishing archives the entire run directory, so it is
+      allowed to be rarer than writing the checkpoint: the write cadence bounds
+      what a *crash* costs, this one bounds what a *preemption* costs.
+      <= 0 publishes after every write.
+  """
+
+  def __init__(self, *args, snapshot_dir=None,
+               snapshot_every_n_steps=0, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.snapshot_dir = (None if snapshot_dir is None
+                         else os.fspath(snapshot_dir))
+    self.snapshot_every_n_steps = int(snapshot_every_n_steps)
+
+  def _save_checkpoint(self, trainer, filepath):
+    super()._save_checkpoint(trainer, filepath)
+    # Every rank enters this method (saving is a collective), but only rank
+    # zero wrote the file and only rank zero owns the snapshot path.
+    if self.snapshot_dir is None or not trainer.is_global_zero:
+      return
+    if (self.snapshot_every_n_steps > 0
+        and trainer.global_step % self.snapshot_every_n_steps != 0):
+      return
+    nirvana_utils.copy_out_to_snapshot(self.snapshot_dir)
 
 
 def get_logger(name=__name__, level=logging.INFO) -> logging.Logger:

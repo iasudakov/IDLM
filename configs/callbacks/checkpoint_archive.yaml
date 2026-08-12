@@ -1,0 +1,16 @@
+# Step-named keepsake checkpoints -- yrDiT's `ema_{step:07d}.pt`. A permanent
+# record every `checkpointing.archive_every_n_steps` steps that the rolling
+# `last.ckpt` never overwrites, so intermediate weights stay evaluatable
+# (`mode=ppl_eval`/`sample_eval` with `eval.checkpoint_path=.../step=00050000.ckpt`).
+# Unlike yrDiT's EMA-only archive these are full Lightning checkpoints: duo's
+# `TrainerBase.on_save_checkpoint` already stores the EMA shadow params under
+# `ema`, and keeping the optimizer state means an archive can also be resumed.
+checkpoint_archive:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  save_top_k: -1 # keep every archive
+  save_last: False
+  dirpath: ${checkpointing.save_dir}/checkpoints
+  filename: 'step={step:08d}'
+  auto_insert_metric_name: False
+  every_n_train_steps: ${checkpointing.archive_every_n_steps}
+  verbose: True
