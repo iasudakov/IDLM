@@ -390,14 +390,55 @@ class FID:
                  cache_path)
       print(f'[fid] reference cached to {cache_path}', flush=True)
 
+  @staticmethod
+  def _mean_cov(feat_sum, cov_sum, n):
+    """(mu, Sigma) from the sums torchmetrics accumulates. Same algebra as its
+    `FrechetInceptionDistance.compute`, in float64."""
+    feat_sum, cov_sum = feat_sum.double(), cov_sum.double()
+    n = n.double()
+    mu = (feat_sum / n).unsqueeze(0)
+    sigma = (cov_sum - n * mu.t().mm(mu)) / (n - 1)
+    return mu.squeeze(0), sigma
+
+  @staticmethod
+  def _frechet(mu1, sigma1, mu2, sigma2):
+    """||mu1-mu2||^2 + tr(S1) + tr(S2) - 2 tr((S1 S2)^1/2).
+
+    torchmetrics evaluates the last term as `eigvals(S1 @ S2).sqrt().sum()` --
+    a *general* (non-symmetric) eigendecomposition of a 2048x2048 matrix in
+    complex arithmetic, which is the single slowest step of an evaluation and
+    costs minutes regardless of how many samples were drawn.
+
+    S1 S2 is similar to the symmetric PSD matrix S1^(1/2) S2 S1^(1/2), so the
+    two have identical eigenvalues and the trace can be had from `eigh` /
+    `eigvalsh` instead: real arithmetic, and a far smaller constant than
+    `geev`. The value is the same; only the route to it changes.
+    """
+    w, v = torch.linalg.eigh(sigma1)
+    sigma1_half = (v * w.clamp_min(0).sqrt()) @ v.t()
+    m = sigma1_half @ sigma2 @ sigma1_half
+    tr_covmean = torch.linalg.eigvalsh(m).clamp_min(0).sqrt().sum()
+    return ((mu1 - mu2) ** 2).sum() + sigma1.trace() + sigma2.trace() \
+        - 2 * tr_covmean
+
   def score(self, images):
-    """FID of `(N, 3, 32, 32)` uint8 generated images against the reference."""
+    """FID of `(N, 3, 32, 32)` uint8 generated images against the reference.
+
+    torchmetrics is used for the Inception features (the part worth reusing)
+    but not for the final distance -- see `_frechet`.
+    """
     self.metric.fake_features_sum.zero_()
     self.metric.fake_features_cov_sum.zero_()
     self.metric.fake_features_num_samples.zero_()
     for i in range(0, images.shape[0], 500):
       self.metric.update(images[i:i + 500].to(self.device), real=False)
-    return self.metric.compute().item()
+    mu_real, cov_real = self._mean_cov(self.metric.real_features_sum,
+                                       self.metric.real_features_cov_sum,
+                                       self.metric.real_features_num_samples)
+    mu_fake, cov_fake = self._mean_cov(self.metric.fake_features_sum,
+                                       self.metric.fake_features_cov_sum,
+                                       self.metric.fake_features_num_samples)
+    return self._frechet(mu_real, cov_real, mu_fake, cov_fake).item()
 
 
 @torch.no_grad()
@@ -597,7 +638,12 @@ def parse_args():
   p.add_argument('--eval-every', type=int, default=10_000,
                  help='the expensive pass: test BPD + FID')
   p.add_argument('--eval-nfe', type=int, default=128)
-  p.add_argument('--eval-fid-samples', type=int, default=10_000)
+  p.add_argument('--eval-fid-samples', type=int, default=2_000,
+                 help='samples per in-loop FID. This is a trend metric, and '
+                      'sampling dominates its cost, so it is kept small; the '
+                      'Table 1 number comes from eval_cifar10_fid.py at 50K. '
+                      'FID is biased upward at low sample counts, so compare '
+                      'these only against each other, never against the paper.')
   p.add_argument('--eval-sample-batch', type=int, default=125)
   p.add_argument('--ckpt-every', type=int, default=2_000,
                  help='rewrite latest.pt this often')
@@ -668,6 +714,16 @@ def main():
   ddp_model = DDP(model, device_ids=[device.index]) if world_size > 1 else model
 
   # -- data ------------------------------------------------------------------ #
+  # Rank 0 fetches CIFAR-10 first and everyone else waits, so the 170 MB
+  # archive is downloaded once rather than once per rank. Without this the
+  # ranks race: they share the bandwidth (so each crawls), and they extract the
+  # same tar into the same directory concurrently, which can corrupt it.
+  # Constructing the dataset is what triggers torchvision's download, and doing
+  # it twice on rank 0 just re-reads an already-present pickle.
+  if is_main(rank) and world_size > 1:
+    DiscreteCIFAR10(args.data_dir, train=True)
+    DiscreteCIFAR10(args.data_dir, train=False)
+  barrier()
   train_set = DiscreteCIFAR10(args.data_dir, train=True)
   test_set = DiscreteCIFAR10(args.data_dir, train=False)
   train_loader, train_sampler = build_loader(
