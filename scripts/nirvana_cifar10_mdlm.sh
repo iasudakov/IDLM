@@ -92,22 +92,35 @@ NUM_GPUS=$(python3 -c 'import torch; print(torch.cuda.device_count())')
 BATCH_SIZE=$((GLOBAL_BATCH / NUM_GPUS))   # per GPU
 
 OUT=$SOURCE_CODE_PATH/code/outputs/cifar10_teacher
-DATA_DIR=$SOURCE_CODE_PATH/code/cache_dir/cifar10
 mkdir -p $OUT
-mkdir -p $DATA_DIR
 
-# CIFAR-10 ships inside the code archive (cache_dir/cifar10), so nothing is
-# downloaded here. Say so loudly either way: the proxy pulls the 170 MB archive
-# at roughly 500 kB/s, and a missing copy means paying that on every fresh
-# attempt -- easy to mistake for a hung job.
-if [ -d $DATA_DIR/cifar-10-batches-py ]; then
-  echo "[data] CIFAR-10 present in $DATA_DIR, no download"
+# Where CIFAR-10 comes from. Two cases, decided at runtime rather than assumed,
+# because it depends on how the job receives its source:
+#
+#   shipped  -- cache_dir/cifar10 arrived with the code (works when Nirvana
+#               uploads the working directory; NOT when it clones from git,
+#               since cache_dir/ is gitignored). Nothing is downloaded.
+#   snapshot -- otherwise fall back to a directory inside $OUT, which IS packed
+#               to the Nirvana snapshot path. The 170 MB download then happens
+#               at most once per *job* instead of once per *attempt*, so a
+#               preemption no longer costs another six minutes on the proxy.
+SHIPPED=$SOURCE_CODE_PATH/code/cache_dir/cifar10
+if [ -d $SHIPPED/cifar-10-batches-py ]; then
+  DATA_DIR=$SHIPPED
+  echo "[data] CIFAR-10 shipped with the code, no download"
 else
-  echo "[data] WARNING: $DATA_DIR/cifar-10-batches-py is missing."
-  echo "[data] Rank 0 will download 170 MB through the proxy (~6 min), and"
-  echo "[data] will do it again on every fresh attempt. To avoid that, ship"
-  echo "[data] cache_dir/cifar10/cifar-10-batches-py in the code archive."
+  DATA_DIR=$OUT/data
+  echo "[data] CIFAR-10 not shipped with the code (cache_dir/ is gitignored,"
+  echo "[data] so a git-based checkout will not carry it). Falling back to"
+  echo "[data] $DATA_DIR, which lives inside the Nirvana snapshot."
+  if [ -d $DATA_DIR/cifar-10-batches-py ]; then
+    echo "[data] Restored from the snapshot, no download."
+  else
+    echo "[data] First attempt: rank 0 downloads 170 MB through the proxy,"
+    echo "[data] roughly 6 minutes. Restarts of this job will reuse it."
+  fi
 fi
+mkdir -p $DATA_DIR
 
 echo "[launch] $NUM_GPUS GPUs, global_batch=$GLOBAL_BATCH ($BATCH_SIZE/gpu)"
 

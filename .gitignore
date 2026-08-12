@@ -174,8 +174,12 @@ cython_debug/
 # run uid, so these accumulate in the repo root as runs are launched.
 batched-metrics-*.txt
 
-# Datasets staged for shipping to Nirvana inside the code archive -- notably
-# cache_dir/cifar10/cifar-10-batches-py (178 MB), which is present so the job
-# never downloads CIFAR-10 through the proxy. Rides along with the upload, but
-# must never enter git.
-cache_dir/
+# cache_dir holds dataset caches. Everything in it is ignored EXCEPT the
+# CIFAR-10 batches, which are tracked on purpose (178 MB) so the Nirvana job
+# never spends ~6 minutes pulling them through the proxy on a fresh attempt.
+# Re-inclusion has to be spelled out level by level: git will not un-ignore a
+# file whose parent directory is itself excluded.
+cache_dir/*
+!cache_dir/cifar10/
+cache_dir/cifar10/*
+!cache_dir/cifar10/cifar-10-batches-py/
