@@ -531,3 +531,19 @@ checkpointing:
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
   use_periodic_train_batch_checkpoint: false
+  # --- Nirvana (preemptible jobs) ---------------------------------------- #
+  # Steps between pushes of `save_dir` to the Nirvana snapshot path, which is
+  # the only state a restarted attempt inherits (see `nirvana_utils`). > 0 also
+  # enables the matching restore at startup, before the resume path above is
+  # resolved. Keep it a multiple of
+  # `callbacks.checkpoint_every_n_steps.every_n_train_steps` so a push carries a
+  # fresh `last.ckpt`; the interval bounds both the transfer I/O and the work a
+  # preemption destroys. 0 (default) => off, and every existing run is
+  # unchanged. Off Nirvana the transfer functions are no-ops regardless.
+  nirvana_snapshot_every_n_steps: 0
+  # Steps between archival EMA-only exports, written as
+  # `checkpoints/ema_<step>.safetensors` in the raw-backbone-key format
+  # `adversarial_distill.teacher_ckpt_path` loads. Unlike `last.ckpt` these are
+  # never overwritten, so they are what lets a finished run hand a specific
+  # intermediate teacher to the distillation stage. 0 (default) => off.
+  ema_export_every_n_steps: 0

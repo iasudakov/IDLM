@@ -1,6 +1,7 @@
 import functools
 import json
 import os
+import time
 
 import fsspec
 import hydra
@@ -13,6 +14,7 @@ import torch
 import algo
 import dataloader
 import metrics
+import nirvana_utils
 import utils
 import underdeep_logger  # noqa: F401  (registers `underdeep_logger.*` Hydra _target_)
 from ipdb import set_trace as debug
@@ -59,6 +61,191 @@ class PeriodicStepCheckpoint(L.Callback):
       print(
         f'Saved periodic checkpoint at train_batch={save_step}: {ckpt_path}',
         flush=True)
+
+
+class NirvanaSnapshot(L.Callback):
+  """Publish the run directory to the Nirvana snapshot path every N steps.
+
+  This is the write half of Nirvana restartability; the read half is the
+  `nirvana_utils.copy_snapshot_to_out` call in `_train`, which has to happen
+  before the resume path is resolved. Mirrors `yrDiT/train.py`, which pushes on
+  the same schedule it writes its archival checkpoints on.
+
+  `every_n_train_steps` should be a multiple of the `ModelCheckpoint` interval so
+  that a push has a fresh `last.ckpt` to carry. Cost is one copy of the run
+  directory plus a tar of it, so the interval also sets the I/O the job spends on
+  being restartable -- and it bounds the work a preemption can throw away.
+
+  The push is deliberately deferred by one batch. Lightning reorders callbacks to
+  put `ModelCheckpoint` last, so at the end of step N this callback runs *before*
+  the checkpoint for step N is written; pushing there would ship the previous
+  interval's checkpoint and silently cost a whole interval of progress on every
+  restart. Waiting for the next batch to start means the file on disk is the one
+  the step just wrote.
+
+  Rank zero only, and never fatal: a failed transfer must not take training
+  down, it only means the next attempt restarts from an older state.
+  """
+
+  def __init__(self, out_dir, every_n_train_steps):
+    self.out_dir = os.fspath(out_dir)
+    self.every_n_train_steps = int(every_n_train_steps)
+    self._last_pushed_step = -1
+    self._push_pending = False
+
+  def _push(self, trainer, reason):
+    if not trainer.is_global_zero:
+      return
+    step = int(trainer.global_step)
+    if step == self._last_pushed_step:
+      return
+    self._last_pushed_step = step
+    print(f'[nirvana] snapshot at step {step} ({reason})', flush=True)
+    try:
+      nirvana_utils.copy_out_to_snapshot(self.out_dir)
+    except Exception as e:  # pragma: no cover - transfer is best-effort
+      print(f'[nirvana] snapshot failed: {e}', flush=True)
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    if self.every_n_train_steps <= 0:
+      return
+    step = int(trainer.global_step)
+    if step > 0 and step % self.every_n_train_steps == 0:
+      # `ModelCheckpoint` has not written this step's file yet; push next batch.
+      self._push_pending = True
+
+  def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+    if self._push_pending:
+      self._push_pending = False
+      self._push(trainer, 'periodic')
+
+  def on_train_end(self, trainer, pl_module):
+    # Write the final state ourselves rather than pushing whatever the last
+    # interval happened to leave behind: a run that reaches `max_steps` should
+    # leave its *final* weights in the snapshot. Collective, so every rank calls
+    # it; only rank zero then transfers.
+    try:
+      trainer.save_checkpoint(
+        os.path.join(self.out_dir, 'checkpoints', 'last.ckpt'))
+    except Exception as e:  # pragma: no cover - best-effort
+      print(f'[nirvana] final checkpoint failed: {e}', flush=True)
+    self._push(trainer, 'train end')
+
+  def on_exception(self, trainer, pl_module, exception):
+    # A crash is exactly when the state is most worth keeping. Preemption by
+    # SIGKILL cannot reach this hook -- that case is covered by the periodic
+    # push, which is what bounds the loss.
+    self._push(trainer, f'exception: {type(exception).__name__}')
+
+
+class EmaExport(L.Callback):
+  """Write an EMA-only `.safetensors` of the backbone every N steps.
+
+  The full Lightning `last.ckpt` is ~4x larger than the weights (optimizer
+  moments, EMA shadow, dataloader state) and is overwritten in place, so it
+  answers "resume this run" but not "give me the teacher as it was at 500k
+  steps". This is the second half of `yrDiT`'s scheme -- `latest.pt` for resume,
+  `ema_<step>.pt` for archival -- with the archival file written in the format
+  `algo._load_pretrained_backbone` reads: raw backbone keys, EMA values, the
+  same layout as the released `jdeschena/duo2-cifar10` teachers. Such a file can
+  be handed straight to `adversarial_distill.teacher_ckpt_path`.
+
+  Rank zero only, and never fatal. The live parameters are never touched: the
+  shadow params are zipped against the parameter order the EMA was built with
+  (`backbone` then `noise`, cf. `TrainerBase._get_parameters`) rather than
+  copied over the model, so an export cannot perturb training.
+  """
+
+  def __init__(self, dirpath, every_n_train_steps):
+    self.dirpath = os.fspath(dirpath)
+    self.every_n_train_steps = int(every_n_train_steps)
+    self._last_saved_step = -1
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    if self.every_n_train_steps <= 0 or not trainer.is_global_zero:
+      return
+    step = int(trainer.global_step)
+    if step <= 0 or step % self.every_n_train_steps != 0:
+      return
+    if step == self._last_saved_step:
+      return
+    self._last_saved_step = step
+    try:
+      self._export(pl_module, step)
+    except Exception as e:  # pragma: no cover - archival is best-effort
+      print(f'[ema-export] failed at step {step}: {e}', flush=True)
+
+  def _export(self, pl_module, step):
+    import safetensors.torch
+    if pl_module.ema is None:
+      raise RuntimeError('training.ema is off, so there is no EMA to export')
+    # Same order `ExponentialMovingAverage` was constructed with, so the
+    # positional shadow params can be given names.
+    names = ([('backbone', n) for n, _ in pl_module.backbone.named_parameters()]
+             + [('noise', n) for n, _ in pl_module.noise.named_parameters()])
+    shadow = list(pl_module.ema.shadow_params)
+    if len(names) != len(shadow):
+      raise RuntimeError(
+        f'EMA shadow params ({len(shadow)}) do not line up with the '
+        f'parameters they were built from ({len(names)})')
+    ema_params = {name: tensor
+                  for (module, name), tensor in zip(names, shadow)
+                  if module == 'backbone'}
+    # Start from the live state dict so buffers come along, then overwrite the
+    # parameters with their EMA values. `clone()` because safetensors rejects
+    # tensors that share storage.
+    state_dict = {k: v.detach().cpu().contiguous().clone()
+                  for k, v in pl_module.backbone.state_dict().items()}
+    missing = [k for k in ema_params if k not in state_dict]
+    if missing:
+      raise RuntimeError(f'EMA names absent from the backbone: {missing[:4]}')
+    state_dict.update({k: v.detach().cpu().contiguous().clone()
+                       for k, v in ema_params.items()})
+    os.makedirs(self.dirpath, exist_ok=True)
+    path = os.path.join(self.dirpath, f'ema_{step:08d}.safetensors')
+    safetensors.torch.save_file(
+      state_dict, path,
+      metadata={'source': 'ema.shadow_params', 'step': str(step)})
+    print(f'[ema-export] wrote {len(state_dict)} tensors to {path}',
+          flush=True)
+
+
+class ThroughputMonitor(L.Callback):
+  """Log optimizer steps/sec and the projected hours left to `max_steps`.
+
+  `trainer/loss` alone cannot distinguish "training normally" from "training at
+  a third of the speed because the machine is contended", which on a multi-day
+  preemptible run is the difference between finishing and not. Timed over
+  `trainer.log_every_n_steps` windows, rank-local (no collective), and logged
+  through the module so it reaches whichever tracker is configured.
+  """
+
+  def __init__(self):
+    self._window_start = None
+    self._window_steps = 0
+
+  def on_train_start(self, trainer, pl_module):
+    self._window_start = time.monotonic()
+    self._window_steps = 0
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    window = max(1, int(trainer.log_every_n_steps))
+    self._window_steps += 1
+    if self._window_steps < window or self._window_start is None:
+      return
+    elapsed = time.monotonic() - self._window_start
+    self._window_start = time.monotonic()
+    self._window_steps = 0
+    if elapsed <= 0:
+      return
+    steps_per_sec = window / elapsed
+    metrics_to_log = {'trainer/steps_per_sec': steps_per_sec}
+    max_steps = int(getattr(trainer, 'max_steps', -1) or -1)
+    if max_steps > 0:
+      remaining = max(0, max_steps - int(trainer.global_step))
+      metrics_to_log['trainer/eta_hours'] = remaining / steps_per_sec / 3600.0
+    pl_module.log_dict(metrics_to_log, on_step=True, on_epoch=False,
+                       prog_bar=False, rank_zero_only=True, sync_dist=False)
 
 
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
@@ -606,11 +793,25 @@ def _train(diffusion_model, config, logger, tokenizer):
   #     **config.wandb)
   train_logger = hydra.utils.instantiate(config.logger)
 
+  # Nirvana restart: pull the preempted attempt's state back into `save_dir`
+  # *before* the resume path below is resolved, and before the underdeep logger
+  # looks for `underdeep_metadata.pt` there, so a restart both resumes the
+  # optimizer state and keeps writing to the same tracker run. Under Lightning's
+  # subprocess launcher this runs in the parent, which spawns the ranks only
+  # inside `trainer.fit()`, i.e. after the restore has finished; off Nirvana it
+  # is a no-op.
+  snapshot_every = int(config.checkpointing.get(
+    'nirvana_snapshot_every_n_steps', 0) or 0)
+  if snapshot_every > 0 and os.environ.get('LOCAL_RANK', '0') == '0':
+    nirvana_utils.copy_snapshot_to_out(
+      os.fspath(config.checkpointing.save_dir))
+
   if (config.checkpointing.resume_from_ckpt
       and config.checkpointing.resume_ckpt_path is not None
       and utils.fsspec_exists(
         config.checkpointing.resume_ckpt_path)):
     ckpt_path = config.checkpointing.resume_ckpt_path
+    logger.info(f'Resuming from checkpoint: {ckpt_path}')
   else:
     ckpt_path = None
 
@@ -623,6 +824,19 @@ def _train(diffusion_model, config, logger, tokenizer):
       callbacks.append(PeriodicStepCheckpoint(
         os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
         config.callbacks.checkpoint_every_n_steps.every_n_train_steps))
+  callbacks.append(ThroughputMonitor())
+  ema_export_every = int(config.checkpointing.get(
+    'ema_export_every_n_steps', 0) or 0)
+  if ema_export_every > 0:
+    callbacks.append(EmaExport(
+      os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
+      ema_export_every))
+  # Ordering relative to `ModelCheckpoint` is not up to us -- Lightning moves
+  # checkpoint callbacks to the end -- which is why the push is deferred by a
+  # batch inside the callback rather than arranged here.
+  if snapshot_every > 0:
+    callbacks.append(NirvanaSnapshot(
+      os.fspath(config.checkpointing.save_dir), snapshot_every))
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)

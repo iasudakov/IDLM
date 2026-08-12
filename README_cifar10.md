@@ -36,6 +36,84 @@ mask token only when `'mdlm' in config.algo.name`, so these weights carry the
 `duo/` checkpoints exist, but IDLM has no uniform D-MMD loss. `algo=mdlm_rl` is
 also out of scope (it needs an autoregressive critic); both error clearly.
 
+**This checkpoint is class-conditional; the paper's teacher is not.** DUO trains
+it with `training.class_dropout_p=0.1` and a `LabelEmbedder`, whereas Sec. 6.1
+says "we train diffusion models to generate unconditional images". Sampling it
+unconditionally runs through the null-class embedding, and sampling it
+class-conditionally is not the paper's setting either. Use it to exercise the
+pipeline; train the teacher below to reproduce the paper.
+
+### 0b. Train the teacher yourself (the paper's unconditional setting)
+
+```bash
+bash scripts/train_cifar10_teacher.sh
+```
+
+`data.num_classes=null` drops the `cond_map` entirely — no null class, nothing
+conditional in the graph. Everything else is DUO's CIFAR-10 MDLM recipe (35M
+UNet, global batch 128, lr 2e-4, 1.5M steps, cosine schedule, EMA 0.9999),
+because the paper gives no hyperparameter table and that recipe is the same
+backbone on the same data. Measured throughput is ~9 optimizer steps/s and it is
+flat from 4 to 6 A100s (the step is per-step-overhead bound, not compute bound),
+so 1.5M steps is ~46 h and four GPUs are enough — use `GPUS=` to pin devices and
+leave the rest free.
+
+Two overrides in that script are *required* rather than tuning, and both are
+hard errors rather than warnings:
+
+* `~callbacks.checkpoint_monitor` — it monitors `val/gen_ppl`, a text-only
+  metric. The image path logs `val/bpd`, `val/nll`, `val/ppl`, `val/fid`,
+  `val/inception_score`, `val/sample_entropy`, `val/pred_entropy`; Lightning
+  raises `MisconfigurationException` on the first validation when the monitored
+  key is absent, so with this callback in place the run dies at
+  `trainer.val_check_interval`. `scripts/train_cifar10_dmmd.sh` needs the same
+  override for the same reason.
+* `callbacks.checkpoint_every_n_steps.save_top_k=0` — `save_last: True` still
+  rewrites `last.ckpt`, but the per-interval `epoch=..-step=...ckpt` files are
+  not kept. They are 572 MB each; keeping all of them fills the disk long before
+  1.5M steps.
+
+#### Restartable on a preemptible machine (Nirvana)
+
+`nirvana_utils.py` is vendored from `yt_tools/nirvana_utils.py` (what
+`yrDiT/train.py` uses), so the repo is self-contained on the Nirvana image. The
+only state a restarted attempt inherits is the *snapshot path*, so the run
+directory is pushed there periodically and pulled back at startup. Off Nirvana
+`nirvana_dl` is not importable and every transfer is a no-op, so the identical
+command trains normally on a local machine.
+
+Three intervals, all env-overridable:
+
+| env | default | what it buys |
+|---|---|---|
+| `CKPT_EVERY` | 2500 | rewrites `checkpoints/last.ckpt` in place — weights, EMA, optimizer, dataloader position (572 MB) |
+| `SNAPSHOT_EVERY` | 10000 | pushes the run dir to the snapshot path. A preemption costs at most this many steps (~18 min). Keep it a multiple of `CKPT_EVERY` |
+| `EMA_EVERY` | 100000 | archival `checkpoints/ema_<step>.safetensors` (143 MB, never overwritten) — the intermediate teachers, in exactly the format `adversarial_distill.teacher_ckpt_path` loads |
+
+Restart semantics, all verified by wiping the run directory between two attempts
+and checking the resumed step:
+
+* the snapshot is restored *before* `checkpointing.resume_ckpt_path` is resolved,
+  otherwise the recovered `last.ckpt` would arrive too late to be used;
+* the underdeep run continues rather than forking a new one, because
+  `underdeep_metadata.pt` lives in `save_dir` and so travels in the snapshot;
+* the periodic push is deferred by one batch on purpose. Lightning reorders
+  callbacks to put `ModelCheckpoint` last, so at the end of step N the checkpoint
+  for step N is not on disk yet — pushing there ships the *previous* interval's
+  checkpoint and silently loses an interval on every restart. This was a real bug
+  caught by the restart test: a run that reached step 100 resumed from step 50.
+
+#### What reaches the tracker
+
+`logger=underdeep` is the default (`logger=tensorboard` still works). Per
+validation: `val/fid`, `val/inception_score`, `val/bpd`, `val/nll`, `val/ppl`,
+`val/sample_entropy`, `val/pred_entropy`, plus a PNG sample grid via
+`log_image`. Per `trainer.log_every_n_steps`: `trainer/loss`, `trainer/lr`,
+`trainer/steps_per_sec`, `trainer/eta_hours` — the last two exist because
+`trainer/loss` cannot distinguish "training normally" from "training at a third
+of the speed on a contended host", which over a multi-day preemptible run is the
+difference between finishing and not.
+
 ### 1. Teacher baseline
 
 ```bash
@@ -87,9 +165,18 @@ measures *our* teacher's curve, and that is the honest baseline for the student.
 
 ### Measured baseline (this branch)
 
-`mdlm/cosine_time_uncond/1500000`, unconditional, `ancestral_cache`, **10 000**
-samples against 10 000 train images (not the 50 000-sample protocol — these are
-biased upward and are the number to compare the student against, not Table 1):
+`mdlm/cosine_time_uncond/1500000`, unconditional, `ancestral_cache`, FID against
+the un-augmented train split.
+
+**Paper protocol, 50 000 generated vs 50 000 train:**
+
+| steps | ours FID | ours IS | paper (Table 1) | ratio |
+|---|---|---|---|---|
+| 16 | **148.92** | 3.48 | 122.9 | 1.21x |
+| 32 | **76.56** | 5.17 | 47.1 | 1.63x |
+
+**Cheaper sweep, 10 000 vs 10 000** (what the student should be compared
+against if you evaluate it at 10k):
 
 | steps | 16 | 32 | 64 | 128 | 1024 |
 |---|---|---|---|---|---|
@@ -97,20 +184,27 @@ biased upward and are the number to compare the student against, not Table 1):
 | IS | 3.47 | 5.19 | 6.03 | 6.58 | 6.86 |
 
 The samples at 1024 steps are clearly recognisable CIFAR-10 objects (see
-`outputs/cifar10/teacher_fid/samples_steps1024.png`), so the pixel layout,
-vocabulary, schedule and sampler are right; the offset from Table 1 is the
-checkpoint, not the port. Two known contributors, in order of size:
+`outputs/cifar10/teacher_fid/samples_steps1024.png`), and the checkpoint loads
+with zero key mismatches, so the pixel layout, vocabulary, schedule and sampler
+are right. The offset from Table 1 is still only partly accounted for:
 
-1. **The null class saw ~10% of training.** DUO trains CIFAR-10 with
+1. **Sample count — measured, and large.** The same teacher at 128 steps scores
+   57.7 at n=2 000 and 41.0 at n=10 000. FID is biased upward at small n on
+   both the generated and the reference side, and the table above uses a tenth
+   of the paper's protocol. Rerun with `NUM_SAMPLES=50000` for the comparable
+   number.
+2. **The null class — measured, and small.** DUO trains with
    `training.class_dropout_p = 0.1` and its own `_eval_fid` samples *class
-   conditionally*, with labels taken from the real batch. Sampling
-   unconditionally — which is what D-MMD Sec. 6.1 reports and what this branch
-   does — runs through an embedding that was trained on a tenth of the data.
-   `scripts/test_cifar10_null_class.py` measures this directly by running the
-   same sampler twice, changing only which class embedding it reads.
-2. **10 000 samples and a 10 000-image reference.** FID is biased upward at
-   both; the standard protocol is 50 000 of each (`NUM_SAMPLES=50000`, ~4.5 h
-   at 1024 steps on 5 GPUs).
+   conditionally*, so the obvious hypothesis is that our unconditional sampling
+   (D-MMD Sec. 6.1) runs through an under-trained embedding.
+   `scripts/test_cifar10_null_class.py` tests exactly that, holding the label
+   fixed across each trajectory and changing nothing else: **null 57.7 vs
+   class-marginal 53.3 at n=2 000/128 steps, a 1.08x ratio.** So this costs
+   ~8%, not the several-fold factor it would need to explain Table 1. Do not
+   repeat the class-dropout story as the explanation; it was tested and it is
+   not the answer.
+3. **A different teacher.** These are DUO's weights from DUO's codebase and
+   training run, not the paper's own masked teacher. Unquantified.
 
 ## The noise pyramid (`_ImageNoiseConditionedBackbone`)
 

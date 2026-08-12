@@ -606,6 +606,14 @@ class TrainerBase(L.LightningModule):
       # `compute()` is a collective under DDP, so every rank must reach it.
       fid = self.metrics.fid.compute()
       self.log('val/fid', fid, on_epoch=True, on_step=False, sync_dist=False)
+      # Free: the Inception activations FID just consumed are the same ones the
+      # Inception Score reads. Worth logging because the two fail differently --
+      # a generator collapsing onto a few good-looking modes improves IS while
+      # FID degrades -- and `mode=fid_eval` already reports both, so tracking it
+      # here keeps the in-training curve comparable to the final report.
+      is_mean, _ = self.metrics.fid.compute_inception_score()
+      self.log('val/inception_score', is_mean,
+               on_epoch=True, on_step=False, sync_dist=False)
     if samples is not None and self.trainer.global_rank == 0:
       self._log_image_grid(self.tokenizer.batch_decode(samples))
 
