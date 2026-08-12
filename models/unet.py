@@ -337,9 +337,18 @@ class UNet(nn.Module):
         )
         self.output_modules = nn.ModuleList(self.output_modules)
 
-        self.cond_map = LabelEmbedder(
-            config.data.num_classes,
-            self.time_embed_dim*4)
+        self.num_classes = config.data.get('num_classes', None)
+        if self.num_classes is not None:
+            # `LabelEmbedder` allocates `num_classes + 1` rows; the extra one is
+            # the classifier-free-guidance null class at index `num_classes`.
+            self.cond_map = LabelEmbedder(
+                self.num_classes,
+                self.time_embed_dim*4)
+        else:
+            # Unconditional (`data.num_classes=null`): no class embedding at all,
+            # not even a null-class row. `forward` already handles this -- it only
+            # raises if a label is passed without a `cond_map`.
+            self.cond_map = None
 
     def _center_data(self, x):
         out = (x - self.data_min_max[0]) / (self.data_min_max[1] - self.data_min_max[0]) # [0, 1]

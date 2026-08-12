@@ -1,10 +1,12 @@
 python -u -m main \
     data=cifar10 \
-    data.cache_dir=<YOUR-CACHE-PATH> \
+    data.cache_dir=/home/iasudakov/IDLM/cache_dir/cifar10 \
+    data.num_classes=null \
     model=unet \
     algo=mdlm \
     algo.backbone=unet \
     noise=cosine \
+    sampling.predictor=ancestral_cache \
     loader.global_batch_size=128 \
     loader.batch_size=32 \
     loader.eval_batch_size=32 \
@@ -15,6 +17,10 @@ python -u -m main \
     eval.generate_samples=False \
     optim.lr=2e-4 \
     callbacks.checkpoint_every_n_steps.every_n_train_steps=5_000 \
-    wandb.name=mdlm_1_5M_d3pm_like_cosine \
-    hydra.run.dir=./outputs/cifar10/mdlm_1_5M_d3pm_like_cosine \
+    logger=underdeep \
+    logger.name=mdlm_1_5M_d3pm_like_cosine_uncond \
+    logger.experiment=generative-models/cifar10_mdlm \
+    '~wandb' \
+    hydra.run.dir=./outputs/cifar10/mdlm_1_5M_d3pm_like_cosine_uncond \
+    "$@"
 

@@ -526,7 +526,10 @@ class Diffusion(TrainerBase):
       labels = torch.where(rand < self.class_cond_dropout, 
                            self.num_classes, labels)
     else:
-      assert labels is None
+      # Unconditional (`data.num_classes=null`). CIFAR-10 batches always carry a
+      # label, so drop it here rather than asserting it away -- the backbone was
+      # built without a class embedding and would reject one.
+      labels = None
     log_x_theta = self.forward(xt, sigma=sigma, labels=labels)
     utils.print_nans(log_x_theta, 'model_output')
     return self.nll_per_token(
@@ -567,8 +570,14 @@ class Diffusion(TrainerBase):
     #  from the class unconditional case.
     if not self.class_conditional or gamma in (None, 0.0):
       if labels is not None:
-        labels = torch.full_like(labels, self.num_classes)
-      return self._get_posterior_from_xt(xt, sigma, labels, 
+        # A class-conditional model represents "unconditional" with the
+        # null-class row; a model built without a class embedding
+        # (`data.num_classes=null`) has no such row and must be called with no
+        # label at all, even when the caller had one (e.g. `mode=fid_eval`,
+        # which reads labels off the real batch).
+        labels = (torch.full_like(labels, self.num_classes)
+                  if self.class_conditional else None)
+      return self._get_posterior_from_xt(xt, sigma, labels,
                                          alpha_s, alpha_t, p_x0)
     elif gamma == 1.0:  
       # Simply sample from the cond. posterior only.
