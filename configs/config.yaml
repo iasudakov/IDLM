@@ -69,6 +69,20 @@ eval:
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
   generate_samples: True
   generated_samples_path: ${cwd:}/samples.json
+  # Demo grid of generated images logged at every validation, for image data
+  # (`data.modality=image`) and to trackers that accept images -- underdeep does;
+  # `TensorBoardLogger` has no `log_image`, so it is skipped. Independent of
+  # `generate_samples` above, which samples at the full `sampling.steps` and only
+  # feeds wandb's text `log_table`.
+  # Cost is one sampling pass of `sample_image_num` images at
+  # `sample_image_steps` NFE per validation -- ~2 s for the CIFAR-10 UNet at the
+  # defaults below, versus minutes at `sampling.steps=1000`. Raise the NFE if the
+  # grid looks worse than the FID a checkpoint scores; this is a sanity check, not
+  # an evaluation.
+  sample_image_grid: True
+  sample_image_num: 16
+  sample_image_steps: 64
+  sample_image_key: val/samples
 
 optim:
   weight_decay: 0

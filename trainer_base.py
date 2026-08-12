@@ -6,6 +6,7 @@ import lightning as L
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision
 import transformers
 
 import dataloader
@@ -376,7 +377,50 @@ class TrainerBase(L.LightningModule):
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)
+    self._log_sample_image_grid()
     self._train_mode()
+
+  @torch.no_grad()
+  def _log_sample_image_grid(self):
+    """Log a grid of generated images to every logger that accepts images.
+
+    A qualitative check, not a metric: it answers "does this thing draw anything
+    yet" without waiting for an FID run. Deliberately independent of
+    `eval.generate_samples`, whose path samples at the full `sampling.steps`
+    (1000 by default) and then only reaches wandb's `log_table`, which is useless
+    for pixels. This one draws `eval.sample_image_num` images at
+    `eval.sample_image_steps` NFE instead.
+
+    Called from `on_validation_epoch_end` before `_train_mode()`, so the EMA
+    weights swapped in by `on_validation_epoch_start` are still the live ones and
+    the backbone is still in eval mode. Rank zero only -- no collective runs
+    between here and the end of validation, so the other ranks just move on.
+    """
+    if (self.config.data.modality != 'image'
+        or not self.config.eval.get('sample_image_grid', False)
+        or self.trainer.sanity_checking
+        or self.trainer.global_rank != 0):
+      return
+    num_samples = self.config.eval.get('sample_image_num', 16)
+    samples = self.generate_samples(
+      num_samples=num_samples,
+      num_steps=self.config.eval.get('sample_image_steps', 64))
+    # (B, C, H, W) uint8, straight out of `RawPixelsVisionTokenizer`.
+    images = self.tokenizer.batch_decode(samples)
+    nrow = max(int(images.shape[0] ** 0.5), 1)
+    grid = torchvision.utils.make_grid(images, nrow=nrow, padding=2)
+    grid = grid.permute(1, 2, 0).cpu().numpy()  # HWC, what trackers expect
+    key = self.config.eval.get('sample_image_key', 'val/samples')
+    for logger in self.trainer.loggers:
+      if not hasattr(logger, 'log_image'):
+        continue  # e.g. TensorBoardLogger has no image hook
+      try:
+        logger.log_image(key=key, image=grid, step=self.global_step)
+      except Exception as e:
+        # `WandbLogger.log_image` takes `images=[...]`, not a single array, so it
+        # lands here rather than silently mangling the call.
+        print(f'[samples] {type(logger).__name__} rejected the image grid: {e}',
+              flush=True)
 
   def configure_optimizers(self):
     optimizer = torch.optim.AdamW(
