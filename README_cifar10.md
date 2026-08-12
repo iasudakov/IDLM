@@ -103,6 +103,43 @@ and checking the resumed step:
   checkpoint and silently loses an interval on every restart. This was a real bug
   caught by the restart test: a run that reached step 100 resumed from step 50.
 
+#### Paper-comparable FID during training
+
+`val/fid` is **not** the Table 1 quantity and the two must not be plotted
+together: it scores a few hundred generated images against the *validation*
+split, while the paper scores 50 000 against the un-augmented *train* split.
+Reference split, reference size and sample count all move FID — the same teacher
+measured 57.7 at n=2000 and 41.0 at n=10000.
+
+`eval.fid_paper_every_n_steps` runs the Table 1 computation itself (same code
+path as `mode=fid_eval`: train split, un-augmented, EMA weights) and logs
+`fid_paper/steps<N>` plus its Inception Score:
+
+```
+  eval.fid_paper_every_n_steps=25000 \
+  eval.fid_paper_num_samples=10000 \
+  'eval.fid_paper_steps=[128]' \
+```
+
+Cost is `num_samples x steps` denoiser forwards and comes out of the training
+budget: ~3 min per evaluation at 10k/128 on 8 GPUs (~40 min over a 375k-step
+run, ~4%), versus ~11 min at the full 50k (~18%). 10k is the floor at which FID
+still means anything; it is biased *upward* relative to the paper's 50k by a few
+points, so treat a 10k curve as an upper bound and run the real sweep offline at
+the end against the `ema_<step>.safetensors` exports.
+
+Each entry in `fid_paper_steps` is a separate full evaluation (its own pass over
+the real images), so keep the list short during training — one step count is
+enough to see the trend — and sweep 1024/512/128/64/32/16 offline.
+
+Two implementation details that were wrong in the first version and are worth not
+reintroducing: the metric is written with `logger.log_metrics(..., step=...)`
+rather than `pl_module.log(on_step=True)`, because the latter buffers until the
+next `log_every_n_steps` flush and so records an occasional metric at the wrong
+step and re-emits stale values; and the evaluation resets `ThroughputMonitor`'s
+window afterwards, since minutes spent sampling are not training speed and
+otherwise drag `trainer/steps_per_sec` and `trainer/eta_hours` down with them.
+
 #### What reaches the tracker
 
 `logger=underdeep` is the default (`logger=tensorboard` still works). Per

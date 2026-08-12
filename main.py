@@ -210,6 +210,123 @@ class EmaExport(L.Callback):
           flush=True)
 
 
+class PaperFidEval(L.Callback):
+  """Log the *paper-protocol* FID during training, so the curve is comparable.
+
+  `val/fid` is a cheap tracker and a different quantity from D-MMD Table 1: it
+  scores a few hundred generated images against reals from the **validation**
+  split, whereas the paper scores 50 000 generated against the un-augmented
+  **train** split. Reference set, split and sample count all move FID, so the two
+  numbers must never be read against each other -- the same teacher measured 57.7
+  at n=2000 and 41.0 at n=10000. This callback runs the Table 1 computation
+  itself, mirroring `_eval_fid_worker`, and logs it as `fid_paper/steps<N>`.
+
+  Cost is dominated by sampling: one evaluation is `num_samples x steps` denoiser
+  forwards, so 10k samples at 128 steps is a few minutes on 8 GPUs while 50k at
+  1024 steps is about an hour. Pick `eval.fid_paper_every_n_steps` accordingly --
+  this is a real slice of the training budget, not a free metric.
+
+  Evaluated under EMA weights, like validation. Every rank runs the same number
+  of batches because `compute()` is a collective.
+  """
+
+  def __init__(self, every_n_train_steps, num_samples, steps_list):
+    self.every_n_train_steps = int(every_n_train_steps)
+    self.num_samples = int(num_samples)
+    self.steps_list = [int(s) for s in steps_list]
+    self._real_set = None
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    if self.every_n_train_steps <= 0 or trainer.sanity_checking:
+      return
+    step = int(trainer.global_step)
+    if step <= 0 or step % self.every_n_train_steps != 0:
+      return
+    try:
+      self._run(trainer, pl_module)
+    except Exception as e:  # pragma: no cover - a metric must not kill training
+      print(f'[fid-paper] failed at step {step}: {e}', flush=True)
+      pl_module._train_mode()
+
+  def _real_dataset(self, pl_module):
+    """The train split, un-augmented -- the paper's reference set. Cached."""
+    if self._real_set is None:
+      config = pl_module.config
+      self._real_set = dataloader.get_dataset(
+        config.data.train, pl_module.tokenizer, wrap=config.data.wrap,
+        mode='train', cache_dir=config.data.cache_dir,
+        insert_eos=config.data.insert_train_eos,
+        block_size=config.model.length, streaming=config.data.streaming,
+        num_proc=config.loader.num_workers, config=config,
+        augment=config.eval.get('fid_augment_real', False))
+    return self._real_set
+
+  def _run(self, trainer, pl_module):
+    config = pl_module.config
+    world = trainer.world_size
+    batch_size = config.loader.eval_batch_size
+    # Round the per-rank share up to whole batches so every rank runs the same
+    # number of iterations; an uneven count deadlocks the collective below.
+    per_rank_batches = -(-(-(-self.num_samples // world) // batch_size))
+    per_rank = per_rank_batches * batch_size
+    real_set = self._real_dataset(pl_module)
+    pl_module._eval_mode()
+    try:
+      for steps in self.steps_list:
+        fid = metrics.build_fid(device=pl_module.device)
+        if fid is None:
+          raise RuntimeError('torch-fidelity missing; cannot compute FID')
+        real_loader = torch.utils.data.DataLoader(
+          real_set, batch_size=batch_size,
+          num_workers=min(4, config.loader.num_workers),
+          pin_memory=config.loader.pin_memory,
+          sampler=torch.utils.data.distributed.DistributedSampler(
+            real_set, num_replicas=world, rank=trainer.global_rank,
+            shuffle=False))
+        real_seen = 0
+        for real_batch in real_loader:
+          if real_seen >= per_rank:
+            break
+          images = pl_module.tokenizer.batch_decode(
+            real_batch['input_ids'][:per_rank - real_seen]).to(pl_module.device)
+          fid.update(images, real=True)
+          real_seen += images.shape[0]
+        with torch.no_grad():
+          for _ in range(per_rank_batches):
+            samples = pl_module.generate_samples(
+              num_samples=batch_size, num_steps=steps)
+            fid.update(
+              pl_module.tokenizer.batch_decode(samples).to(pl_module.device),
+              real=False)
+        value = float(fid.compute())
+        is_mean, _ = fid.compute_inception_score()
+        # Written straight to the logger rather than through `pl_module.log`:
+        # `on_step=True` buffers until the next `log_every_n_steps` flush, which
+        # for a metric produced once every few thousand steps lands the point at
+        # the wrong step and re-emits the stale value at later flushes. This
+        # writes one point at the step it was measured. `compute()` has already
+        # reduced across ranks, so the value is global; the logger's own
+        # rank-zero guard keeps it from being written once per rank.
+        if trainer.logger is not None:
+          trainer.logger.log_metrics(
+            {f'fid_paper/steps{steps}': value,
+             f'fid_paper/inception_score_steps{steps}': float(is_mean)},
+            step=int(trainer.global_step))
+        if trainer.is_global_zero:
+          print(f'[fid-paper] step {int(trainer.global_step)}: '
+                f'{steps}-step FID {value:.3f} IS {float(is_mean):.3f} '
+                f'({per_rank * world} samples vs train split)', flush=True)
+    finally:
+      pl_module._train_mode()
+      # The minutes spent here are not training speed. Without this the next
+      # `trainer/steps_per_sec` window reads an order of magnitude low and drags
+      # `trainer/eta_hours` with it, which is exactly the signal one watches to
+      # decide whether a run is healthy.
+      for callback in trainer.callbacks:
+        if isinstance(callback, ThroughputMonitor):
+          callback.reset_window()
+
+
 class ThroughputMonitor(L.Callback):
   """Log optimizer steps/sec and the projected hours left to `max_steps`.
 
@@ -224,9 +341,13 @@ class ThroughputMonitor(L.Callback):
     self._window_start = None
     self._window_steps = 0
 
-  def on_train_start(self, trainer, pl_module):
+  def reset_window(self):
+    """Drop the current window, e.g. after an evaluation that is not training."""
     self._window_start = time.monotonic()
     self._window_steps = 0
+
+  def on_train_start(self, trainer, pl_module):
+    self.reset_window()
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     window = max(1, int(trainer.log_every_n_steps))
@@ -825,6 +946,12 @@ def _train(diffusion_model, config, logger, tokenizer):
         os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
         config.callbacks.checkpoint_every_n_steps.every_n_train_steps))
   callbacks.append(ThroughputMonitor())
+  fid_paper_every = int(config.eval.get('fid_paper_every_n_steps', 0) or 0)
+  if fid_paper_every > 0:
+    callbacks.append(PaperFidEval(
+      fid_paper_every,
+      config.eval.get('fid_paper_num_samples', 10000),
+      config.eval.get('fid_paper_steps', [128])))
   ema_export_every = int(config.checkpointing.get(
     'ema_export_every_n_steps', 0) or 0)
   if ema_export_every > 0:

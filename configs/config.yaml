@@ -440,6 +440,23 @@ eval:
   # horizontal flip). False = the un-flipped train set, which is the standard
   # FID reference.
   fid_augment_real: False
+  # --- Paper-protocol FID during training (D-MMD Table 1) ---
+  # `val/fid` scores a few hundred samples against the *validation* split; Table
+  # 1 scores 50 000 against the un-augmented *train* split. Different quantities,
+  # not comparable. These knobs run the Table 1 computation on a schedule and log
+  # it as `fid_paper/steps<N>`, so the training curve can be read against the
+  # paper directly. 0 (default) => off.
+  #
+  # Cost is `fid_paper_num_samples x steps` denoiser forwards per evaluation and
+  # comes out of the training budget: 10k samples at 128 steps is a few minutes
+  # on 8 GPUs, 50k at 1024 steps is about an hour. Below ~10k samples FID is
+  # biased upward and no longer comparable to the paper, which is the floor worth
+  # using here.
+  fid_paper_every_n_steps: 0
+  fid_paper_num_samples: 10000
+  # Denoising step counts to evaluate, e.g. [128, 64]. Each entry costs a full
+  # evaluation, including its own pass over the real images.
+  fid_paper_steps: [128]
   # Where `mode=sample_eval` / the validation pass writes its PNG sample grid.
   image_grid_path: ${cwd:}/samples.png
   # Where `mode=fid_eval` writes its JSON report.
