@@ -498,14 +498,16 @@ class Tracker:
 # Checkpointing (yrDiT style)
 # --------------------------------------------------------------------------- #
 
-def save_checkpoint(path, model, ema, opt, step, args, out_dir):
+def save_checkpoint(path, model, ema, opt, step, args):
+  # Re-created rather than assumed: on Nirvana the run directory is copied
+  # around underneath us, and a missing parent here would throw away the run.
+  os.makedirs(os.path.dirname(path), exist_ok=True)
   torch.save({'model': model.state_dict(),
               'ema': ema.state_dict(),
               'opt': opt.state_dict(),
               'step': step,
               'args': vars(args)}, path)
   print(f'[ckpt] saved {path} at step {step}', flush=True)
-  nirvana_utils.copy_out_to_snapshot(out_dir)
 
 
 def load_checkpoint(path, model, ema, opt, device):
@@ -597,8 +599,14 @@ def parse_args():
   p.add_argument('--eval-nfe', type=int, default=128)
   p.add_argument('--eval-fid-samples', type=int, default=10_000)
   p.add_argument('--eval-sample-batch', type=int, default=125)
-  p.add_argument('--ckpt-every', type=int, default=2_000)
-  p.add_argument('--ema-ckpt-every', type=int, default=50_000)
+  p.add_argument('--ckpt-every', type=int, default=2_000,
+                 help='rewrite latest.pt this often')
+  p.add_argument('--ema-ckpt-every', type=int, default=50_000,
+                 help='archive ema_<step>.pt this often (never overwritten)')
+  p.add_argument('--snapshot-every', type=int, default=10_000,
+                 help='push the run directory to the Nirvana snapshot path '
+                      'this often. No-op off Nirvana. Keep it a multiple of '
+                      '--ckpt-every so the snapshot holds a fresh latest.pt.')
 
   p.add_argument('--underdeep-experiment',
                  default='generative-models/cifar10_mdlm',
@@ -625,6 +633,7 @@ def parse_args():
     args.eval_sample_batch = 32
     args.ckpt_every = 10
     args.ema_ckpt_every = 20
+    args.snapshot_every = 20
     args.num_workers = 2
     args.no_underdeep = True
     args.out = args.out if args.out != 'outputs/cifar10_teacher' else 'outputs/smoke'
@@ -779,14 +788,19 @@ def main():
     # step would serialize training behind the slowest rank for no reason.
     save_now = step % args.ckpt_every == 0 or step == args.max_steps
     archive_now = step % args.ema_ckpt_every == 0
-    if save_now or archive_now:
+    # Pushing to the Nirvana snapshot path archives the whole run directory, so
+    # it is deliberately rarer than writing latest.pt: `--ckpt-every` bounds
+    # what a crash costs, `--snapshot-every` bounds what a *preemption* costs.
+    snapshot_now = step % args.snapshot_every == 0 or step == args.max_steps
+    if save_now or archive_now or snapshot_now:
       if is_main(rank):
         if save_now:
           save_checkpoint(os.path.join(ckpt_dir, 'latest.pt'), model, ema, opt,
-                          step, args, out_dir)
+                          step, args)
         if archive_now:
           torch.save(ema.state_dict(),
                      os.path.join(ckpt_dir, f'ema_{step:07d}.pt'))
+        if snapshot_now:
           nirvana_utils.copy_out_to_snapshot(out_dir)
       barrier()
 
