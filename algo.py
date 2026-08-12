@@ -24,6 +24,7 @@ class AR(trainer_base.TrainerBase):
       self.mask_index = tokenizer.mask_token_id
     super().__init__(config, tokenizer,
                      vocab_size=vocab_size)
+    self.bos_token_id = getattr(tokenizer, 'bos_token_id', None)
     self.save_hyperparameters()
     self._validate_configuration()
 
@@ -33,14 +34,27 @@ class AR(trainer_base.TrainerBase):
     assert self.config.prior.type == 'none'
 
   def _process_model_input(self, x0, valid_tokens):
-    input_tokens = x0[:, :-1]
-    output_tokens = x0[:, 1:]
-    valid_tokens = valid_tokens[:, 1:]
-    return input_tokens, output_tokens, valid_tokens
+    if self.bos_token_id is not None:
+      # Text: the stream already carries BOS/EOS, so the standard shift both
+      # models every position and leaves sampling a token to start from.
+      input_tokens = x0[:, :-1]
+      output_tokens = x0[:, 1:]
+      valid_tokens = valid_tokens[:, 1:]
+      return input_tokens, output_tokens, valid_tokens
+    # Images have no BOS in the stream (`RawPixelsVisionTokenizer` is built with
+    # `add_special_tokens=False`), so shifting would leave the first pixel
+    # unmodelled and give `generate_samples` nothing to condition on. Feed
+    # `mask_index` as the start token instead: `nll` forces that column to
+    # -infinity, so the slot is never a prediction target and is free to reuse.
+    start = torch.full_like(x0[:, :1], self.mask_index)
+    input_tokens = torch.cat([start, x0[:, :-1]], dim=1)
+    return input_tokens, x0, valid_tokens
 
-  def nll(self, input_tokens, output_tokens,
-          current_accumulation_step):
-    del current_accumulation_step
+  def nll(self, input_tokens, labels, output_tokens,
+          current_accumulation_step=None, train_mode=False):
+    # `labels` is the class-conditioning signal the diffusion algos take; AR here
+    # is unconditional and never reaches the backbone's class embedding.
+    del labels, current_accumulation_step, train_mode
     output = self.backbone(input_tokens, None)
     output[:, :, self.mask_index] = self.neg_infinity
     output = output.log_softmax(-1)
@@ -48,13 +62,23 @@ class AR(trainer_base.TrainerBase):
       -1, output_tokens[:, :, None])[:, :, 0]
 
   def generate_samples(self, num_samples, **kwargs):
+    # `num_steps` and friends are meaningless here -- AR decoding is one forward
+    # per token, so the sequence length *is* the step budget.
+    del kwargs
     # precompute token buffer
-    num_pred_tokens = self.num_tokens - 1
+    if self.bos_token_id is not None:
+      start_token = self.bos_token_id
+      num_pred_tokens = self.num_tokens - 1
+    else:
+      # Image data: start from the same token `_process_model_input` trains on,
+      # and predict every position, so the result is `num_tokens` pixels.
+      start_token = self.mask_index
+      num_pred_tokens = self.num_tokens
     x = torch.zeros(
       (num_samples, num_pred_tokens + 1),
       dtype=torch.long,
       device=self.device)
-    x[:, 0] = self.tokenizer.bos_token_id
+    x[:, 0] = start_token
     # precompute noise
     noise = (torch.distributions.Gumbel(0, 1)
              .sample((num_samples, num_pred_tokens, self.vocab_size))
@@ -67,7 +91,11 @@ class AR(trainer_base.TrainerBase):
       output = output.log_softmax(-1)
       y = (output[:, -1, :] + noise[:, i, :]).argmax(-1)
       x[:, i + 1] = y
-    return x
+    if self.bos_token_id is not None:
+      return x  # text: the BOS column is part of the sequence, as before
+    # Images: drop the synthetic start token so the caller gets exactly
+    # `num_tokens` pixels, which is what `batch_decode` reshapes.
+    return x[:, 1:]
 
   def _process_sigma(self, sigma):
     del sigma
@@ -590,8 +618,9 @@ class DUO(DUO_BASE):
                           device=self.device)
     return alpha_t * x + sigma_t * epsilon
 
-  def nll(self, x0, output_tokens,
+  def nll(self, x0, labels, output_tokens,
           current_accumulation_step=None, train_mode=False):
+    del labels  # uniform-state DUO is unconditional
     use_true_nll = (self.global_step > self.curriculum_end
                     or not train_mode)
     if use_true_nll:
@@ -713,9 +742,9 @@ class Distillation(DUO):
     n = self.global_step // self.update_teacher_every
     return 2 ** n / self.T
 
-  def nll(self, x0, output_tokens,
+  def nll(self, x0, labels, output_tokens,
           current_accumulation_step=None, train_mode=None):
-    del output_tokens, train_mode
+    del labels, output_tokens, train_mode
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dt = self._compute_dt()
     t = torch.clip(t + dt, 0, 1)

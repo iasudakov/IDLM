@@ -403,6 +403,13 @@ class TrainerBase(L.LightningModule):
         or self.trainer.sanity_checking
         or self.trainer.global_rank != 0):
       return
+    # Throttle: cheap for a diffusion sampler at a fixed NFE (~2 s), but AR
+    # decoding is one forward per token, which is ~45 s for a 3072-pixel image.
+    self._grid_validations = getattr(self, '_grid_validations', 0) + 1
+    every = max(
+      int(self.config.eval.get('sample_image_every_n_validations', 1)), 1)
+    if self._grid_validations % every != 0:
+      return
     num_samples = self.config.eval.get('sample_image_num', 16)
     samples = self.generate_samples(
       num_samples=num_samples,
@@ -423,6 +430,8 @@ class TrainerBase(L.LightningModule):
         # lands here rather than silently mangling the call.
         print(f'[samples] {type(logger).__name__} rejected the image grid: {e}',
               flush=True)
+    print('[samples] logged {} as a {}-image grid at step {}'.format(
+      key, images.shape[0], self.global_step), flush=True)
 
   @torch.no_grad()
   def _log_fid(self):
@@ -478,9 +487,12 @@ class TrainerBase(L.LightningModule):
         num_ref=self.config.eval.get('fid_num_reference', None))
     score = self._fid.score(images)
     key = self.config.eval.get('fid_key', 'val/fid')
-    print('[fid] {}={:.3f} ({} samples, {} NFE, step {})'.format(
-      key, score, images.shape[0], self.config.eval.get('fid_steps', 64),
-      self.global_step), flush=True)
+    # `fid_steps` is the diffusion sampler's NFE; AR ignores it, since it spends
+    # exactly one forward per token, so don't report a step budget it never used.
+    budget = ('AR decode' if self.config.algo.name == 'ar'
+              else '{} NFE'.format(self.config.eval.get('fid_steps', 64)))
+    print('[fid] {}={:.3f} ({} samples, {}, step {})'.format(
+      key, score, images.shape[0], budget, self.global_step), flush=True)
     for logger in self.trainer.loggers:
       logger.log_metrics({key: score}, step=self.global_step)
 

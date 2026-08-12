@@ -82,6 +82,10 @@ eval:
   sample_image_grid: True
   sample_image_num: 16
   sample_image_steps: 64
+  # Throttle, in validations. 1 is right for a diffusion sampler at a fixed NFE;
+  # raise it for `algo=ar`, where decoding is one forward per token (~45 s for a
+  # 3072-pixel image) rather than `sample_image_steps` of them.
+  sample_image_every_n_validations: 1
   sample_image_key: val/samples
   # In-loop FID (image data only), logged as `fid_key`. Sampling is sharded over
   # the ranks; the distance is computed on rank zero against reference statistics
