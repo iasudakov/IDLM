@@ -4,7 +4,15 @@
 #
 # Student, frozen teacher and trainable auxiliary critic all start from
 # `adversarial_distill.teacher_ckpt_path` (loaded before the critics are
-# deep-copied), which is the standard D-MMD/DMD initialisation.
+# deep-copied), which is the standard D-MMD/DMD initialisation. That path takes
+# either the downloaded `.safetensors` or an `ema_<step>.safetensors` written by
+# `train_cifar10_teacher.sh` -- the same format, so an own-trained teacher drops
+# straight in.
+#
+# `~callbacks.checkpoint_monitor` is required, not optional: that callback
+# monitors `val/gen_ppl`, which the image path never logs, and Lightning raises
+# MisconfigurationException on the first validation when the monitored key is
+# missing. Without it the run dies at step 2500.
 #
 #   bash scripts/train_cifar10_dmmd.sh
 #   NOISE_DIM=0 RUN_NAME=cifar10_dmmd_nonoise bash scripts/train_cifar10_dmmd.sh
@@ -62,6 +70,7 @@ CUDA_VISIBLE_DEVICES="${GPUS}" "${PYTHON}" -u -m main \
   trainer.max_steps="${MAX_STEPS}" \
   trainer.val_check_interval=2500 \
   trainer.gradient_clip_val=null \
+  '~callbacks.checkpoint_monitor' \
   strategy.find_unused_parameters=True \
   optim.lr="${LR}" \
   sampling.steps=8 \

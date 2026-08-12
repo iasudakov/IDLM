@@ -210,6 +210,68 @@ class EmaExport(L.Callback):
           flush=True)
 
 
+class SampleImageGrid(L.Callback):
+  """Write a PNG sample grid every N steps, independent of validation.
+
+  Images otherwise only appear on the validation schedule, which for a run this
+  long is every 10k steps and carries a full validation pass with it. This
+  samples on its own cadence so progress is watchable early, when it changes
+  fastest, without paying for validation.
+
+  Rank zero only: sampling has no collectives, so the other ranks simply wait at
+  the next gradient sync. Cost is `num_images x steps` denoiser forwards on one
+  GPU -- 64 images at 128 steps is ~6 s, about 4% of a 1000-step interval.
+
+  `use_ema=False` by default, and deliberately: at decay 0.9999 the EMA averages
+  over ~10k steps, so an EMA grid at step 1000 is still mostly the random
+  initialisation and shows nothing about progress. These are progress pictures,
+  so they come from the live weights; `val/fid` and the validation grid remain
+  EMA, which is the model that actually gets shipped.
+  """
+
+  def __init__(self, every_n_train_steps, num_images, steps, use_ema):
+    self.every_n_train_steps = int(every_n_train_steps)
+    self.num_images = int(num_images)
+    self.steps = None if steps is None else int(steps)
+    self.use_ema = bool(use_ema)
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    if self.every_n_train_steps <= 0 or trainer.sanity_checking:
+      return
+    step = int(trainer.global_step)
+    if step <= 0 or step % self.every_n_train_steps != 0:
+      return
+    if not trainer.is_global_zero:
+      return
+    try:
+      if self.use_ema:
+        pl_module._eval_mode()
+      else:
+        pl_module.backbone.eval()
+        pl_module.noise.eval()
+      started = time.monotonic()
+      num_steps = self.steps or pl_module.config.sampling.steps
+      with torch.no_grad():
+        samples = pl_module.generate_samples(
+          num_samples=self.num_images, num_steps=num_steps)
+      pl_module._log_image_grid(pl_module.tokenizer.batch_decode(samples))
+      print(f'[sample-grid] step {step}: {self.num_images} images at '
+            f'{num_steps} steps in {time.monotonic() - started:.1f}s -> '
+            f'{pl_module.config.eval.get("image_grid_path", "(not written)")}',
+            flush=True)
+    except Exception as e:  # pragma: no cover - a picture must not kill training
+      print(f'[sample-grid] failed at step {step}: {e}', flush=True)
+    finally:
+      if self.use_ema:
+        pl_module._train_mode()
+      else:
+        pl_module.backbone.train()
+        pl_module.noise.train()
+      for callback in trainer.callbacks:
+        if isinstance(callback, ThroughputMonitor):
+          callback.reset_window()
+
+
 class PaperFidEval(L.Callback):
   """Log the *paper-protocol* FID during training, so the curve is comparable.
 
@@ -946,6 +1008,13 @@ def _train(diffusion_model, config, logger, tokenizer):
         os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
         config.callbacks.checkpoint_every_n_steps.every_n_train_steps))
   callbacks.append(ThroughputMonitor())
+  image_grid_every = int(config.eval.get('image_grid_every_n_steps', 0) or 0)
+  if image_grid_every > 0:
+    callbacks.append(SampleImageGrid(
+      image_grid_every,
+      config.eval.get('image_grid_num_images', 64),
+      config.eval.get('image_grid_steps', None),
+      config.eval.get('image_grid_use_ema', False)))
   fid_paper_every = int(config.eval.get('fid_paper_every_n_steps', 0) or 0)
   if fid_paper_every > 0:
     callbacks.append(PaperFidEval(

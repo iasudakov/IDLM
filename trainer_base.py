@@ -632,8 +632,13 @@ class TrainerBase(L.LightningModule):
       if path:
         torchvision.io.write_png(grid, os.fspath(path))
       if hasattr(self.trainer.logger, 'log_image'):
+        # One constant title, versioned by `step`: that is what makes the
+        # tracker collapse the grids into a single step-indexed series you can
+        # scrub with a slider. Putting the step in the *key* instead creates a
+        # separate titled image per call -- hundreds of them over a run, with no
+        # way to page through them. Same convention as `pareto_image_key`.
         self.trainer.logger.log_image(
-          key=f'samples@global_step{self.global_step}',
+          key=self.config.eval.get('image_grid_key', 'samples'),
           image=grid.permute(1, 2, 0).numpy(),
           step=self.global_step)
     except Exception as e:  # pragma: no cover - diagnostics are best-effort

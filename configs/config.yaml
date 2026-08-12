@@ -459,6 +459,27 @@ eval:
   fid_paper_steps: [128]
   # Where `mode=sample_eval` / the validation pass writes its PNG sample grid.
   image_grid_path: ${cwd:}/samples.png
+  # --- Sample grid on its own schedule ---
+  # Images otherwise only appear when validation runs. This samples every N train
+  # steps instead, so progress is watchable early without paying for a full
+  # validation pass. The PNG at `image_grid_path` is overwritten each time (it is
+  # the latest), while trackers that accept images receive a step-indexed series.
+  # 0 (default) => off. Rank zero only; costs `num_images x steps` forwards on one
+  # GPU (~6 s for 64 images at 128 steps).
+  # Tracker title for the sample grids. Deliberately constant: repeated calls
+  # under one title, versioned by `step`, become a single step-indexed series the
+  # tracker renders with a slider, so the run can be replayed. A per-step title
+  # would instead produce hundreds of unrelated images.
+  image_grid_key: samples
+  image_grid_every_n_steps: 0
+  image_grid_num_images: 64
+  # Denoising steps for these grids. null => `sampling.steps`. Fewer steps makes
+  # them cheaper and uglier; they are a progress view, not a metric.
+  image_grid_steps: null
+  # Sample from the EMA weights rather than the live ones. False by default: at
+  # decay 0.9999 the EMA lags ~10k steps, so early EMA grids are mostly the random
+  # initialisation and show nothing. Validation grids stay EMA regardless.
+  image_grid_use_ema: False
   # Where `mode=fid_eval` writes its JSON report.
   fid_report_path: ${cwd:}/fid.json
   # --- Quality/diversity Pareto curve ---
