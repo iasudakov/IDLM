@@ -1,0 +1,10 @@
+# Cosine alpha-schedule (DUO's `trainer_base.Cosine`), the one the released
+# CIFAR-10 checkpoints named `mdlm/cosine_time_*` were trained with.
+#
+# NOTE: `Diffusion._sigma_from_alphat` is `-log(alpha_t)`, which diverges as
+# `alpha_t -> 0`. Under cosine that happens at `t -> 1`. It is harmless only
+# while `algo.time_conditioning=False` zeroes sigma before the backbone sees it
+# (the default, and what the `*_time_uncond` checkpoints expect). Read the
+# warning in `README_cifar10.md` before switching to a `*_time_cond` variant.
+type: cosine
+eps: 1e-3

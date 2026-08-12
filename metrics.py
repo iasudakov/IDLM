@@ -238,14 +238,76 @@ class GradientMoment:
     return (s_norm_sq - self._Q) / (self._M * (self._M - 1))
 
 
+def build_fid(device=None):
+  """torchmetrics FID + Inception Score, or `None` when unavailable.
+
+  Both take **uint8** `(B, 3, H, W)` tensors -- exactly what
+  `dataloader.RawPixelsVisionTokenizer.batch_decode` returns -- hence
+  `normalize=False`. Returned as a pair so callers keep one handle.
+
+  Requires `torch-fidelity` (torchmetrics' image backend). Missing it is not
+  fatal: everything except FID still runs, and the caller logs the reason.
+  """
+  try:
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    from torchmetrics.image.inception import InceptionScore
+  except Exception as e:  # pragma: no cover - environment dependent
+    print(f'[metrics] FID unavailable ({e}); install torch-fidelity.',
+          flush=True)
+    return None
+  fid = _FID(FrechetInceptionDistance(normalize=False),
+             InceptionScore(normalize=False))
+  return fid.to(device) if device is not None else fid
+
+
+class _FID:
+  """Thin holder pairing FID with Inception Score over uint8 images.
+
+  Kept out of `MetricCollection` because both metrics carry a frozen Inception
+  network; they must not be dtype-cast to float64 with the NLL collection, and
+  their `compute()` is a DDP collective that has to be called on every rank.
+  """
+
+  def __init__(self, fid, inception_score):
+    self.fid = fid
+    self.inception_score = inception_score
+
+  def to(self, *args, **kwargs):
+    self.fid = self.fid.to(*args, **kwargs)
+    self.inception_score = self.inception_score.to(*args, **kwargs)
+    return self
+
+  def update(self, images, real):
+    """`images`: uint8 `(B, 3, H, W)`. `real=False` also feeds Inception Score."""
+    assert images.dtype == torch.uint8, images.dtype
+    assert images.ndim == 4 and images.shape[1] == 3, images.shape
+    self.fid.update(images, real=real)
+    if not real:
+      self.inception_score.update(images)
+
+  def compute(self):
+    return self.fid.compute()
+
+  def compute_inception_score(self):
+    """(mean, std) of the Inception Score over the generated images."""
+    return self.inception_score.compute()
+
+  def reset(self):
+    self.fid.reset()
+    self.inception_score.reset()
+
+
 class Metrics:
   def __init__(self, gen_ppl_eval_model_name_or_path=None,
                eval_ppl_batch_size=None,
                compute_gm=False,
-               gm_eval_model_name_or_path='gpt2') -> None:
+               gm_eval_model_name_or_path='gpt2',
+               modality='text',
+               compute_fid=False) -> None:
     metrics = torchmetrics.MetricCollection({
         'nll': NLL(), 'bpd': BPD(), 'ppl': Perplexity()})
     metrics.set_dtype(torch.float64)
+    self.modality = modality
     self.train_nlls = metrics.clone(prefix='train/')
     self.train_aux = BPD()
     self.valid_nlls = metrics.clone(prefix='val/')
@@ -254,14 +316,24 @@ class Metrics:
     self.sample_entropy = torchmetrics.aggregation.MeanMetric()
     self.pred_entropy = torchmetrics.aggregation.MeanMetric()
     self.eval_ppl_batch_size = eval_ppl_batch_size
+    # NLL / BPD / Perplexity stay valid for images: the sequence is 3072 pixel
+    # tokens, so `val/bpd` *is* bits-per-dim, the standard likelihood number for
+    # CIFAR-10. Only the reference-LM metrics below are text-only.
+    is_image = modality == 'image'
     self.gm = (GradientMoment(gm_eval_model_name_or_path)
-               if compute_gm else None)
+               if (compute_gm and not is_image) else None)
+    self.fid = build_fid() if (compute_fid and is_image) else None
     self.gen_ppl_eval_model_name_or_path = gen_ppl_eval_model_name_or_path
-    self.tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(gen_ppl_eval_model_name_or_path)
-    if self.tokenizer.pad_token is None:
-      self.tokenizer.pad_token = self.tokenizer.eos_token
-      self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+    if is_image:
+      # No GPT-2 tokenizer download, and no text metrics: generative perplexity
+      # and GM both score samples with a *language* model.
+      self.tokenizer = None
+    else:
+      self.tokenizer = transformers.AutoTokenizer.\
+        from_pretrained(gen_ppl_eval_model_name_or_path)
+      if self.tokenizer.pad_token is None:
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
   def to(self, *args, **kwargs):
     self.gen_ppl = self.gen_ppl.to(*args, **kwargs)
@@ -273,6 +345,8 @@ class Metrics:
     self.valid_aux = self.valid_aux.to(*args, **kwargs)
     if self.gm is not None:
       self.gm.to(*args, **kwargs)
+    if self.fid is not None:
+      self.fid.to(*args, **kwargs)
 
   def reset(self):
     self.gen_ppl.reset()
@@ -284,6 +358,8 @@ class Metrics:
     self.valid_aux.reset()
     if self.gm is not None:
       self.gm.reset()
+    if self.fid is not None:
+      self.fid.reset()
 
   def update_train(self, nll, aux_loss, num_tokens):
     self.train_nlls.update(nll, num_tokens)

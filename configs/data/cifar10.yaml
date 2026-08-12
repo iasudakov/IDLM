@@ -1,0 +1,21 @@
+# CIFAR-10 as 3072 discrete pixel tokens over a 256-value vocabulary
+# (D-MMD arXiv:2603.20155 Sec. 6.1 / Tables 1 & 4). Ported from DUO's
+# `configs/data/cifar10.yaml`.
+#
+# `modality: image` is what switches off every text-only code path
+# (GPT-2 retokenization, gen-ppl, GM, the sample table, the Pareto curve);
+# see `trainer_base.TrainerBase.modality`.
+train: cifar10
+valid: cifar10
+modality: image
+tokenizer_name_or_path: cifar10
+num_classes: 10  # 10 classes + 1 classifier-free-guidance null class
+size: 1024       # 32 * 32 pixels
+length: 3072     # 3 * 32 * 32 tokens per image
+cache_dir: ~/data/cifar10
+streaming: False
+# Text-only knobs, off for pixels: there is nothing to wrap and no sentence
+# boundary to mark.
+wrap: False
+insert_train_eos: False
+insert_valid_eos: False

@@ -1,0 +1,27 @@
+# D3PM-style UNet over 32x32x3 pixels (`models/unet.py`). These values are
+# DUO's and must not be changed if you intend to load the released
+# `jdeschena/duo2-cifar10` checkpoints -- they define the module shapes.
+name: unet
+type: unet
+ch: 128
+num_res_blocks: 2
+num_scales: 4
+ch_mult: [1, 2, 2, 2]
+input_channels: 3
+output_channels: -1  # determined by vocab_size (truncated-logistic head)
+scale_count_to_put_attn: 1  # at 16x16 resolution
+data_min_max: [0, 255]  # unused: the head derives its bin grid from vocab_size
+dropout: 0.1
+skip_rescale: True
+time_conditioning: True  # whether the backbone *has* time embeddings at all;
+                         # `algo.time_conditioning` decides whether sigma is fed
+time_scale_factor: 1000
+time_embed_dim: ${.ch}
+fix_logistic: False
+size: ${data.size}
+cond_dim: ${.ch}
+length: ${data.length}
+# Read by `algo._wrap_backbone_with_noise`'s `default_hidden` argument, i.e. the
+# width of the residual stream the input-noise projection writes into. For the
+# UNet that is the `input_conv` output, which has `ch` channels.
+hidden_size: ${.ch}

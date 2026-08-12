@@ -196,7 +196,135 @@ def _embedding_std(embed_module):
   return 0.02
 
 
-class _NoiseConditionedBackbone(torch.nn.Module):
+def _load_pretrained_backbone(backbone, path, use_ema=True):
+  """Load pretrained denoiser weights into `backbone`, in place, strictly.
+
+  Feeds `adversarial_distill.teacher_ckpt_path`. Two formats:
+
+  * `.safetensors` -- raw backbone keys, one tensor set. This is what the
+    released CIFAR-10 teachers (`jdeschena/duo2-cifar10`) ship, and their
+    tensors are already the EMA shadow params (their metadata records
+    `source: ema.shadow_params`), so `use_ema` does not apply.
+  * `.ckpt` -- a Lightning checkpoint of this repo. The `backbone.` prefix is
+    stripped, and with `use_ema` the EMA shadow params are preferred over the
+    raw weights. `ExponentialMovingAverage` stores those positionally, so they
+    are zipped against `backbone.named_parameters()` in order; the lengths are
+    asserted rather than trusted.
+
+  `strict=True` on purpose: a silently-partial load would leave part of the
+  "pretrained" teacher random, and the whole point of this path is that student,
+  teacher and auxiliary all start from the *same known* denoiser.
+  """
+  path = os.path.expanduser(str(path))
+  assert utils.fsspec_exists(path), (
+    f'adversarial_distill.teacher_ckpt_path does not exist: {path}')
+  if path.endswith('.safetensors'):
+    import safetensors.torch
+    state_dict = safetensors.torch.load_file(path, device='cpu')
+    source = 'safetensors'
+  else:
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    state_dict = ckpt.get('state_dict', ckpt)
+    ema_state = ckpt.get('ema', None) if isinstance(ckpt, dict) else None
+    shadow = (ema_state or {}).get('shadow_params', None) if use_ema else None
+    if shadow:
+      names = [n for n, _ in backbone.named_parameters()]
+      assert len(names) == len(shadow), (
+        f'EMA shadow params ({len(shadow)}) do not line up with the '
+        f'backbone parameters ({len(names)}); pass teacher_use_ema=False to '
+        f'load the raw weights from {path}.')
+      # Buffers are not in the EMA, so start from the raw weights and overwrite
+      # only the parameters.
+      state_dict = {k[len('backbone.'):]: v
+                    for k, v in state_dict.items()
+                    if k.startswith('backbone.')} or dict(state_dict)
+      state_dict.update({n: t for n, t in zip(names, shadow)})
+      source = 'lightning ckpt (EMA shadow params)'
+    else:
+      state_dict = {k[len('backbone.'):]: v
+                    for k, v in state_dict.items()
+                    if k.startswith('backbone.')} or dict(state_dict)
+      source = 'lightning ckpt (raw weights)'
+  # A checkpoint saved from an already-wrapped student carries the wrapper's
+  # `backbone.` level too; unwrap it so it lands on the bare denoiser.
+  if all(k.startswith('backbone.') for k in state_dict):
+    state_dict = {k[len('backbone.'):]: v for k, v in state_dict.items()}
+  missing, unexpected = backbone.load_state_dict(state_dict, strict=True)
+  assert not missing and not unexpected, (missing, unexpected)
+  print(f'[teacher] loaded {len(state_dict)} tensors from {path} ({source}).',
+        flush=True)
+  return backbone
+
+
+class _NoiseScheduleMixin:
+  """The magnitude schedule shared by the text and image noise wrappers.
+
+  Factored out verbatim from `_NoiseConditionedBackbone` so
+  `_ImageNoiseConditionedBackbone` presents the identical public surface --
+  `noise_proj`, `effective_weight()`, `noise_gain`, `set_noise_step`,
+  `noise_stream` -- and every knob (`noise_scale`, `noise_warmup_steps`,
+  `noise_hold_rms`, `noise_lr`), the `noise/*` diagnostics
+  (`MDLM_with_AR._noise_conditioning_stats`) and the noise-diversity probe keep
+  working against either one. Nothing here touches the projection's *shape*, so
+  it is agnostic to `noise_proj` being an `nn.Linear` (text) or a 1x1
+  `nn.Conv2d` (image).
+  """
+
+  @contextlib.contextmanager
+  def noise_stream(self, seed):
+    """Draw the injected noise from a private RNG seeded with `seed`.
+
+    Inside this context the noise is still redrawn on every forward pass, but
+    the whole *sequence* of draws is a deterministic function of `seed` and is
+    taken from a generator of its own, so it neither consumes nor is consumed
+    by the global RNG stream that drives the sampler's categorical draws.
+    That decoupling is what lets `TrainerBase.noise_diversity_report` hold the
+    decoding randomness fixed while varying the noise, and vice versa.
+    """
+    device = self.noise_proj.weight.device
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    previous = self._noise_generator
+    self._noise_generator = generator
+    try:
+      yield
+    finally:
+      self._noise_generator = previous
+
+  def set_noise_step(self, step):
+    """Point the warmup ramp at `step` (the trainer's global step)."""
+    self._noise_step = int(step)
+
+  @property
+  def noise_gain(self):
+    """Multiplier on the injected vector: 0 at step 0, 1 once warmed up.
+
+    Derived from the step rather than accumulated, so a resumed run picks the
+    schedule back up where it left off and the ramp is identical on every rank
+    without any communication.
+    """
+    if self.warmup_steps <= 0 or self._noise_step is None:
+      return 1.0
+    return min(1.0, max(0.0, self._noise_step / self.warmup_steps))
+
+  def effective_weight(self):
+    """The projection actually applied, i.e. after the magnitude schedule.
+
+    `rms(effective_weight)` is the injection's `noise/snr` (see the class
+    docstring), so this is also what the diagnostics read.
+    """
+    w = self.noise_proj.weight
+    if self.hold_rms:
+      # Differentiable normalisation: the gradient through `rms` cancels the
+      # radial component, so the optimizer spends its updates on the direction
+      # instead of pushing against a constraint that silently undoes them.
+      rms = w.pow(2).mean().sqrt().clamp_min(1e-12)
+      w = w * (self.noise_scale / rms)
+    gain = self.noise_gain
+    return w if gain == 1.0 else gain * w
+
+
+class _NoiseConditionedBackbone(_NoiseScheduleMixin, torch.nn.Module):
   """Wraps a denoiser backbone and injects a learned projection of Gaussian
   noise into the token-embedding residual (D-MMD Sec. 6.5). By default the
   noise is drawn independently per token position; with `shared_noise` a single
@@ -319,59 +447,6 @@ class _NoiseConditionedBackbone(torch.nn.Module):
     self._noise_generator = None
     embed_module.register_forward_hook(self._add_noise)
 
-  @contextlib.contextmanager
-  def noise_stream(self, seed):
-    """Draw the injected noise from a private RNG seeded with `seed`.
-
-    Inside this context the noise is still redrawn on every forward pass, but
-    the whole *sequence* of draws is a deterministic function of `seed` and is
-    taken from a generator of its own, so it neither consumes nor is consumed
-    by the global RNG stream that drives the sampler's categorical draws.
-    That decoupling is what lets `TrainerBase.noise_diversity_report` hold the
-    decoding randomness fixed while varying the noise, and vice versa.
-    """
-    device = self.noise_proj.weight.device
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(seed))
-    previous = self._noise_generator
-    self._noise_generator = generator
-    try:
-      yield
-    finally:
-      self._noise_generator = previous
-
-  def set_noise_step(self, step):
-    """Point the warmup ramp at `step` (the trainer's global step)."""
-    self._noise_step = int(step)
-
-  @property
-  def noise_gain(self):
-    """Multiplier on the injected vector: 0 at step 0, 1 once warmed up.
-
-    Derived from the step rather than accumulated, so a resumed run picks the
-    schedule back up where it left off and the ramp is identical on every rank
-    without any communication.
-    """
-    if self.warmup_steps <= 0 or self._noise_step is None:
-      return 1.0
-    return min(1.0, max(0.0, self._noise_step / self.warmup_steps))
-
-  def effective_weight(self):
-    """The projection actually applied, i.e. after the magnitude schedule.
-
-    `rms(effective_weight)` is the injection's `noise/snr` (see the class
-    docstring), so this is also what the diagnostics read.
-    """
-    w = self.noise_proj.weight
-    if self.hold_rms:
-      # Differentiable normalisation: the gradient through `rms` cancels the
-      # radial component, so the optimizer spends its updates on the direction
-      # instead of pushing against a constraint that silently undoes them.
-      rms = w.pow(2).mean().sqrt().clamp_min(1e-12)
-      w = w * (self.noise_scale / rms)
-    gain = self.noise_gain
-    return w if gain == 1.0 else gain * w
-
   def _add_noise(self, module, inputs, output):
     if self._noise is None:
       return output
@@ -399,26 +474,159 @@ class _NoiseConditionedBackbone(torch.nn.Module):
       self._noise = None
 
 
+class _ImageNoiseConditionedBackbone(_NoiseScheduleMixin, torch.nn.Module):
+  """Image counterpart of `_NoiseConditionedBackbone` (D-MMD Sec. 6.5).
+
+  The paper injects, for the CIFAR-10 generator, "a 2D Gaussian noise pyramid
+  ... added to the residual": independent Gaussian noise is drawn at 32x32,
+  16x16, ... down to 1x1, every level is nearest-upsampled back to 32x32 and
+  the `num_levels * noise_dim` resulting channels are mapped by a single 1x1
+  convolution onto the `input_conv` output. The pyramid is what makes the noise
+  usable at every spatial scale: a 32x32 i.i.d. field can only perturb local
+  texture, while the 1x1 level is a global latent for the whole image.
+
+  Table 6 says this is not a minor knob for masked image D-MMD -- it is the
+  difference between FID 151 and 22.3 at 4 steps.
+
+  The public surface is identical to the text wrapper's (`noise_proj`,
+  `effective_weight()`, `noise_gain`, `noise_out_scale`, `set_noise_step`,
+  `noise_stream`), so `noise_scale` / `noise_warmup_steps` / `noise_hold_rms` /
+  `noise_lr`, the `noise/*` diagnostics and the noise-diversity probe all work
+  unchanged. In particular `noise_proj.weight` has shape
+  `(ch, num_levels * noise_dim, 1, 1)`, whose `shape[0]` is still the width of
+  the residual stream and whose Frobenius norm still enters the diagnostics the
+  same way, so `noise/snr` keeps its documented meaning of `rms(W)`:
+
+      inject_std = noise_out_scale * ||W||_F / sqrt(ch)
+                 = reference_std * ||W||_F / sqrt(ch * num_levels * noise_dim)
+                 = reference_std * rms(W)
+
+  which is why `noise_out_scale` is `reference_std / sqrt(num_levels *
+  noise_dim)`, calibrated at construction from the *measured* `input_conv`
+  output scale (`models.unet.UNet.reference_std`) rather than from a constant.
+  """
+
+  def __init__(self, backbone, input_conv, noise_dim, hidden_size,
+               image_size, reference_std,
+               shared_noise=False, noise_scale=1.0, warmup_steps=0,
+               hold_rms=False):
+    super().__init__()
+    self.backbone = backbone
+    self.noise_dim = noise_dim
+    self.image_size = int(image_size)
+    # `shared_noise` maps onto the pyramid's coarsest level: one Gaussian vector
+    # per sample, constant over space -- the same semantics the text wrapper's
+    # flag has (one vector per sample, broadcast over every position).
+    self.shared_noise = shared_noise
+    if shared_noise:
+      self.resolutions = [1]
+    else:
+      res, resolutions = self.image_size, []
+      while res >= 1:
+        resolutions.append(res)
+        res //= 2
+      self.resolutions = resolutions
+    self.noise_scale = noise_scale
+    self.warmup_steps = int(warmup_steps or 0)
+    self.hold_rms = bool(hold_rms)
+    assert not ((self.warmup_steps > 0 or self.hold_rms) and not noise_scale), (
+      'adversarial_distill.noise_scale is the TARGET the schedule ramps to and '
+      'holds, so it must be > 0 when noise_warmup_steps > 0 or '
+      'noise_hold_rms=True; got noise_scale=0, which schedules nothing.')
+    self._noise_step = None
+    in_channels = len(self.resolutions) * noise_dim
+    self.noise_proj = torch.nn.Conv2d(in_channels, hidden_size, kernel_size=1)
+    self.register_buffer(
+      'noise_out_scale',
+      torch.tensor(reference_std / (in_channels ** 0.5), dtype=torch.float32),
+      persistent=False)
+    if noise_scale:
+      torch.nn.init.normal_(self.noise_proj.weight, std=noise_scale)
+    else:
+      # Zero-init: the wrapped student starts as an exact copy of the
+      # checkpoint's function (the "zero-conv" of ControlNet / AdaLN-zero) and
+      # grows its noise usage only if the objective pays for it.
+      torch.nn.init.zeros_(self.noise_proj.weight)
+    torch.nn.init.zeros_(self.noise_proj.bias)
+    self._noise = None
+    self._noise_generator = None
+    input_conv.register_forward_hook(self._add_noise)
+
+  def _draw_noise(self, batch_size, device):
+    """The pyramid, upsampled to `image_size` and concatenated on channels."""
+    levels = []
+    for res in self.resolutions:
+      z = torch.randn(batch_size, self.noise_dim, res, res,
+                      device=device, dtype=torch.float32,
+                      generator=self._noise_generator)
+      if res != self.image_size:
+        # Nearest, so each level stays exactly unit-variance per pixel and the
+        # `rms(W)` bookkeeping above holds for every level alike.
+        z = F.interpolate(z, size=(self.image_size, self.image_size),
+                          mode='nearest')
+      levels.append(z)
+    return torch.cat(levels, dim=1)
+
+  def _add_noise(self, module, inputs, output):
+    if self._noise is None:
+      return output
+    gain = self.noise_gain
+    bias = self.noise_proj.bias
+    injected = self.noise_out_scale * F.conv2d(
+      self._noise, self.effective_weight(),
+      bias if gain == 1.0 else gain * bias)
+    # At gain == 0 this adds an exact zero (the forward is bit-identical to the
+    # unwrapped checkpoint) but still touches `noise_proj`, so DDP does not have
+    # to be told the projection is unused for the duration of the ramp.
+    return output + injected.to(output.dtype)
+
+  def forward(self, xt, sigma=None, *args, **kwargs):
+    self._noise = self._draw_noise(xt.shape[0], xt.device)
+    try:
+      return self.backbone(xt, sigma, *args, **kwargs)
+    finally:
+      self._noise = None
+
+
 def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden,
                               shared_noise=False, noise_scale=1.0,
                               warmup_steps=0, hold_rms=False):
-  """Locate the token-embedding module of `backbone` and wrap it so a learned
-  Gaussian-noise projection is added to the embedding residual."""
+  """Wrap `backbone` so a learned Gaussian-noise projection is added to its
+  input residual (D-MMD Sec. 6.5).
+
+  Dispatches on what the backbone actually is: a `vocab_embed` module means a
+  token model (DiT) and the noise goes into the embedding residual; an
+  `input_conv` means the pixel UNet and the noise goes into that conv's output
+  as a 2D pyramid. Both wrappers expose the same surface -- see
+  `_ImageNoiseConditionedBackbone`.
+  """
   embed_module = None
   for name, module in backbone.named_modules():
     if name.endswith('vocab_embed'):
       embed_module = module
       break
-  assert embed_module is not None, (
-    'Could not locate a `vocab_embed` module for noise conditioning.')
-  if hasattr(embed_module, 'embedding'):
-    hidden_size = embed_module.embedding.shape[-1]
-  elif hasattr(embed_module, 'embedding_dim'):
-    hidden_size = embed_module.embedding_dim
-  else:
-    hidden_size = default_hidden
-  return _NoiseConditionedBackbone(
-    backbone, embed_module, noise_dim, hidden_size,
+  if embed_module is not None:
+    if hasattr(embed_module, 'embedding'):
+      hidden_size = embed_module.embedding.shape[-1]
+    elif hasattr(embed_module, 'embedding_dim'):
+      hidden_size = embed_module.embedding_dim
+    else:
+      hidden_size = default_hidden
+    return _NoiseConditionedBackbone(
+      backbone, embed_module, noise_dim, hidden_size,
+      shared_noise=shared_noise, noise_scale=noise_scale,
+      warmup_steps=warmup_steps, hold_rms=hold_rms)
+
+  input_conv = getattr(backbone, 'input_conv', None)
+  assert input_conv is not None, (
+    'Could not locate a `vocab_embed` (token) or `input_conv` (image) module '
+    'for noise conditioning.')
+  hidden_size = getattr(input_conv, 'out_channels', default_hidden)
+  image_size = int(getattr(backbone, 'size', 1024) ** 0.5)
+  reference_std = getattr(backbone, 'reference_std', 0.02)
+  return _ImageNoiseConditionedBackbone(
+    backbone, input_conv, noise_dim, hidden_size,
+    image_size=image_size, reference_std=reference_std,
     shared_noise=shared_noise, noise_scale=noise_scale,
     warmup_steps=warmup_steps, hold_rms=hold_rms)
 
@@ -442,6 +650,27 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
     self._validate_configuration()
+    # Pretrained denoiser, loaded BEFORE the critics are deep-copied below so
+    # student, frozen teacher and trainable auxiliary all start from the same
+    # weights (the standard D-MMD/DMD initialisation). `training.finetune_path`
+    # cannot do this: Lightning restores a checkpoint after `__init__` returns,
+    # by which point the critics have already been copied from the random
+    # backbone. See `configs/config.yaml`.
+    teacher_ckpt_path = getattr(
+      self.config.adversarial_distill, 'teacher_ckpt_path', '')
+    if teacher_ckpt_path:
+      _load_pretrained_backbone(
+        self.backbone, teacher_ckpt_path,
+        use_ema=getattr(
+          self.config.adversarial_distill, 'teacher_use_ema', True))
+      if self.ema is not None:
+        # `TrainerBase.__init__` built the EMA from the *random* backbone a
+        # moment ago. Left alone, `_eval_mode` would copy those shadow params
+        # over the weights just loaded and evaluate noise. The distill branch
+        # below rebuilds the EMA again (over the wrapped student); this one
+        # covers the plain `is_distill=False` path, i.e. the teacher baseline.
+        self.ema = models.ema.ExponentialMovingAverage(
+          self._get_parameters(), decay=self.config.training.ema)
     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
     # Resolved lazily by `_student_embed_std` for the noise diagnostics.
     self._embed_module_cache = None
@@ -458,6 +687,13 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self.config.adversarial_distill, 'critic_type', 'ar')
       assert self.critic_type in ('ar', 'diffusion'), (
         f'Unknown adversarial_distill.critic_type: {self.critic_type}')
+      if self.modality == 'image' and self.critic_type != 'diffusion':
+        raise ValueError(
+          "adversarial_distill.critic_type='ar' needs an autoregressive "
+          'language-model critic (the owt-ar GPT-2 checkpoint), which cannot '
+          "score pixel sequences. Use critic_type='diffusion' with "
+          'data.modality=image -- that is the arm D-MMD Sec. 6.1 / Table 1 '
+          'reports for CIFAR-10.')
 
       # Whether to use the trainable fake critic at all. If False, the fake
       # model is not created and the generator is trained with only the teacher
@@ -820,6 +1056,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
+    dalpha_t = trainer_base.match_alpha_shape(dalpha_t, alpha_t)
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
 
@@ -1125,6 +1362,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       t = self._sample_t(x0.shape[0], current_accumulation_step)
       dalpha_t, alpha_t = self.noise(t)
       alpha_t = alpha_t.unsqueeze(-1)
+      dalpha_t = trainer_base.match_alpha_shape(dalpha_t, alpha_t)
       assert alpha_t.ndim == 2
       sigma = self._sigma_from_alphat(alpha_t)
       sigma = self._process_sigma(sigma)
@@ -1254,6 +1492,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
+    dalpha_t = trainer_base.match_alpha_shape(dalpha_t, alpha_t)
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
     sigma = self._process_sigma(sigma)
@@ -1481,16 +1720,28 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     return {}
 
   def _student_embed_std(self):
-    """Per-entry std of the (possibly noise-wrapped) student's embedding."""
+    """Scale of the residual the noise injection competes with, i.e. the
+    denominator of `noise/snr`.
+
+    Per-entry std of the token embedding for a DiT student. The pixel UNet has
+    no token embedding, so it exposes `reference_std` -- the measured spread of
+    its `input_conv` output -- which plays exactly the same role there and
+    keeps `noise/snr` reading as `rms(W)`. The 0.02 constant (the DiT init
+    scale) remains the last resort.
+    """
     if self._embed_module_cache is None:
       inner = getattr(self.backbone, 'backbone', self.backbone)
       for name, module in inner.named_modules():
         if name.endswith('vocab_embed'):
           self._embed_module_cache = module
           break
-    if self._embed_module_cache is None:
-      return 0.02
-    return _embedding_std(self._embed_module_cache)
+    if self._embed_module_cache is not None:
+      return _embedding_std(self._embed_module_cache)
+    inner = getattr(self.backbone, 'backbone', self.backbone)
+    reference_std = getattr(inner, 'reference_std', None)
+    if reference_std is not None:
+      return float(reference_std)
+    return 0.02
 
   def _clip_gradients(self, parameters, name):
     """Optionally clip gradients in the manual-optimization loop; log the norm.
@@ -1824,6 +2075,7 @@ class MDLM_DMMD(MDLM_with_AR):
       t = self._sample_t(x0.shape[0], current_accumulation_step)
       dalpha_t, alpha_t = self.noise(t)
       alpha_t = alpha_t.unsqueeze(-1)
+      dalpha_t = trainer_base.match_alpha_shape(dalpha_t, alpha_t)
       assert alpha_t.ndim == 2
       # Hard sample then mask, rather than one draw from the mixture: same
       # marginal, but exposes `x_hard` for the hard fake target (see
@@ -1845,6 +2097,7 @@ class MDLM_DMMD(MDLM_with_AR):
     dalpha_s, alpha_s = self.noise(s)
     alpha_t = alpha_t.unsqueeze(-1)
     alpha_s = alpha_s.unsqueeze(-1)
+    dalpha_s = trainer_base.match_alpha_shape(dalpha_s, alpha_s)
     assert alpha_t.ndim == 2 and alpha_s.ndim == 2
 
     # Generate the student prediction at the (noisier) generation latent z_t.
@@ -2125,6 +2378,14 @@ class MDLM_RL(MDLM_DMMD):
   """
 
   def __init__(self, config, tokenizer):
+    # Checked before `super().__init__` so the message names the real problem
+    # rather than the `critic_type='ar'` conflict it would trip on first.
+    if config.data.get('modality', 'text') == 'image':
+      raise ValueError(
+        'algo=mdlm_rl is text-only: its reward is '
+        '`log p_teacher(x) - log p_fake(x)` from the autoregressive owt-ar '
+        'critics, and there is no autoregressive pixel critic here. Use '
+        'algo=mdlm_dmmd for CIFAR-10 (D-MMD Sec. 6.1).')
     super().__init__(config, tokenizer)
     ad = self.config.adversarial_distill
     # k: rollout length. The policy makes k+1 denoiser calls (the grid plus

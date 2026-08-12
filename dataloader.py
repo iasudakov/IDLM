@@ -11,6 +11,7 @@ import zipfile
 from typing import Optional
 
 import datasets
+import einops
 import fsspec
 import numpy as np
 import requests
@@ -21,6 +22,106 @@ import transformers
 import utils
 
 LOGGER = utils.get_logger(__name__)
+
+
+class RawPixelsVisionTokenizer:
+  """Identity "tokenizer" for raw 8-bit pixels (ported from DUO).
+
+  A CIFAR-10 image is already a sequence of 3072 integers in [0, 255], so
+  tokenization is the identity and *de*tokenization is a reshape back to
+  `(C, H, W)` uint8. It exposes just enough of the `PreTrainedTokenizer`
+  surface for `trainer_base.AbsorbingState` to read a vocabulary and a mask
+  token off it.
+
+  With `add_mask_token=True` the vocabulary is 257 and `mask_token_id` is 256,
+  which is the `[MASK]` bin of the truncated-logistic head in `models/unet.py`
+  and the `mask_index` `AbsorbingState` picks up. That is the vocabulary the
+  released `mdlm/...` CIFAR-10 checkpoints were trained with.
+  """
+
+  def __init__(self, vocab_size, image_size,
+               add_mask_token=True, add_special_tokens=True):
+    self.pad_token_id = None
+    self.pad_token = None
+    if add_mask_token:
+      self.mask_token = vocab_size
+      self.mask_token_id = vocab_size
+      self.vocab_size = vocab_size + 1  # mask token
+    else:
+      self.mask_token = None
+      self.mask_token_id = None
+      self.vocab_size = vocab_size
+    if add_special_tokens:
+      self.bos_token_id = vocab_size
+      self.bos_token = vocab_size
+      self.eos_token_id = vocab_size + 1
+      self.eos_token = vocab_size + 1
+      # mask token, bos_token, eos_token
+      self.vocab_size = self.vocab_size + 2
+    else:
+      self.bos_token_id = None
+      self.bos_token = None
+      self.eos_token_id = None
+      self.eos_token = None
+    self.image_size = image_size
+
+  def __call__(self, x):
+    return x
+
+  def batch_decode(self, x):
+    """(B, 3072) int tokens -> (B, 3, 32, 32) uint8, the layout FID wants."""
+    x = einops.rearrange(x, 'b (c h w) -> b c h w', c=3,
+                         h=self.image_size)
+    x = x.to(dtype=torch.uint8)
+    return x
+
+  def decode(self, x):
+    x = einops.rearrange(x, '(c h w) -> h w c', c=3,
+                         h=self.image_size)
+    x = x.to(dtype=torch.uint8)
+    return x
+
+  def __len__(self):
+    return self.vocab_size
+
+
+class DiscreteCIFAR10(torch.utils.data.Dataset):
+  """CIFAR-10 flattened to `(c h w)` int64 pixel tokens (ported from DUO).
+
+  `augment` is an addition to DUO's version: the FID reference pass has to read
+  the *un-flipped* train images, while training wants the random horizontal
+  flip. It defaults to `train` so the training path is unchanged.
+  """
+
+  def __init__(self, cache_dir, train, augment=None):
+    import torchvision
+    import torchvision.transforms as th_transforms
+    self._dataset = torchvision.datasets.CIFAR10(
+      root=cache_dir, train=train, download=True)
+
+    if augment is None:
+      augment = train
+    transforms = []
+    if augment:
+      transforms += [th_transforms.RandomHorizontalFlip()]
+
+    transforms += [th_transforms.Lambda(
+          lambda x: torch.from_numpy(np.array(x))),
+                  th_transforms.Lambda(
+          lambda x: einops.rearrange(x, "h w c -> (c h w)")),]
+
+    self.transform = th_transforms.Compose(transforms)
+
+  def __len__(self):
+    return len(self._dataset)
+
+  def __getitem__(self, index):
+    img, labels = self._dataset[index]
+
+    img = self.transform(img)
+    attention_mask = torch.ones_like(img)
+    return {'input_ids': img.to(torch.long), 'labels': labels,
+            'attention_mask': attention_mask}
 
 
 def wt_detokenizer(string):
@@ -587,7 +688,15 @@ def get_dataset(dataset_name,
                 num_proc=len(os.sched_getaffinity(0)),
                 streaming=False,
                 revision : Optional[str]=None,
-                config=None):
+                config=None,
+                augment=None):
+  if dataset_name == 'cifar10':
+    # Early return: pixels need none of the tokenize / wrap / .dat-caching
+    # machinery below -- torchvision already caches the raw dataset.
+    assert mode in ('train', 'validation'), mode
+    return DiscreteCIFAR10(cache_dir=os.path.expanduser(cache_dir),
+                           train=mode == 'train',
+                           augment=augment)
   eos_tag = ''
   if not insert_eos:
     eos_tag = '_eosFalse'
@@ -868,6 +977,18 @@ def get_tokenizer(config):
       from_pretrained('bert-base-uncased')
   elif config.data.tokenizer_name_or_path == 'synthetic':
     tokenizer = SyntheticTokenizer(vocab_size=256)
+  elif config.data.tokenizer_name_or_path == 'cifar10':
+    # Returns early: everything below this branch is text-only (the GPT-2
+    # post-processor, and the bos/eos/pad fixups, which would invent special
+    # tokens that do not exist in a 256-value pixel vocabulary).
+    #
+    # `add_mask_token` follows DUO's rule so the vocabulary matches whichever
+    # released checkpoint family is being loaded: the absorbing-state algos
+    # (`mdlm`, `mdlm_dmmd`, `mdlm_rl`) get the 257th `[MASK]` bin, the
+    # uniform-state ones (`duo*`) stay at 256.
+    return RawPixelsVisionTokenizer(
+      vocab_size=256, image_size=32, add_special_tokens=False,
+      add_mask_token='mdlm' in config.algo.name)
   else:
     tokenizer = transformers.AutoTokenizer.from_pretrained(
       config.data.tokenizer_name_or_path)

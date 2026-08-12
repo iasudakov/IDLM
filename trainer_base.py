@@ -1,5 +1,6 @@
 import contextlib
 import itertools
+import os
 import typing
 from dataclasses import dataclass
 
@@ -33,9 +34,63 @@ class LogLinear(torch.nn.Module):
 
   def forward(self, t):
     t = (1 - self.eps) * t
-    alpha_t = 1 - t 
+    alpha_t = 1 - t
     dalpha_t = - (1 - self.eps)
     return dalpha_t, alpha_t
+
+
+class Cosine(torch.nn.Module):
+  """Cosine alpha-schedule, ported from DUO's `trainer_base.Cosine`.
+
+  Selected with `noise=cosine`. It is the schedule the released CIFAR-10
+  checkpoints (`jdeschena/duo2-cifar10`, `mdlm/cosine_time_*`) were trained
+  with, so it has to match theirs exactly.
+
+  Note that `alpha_t -> 0` as `t -> 1` here, and `Diffusion._sigma_from_alphat`
+  is `-log(alpha_t)`, which therefore diverges. That is harmless only while
+  `algo.time_conditioning=False` zeroes sigma before the backbone reads it --
+  see the warning in `configs/noise/cosine.yaml`.
+  """
+
+  def __init__(self, eps):
+    super().__init__()
+    self.eps = eps
+    self.half_pi = torch.pi / 2
+
+  def forward(self, t):
+    t = (1 - self.eps) * t
+    alpha_t = 1 - torch.cos(self.half_pi * (1 - t))
+    dalpha_t = - torch.sin(self.half_pi * (1 - t)) * self.half_pi
+    return dalpha_t, alpha_t
+
+  def get_t_for_alpha(self, alpha_t):
+    is_tensor = torch.is_tensor(alpha_t)
+    if not is_tensor:
+      alpha_t = torch.tensor([alpha_t])
+    t = 1 - 2 / torch.pi * torch.acos(1 - alpha_t)
+    if not is_tensor:
+      t = t.cpu().item()
+    return t
+
+
+def match_alpha_shape(dalpha_t, alpha_t):
+  """Give `dalpha_t` the same broadcast shape the caller just gave `alpha_t`.
+
+  Callers do `alpha_t = alpha_t.unsqueeze(-1)` to broadcast a per-sample value
+  against `(B, L)` token tensors, but historically left `dalpha_t` alone --
+  which worked only because `LogLinear.forward` returns the *Python float*
+  `-(1 - eps)`, identical for every sample. A schedule whose derivative
+  actually varies with `t` (`Cosine`) returns a `(B,)` tensor there, and
+  `(B, L) * (B,)` is a shape error.
+
+  A no-op for anything that is not a tensor, so every log-linear (i.e. every
+  existing text) run is bit-identical.
+  """
+  if not torch.is_tensor(dalpha_t):
+    return dalpha_t
+  while dalpha_t.ndim < alpha_t.ndim:
+    dalpha_t = dalpha_t.unsqueeze(-1)
+  return dalpha_t
 
 
 def sample_categorical(categorical_probs):
@@ -142,13 +197,29 @@ class TrainerBase(L.LightningModule):
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         config.eval.checkpoint_path, trust_remote_code=True)
+    elif self.config.algo.backbone == 'unet':
+      self.backbone = models.unet.UNet(
+        self.config, vocab_size=self.vocab_size)
 
     self.T = self.config.algo.T
     self.num_tokens = self.config.model.length
     self.softplus = torch.nn.Softplus()
     self.p_nucleus = self.config.sampling.p_nucleus
-    # Noise Schedule
-    self.noise = LogLinear()
+    # 'text' (default) or 'image'. Gates every metric and logging path that
+    # assumes a text tokenizer -- gen-ppl, GM, the sample table, the Pareto
+    # curve -- and switches sample logging to FID + a PNG grid instead.
+    self.modality = self.config.data.get('modality', 'text')
+    assert self.modality in ('text', 'image'), self.modality
+    # Noise Schedule. `LogLinear()` is constructed exactly as before (its eps is
+    # hardcoded, and `configs/noise/log-linear.yaml` was never read), so every
+    # existing text run is bit-identical; only `noise=cosine` takes a new path.
+    noise_type = self.config.noise.get('type', 'log-linear')
+    if noise_type == 'log-linear':
+      self.noise = LogLinear()
+    elif noise_type == 'cosine':
+      self.noise = Cosine(float(self.config.noise.eps))
+    else:
+      raise ValueError(f'Unknown noise.type: {noise_type}')
 
     self.metrics = metrics.Metrics(
       gen_ppl_eval_model_name_or_path=\
@@ -157,7 +228,9 @@ class TrainerBase(L.LightningModule):
         self.config.eval.perplexity_batch_size,
       compute_gm=self.config.eval.get('compute_gm', False),
       gm_eval_model_name_or_path=self.config.eval.get(
-        'gm_eval_model_name_or_path', 'gpt2'))
+        'gm_eval_model_name_or_path', 'gpt2'),
+      modality=self.modality,
+      compute_fid=self.config.eval.get('compute_fid', False))
 
     if self.config.training.ema > 0:
       self.ema = models.ema.ExponentialMovingAverage(
@@ -174,7 +247,7 @@ class TrainerBase(L.LightningModule):
     self.fast_forward_batches = None
 
   def _validate_configuration(self):
-    assert self.config.algo.backbone in {'dit', 'hf_dit'}
+    assert self.config.algo.backbone in {'dit', 'hf_dit', 'unet'}
     if self.config.algo.parameterization == 'ar':
       assert not self.config.algo.time_conditioning
       assert self.config.prior.type == 'none'
@@ -361,15 +434,28 @@ class TrainerBase(L.LightningModule):
     self._eval_mode()
     # Buffer for GM data batches (decoded to text; see on_validation_epoch_end).
     self._gm_data_texts = []
+    # Real images already folded into `val/fid` this epoch (image modality).
+    self._fid_real_seen = 0
     assert self.metrics.valid_nlls.nll.mean_value == 0
     assert self.metrics.valid_nlls.nll.weight == 0
 
   def validation_step(self, batch, batch_idx):
     del batch_idx
+    if self.modality == 'image':
+      # No text to buffer for GM. Instead, feed the real half of `val/fid`
+      # straight into the Inception statistics -- accumulating features costs
+      # far less memory than holding `fid_num_samples_val` images.
+      if self.metrics.fid is not None:
+        budget = self.config.eval.get('fid_num_samples_val', 10000)
+        if self._fid_real_seen < budget:
+          real = self.tokenizer.batch_decode(
+            batch['input_ids'][:budget - self._fid_real_seen])
+          self.metrics.fid.update(real.to(self.device), real=True)
+          self._fid_real_seen += real.shape[0]
     # GPT-2 Gradient Moment needs *data* samples to pair with generated ones.
     # Buffer the first `gm_num_batches` val batches as text (not tensors, which
     # would be inference tensors and unusable in the autograd pass GM needs).
-    if self.metrics.gm is not None and len(
+    elif self.metrics.gm is not None and len(
         self._gm_data_texts) < self.config.eval.get('gm_num_batches', 4):
       self._gm_data_texts.append(
         self.tokenizer.batch_decode(batch['input_ids']))
@@ -384,6 +470,14 @@ class TrainerBase(L.LightningModule):
       self.log(name=k,  value=v.compute(), on_step=False,
                on_epoch=True, sync_dist=True)
     if ((self.config.eval.compute_perplexity_on_sanity
+         or not self.trainer.sanity_checking)
+         and self.config.eval.generate_samples
+         and self.modality == 'image'):
+      # Image modality: everything in the text branch below routes through a
+      # word tokenizer and a GPT-2-family reference model, so none of it
+      # applies. FID and a PNG grid take their place.
+      self._image_validation_samples()
+    elif ((self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples):
       samples, text_samples = None, None
@@ -454,14 +548,18 @@ class TrainerBase(L.LightningModule):
     if ((self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)
         and self.config.eval.get('noise_diversity', False)):
-      diversity = self.noise_diversity_report(return_variants=True)
+      # The agreement metrics are computed on token tensors and are modality
+      # agnostic; only the decoded `variants` table is text-specific.
+      want_variants = self.modality != 'image'
+      diversity = self.noise_diversity_report(return_variants=want_variants)
       for name, value in diversity.metrics.items():
         self.log(f'val/{name}',
                  torch.tensor(value, device=self.device),
                  on_epoch=True,
                  on_step=False,
                  sync_dist=True)
-      if (self.trainer.global_rank == 0
+      if (want_variants
+          and self.trainer.global_rank == 0
           and hasattr(self.trainer.logger, 'log_table')):
         # One row per noise draw, same decoding seed: the qualitative version
         # of `noise_div/agree_noise`.
@@ -471,6 +569,67 @@ class TrainerBase(L.LightningModule):
           data=[[k, replicate[0]]
                 for k, replicate in enumerate(diversity.variants)])
     self._train_mode()
+
+  def _image_validation_samples(self):
+    """Image-modality replacement for the text sampling block above.
+
+    Generates `sampling.num_sample_batches` batches and, from them:
+
+    * logs `val/fid` when `eval.compute_fid` is on -- against the real images
+      `validation_step` already folded in, i.e. the CIFAR-10 *test* split. The
+      paper's protocol (and `mode=fid_eval`) uses 50 000 samples against the
+      *train* split; this is the cheap in-training tracker, not that number, so
+      compare it only against itself across steps.
+    * writes a PNG grid of the last batch to `eval.image_grid_path` and logs it
+      to trackers that accept images.
+
+    `val/sample_entropy` still applies (it is the unigram entropy of the token
+    sequence, which for pixels reads as colour diversity and collapses to ~0 if
+    the student starts emitting flat images), so it is kept.
+    """
+    samples = None
+    for _ in range(self.config.sampling.num_sample_batches):
+      samples = self.generate_samples(
+        num_samples=self.config.loader.eval_batch_size)
+      self.metrics.record_entropy(samples)
+      if self.metrics.fid is not None:
+        self.metrics.fid.update(
+          self.tokenizer.batch_decode(samples).to(self.device), real=False)
+    self.log('val/sample_entropy',
+             self.metrics.sample_entropy.compute(),
+             on_epoch=True, on_step=False, sync_dist=True)
+    if float(self.metrics.pred_entropy.weight) > 0:
+      self.log('val/pred_entropy',
+               self.metrics.pred_entropy.compute(),
+               on_epoch=True, on_step=False, sync_dist=True)
+    if self.metrics.fid is not None:
+      # `compute()` is a collective under DDP, so every rank must reach it.
+      fid = self.metrics.fid.compute()
+      self.log('val/fid', fid, on_epoch=True, on_step=False, sync_dist=False)
+    if samples is not None and self.trainer.global_rank == 0:
+      self._log_image_grid(self.tokenizer.batch_decode(samples))
+
+  def _log_image_grid(self, images):
+    """Write a PNG grid of `images` (uint8 `(B, 3, H, W)`) and log it.
+
+    Rank zero only, and never fatal: a tracker or torchvision failure must not
+    take a training run down.
+    """
+    try:
+      import torchvision
+      n = min(images.shape[0], self.config.sampling.num_sample_log)
+      grid = torchvision.utils.make_grid(
+        images[:n].cpu(), nrow=int(max(1, n ** 0.5)), padding=2)
+      path = self.config.eval.get('image_grid_path', None)
+      if path:
+        torchvision.io.write_png(grid, os.fspath(path))
+      if hasattr(self.trainer.logger, 'log_image'):
+        self.trainer.logger.log_image(
+          key=f'samples@global_step{self.global_step}',
+          image=grid.permute(1, 2, 0).numpy(),
+          step=self.global_step)
+    except Exception as e:  # pragma: no cover - diagnostics are best-effort
+      print('[image grid] logging failed: {}'.format(e), flush=True)
 
   def _log_pareto_curve(self, sample_entropy, gen_ppl):
     """Extend the run's quality/diversity Pareto curve by one point.
@@ -813,6 +972,7 @@ class Diffusion(TrainerBase):
     
     dalpha_t, alpha_t = self.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
+    dalpha_t = match_alpha_shape(dalpha_t, alpha_t)
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
 

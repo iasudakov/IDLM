@@ -1,3 +1,4 @@
+import functools
 import json
 import os
 
@@ -11,6 +12,7 @@ import torch
 
 import algo
 import dataloader
+import metrics
 import utils
 import underdeep_logger  # noqa: F401  (registers `underdeep_logger.*` Hydra _target_)
 from ipdb import set_trace as debug
@@ -63,7 +65,18 @@ def _load_from_checkpoint(diffusion_model, config, tokenizer):
   if 'hf' in config.algo.backbone:
     model = diffusion_model(config, tokenizer=tokenizer).to('cuda')
     return model
-  
+
+  if not config.eval.checkpoint_path:
+    # No Lightning checkpoint: the weights must come from somewhere else, and
+    # `adversarial_distill.teacher_ckpt_path` is that somewhere -- this is how
+    # the *teacher* baseline is evaluated (`scripts/fid_cifar10_teacher.sh`),
+    # since a downloaded `.safetensors` denoiser is not a Lightning checkpoint.
+    assert config.adversarial_distill.get('teacher_ckpt_path', ''), (
+      'eval.checkpoint_path is empty and no '
+      'adversarial_distill.teacher_ckpt_path was given, so there are no '
+      'weights to evaluate.')
+    return diffusion_model(config, tokenizer=tokenizer).to('cuda')
+
   return diffusion_model.load_from_checkpoint(
     config.eval.checkpoint_path,
     tokenizer=tokenizer,
@@ -107,7 +120,7 @@ def _print_config(
 
 
 @L.pytorch.utilities.rank_zero_only
-def _print_batch(train_ds, valid_ds, tokenizer, k=64):
+def _print_batch(train_ds, valid_ds, tokenizer, k=64, modality='text'):
   for dl_type, dl in [
     ('train', train_ds), ('valid', valid_ds)]:
     print(f'Printing {dl_type} dataloader batch.')
@@ -115,6 +128,15 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     print('Batch input_ids.shape', batch['input_ids'].shape)
     first = batch['input_ids'][0, :k]
     last = batch['input_ids'][0, -k:]
+    if modality == 'image':
+      # `decode` returns an image tensor, not a string: print the numbers and
+      # the range instead, which is what one actually checks here (pixels must
+      # be int64 in [0, 255], with no stray mask/special ids).
+      ids = batch['input_ids']
+      print(f'First {k} pixel ids:', first.tolist())
+      print(f'Last {k} pixel ids:', last.tolist())
+      print(f'dtype={ids.dtype} min={int(ids.min())} max={int(ids.max())}')
+      continue
     print(f'First {k} tokens:', tokenizer.decode(first))
     print('ids:', first)
     print(f'Last {k} tokens:', tokenizer.decode(last))
@@ -185,8 +207,100 @@ def _prepare_gm_data(model, config, logger, tokenizer):
   return texts
 
 
+def _save_image_grid(images, path, nrow=None):
+  """Write uint8 `(B, 3, H, W)` images to `path` as a single PNG grid."""
+  import torchvision
+  n = images.shape[0]
+  nrow = int(max(1, n ** 0.5)) if nrow is None else nrow
+  grid = torchvision.utils.make_grid(images.cpu(), nrow=nrow, padding=2)
+  torchvision.io.write_png(grid, os.fspath(path))
+  return path
+
+
+def _generate_image_samples(diffusion_model, config, logger, tokenizer):
+  """`mode=sample_eval` for `data.modality=image`.
+
+  Generative perplexity and GM both score samples with a GPT-2-family language
+  model, so neither exists here. What replaces them is a PNG grid (the thing
+  one actually looks at) plus, optionally, FID against the validation split --
+  the cheap version. For the paper's number use `mode=fid_eval`, which follows
+  the 50 000-sample protocol against the train split.
+  """
+  logger.info('Starting Sample Eval (image).')
+  model = _load_from_checkpoint(
+    diffusion_model=diffusion_model,
+    config=config,
+    tokenizer=tokenizer)
+  model.metrics.sample_entropy.reset()
+  model.metrics.pred_entropy.reset()
+  if config.eval.disable_ema:
+    logger.info('Disabling EMA.')
+    model.ema = None
+
+  fid = None
+  if config.eval.get('compute_fid', False):
+    fid = metrics.build_fid(device=model.device)
+    if fid is None:
+      logger.warning('eval.compute_fid is set but FID is unavailable.')
+    else:
+      _, valid_ds = dataloader.get_dataloaders(
+        config, tokenizer, skip_train=True)
+      seen, budget = 0, config.eval.get('fid_num_samples_val', 10000)
+      for batch in valid_ds:
+        real = tokenizer.batch_decode(batch['input_ids'][:budget - seen])
+        fid.update(real.to(model.device), real=True)
+        seen += real.shape[0]
+        if seen >= budget:
+          break
+      logger.info('FID reference: %d real images.', seen)
+
+  model._eval_mode()
+  last = None
+  num_generated = 0
+  for _ in range(config.sampling.num_sample_batches):
+    samples = model.generate_samples(
+      num_samples=config.loader.eval_batch_size,
+      num_steps=config.sampling.steps)
+    model.metrics.record_entropy(samples)
+    last = tokenizer.batch_decode(samples)
+    num_generated += last.shape[0]
+    if fid is not None:
+      fid.update(last.to(model.device), real=False)
+  model._train_mode()
+
+  entropy = model.metrics.sample_entropy.compute().item()
+  pred_entropy = 0.
+  print('Sample entropy:', entropy)
+  if float(model.metrics.pred_entropy.weight) > 0:
+    pred_entropy = model.metrics.pred_entropy.compute().item()
+    print('Model predictive entropy:', pred_entropy)
+  fid_value = None
+  if fid is not None:
+    fid_value = float(fid.compute())
+    print('FID (vs. validation split):', fid_value)
+
+  grid_path = config.eval.get('image_grid_path', None)
+  if last is not None and grid_path:
+    _save_image_grid(last[:config.sampling.num_sample_log], grid_path)
+    print('Sample grid saved at:', grid_path)
+
+  samples_path = config.eval.generated_samples_path
+  with fsspec.open(samples_path, 'w') as f:
+    json.dump({'entropy': entropy,
+               'pred_entropy': pred_entropy,
+               'fid': fid_value,
+               'num_generated': num_generated,
+               'sampling_steps': config.sampling.steps,
+               'image_grid_path': str(grid_path) if grid_path else None}, f,
+              indent=4)
+  print('Report saved at:', samples_path)
+
+
 def _generate_samples(diffusion_model, config, logger,
                       tokenizer):
+  if config.data.get('modality', 'text') == 'image':
+    return _generate_image_samples(
+      diffusion_model, config, logger, tokenizer)
   logger.info('Starting Sample Eval.')
   model = _load_from_checkpoint(
     diffusion_model=diffusion_model,
@@ -300,6 +414,158 @@ def _noise_diversity_eval(diffusion_model, config, logger, tokenizer):
   print('Noise diversity report saved at:', report_path)
 
 
+def _eval_fid(diffusion_model, config, logger, tokenizer):
+  """`mode=fid_eval` -- the paper's CIFAR-10 protocol (D-MMD Table 1).
+
+  Ported from DUO's `_eval_fid` (`~/duo/main.py`) with one change: it is
+  **unconditional**. DUO generates with `labels` matching each real batch;
+  here the backbone falls back to the checkpoint's classifier-free-guidance
+  null class (see `models.unet.UNet.forward`), which is what D-MMD Sec. 6.1
+  reports, so no label plumbing is needed through the sampler.
+
+  `eval.fid_num_samples` (default 50 000, the standard protocol) generated
+  images are compared against the same number of **train** images -- FID
+  against train is the convention these papers follow. The work is split over
+  `trainer.devices` ranks via Fabric; torchmetrics reduces the Inception
+  statistics across ranks inside `compute()`, so every rank must reach it.
+
+  The body runs inside `fabric.launch(fn)` rather than after a bare
+  `fabric.launch()`: with more than one device Lightning's launcher requires a
+  function to run in each process, and errors out otherwise.
+  """
+  import datetime
+
+  from lightning.fabric import Fabric
+  from lightning.fabric.strategies import DDPStrategy
+
+  # A long process-group timeout, not NCCL's 30-minute default: the ranks only
+  # meet at the barrier after the whole sampling loop, and at high
+  # `sampling.steps` with 50 000 samples that loop runs for hours. Any drift
+  # between ranks is then charged against the timeout, and a rank that merely
+  # finished early would otherwise tear the job down.
+  fabric = Fabric(accelerator=config.trainer.accelerator,
+                  devices=config.trainer.devices,
+                  num_nodes=config.trainer.num_nodes,
+                  strategy=DDPStrategy(
+                    timeout=datetime.timedelta(hours=12)))
+  fabric.launch(functools.partial(
+    _eval_fid_worker, diffusion_model=diffusion_model, config=config,
+    logger=logger, tokenizer=tokenizer))
+
+
+def _eval_fid_worker(fabric, diffusion_model, config, logger, tokenizer):
+  """One rank's share of `mode=fid_eval`. See `_eval_fid`."""
+  seed = config.seed + fabric.global_rank
+  L.seed_everything(seed)
+  print(f'(Rank {fabric.global_rank}): seed: {seed}', flush=True)
+
+  assert config.data.get('modality', 'text') == 'image', (
+    'mode=fid_eval requires data.modality=image (e.g. data=cifar10).')
+
+  model = _load_from_checkpoint(
+    diffusion_model=diffusion_model,
+    config=config,
+    tokenizer=tokenizer)
+  model.to(fabric.device)
+  if config.eval.disable_ema:
+    logger.info('Disabling EMA.')
+    model.ema = None
+  model._eval_mode()
+
+  fid = metrics.build_fid(device=fabric.device)
+  assert fid is not None, (
+    'mode=fid_eval needs torchmetrics image metrics; install torch-fidelity.')
+
+  num_samples = int(config.eval.get('fid_num_samples', 50000))
+  batch_size = config.loader.eval_batch_size
+  world = fabric.world_size
+  # Round the per-rank share up to whole batches so every rank runs the same
+  # number of iterations -- an uneven count deadlocks the collective in
+  # `compute()`.
+  per_rank_batches = -(-(-(-num_samples // world) // batch_size))
+  per_rank = per_rank_batches * batch_size
+  if fabric.global_rank == 0:
+    logger.info(
+      'FID: %d images/rank x %d rank(s) = %d generated (requested %d), '
+      'at sampling.steps=%s.',
+      per_rank, world, per_rank * world, num_samples, config.sampling.steps)
+    if per_rank * world < 10000:
+      logger.warning(
+        'Fewer than 10k samples: FID is strongly biased upward at this size '
+        'and is only meaningful as a smoke test.')
+
+  # --- Real images: the train split, un-augmented unless asked otherwise. ---
+  real_set = dataloader.get_dataset(
+    config.data.train, tokenizer, wrap=config.data.wrap, mode='train',
+    cache_dir=config.data.cache_dir,
+    insert_eos=config.data.insert_train_eos,
+    block_size=config.model.length, streaming=config.data.streaming,
+    num_proc=config.loader.num_workers, config=config,
+    augment=config.eval.get('fid_augment_real', False))
+  # Deliberately NOT `config.loader.num_workers`: that defaults to the machine's
+  # full CPU count (255 here), and every worker is a fork holding its own copy of
+  # the in-memory CIFAR-10 arrays. Multiplied by the number of ranks that is
+  # >1000 processes and enough resident memory to get the rank OOM-killed --
+  # which then surfaces as an NCCL watchdog timeout on the *other* ranks. This
+  # pass reads at most `per_rank` images once, sequentially, so a couple of
+  # workers already hide the decode latency behind the sampler.
+  real_workers = min(4, config.loader.num_workers)
+  real_loader = torch.utils.data.DataLoader(
+    real_set, batch_size=batch_size, num_workers=real_workers,
+    pin_memory=config.loader.pin_memory,
+    sampler=torch.utils.data.distributed.DistributedSampler(
+      real_set, num_replicas=world, rank=fabric.global_rank, shuffle=False))
+  real_seen = 0
+  for batch in real_loader:
+    if real_seen >= per_rank:
+      break
+    images = tokenizer.batch_decode(
+      batch['input_ids'][:per_rank - real_seen]).to(fabric.device)
+    fid.update(images, real=True)
+    real_seen += images.shape[0]
+
+  # --- Generated images. ---
+  for i in range(per_rank_batches):
+    samples = model.generate_samples(
+      num_samples=batch_size, num_steps=config.sampling.steps)
+    fid.update(
+      tokenizer.batch_decode(samples).to(fabric.device), real=False)
+    if fabric.global_rank == 0 and (i + 1) % 10 == 0:
+      logger.info('  generated %d / %d per-rank images.',
+                  (i + 1) * batch_size, per_rank)
+    if i == 0 and fabric.global_rank == 0:
+      grid_path = config.eval.get('image_grid_path', None)
+      if grid_path:
+        _save_image_grid(
+          tokenizer.batch_decode(samples)[:config.sampling.num_sample_log],
+          grid_path)
+
+  fabric.barrier()
+  logger.info('Done sampling. Computing FID & IS...')
+  # Collectives: every rank must call these.
+  fid_value = float(fid.compute())
+  is_mean, is_std = fid.compute_inception_score()
+
+  if fabric.global_rank == 0:
+    print(f'FID: {fid_value}')
+    print(f'IS: {float(is_mean)} +/- {float(is_std)}')
+    report_path = config.eval.get('fid_report_path', None)
+    if report_path:
+      with fsspec.open(report_path, 'w') as f:
+        json.dump({'fid': fid_value,
+                   'inception_score_mean': float(is_mean),
+                   'inception_score_std': float(is_std),
+                   'num_generated': per_rank * world,
+                   'num_real': real_seen * world,
+                   'sampling_steps': config.sampling.steps,
+                   'sampling_predictor': config.sampling.predictor,
+                   'checkpoint_path': config.eval.checkpoint_path,
+                   'teacher_ckpt_path': config.adversarial_distill.get(
+                     'teacher_ckpt_path', '')}, f, indent=4)
+      print('FID report saved at:', report_path)
+  fabric.barrier()
+
+
 def _eval_ppl(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Perplexity Eval.')
 
@@ -360,7 +626,8 @@ def _train(diffusion_model, config, logger, tokenizer):
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)
-  _print_batch(train_ds, valid_ds, tokenizer)
+  _print_batch(train_ds, valid_ds, tokenizer,
+               modality=config.data.get('modality', 'text'))
 
   if config.training.finetune_path != '':
     assert utils.fsspec_exists(config.training.finetune_path)
@@ -424,6 +691,8 @@ def main(config):
     _noise_diversity_eval(**kwargs)
   elif config.mode == 'ppl_eval':
     _eval_ppl(**kwargs)
+  elif config.mode == 'fid_eval':
+    _eval_fid(**kwargs)
   else:
     _train(**kwargs)
 

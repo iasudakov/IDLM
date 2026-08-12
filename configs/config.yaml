@@ -10,7 +10,8 @@ defaults:
   - /algo: duo_base
   - /logger: underdeep
 
-mode: train  # train / ppl_eval / sample_eval / noise_diversity_eval
+mode: train  # train / ppl_eval / sample_eval / noise_diversity_eval / fid_eval
+             # fid_eval is image-modality only (data=cifar10); see eval.fid_*
 debug: False
 seed: 1
 
@@ -38,6 +39,24 @@ adversarial_distill:
   # Autoregressive teacher (and fake-model initialisation) for MDLM_with_AR.
   # A HF hub id or a local dir with the owt-ar config.json / pytorch_model.bin.
   ar_model_path: kuleshov-group/owt-ar
+  # Pretrained weights for the *diffusion* critic path (critic_type=diffusion).
+  # Loaded into `self.backbone` in `MDLM_with_AR.__init__` BEFORE the teacher and
+  # fake critics are deep-copied from it, so student, frozen teacher and
+  # trainable auxiliary all start from the same pretrained denoiser -- the
+  # standard D-MMD/DMD initialisation (arXiv:2603.20155 Alg. 1).
+  #
+  # This cannot be done with `training.finetune_path`: Lightning restores a
+  # checkpoint *after* `__init__` has run, by which time the critics have already
+  # been copied from the still-random backbone.
+  #
+  # Accepts either a `.safetensors` file of raw backbone keys (e.g. the released
+  # `jdeschena/duo2-cifar10` CIFAR-10 teachers, whose tensors are EMA shadow
+  # params) or a Lightning `.ckpt` (the `backbone.` prefix is stripped).
+  # '' (default) => no pretrained teacher, i.e. every existing run is unchanged.
+  teacher_ckpt_path: ''
+  # For a Lightning `.ckpt` only: prefer the EMA shadow parameters over the raw
+  # weights. Ignored for `.safetensors`, which carry a single tensor set.
+  teacher_use_ema: True
   # Learning rate for the fake critic. null => fall back to optim.lr (original
   # IDLM: fake and student share optim.lr). Set e.g. 1e-4 to give the critic a
   # larger, separate LR (two-time-scale).
@@ -402,6 +421,29 @@ eval:
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
   generate_samples: True
   generated_samples_path: ${cwd:}/samples.json
+  # --- FID (image modality only; `data.modality=image`) ---
+  # The CIFAR-10 metric of D-MMD Table 1. Requires torchmetrics'
+  # `FrechetInceptionDistance`, i.e. `torch-fidelity` installed.
+  # `mode=fid_eval` always computes FID; this flag is for the *training-time*
+  # validation pass, which samples `sampling.num_sample_batches` batches and
+  # logs `val/fid` against `fid_num_samples_val` real images. Off by default
+  # because a meaningful FID needs far more samples than a validation pass
+  # should spend.
+  compute_fid: False
+  # Sample count for `mode=fid_eval`. 50 000 is the standard protocol and what
+  # the paper's numbers use; anything below ~10 000 is biased upward and only
+  # useful as a smoke test.
+  fid_num_samples: 50000
+  # Real images used for the `val/fid` reference statistics during training.
+  fid_num_samples_val: 10000
+  # Whether the real-image pass applies the training augmentation (random
+  # horizontal flip). False = the un-flipped train set, which is the standard
+  # FID reference.
+  fid_augment_real: False
+  # Where `mode=sample_eval` / the validation pass writes its PNG sample grid.
+  image_grid_path: ${cwd:}/samples.png
+  # Where `mode=fid_eval` writes its JSON report.
+  fid_report_path: ${cwd:}/fid.json
   # --- Quality/diversity Pareto curve ---
   # val/sample_entropy and val/gen_ppl plotted against each other rather than
   # against the step: one point per validation, so the run traces the
