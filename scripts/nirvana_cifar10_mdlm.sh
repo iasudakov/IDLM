@@ -31,7 +31,13 @@ GLOBAL_BATCH=512
 LR=4e-4
 WARMUP=5000
 EMA_DECAY=0.9999
-NUM_WORKERS=8
+# Deliberately small. Each worker forks a copy of torchvision's in-memory
+# CIFAR-10 array (~154 MB); copy-on-write shares it at first, but CPython's
+# refcounting writes to object headers and faults the pages in over time. At 8
+# workers x 8 ranks that is 64 processes drifting toward ~10 GB resident, to
+# feed a transform that is one horizontal flip and a reshape over data already
+# in RAM.
+NUM_WORKERS=2
 
 SAMPLE_EVERY=1000       # sample grid -> underdeep
 EVAL_EVERY=10000        # test BPD + FID

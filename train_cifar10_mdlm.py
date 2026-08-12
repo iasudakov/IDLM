@@ -626,7 +626,11 @@ def parse_args():
                       'reveals t, and DUO trained its CIFAR-10 masked '
                       'checkpoints time-unconditionally.')
   p.add_argument('--seed', type=int, default=1)
-  p.add_argument('--num-workers', type=int, default=4)
+  p.add_argument('--num-workers', type=int, default=2,
+                 help='per rank. Kept low on purpose: every worker forks a '
+                      'copy of the in-memory CIFAR-10 array (~154 MB), which '
+                      'multiplied by the world size is real resident memory, '
+                      'and the transform it feeds is a flip plus a reshape.')
 
   # Logging / eval cadence.
   p.add_argument('--log-every', type=int, default=100)
