@@ -1,4 +1,5 @@
 import itertools
+import math
 from dataclasses import dataclass
 
 import hydra.utils
@@ -378,6 +379,7 @@ class TrainerBase(L.LightningModule):
                    on_step=False,
                    sync_dist=True)
     self._log_sample_image_grid()
+    self._log_fid()
     self._train_mode()
 
   @torch.no_grad()
@@ -421,6 +423,66 @@ class TrainerBase(L.LightningModule):
         # lands here rather than silently mangling the call.
         print(f'[samples] {type(logger).__name__} rejected the image grid: {e}',
               flush=True)
+
+  @torch.no_grad()
+  def _log_fid(self):
+    """Track FID during training, as `eval.fid_key` (default `val/fid`).
+
+    Runs every `eval.fid_every_n_validations`-th validation, because it is the
+    one expensive thing here: `eval.fid_num_samples` images at
+    `eval.fid_steps` NFE. The sampling is sharded across ranks and gathered, so
+    the cost divides by the world size; `metrics.FID` then computes the distance
+    on rank zero against reference statistics it built (and cached) once.
+
+    Unlike `_log_sample_image_grid` this cannot be rank-zero-only: `all_gather`
+    is a collective, so every rank must reach it. The cadence is a function of
+    `global_step` alone, which is identical on all of them.
+
+    The number is a trend, not a result -- see `metrics.FID` on sample-count
+    bias. `mode=fid_eval` is what reports a comparable figure.
+    """
+    if (self.config.data.modality != 'image'
+        or not self.config.eval.get('fid', False)
+        or self.trainer.sanity_checking):
+      return
+    self._fid_validations = getattr(self, '_fid_validations', 0) + 1
+    every = max(int(self.config.eval.get('fid_every_n_validations', 1)), 1)
+    if self._fid_validations % every != 0:
+      return
+
+    world_size = max(self.trainer.world_size, 1)
+    total = int(self.config.eval.get('fid_num_samples', 2048))
+    batch_size = int(self.config.eval.get('fid_batch_size', 256))
+    # Round the per-rank count up to whole batches so every rank samples the
+    # same number of images and `all_gather` stays balanced.
+    per_rank = math.ceil(math.ceil(total / world_size) / batch_size)
+    per_rank *= batch_size
+    chunks = []
+    for _ in range(per_rank // batch_size):
+      samples = self.generate_samples(
+        num_samples=batch_size,
+        num_steps=int(self.config.eval.get('fid_steps', 64)))
+      chunks.append(self.tokenizer.batch_decode(samples))
+    images = torch.cat(chunks, dim=0)
+    if world_size > 1:
+      images = self.all_gather(images).flatten(0, 1)
+    images = images[:total]
+
+    if self.trainer.global_rank != 0:
+      return
+    if getattr(self, '_fid', None) is None:
+      self._fid = metrics.FID(
+        device=self.device,
+        cache_path=self.config.eval.get('fid_ref_path', None),
+        cache_dir=self.config.data.cache_dir,
+        num_ref=self.config.eval.get('fid_num_reference', None))
+    score = self._fid.score(images)
+    key = self.config.eval.get('fid_key', 'val/fid')
+    print('[fid] {}={:.3f} ({} samples, {} NFE, step {})'.format(
+      key, score, images.shape[0], self.config.eval.get('fid_steps', 64),
+      self.global_step), flush=True)
+    for logger in self.trainer.loggers:
+      logger.log_metrics({key: score}, step=self.global_step)
 
   def configure_optimizers(self):
     optimizer = torch.optim.AdamW(

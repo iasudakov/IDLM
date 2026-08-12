@@ -208,3 +208,110 @@ class Metrics:
         token_mask = sample_chunk != self.tokenizer.eos_token_id
         valid_tokens = first_eos[..., 1:] + token_mask[..., 1:]
         self.gen_ppl.update(nlls * valid_tokens, valid_tokens)
+
+
+class FID:
+  """FID against CIFAR-10, cheap enough to run inside the training loop.
+
+  Vendored from the standalone `IDLM/train_cifar10_mdlm.py` trainer, which is
+  where the two things that make it affordable were worked out:
+
+  * the real-side Inception statistics are built once over the full un-flipped
+    train split and cached to disk, so a restart does not repeat that pass;
+  * the Frechet distance is evaluated through `eigh`/`eigvalsh` rather than
+    torchmetrics' `eigvals`, i.e. real symmetric arithmetic instead of a general
+    complex eigendecomposition of a 2048x2048 matrix. Same number, seconds
+    instead of minutes -- and that cost is paid per evaluation regardless of how
+    few samples were drawn, so it dominates in-loop use.
+
+  torchmetrics is still what computes the Inception features, which is the part
+  worth reusing.
+
+  NOTE the score is only comparable to published numbers at a comparable sample
+  count. Fewer samples bias FID upward, so a few thousand is a training-time
+  *trend*, not a result; use `mode=fid_eval` for the real figure.
+  """
+
+  def __init__(self, device, cache_path=None, cache_dir=None, num_ref=None,
+               batch_size=500):
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    self.metric = FrechetInceptionDistance(normalize=False).to(device)
+    self.device = device
+    self.batch_size = batch_size
+    self._load_or_build_reference(cache_path, cache_dir, num_ref)
+
+  def _load_or_build_reference(self, cache_path, cache_dir, num_ref):
+    if cache_path is not None and os.path.exists(cache_path):
+      state = torch.load(cache_path, map_location=self.device,
+                         weights_only=False)
+      self.metric.real_features_sum = state['sum'].to(self.device)
+      self.metric.real_features_cov_sum = state['cov_sum'].to(self.device)
+      self.metric.real_features_num_samples = state['n'].to(self.device)
+      print('[fid] reference loaded from {} ({} images)'.format(
+        cache_path, int(state['n'].item())), flush=True)
+      return
+
+    print('[fid] building reference statistics over the CIFAR-10 train split '
+          '(un-flipped); this happens once', flush=True)
+    import dataloader
+    dataset = dataloader.DiscreteCIFAR10(cache_dir, train=True, augment=False)
+    if num_ref is not None:
+      dataset = torch.utils.data.Subset(dataset, range(num_ref))
+    loader = torch.utils.data.DataLoader(
+      dataset, batch_size=self.batch_size, num_workers=2)
+    for batch in loader:
+      self.metric.update(self._to_images(batch['input_ids']), real=True)
+    if cache_path is not None:
+      torch.save({'sum': self.metric.real_features_sum.cpu(),
+                  'cov_sum': self.metric.real_features_cov_sum.cpu(),
+                  'n': self.metric.real_features_num_samples.cpu()},
+                 cache_path)
+      print('[fid] reference cached to {}'.format(cache_path), flush=True)
+
+  def _to_images(self, tokens):
+    """Flat pixel tokens -> the (B, 3, H, W) uint8 Inception wants."""
+    size = int((tokens.shape[-1] // 3) ** 0.5)
+    images = tokens.reshape(-1, 3, size, size)
+    return images.to(dtype=torch.uint8, device=self.device)
+
+  @staticmethod
+  def _mean_cov(feat_sum, cov_sum, n):
+    """(mu, Sigma) from the sums torchmetrics accumulates, in float64."""
+    feat_sum, cov_sum = feat_sum.double(), cov_sum.double()
+    n = n.double()
+    mu = (feat_sum / n).unsqueeze(0)
+    sigma = (cov_sum - n * mu.t().mm(mu)) / (n - 1)
+    return mu.squeeze(0), sigma
+
+  @staticmethod
+  def _frechet(mu1, sigma1, mu2, sigma2):
+    """||mu1-mu2||^2 + tr(S1) + tr(S2) - 2 tr((S1 S2)^1/2).
+
+    S1 S2 is similar to the symmetric PSD matrix S1^(1/2) S2 S1^(1/2), so the
+    trace term can come from a symmetric eigendecomposition.
+    """
+    w, v = torch.linalg.eigh(sigma1)
+    sigma1_half = (v * w.clamp_min(0).sqrt()) @ v.t()
+    m = sigma1_half @ sigma2 @ sigma1_half
+    tr_covmean = torch.linalg.eigvalsh(m).clamp_min(0).sqrt().sum()
+    return (((mu1 - mu2) ** 2).sum() + sigma1.trace() + sigma2.trace()
+            - 2 * tr_covmean)
+
+  def score(self, images):
+    """FID of `(N, 3, H, W)` uint8 generated images against the reference."""
+    self.metric.fake_features_sum.zero_()
+    self.metric.fake_features_cov_sum.zero_()
+    self.metric.fake_features_num_samples.zero_()
+    for i in range(0, images.shape[0], self.batch_size):
+      chunk = images[i:i + self.batch_size]
+      self.metric.update(chunk.to(dtype=torch.uint8, device=self.device),
+                         real=False)
+    mu_real, cov_real = self._mean_cov(
+      self.metric.real_features_sum,
+      self.metric.real_features_cov_sum,
+      self.metric.real_features_num_samples)
+    mu_fake, cov_fake = self._mean_cov(
+      self.metric.fake_features_sum,
+      self.metric.fake_features_cov_sum,
+      self.metric.fake_features_num_samples)
+    return self._frechet(mu_real, cov_real, mu_fake, cov_fake).item()

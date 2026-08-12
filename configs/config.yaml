@@ -83,6 +83,24 @@ eval:
   sample_image_num: 16
   sample_image_steps: 64
   sample_image_key: val/samples
+  # In-loop FID (image data only), logged as `fid_key`. Sampling is sharded over
+  # the ranks; the distance is computed on rank zero against reference statistics
+  # built once over the un-flipped train split and cached to `fid_ref_path`
+  # (which lives under `checkpointing.save_dir`, so it survives a restart and
+  # rides the Nirvana snapshot). See `metrics.FID`.
+  # The expensive knob is `fid_num_samples` x `fid_steps` NFE, hence the
+  # `fid_every_n_validations` throttle: at the defaults below FID runs every 4th
+  # validation, i.e. every 10k steps for the CIFAR-10 recipe.
+  # A few thousand samples biases FID upward, so this tracks the *trend*;
+  # `mode=fid_eval` is what produces a comparable number.
+  fid: True
+  fid_num_samples: 2048
+  fid_steps: 64
+  fid_batch_size: 256
+  fid_every_n_validations: 4
+  fid_num_reference: null  # null => the whole 50k train split
+  fid_ref_path: ${checkpointing.save_dir}/fid_ref.pt
+  fid_key: val/fid
 
 optim:
   weight_decay: 0

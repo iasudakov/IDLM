@@ -70,12 +70,14 @@ class RawPixelsVisionTokenizer:
   
 
 class DiscreteCIFAR10(torch.utils.data.Dataset):
-  def __init__(self, cache_dir, train):
+  def __init__(self, cache_dir, train, augment=True):
     self._dataset = torchvision.datasets.CIFAR10(
       root=cache_dir, train=train, download=True)
 
     transforms = []
-    if train:
+    # `augment=False` gives the un-flipped train split, which is the reference
+    # distribution FID is measured against (`metrics.FID`).
+    if train and augment:
       transforms += [th_transforms.RandomHorizontalFlip()]
       
     transforms += [th_transforms.Lambda(
