@@ -90,6 +90,19 @@ DATA_DIR=$SOURCE_CODE_PATH/code/cache_dir/cifar10
 mkdir -p $OUT
 mkdir -p $DATA_DIR
 
+# CIFAR-10 ships inside the code archive (cache_dir/cifar10), so nothing is
+# downloaded here. Say so loudly either way: the proxy pulls the 170 MB archive
+# at roughly 500 kB/s, and a missing copy means paying that on every fresh
+# attempt -- easy to mistake for a hung job.
+if [ -d $DATA_DIR/cifar-10-batches-py ]; then
+  echo "[data] CIFAR-10 present in $DATA_DIR, no download"
+else
+  echo "[data] WARNING: $DATA_DIR/cifar-10-batches-py is missing."
+  echo "[data] Rank 0 will download 170 MB through the proxy (~6 min), and"
+  echo "[data] will do it again on every fresh attempt. To avoid that, ship"
+  echo "[data] cache_dir/cifar10/cifar-10-batches-py in the code archive."
+fi
+
 echo "[launch] $NUM_GPUS GPUs, global_batch=$GLOBAL_BATCH ($BATCH_SIZE/gpu)"
 
 exec torchrun --nproc_per_node=$NUM_GPUS --master_port=29511 \

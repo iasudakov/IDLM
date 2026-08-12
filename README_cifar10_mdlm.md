@@ -106,6 +106,28 @@ the dataloader epoch is advanced so the shuffle does not replay, and the underde
 run is resumed from `metadata.pt` rather than a fresh one being opened. Off
 Nirvana the snapshot transfers are no-ops and the same command trains normally.
 
+## Nirvana
+
+`scripts/nirvana_cifar10_mdlm.sh` is the entrypoint. Two constraints that are
+easy to trip over:
+
+- **No `${...}` anywhere in that file, comments included.** Nirvana renders
+  `run-command` through FreeMarker first, which claims dollar-brace as its own
+  interpolation syntax and fails the job at render time. Bare `$FOO`, `$(cmd)`
+  and `$((a / b))` are safe.
+- **CIFAR-10 ships with the code archive**, in `cache_dir/cifar10/cifar-10-batches-py`.
+  It is gitignored (178 MB) but must ride along in whatever gets uploaded.
+  Without it, rank 0 pulls 170 MB through the proxy at ~500 kB/s on *every*
+  fresh attempt. Stage it with:
+
+  ```bash
+  mkdir -p cache_dir/cifar10
+  cp -r ~/data/cifar10/cifar-10-batches-py cache_dir/cifar10/
+  ```
+
+  The script prints whether the data is present before launching, so a silent
+  download does not get mistaken for a hung job.
+
 ## Cost note
 
 `torchmetrics`' FID does a 2048×2048 matrix square root on CPU, which takes a few
