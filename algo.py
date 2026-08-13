@@ -2058,6 +2058,24 @@ class MDLM_RL(MDLM_DMMD):
   the AR critics, and trains with REINFORCE. Same objective, but `pi_eta` is
   now genuinely the sampler's marginal.
 
+  Two policies (`adversarial_distill.rl_policy`)
+  ----------------------------------------------
+  The gap above has two halves -- *which distribution* the samples come from,
+  and *which estimator* the gradient uses -- and the config splits them so
+  they can be attributed separately:
+
+  * `'trajectory'` (default): changes both. The rest of this docstring
+    describes it.
+  * `'onestep'`: changes only the estimator. Samples are drawn exactly as
+    `MDLM_DMMD`/`MDLM_with_AR` draw them -- one denoiser call on a
+    data-derived latent, `x ~ Cat(x_hat_eta(z_t))` -- and the same reward is
+    optimized with the score function instead of the pathwise term, with the
+    baseline group being `rl_onestep_group_size` draws from the *same* latent.
+    Costs one student forward per micro-step instead of `k+1`. See
+    `_rl_onestep_generator_loss`; the sections below marked with the
+    trajectory machinery (`_rl_rollout`, the buffer, `rl_grad_steps`) do not
+    apply to it.
+
   The estimator
   -------------
   A trajectory is `tau = (z_0 = [MASK]^L, ..., z_K, x)`::
@@ -2129,6 +2147,15 @@ class MDLM_RL(MDLM_DMMD):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
     ad = self.config.adversarial_distill
+    # Which distribution the policy gradient is taken over: the multi-step
+    # sampler's marginal ('trajectory', the class docstring above) or the
+    # one-shot conditional the non-RL algos already sample from ('onestep',
+    # see `_rl_onestep_generator_loss`).
+    self.rl_policy = self._normalize_rl_policy(
+      getattr(ad, 'rl_policy', 'trajectory'))
+    # G: i.i.d. draws per latent in 'onestep' mode, and the baseline group.
+    group = getattr(ad, 'rl_onestep_group_size', 4)
+    self.rl_onestep_group_size = 4 if group is None else int(group)
     # k: rollout length. The policy makes k+1 denoiser calls (the grid plus
     # the final noise-removal step), matching `generate_samples`.
     self.rl_num_steps = int(getattr(ad, 'rl_num_steps', 16) or 16)
@@ -2158,6 +2185,8 @@ class MDLM_RL(MDLM_DMMD):
       f'got {self.rl_grad_steps} with rl_num_steps={self.rl_num_steps}.')
     assert self.rl_rollout_reuse >= 1, (
       'adversarial_distill.rl_rollout_reuse must be >= 1.')
+    assert self.rl_onestep_group_size >= 1, (
+      'adversarial_distill.rl_onestep_group_size must be >= 1.')
 
     # FIFO of finished rollouts the auxiliary critic is fit on. Generator
     # steps fill it; fake steps drain it without paying for a rollout.
@@ -2177,11 +2206,28 @@ class MDLM_RL(MDLM_DMMD):
         'sequence, and the diffusion critic has no tractable sequence '
         'log-likelihood to supply it (only an ELBO bound, which is not '
         'implemented here). Use algo=mdlm_dmmd for the diffusion critic.')
+      if self.rl_policy == 'onestep':
+        # 'onestep' shares the parent's sampling distribution, so the only
+        # trajectory-mode knobs it reads are the reward/advantage ones.
+        if self.rl_onestep_group_size < 2:
+          print('[rl] adversarial_distill.rl_onestep_group_size=1: the '
+                'baseline falls back to a batch-level group, but the rows '
+                'of a batch are one-step samples from *different* latents '
+                '(different x0 and t), so most of the reward spread is the '
+                'latent rather than the sample. Still unbiased with '
+                "rl_baseline='leave_one_out', just much noisier -- prefer "
+                '>= 2 so the group is a set of draws from one latent.',
+                flush=True)
+        print(f'[rl] policy=onestep group_size={self.rl_onestep_group_size} '
+              f'baseline={self.rl_baseline} '
+              f'advantage_norm={self.rl_advantage_norm} '
+              f'pathwise_weight={self.rl_pathwise_weight}', flush=True)
+        return
       if self.fake_soft_target:
         print('[rl] adversarial_distill.fake_soft_target is ignored by '
-              'algo=mdlm_rl: the auxiliary critic is fit to the hard '
-              'trajectory samples, because its log-density is what the '
-              'reward subtracts.', flush=True)
+              "algo=mdlm_rl with rl_policy='trajectory': the auxiliary "
+              'critic is fit to the hard trajectory samples, because its '
+              'log-density is what the reward subtracts.', flush=True)
       if self.sampler == 'confidence':
         print('[rl] sampling.predictor=\'confidence\' decodes by confidence '
               'rank, but the RL rollout is always ancestral -- a cached or '
@@ -2202,7 +2248,7 @@ class MDLM_RL(MDLM_DMMD):
       # where *no* position changed anywhere in the batch, and each grid step
       # reveals ~model.length/k positions, so at realistic lengths the cache
       # never engages and the decoder is bit-for-bit the rollout's.
-      print(f'[rl] num_steps={self.rl_num_steps} '
+      print(f'[rl] policy=trajectory num_steps={self.rl_num_steps} '
             f'grad_steps={self.rl_grad_steps} '
             f'baseline={self.rl_baseline} '
             f'advantage_norm={self.rl_advantage_norm} '
@@ -2211,6 +2257,25 @@ class MDLM_RL(MDLM_DMMD):
             f'buffer={self.rl_buffer_size} '
             f'rollout_reuse={self.rl_rollout_reuse} '
             f'eps={self.rl_eps}', flush=True)
+
+  @staticmethod
+  def _normalize_rl_policy(value):
+    """Normalize `adversarial_distill.rl_policy` to 'trajectory' / 'onestep'.
+
+    'trajectory' (default) takes the policy gradient over the multi-step
+    sampler's marginal; 'onestep' takes it over the one-shot conditional
+    `Cat(x_hat_eta(z_t))` that the non-RL algos already sample from.
+    """
+    if value is None:
+      return 'trajectory'
+    mode = str(value).lower()
+    if mode in ('trajectory', 'traj', 'rollout', 'multistep', 'multi_step'):
+      return 'trajectory'
+    if mode in ('onestep', 'one_step', 'one-step', 'single', 'dmmd'):
+      return 'onestep'
+    raise ValueError(
+      f'Unknown adversarial_distill.rl_policy: {value!r} '
+      "(expected 'trajectory' or 'onestep').")
 
   @staticmethod
   def _normalize_rl_baseline(value):
@@ -2626,6 +2691,196 @@ class MDLM_RL(MDLM_DMMD):
         valid_tokens, length)
     return loss
 
+  # --- one-step policy ('onestep') --------------------------------------
+
+  def _rl_onestep_advantage(self, reward):
+    """Group-baselined advantage for a `(batch, G)` reward, detached.
+
+    The same estimator as `_rl_advantage`, taken along the *group* axis: the
+    G columns of a row are i.i.d. draws from `Cat(x_hat_eta(z_t))` at one
+    latent, so their mean is a valid baseline for that row (GRPO / RLOO with
+    the latent as the prompt).
+
+    The batch axis is deliberately left alone. Unlike trajectory rollouts,
+    which all start from the same all-mask prior, each row here is a sample
+    from a *different* `(x0, t)`: a batch-level baseline would mostly
+    subtract off how easy the latent was rather than how good the sample
+    was, and the leftover advantage would rank latents instead of actions.
+
+    `G == 1` has no per-latent group, so it falls back to the batch-level
+    `_rl_advantage` (warned about at init).
+    """
+    reward = reward.detach()
+    n = reward.shape[1]
+    if n < 2:
+      return self._rl_advantage(reward.squeeze(1))[:, None]
+    if self.rl_baseline == 'none':
+      adv = reward
+    elif self.rl_baseline == 'leave_one_out':
+      # Baseline for column g is the mean of the other G-1 rewards of the
+      # same row, hence independent of column g: the estimator stays unbiased.
+      adv = reward - (reward.sum(1, keepdim=True) - reward) / (n - 1)
+    else:
+      adv = reward - reward.mean(1, keepdim=True)
+    if self.rl_advantage_norm == 'std':
+      std = reward.std(1, keepdim=True)
+      # Tensor-valued guard rather than a Python `if`, so no host sync. A row
+      # whose G samples all scored the same carries no information about
+      # which was better, so it contributes exactly nothing.
+      adv = torch.where(std > 1e-6, adv / std.clamp_min(1e-6),
+                        torch.zeros_like(adv))
+    return adv
+
+  def _rl_onestep_generator_loss(self, x0, valid_tokens,
+                                 current_accumulation_step):
+    """REINFORCE over the **one-shot** samples the non-RL algos already draw.
+
+    Sampling distribution: identical to `MDLM_DMMD._generator_loss_ar` (and
+    to `MDLM_with_AR`'s). One denoiser call on a data-derived latent
+    `z_t ~ q(. | x0, t)`, `t` from the usual `_sample_t` draw, then
+    `x ~ Cat(x_hat_eta(z_t))`. Only the *estimator* changes::
+
+        pathwise (D-MMD):  grad sum_i sum_v p_eta(v|z_t)_i * (log p_teacher
+                             - log p_fake)(v | x_<i)      # x_<i held fixed
+        score function:    E_x [ A(x) * grad sum_i log p_eta(x_i | z_t) ]
+
+    The pathwise term differentiates the student's probabilities while
+    holding the *context* the AR critics condition on fixed, so it misses
+    every way a token changes how the rest of the sequence is scored -- it is
+    the gradient of a per-position surrogate, not of the sequence-level
+    reward. The score function is unbiased for the real thing, at the price
+    of variance (which is what the group baseline and `rl_advantage_norm`
+    are for). `rl_pathwise_weight` mixes the two.
+
+    Compared to `rl_policy='trajectory'` this trains the one-step conditional
+    rather than the deployed k-step sampler's marginal, which is the same
+    limitation the non-RL objectives have. What it buys is cost: **one**
+    student forward instead of `rl_num_steps + 1`.
+
+    Three simplifications follow from the sample and the gradient coming out
+    of the *same* forward call, rather than a no-grad rollout that is later
+    recomputed:
+
+    * No `_rl_policy_mode`. There is no second forward to keep consistent
+      with the first, so dropout and injected input noise are shared by
+      construction and the backbone stays in whatever mode
+      `utils.activate_model` left it -- exactly as in the non-RL path.
+    * No `_noise_stream` seed bookkeeping, for the same reason.
+    * No rollout buffer: the auxiliary critic draws its own one-shot samples
+      as cheaply as the generator does (see `_fake_loss_ar`).
+
+    Scale: the surrogate is divided by `model.length` (via `_rl_sum_norm`),
+    not by the number of masked positions, so it stays an unbiased estimate
+    of a fixed multiple of the true gradient. Dividing by the mask count
+    instead would silently reweight the objective by `1/(1 - alpha_t)`, which
+    blows up as `t -> 0`. The practical consequence is that `student_loss`
+    here is smaller than the trajectory mode's by roughly the average mask
+    rate -- only masked positions are actions.
+    """
+    # `multistep_generation`'s body, inline: the surrogate needs the *log*
+    # probabilities, and going through its `student_probs` would mean taking
+    # a log of an exp and reading -inf out of the prompt-preserved one-hots.
+    t = self._sample_t(x0.shape[0], current_accumulation_step)
+    _, alpha_t = self.noise(t)
+    alpha_t = alpha_t.unsqueeze(-1)
+    assert alpha_t.ndim == 2
+    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    log_x_theta = self.forward(xt, sigma=self._sigma_from_alphat(alpha_t))
+
+    # Positions the student actually acted on. The rest are prompt tokens or
+    # positions `q_xt` left revealed, which `_process_model_output` pins to a
+    # one-hot -- their log-prob is the constant 0 and carries no gradient, so
+    # this is a clarification rather than a change of value.
+    acted = (xt == self.mask_index)
+    if valid_tokens is not None:
+      acted = acted & valid_tokens.bool()
+    weight = acted.to(log_x_theta.dtype)
+
+    # G i.i.d. hard samples from the one prediction. Drawn (and the `(B,L,V)`
+    # `exp()` freed) before any critic forward, so only one tensor that size
+    # is alive at a time.
+    group = max(1, self.rl_onestep_group_size)
+    with torch.no_grad():
+      probs = log_x_theta.detach().exp()
+      samples = [
+        self._preserve_prompt_tokens(
+          trainer_base.sample_categorical(probs), x0, valid_tokens)
+        for _ in range(group)]
+      del probs
+
+    # `reward` scores the whole sequence, so the positions `z_t` left
+    # revealed (real data) are in it too. They are not constant across the
+    # group -- they are AR-conditioned on the sampled tokens -- and what is
+    # shared between the G draws is exactly what the per-latent baseline
+    # subtracts off.
+    rewards, teacher_nlls, fake_nlls = [], [], []
+    for x_gen in samples:
+      reward, teacher_nll, fake_nll = self._rl_reward(x_gen, valid_tokens)
+      rewards.append(reward)
+      teacher_nlls.append(teacher_nll)
+      fake_nlls.append(fake_nll)
+    reward = torch.stack(rewards, dim=1)            # (batch, G)
+    advantage = self._rl_onestep_advantage(reward)  # (batch, G)
+
+    norm = self._rl_sum_norm(valid_tokens, xt.shape[1])
+    loss = 0.0
+    logp_total = 0.0
+    for g, x_gen in enumerate(samples):
+      logp = (log_x_theta.gather(-1, x_gen[..., None]).squeeze(-1)
+              * weight).sum(-1)
+      loss = loss - advantage[:, g] * logp
+      logp_total = logp_total + logp.detach()
+    # Mean over the group: each draw is an independent estimate of the same
+    # expectation, so averaging keeps the step size independent of G.
+    loss = loss / (group * norm)
+
+    self._rl_record_entropy(log_x_theta, xt, valid_tokens)
+    self._rl_record_stats(
+      reward.reshape(-1),
+      torch.stack(teacher_nlls, dim=1).reshape(-1),
+      torch.stack(fake_nlls, dim=1).reshape(-1),
+      logp_total / (group * norm),
+      advantage.reshape(-1),
+      # The spread that survives the baseline is the *within-latent* one;
+      # across rows it is dominated by which `(x0, t)` was drawn.
+      reward_std=reward.std(1).mean() if group > 1 else None)
+    if self.rl_pathwise_weight != 0.0:
+      loss = loss + self.rl_pathwise_weight * self._rl_onestep_pathwise(
+        log_x_theta, samples[0], x0, valid_tokens)
+    return loss
+
+  def _rl_onestep_pathwise(self, log_x_theta, x_gen, x0, valid_tokens):
+    """The D-MMD pathwise generator term at this latent, `(batch,)`.
+
+    Exactly `MDLM_DMMD._generator_loss_ar` -- `CE(teacher || x_hat_eta) -
+    CE(fake || x_hat_eta)` with the hard sample as AR context -- but reduced
+    to per-token nats so `rl_pathwise_weight` trades against the surrogate at
+    a comparable scale. `rl_pathwise_weight=1` therefore adds the entire
+    non-RL objective on top of the policy gradient.
+
+    Reuses the surrogate's own forward and its first sample, so the only
+    extra cost is two AR critic forwards. Those are re-run rather than kept
+    from `_rl_reward`: at OWT shapes one `(B, L, V)` float32 log-prob tensor
+    is ~1.6 GB, which is not worth holding across an off-by-default term.
+    """
+    student_probs = self._preserve_prompt_probs(
+      log_x_theta.exp(), x0, valid_tokens)
+    length = x_gen.shape[1] - 1
+    with torch.no_grad():
+      teacher_logprobs = self._apply_top_p_to_teacher(
+        self._ar_logprobs(self.teacher, x_gen))
+    loss = self._rl_reduced_to_per_token(
+      self._ar_cross_entropy(teacher_logprobs, student_probs, valid_tokens),
+      valid_tokens, length)
+    del teacher_logprobs
+    if self.use_fake:
+      with torch.no_grad():
+        fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
+      loss = loss - self._rl_reduced_to_per_token(
+        self._ar_cross_entropy(fake_logprobs, student_probs, valid_tokens),
+        valid_tokens, length)
+    return loss
+
   # --- losses -----------------------------------------------------------
 
   def _generator_loss_ar(self, x0, valid_tokens, current_accumulation_step):
@@ -2635,6 +2890,9 @@ class MDLM_RL(MDLM_DMMD):
     inherited entropy-bonus plumbing (`generator_loss` ->
     `_entropy_term_sum` -> `entropy_weight * H`) applies here untouched.
     """
+    if self.rl_policy == 'onestep':
+      return self._rl_onestep_generator_loss(
+        x0, valid_tokens, current_accumulation_step)
     del current_accumulation_step  # the rollout starts from the prior, not x0
     rollout = self._rl_get_rollout(x0, valid_tokens)
     reward, teacher_nll, fake_nll = self._rl_reward(rollout.x, valid_tokens)
@@ -2648,6 +2906,9 @@ class MDLM_RL(MDLM_DMMD):
 
   def _fake_loss_ar(self, x0, valid_tokens, current_accumulation_step):
     """Auxiliary/fake objective, fit to **trajectory** samples.
+
+    (`rl_policy='onestep'` defers to the parent instead -- see the branch
+    below.)
 
     This is the change that keeps the min-max consistent. `log p_fake`
     appears in the reward as the stand-in for the student's own intractable
@@ -2671,6 +2932,15 @@ class MDLM_RL(MDLM_DMMD):
     changed, so `adversarial_distill.fake_lr` transfers from `mdlm_dmmd`
     unmodified. Only `optim.lr` needs revisiting.
     """
+    if self.rl_policy == 'onestep':
+      # `log p_fake` must be the density of the distribution the reward is
+      # computed on. In 'onestep' that is the one-shot conditional the parent
+      # already fits its critic to, so the inherited objective is exactly the
+      # right one -- and `fake_soft_target` applies with its usual meaning.
+      # It also draws its own samples (one student forward), so the rollout
+      # FIFO is not needed and stays empty.
+      return super()._fake_loss_ar(
+        x0, valid_tokens, current_accumulation_step)
     del current_accumulation_step
     x_gen, buffered_valid = self._rl_draw_buffer(x0, valid_tokens)
     fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
@@ -2700,15 +2970,23 @@ class MDLM_RL(MDLM_DMMD):
 
   # --- logging ----------------------------------------------------------
 
-  def _rl_record_stats(self, reward, teacher_nll, fake_nll, logp, advantage):
-    """Accumulate the `rl/*` diagnostics over this step's micro-batches."""
+  def _rl_record_stats(self, reward, teacher_nll, fake_nll, logp, advantage,
+                       reward_std=None):
+    """Accumulate the `rl/*` diagnostics over this step's micro-batches.
+
+    `reward_std` overrides the default spread with the one the baseline
+    actually leaves behind, for callers whose group is not the batch
+    (`_rl_onestep_generator_loss` passes the within-latent std).
+    """
     values = {
       'rl/reward': reward.mean(),
-      # Spread of the reward *within* the batch. This is the signal the
-      # baseline leaves behind: at 0 every trajectory looked equally good
-      # and the advantage (hence the whole gradient) is 0.
-      'rl/reward_std': (reward.std() if reward.shape[0] > 1
-                        else torch.zeros_like(reward.mean())),
+      # Spread of the reward *within* the baseline group. This is the signal
+      # the baseline leaves behind: at 0 every sample looked equally good and
+      # the advantage (hence the whole gradient) is 0.
+      'rl/reward_std': (
+        reward_std if reward_std is not None
+        else (reward.std() if reward.shape[0] > 1
+              else torch.zeros_like(reward.mean()))),
       'rl/teacher_nll': teacher_nll.mean(),
       'rl/fake_nll': fake_nll.mean(),
       'rl/logp': logp.mean(),

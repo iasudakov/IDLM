@@ -225,23 +225,20 @@ adversarial_distill:
   confidence_loss_threshold: null
   confidence_loss_min_k: null
 
-  # --- Trajectory-level RL distillation (algo=mdlm_rl, algo.MDLM_RL) --------
+  # --- RL distillation (algo=mdlm_rl, algo.MDLM_RL) -------------------------
   #
   # Everything below is read only by `algo=mdlm_rl`. That algo optimizes the
-  # SAME reverse KL as D-MMD, but on samples from the student's own multi-step
-  # sampler instead of a one-shot draw from a data-derived latent: it rolls out
-  # the ancestral sampler from the all-mask prior, scores the finished sequence
-  # with the AR critics (`reward = log p_teacher(x) - log p_fake(x)`), and
-  # trains with REINFORCE on the trajectory's log-probability. It requires
-  # critic_type=ar (the diffusion critic has no tractable sequence log-density
-  # to reward with) and reuses top_p / top_p_delta / entropy_weight /
-  # fake_teacher_weight / fake_lr / fake_frequency / use_fake /
-  # use_gradient_clipping unchanged.
+  # SAME reverse KL as D-MMD, but replaces D-MMD's *pathwise* gradient (which
+  # differentiates through the student's soft prediction while holding the AR
+  # critics' context fixed) with a REINFORCE / policy gradient on the hard
+  # samples the critics actually score. It requires critic_type=ar (the reward
+  # is a sequence log-density, which the diffusion critic cannot supply) and
+  # reuses top_p / top_p_delta / entropy_weight / fake_teacher_weight /
+  # fake_lr / fake_frequency / use_fake / use_gradient_clipping unchanged.
   #
   # Ignored by mdlm_rl: dmmd_* (the D-MMD mask-sampling scheme is specific to
-  # the diffusion critic), fake_soft_target (the critic is fit to hard
-  # trajectory samples, because its log-density is what the reward subtracts),
-  # confidence_loss_* , loss_weighting and generator_num_noised_samples.
+  # the diffusion critic), confidence_loss_*, loss_weighting and
+  # generator_num_noised_samples.
   #
   # SCALE: every generator-side RL term is reduced to per-token nats, whereas
   # the D-MMD losses are a *sum* over ~model.length positions on OWT. So
@@ -249,8 +246,47 @@ adversarial_distill:
   # expect to raise it. `fake_lr` does transfer (the critic objective keeps its
   # original units). Compare `grad_norm_student`, which both algos log.
   #
-  # k: rollout length. The policy makes k+1 denoiser calls (the grid plus the
-  # terminal noise-removal step), exactly what generate_samples does, so this
+  # WHICH samples the policy gradient is taken over:
+  # * 'trajectory' (default): roll the student's own multi-step ancestral
+  #   sampler out from the all-mask prior and score the finished sequence, so
+  #   `pi_eta` is genuinely the deployed k-step sampler's marginal. Costs
+  #   `rl_num_steps + 1` student forwards per micro-step. Reads rl_num_steps /
+  #   rl_grad_steps / rl_buffer_size / rl_rollout_reuse / rl_eps; the auxiliary
+  #   critic is retargeted to trajectory samples, so fake_soft_target does not
+  #   apply.
+  # * 'onestep': draw the sample exactly the way the non-RL runs do -- one
+  #   denoiser call on a data-derived latent `z_t ~ q(.|x0, t)`, then
+  #   `x ~ Cat(x_hat_eta(z_t))` -- and take the policy gradient of the same
+  #   reward over *that* distribution. Same sampling distribution as
+  #   algo=mdlm_dmmd / mdlm (critic_type=ar), only the estimator changes:
+  #   unbiased score-function instead of the pathwise term, which is biased
+  #   because it freezes the AR context while differentiating the
+  #   probabilities. Costs ONE student forward (the sample and the gradient
+  #   come from the same call) plus `rl_onestep_group_size` critic forwards --
+  #   substantially cheaper than 'trajectory'. Reads rl_onestep_group_size;
+  #   ignores rl_num_steps / rl_grad_steps / rl_buffer_size /
+  #   rl_rollout_reuse / rl_eps, and the auxiliary critic keeps the parent's
+  #   one-shot objective (so fake_soft_target applies as usual).
+  # Aliases: {'trajectory','traj','rollout','multistep'} /
+  #          {'onestep','one_step','one-step','single','dmmd'}.
+  rl_policy: trajectory
+  # G: i.i.d. hard samples drawn per latent in rl_policy='onestep', and the
+  # group the baseline is computed over. Grouping *per latent* is what makes
+  # the baseline valid here: unlike trajectory rollouts (which all start from
+  # the same all-mask prior and are therefore i.i.d.), one-step samples are
+  # conditioned on a different `x0` and `t` in every row, so a batch-level
+  # baseline mostly measures which latent was easy rather than which sample
+  # was good. With G samples from one `z_t` it is GRPO with the prompt being
+  # that latent. Costs G teacher + G fake forwards per micro-step (one at a
+  # time, so peak memory is unchanged); the student forward is shared.
+  # G=1 disables per-latent grouping and falls back to a batch-level baseline
+  # across latents -- still unbiased with rl_baseline='leave_one_out', but
+  # much noisier; a warning is printed.
+  rl_onestep_group_size: 4
+  #
+  # k: rollout length ('trajectory' only). The policy makes k+1 denoiser calls
+  # (the grid plus the terminal noise-removal step), exactly what
+  # generate_samples does, so this
   # is also the step budget the student is being trained to decode at -- set
   # sampling.steps to the same value to evaluate what was trained. Cost is
   # linear in it: a generator micro-step is k+1 no-grad forwards plus
@@ -271,9 +307,12 @@ adversarial_distill:
   # a bug -- the step's true contribution really is ~0 -- and `rl/logp` logging
   # exactly 0.0 is the tell. Raise M if losing ~6% of updates matters.
   rl_grad_steps: 1
-  # Baseline subtracted from the reward, over the group of trajectories (they
-  # all start from the same all-mask prior, so they are i.i.d. and the group
-  # mean is a valid baseline -- GRPO with an empty prompt).
+  # Baseline subtracted from the reward, over the group of samples. In
+  # rl_policy='trajectory' the group is a set of rollouts, which all start from
+  # the same all-mask prior and so are i.i.d. -- GRPO with an empty prompt. In
+  # rl_policy='onestep' it is the rl_onestep_group_size draws from one latent
+  # -- GRPO with that latent as the prompt. Both settings below apply to
+  # either.
   # 'leave_one_out' (default): mean of the *other* rewards, so the baseline is
   #   independent of the row it is subtracted from and the estimator stays
   #   unbiased. 'group_mean': plain GRPO. 'none': raw reward (unbiased, but
@@ -286,6 +325,9 @@ adversarial_distill:
   # Trajectories per baseline group. 0 => the whole local rollout batch (i.e.
   # loader.batch_size). A group of 1 has no baseline and contributes a zero
   # advantage, so keep loader.batch_size >= 2.
+  # rl_policy='onestep' groups per latent instead (see rl_onestep_group_size)
+  # and only consults this when that is set to 1, i.e. for the batch-level
+  # fallback.
   #
   # With rl_advantage_norm='std' the advantage is a z-score, so its magnitude
   # says nothing about how far apart the rewards actually were -- only how the
@@ -295,25 +337,34 @@ adversarial_distill:
   # some magnitude information; use rl_advantage_norm='none' if you want the
   # reward gap itself to drive the step size.
   rl_group_size: 0
-  # Mix the D-MMD *pathwise* generator term back in, evaluated at one of the
-  # trajectory's own latents with the rolled-out sequence as AR context. 0
-  # (default) => pure policy gradient and nothing extra is built. The pathwise
-  # gradient is low-variance but biased toward the one-step conditional, so a
-  # small weight can stabilize early training. Costs two extra AR forwards.
+  # Mix the D-MMD *pathwise* generator term back in. 0 (default) => pure policy
+  # gradient and nothing extra is built. The pathwise gradient is low-variance
+  # but biased (it freezes the AR context), the policy gradient is unbiased but
+  # high-variance, so a small weight can stabilize early training. Costs two
+  # extra AR forwards.
+  # * rl_policy='trajectory': evaluated at one of the trajectory's own latents
+  #   with the rolled-out sequence as AR context.
+  # * rl_policy='onestep': evaluated at the same latent and on the same sample
+  #   the policy gradient uses, so it is *exactly* the algo=mdlm_dmmd AR
+  #   generator loss (in per-token nats). Weight 1.0 therefore adds the whole
+  #   non-RL objective on top of the RL one.
   rl_pathwise_weight: 0.0
-  # FIFO of finished rollouts the auxiliary critic is fit on. Generator steps
+  # ('trajectory' only.) FIFO of finished rollouts the auxiliary critic is fit
+  # on. Generator steps
   # fill it, fake steps draw from it, so a fake step costs no rollout. Only the
   # sequences are stored (rl_buffer_size * loader.batch_size * model.length
   # int64s). Larger => the critic sees a slightly staler mixture.
   rl_buffer_size: 8
-  # Reuse one rollout for this many consecutive generator micro-steps. Setting
+  # ('trajectory' only.) Reuse one rollout for this many consecutive generator
+  # micro-steps. Setting
   # it to `accum_batches` is *exactly* on-policy -- neither the student nor the
   # critic takes an optimizer step inside an accumulation window -- and divides
   # the rollout cost by that factor; the price is correlated gradients within
   # the window. Beyond accum_batches it becomes off-policy and, with no
   # importance ratio implemented, biased.
   rl_rollout_reuse: 1
-  # Terminal time of the rollout's sampling grid. null => 1e-5, the default
+  # ('trajectory' only.) Terminal time of the rollout's sampling grid. null =>
+  # 1e-5, the default
   # `TrainerBase.generate_samples` decodes with, so the trained policy is the
   # evaluated one. NOTE this is deliberately not training.sampling_eps (1e-3),
   # which floors the *training* time draw.
