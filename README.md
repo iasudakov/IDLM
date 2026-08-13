@@ -205,8 +205,21 @@ whole run**, while the generated side is re-sampled every validation at
 `1000 / loader.eval_batch_size` batches of `sampling.steps` denoiser calls — that
 is the half that bounds both the runtime and the accuracy. `val/fid_num_gen` and
 `val/fid_num_real` are logged beside it, because the estimator is biased upward at
-small counts (real vs. real at 64 images per side measures ~199 here) and the
-number means nothing without them.
+small counts and the number means nothing without them.
+
+Measured reference points at `sampling.steps=32`, useful for reading `val/fid`:
+
+| | FID |
+|---|---|
+| real vs. real, 64 per side (the old defaults) | ~199 |
+| real vs. real, 1000 vs 50000 (the floor at these counts) | **30.4** |
+| the loaded teacher, 1000 vs 50000 | **106.3** |
+
+So at 1000 generated images roughly 30 points are estimator bias and the teacher
+sits ~76 above the floor — that gap is the room distillation has to move in. Under
+the previous few-batch defaults the floor (~199) exceeded the whole signal, which
+is why the counts matter more than they look. Bias falls roughly as `1/n_gen`, so
+raise `eval.fid_num_gen_images` if you need to resolve smaller differences.
 
 `eval.compute_perplexity_on_sanity=True` additionally runs that whole block
 during Lightning's sanity check, before the first optimizer step, and pushes it
