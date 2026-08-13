@@ -265,22 +265,25 @@ def _eval_fid(diffusion_model, config, logger, tokenizer):
   assert config.data.train == 'cifar10', \
                     'FID eval only implemented for CIFAR-10'
 
-  # Like in flow matching papers: FID against train
-  loader, _ = dataloader.get_dataloaders(config, 
-    tokenizer=tokenizer, skip_valid=True)
+  # Like in flow matching papers: FID against train -- un-flipped. The reference
+  # is the data distribution itself, and `DiscreteCIFAR10(train=True)` otherwise
+  # hands back randomly mirrored images, since `RandomHorizontalFlip` is a
+  # *training* augmentation. Going through `get_dataloaders` would apply it.
+  dataset = dataloader.DiscreteCIFAR10(
+    config.data.cache_dir, train=True, augment=False)
 
   sampler = DistributedSampler(
-    loader.dataset,
+    dataset,
     num_replicas=fabric.world_size,
     rank=fabric.global_rank,
     shuffle=False)
-  
+
   loader = torch.utils.data.DataLoader(
-    loader.dataset,
+    dataset,
     batch_size=config.loader.eval_batch_size,
     sampler=sampler,
-    num_workers=loader.num_workers if hasattr(loader, 'num_workers') else 0,
-    pin_memory=getattr(loader, 'pin_memory', False))
+    num_workers=config.loader.num_workers,
+    pin_memory=config.loader.pin_memory)
   
   # Check each GPU must generate the same number of images
   assert len(loader) == len(loader.dataset) // loader.batch_size // fabric.world_size, \
