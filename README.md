@@ -159,6 +159,41 @@ bash scripts/train_idlm_mdlm_tynigsm.sh
 bash scripts/train_idlm_duo_tynigsm.sh
 ```
 
+### Unconditional CIFAR-10 Distillation
+
+The same D-MMD recipe (`algo=mdlm_dmmd`) on images instead of text. CIFAR-10 is
+modelled as raw pixels — every image is a sequence of `3*32*32 = 3072` byte
+tokens over a 257-category vocabulary (256 byte values plus `[MASK]`) — so only
+the domain-specific pieces change: `data=cifar10`, the D3PM UNet denoiser
+(`model=unet`, `algo.backbone=unet`), and the cosine noise schedule with time
+conditioning (`noise=cosine`, `algo.time_conditioning=True`), which is what the
+teacher was trained with.
+
+The teacher is the 1.5M-step MDLM checkpoint from
+[jdeschena/duo2-cifar10](https://huggingface.co/jdeschena/duo2-cifar10/tree/main/mdlm/cosine_time_cond)🤗.
+Nothing needs pre-downloading: `eval.checkpoint_path` accepts a
+`<hf_repo>:<path>` hub spec, which is fetched and cached while the model is
+built — before training starts — and torchvision fetches CIFAR-10 into
+`data.cache_dir` on the first batch. A local `.ckpt` path works there too.
+
+```bash
+bash scripts/train_idlm_mdlm_cifar10.sh
+```
+
+Note `callbacks.checkpoint_monitor.monitor=val/nll` in that script: the default
+monitors `val/gen_ppl`, one of the text metrics an image run does not log, and
+Lightning raises rather than warns on a missing monitor key.
+
+Because `configs/data/cifar10.yaml` sets `modality: image`, the text metrics
+(generative perplexity, the GPT-2 gradient moment, decoded sample tables) are
+skipped and the image ones take their place at every validation: `val/fid`,
+`val/bpd`, `val/sample_entropy`, `val/pred_entropy`, plus a grid of generated
+images for loggers that support them. `val/fid` is computed over
+`sampling.num_sample_batches` generated batches against `eval.fid_num_batches`
+validation ones — a few hundred images, not the usual 50k — so it is a relative
+signal across the steps of one run rather than a publishable FID; raise both to
+tighten it. `mode=sample_eval` writes the same numbers plus a PNG grid.
+
 ---
 
 ## Evaluation

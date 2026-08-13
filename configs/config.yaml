@@ -412,6 +412,26 @@ eval:
   # cross terms, so raise it to cut variance -- in `mode=sample_eval` the
   # effective M is min(this, sampling.num_sample_batches) and is printed.
   gm_num_batches: 10
+  # --- Image (raw-pixel) metrics: only used when `data.modality=image`
+  # (data=cifar10). The text metrics above -- generative perplexity and GM --
+  # are skipped there; these replace them. See
+  # `trainer_base.TrainerBase._log_image_metrics`.
+  #
+  # Frechet Inception Distance between generated images and validation images,
+  # logged as val/fid. Cheap because it is computed over a FEW batches only:
+  # `sampling.num_sample_batches` generated batches against `fid_num_batches`
+  # validation ones, i.e. a few hundred images rather than the usual 50k. The
+  # estimator is biased upward at that size, so read val/fid as a relative
+  # signal across steps of one run, not as a publishable FID.
+  compute_fid: True
+  fid_num_batches: 4
+  fid_feature: 2048  # Inception-V3 feature layer (64 / 192 / 768 / 2048)
+  # Log a grid of the last generated batch every validation, for loggers that
+  # support images (underdeep does; TensorBoard silently skips it).
+  log_sample_images: True
+  sample_image_key: val/samples
+  sample_image_num: 16
+  sample_image_nrow: 8
   compute_perplexity_on_sanity: False
   # Mean entropy (nats) of the denoiser's *own* predictive distribution
   # p_theta(x0 | x_t), averaged over every (denoiser call, still-masked

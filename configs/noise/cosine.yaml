@@ -1,0 +1,9 @@
+# alpha_t = 1 - cos(pi/2 * (1 - t)), the schedule the published CIFAR-10
+# checkpoints (jdeschena/duo2-cifar10, `.../cosine_time_cond/`) were trained
+# with. Selected by `trainer_base.TrainerBase` on `noise.type`.
+type: cosine
+parameterization: cosine
+eps: 1e-3
+denoiser_latent_conditioning: -1
+freeze_encoder: False
+freeze_decoder: False

@@ -54,6 +54,92 @@ def print_nans(tensor, name):
     print(name, tensor)
 
 
+def is_vision(config):
+  """Whether this run is on images (raw pixels) rather than text.
+
+  Read off `data.modality` (see `configs/data/cifar10.yaml`), so any dataset
+  config can opt in. Gates the text-only evaluation path -- generative
+  perplexity, the GPT-2 gradient moment, decoded sample tables -- in favour of
+  the image one (FID, sample grids).
+  """
+  return str(config.data.get('modality', 'text')) == 'image'
+
+
+def resolve_checkpoint_path(path):
+  """Local path for `path`, downloading it from the HF hub if need be.
+
+  Accepts either
+    * a local file / directory, returned unchanged, or
+    * a `<repo_id>:<path/inside/repo>` hub spec (optionally prefixed `hf:`),
+      e.g. `jdeschena/duo2-cifar10:mdlm/cosine_time_cond/1500000.ckpt`,
+      which is downloaded into the shared HF cache and the cached path
+      returned. Already-cached files are not re-downloaded, so pre-fetching with
+      `scripts/download_cifar10_teacher.py` makes training start offline.
+  """
+  path = os.fspath(path)
+  if os.path.exists(path):
+    return path
+  spec = path[len('hf:'):] if path.startswith('hf:') else path
+  if ':' not in spec:
+    raise FileNotFoundError(
+      f'Checkpoint {path!r} does not exist locally and is not a '
+      "'<hf_repo_id>:<path/in/repo>' hub spec.")
+  repo_id, _, filename = spec.partition(':')
+  import huggingface_hub
+  return huggingface_hub.hf_hub_download(repo_id, filename)
+
+
+def load_backbone_from_lightning_checkpoint(backbone, checkpoint_path,
+                                            use_ema=True):
+  """Load a Lightning checkpoint's `backbone.*` weights into `backbone`.
+
+  Used to bring the published raw-pixel checkpoints (`jdeschena/duo2-cifar10`,
+  saved by the upstream duo trainer) into this repo's UNet, which is why only
+  the backbone sub-tree is touched: the rest of that checkpoint (optimizer
+  state, the pickled tokenizer, that trainer's loop state) describes a different
+  training run and is irrelevant to distilling from it.
+
+  `use_ema` substitutes the checkpoint's EMA shadow parameters for the raw ones,
+  which is what upstream evaluates with (`_eval_mode` copies EMA into place), so
+  the teacher we distill from is the model whose published sample quality was
+  measured. The shadow list is ordered by `parameters()`, so it is zipped
+  against the checkpoint's own parameter keys in state-dict order and only used
+  when the two line up exactly.
+  """
+  checkpoint_path = resolve_checkpoint_path(checkpoint_path)
+  checkpoint = torch.load(
+    checkpoint_path, map_location='cpu', weights_only=False)
+  state_dict = checkpoint.get('state_dict', checkpoint)
+  prefix = 'backbone.'
+  weights = {key[len(prefix):]: value
+             for key, value in state_dict.items()
+             if key.startswith(prefix)}
+  if not weights:
+    raise ValueError(
+      f'No `backbone.*` weights found in {checkpoint_path}.')
+  ema_state = checkpoint.get('ema', None) if use_ema else None
+  shadow_params = (ema_state or {}).get('shadow_params', None)
+  if shadow_params:
+    param_names = {name for name, _ in backbone.named_parameters()}
+    # State-dict order == `parameters()` order for this backbone (it holds no
+    # buffers); the length check is what guarantees the pairing is meaningful.
+    ordered = [key[len(prefix):] for key in state_dict
+               if key.startswith(prefix)
+               and key[len(prefix):] in param_names]
+    if len(ordered) == len(shadow_params):
+      weights.update(zip(ordered, shadow_params))
+    else:
+      print('[checkpoint] EMA shadow params ({}) do not line up with the '
+            'checkpoint\'s backbone parameters ({}); loading the raw '
+            'weights instead.'.format(len(shadow_params), len(ordered)),
+            flush=True)
+  backbone.load_state_dict(weights, strict=True)
+  print('[checkpoint] loaded {} backbone tensors from {}{}'.format(
+    len(weights), checkpoint_path,
+    ' (EMA)' if shadow_params else ''), flush=True)
+  return backbone
+
+
 class LRHalveScheduler:
   def __init__(self, warmup_steps, n_halve_steps):
     self.warmup_steps = warmup_steps

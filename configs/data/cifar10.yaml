@@ -1,0 +1,22 @@
+# CIFAR-10 as discrete raw pixels: every image is a sequence of
+# 3 * 32 * 32 = 3072 tokens over a 256-category (byte) vocabulary, channel-major
+# (see `dataloader.DiscreteCIFAR10`). `modality: image` is what switches the
+# eval path from the text metrics (generative perplexity, GPT-2 GM) to the image
+# ones (FID, sample grids) -- see `trainer_base.TrainerBase`.
+#
+# NOTE the default `callbacks/checkpoint_monitor` watches `val/gen_ppl`, which is
+# one of the text metrics an image run does not log, and Lightning raises on a
+# missing monitor key. Pass `callbacks.checkpoint_monitor.monitor=val/nll` (or
+# `val/fid`); `scripts/train_idlm_mdlm_cifar10.sh` does.
+train: cifar10
+valid: cifar10        # torchvision's test split
+modality: image
+tokenizer_name_or_path: cifar10
+cache_dir: /slot/sandbox/d/in/script/0_script_unpacked/code/cache_dir
+num_classes: 10
+size: 1024            # H * W
+length: 3072          # 3 * H * W, i.e. model.length
+wrap: False
+streaming: False
+insert_train_eos: False
+insert_valid_eos: False

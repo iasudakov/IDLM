@@ -1,0 +1,28 @@
+# D3PM-style UNet denoiser for raw-pixel image diffusion (CIFAR-10).
+# These values are the ones the published CIFAR-10 checkpoints
+# (jdeschena/duo2-cifar10) were trained with -- do not change them if you intend
+# to load those weights.
+name: unet
+type: unet
+ch: 128
+num_res_blocks: 2
+num_scales: 4
+ch_mult: [1, 2, 2, 2]
+input_channels: 3
+output_channels: -1  # 2 * input_channels (truncated-logistic mu / log-scale)
+scale_count_to_put_attn: 1  # attention at 16x16
+data_min_max: [0, 255]  # unused; the rescaling reads vocab_size
+dropout: 0.1
+skip_rescale: True
+time_conditioning: True
+time_scale_factor: 1000
+time_embed_dim: ${.ch}
+fix_logistic: False
+size: ${data.size}
+cond_dim: ${.ch}
+length: ${data.length}
+# Width of the vector the generator input-noise projection writes into
+# (`adversarial_distill.noise_dim > 0`). For this backbone that is the time
+# embedding, i.e. 4 * ch -- there is no token embedding to inject into. Only
+# read as a fallback by `algo._wrap_backbone_with_noise`.
+hidden_size: 512

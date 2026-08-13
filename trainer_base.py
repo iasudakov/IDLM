@@ -33,8 +33,37 @@ class LogLinear(torch.nn.Module):
 
   def forward(self, t):
     t = (1 - self.eps) * t
-    alpha_t = 1 - t 
+    alpha_t = 1 - t
     dalpha_t = - (1 - self.eps)
+    return dalpha_t, alpha_t
+
+
+class Cosine(torch.nn.Module):
+  """`alpha_t = 1 - cos(pi/2 * (1 - t))`, as in the upstream duo repo.
+
+  Selected with `noise=cosine`; it is the schedule the published CIFAR-10
+  checkpoints (`jdeschena/duo2-cifar10`) were trained under, so distilling from
+  them requires it -- `alpha_t` is what `q_xt` masks with and what the teacher's
+  time conditioning is derived from, and a mismatched schedule silently scores
+  the teacher at noise levels it never saw.
+
+  `dalpha_t` is returned with a trailing singleton axis (its callers pair it
+  with an already-unsqueezed `alpha_t` against a `(batch, length)` loss, which a
+  bare `(batch,)` would not broadcast against; `LogLinear` sidesteps this by
+  returning a scalar).
+  """
+
+  def __init__(self):
+    super().__init__()
+    self.eps = 1e-3
+    self.half_pi = torch.pi / 2
+
+  def forward(self, t):
+    t = (1 - self.eps) * t
+    alpha_t = 1 - torch.cos(self.half_pi * (1 - t))
+    dalpha_t = - torch.sin(self.half_pi * (1 - t)) * self.half_pi
+    if dalpha_t.ndim == 1:
+      dalpha_t = dalpha_t.unsqueeze(-1)
     return dalpha_t, alpha_t
 
 
@@ -142,22 +171,57 @@ class TrainerBase(L.LightningModule):
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         config.eval.checkpoint_path, trust_remote_code=True)
+    elif self.config.algo.backbone == 'unet':
+      # Raw-pixel (CIFAR-10) denoiser. As with `hf_dit`, `eval.checkpoint_path`
+      # is where the pretrained weights come from -- for distillation those are
+      # the teacher's, and `algo.MDLM_with_AR` copies this backbone into the
+      # teacher / fake critics. Accepts a local Lightning `.ckpt` or a
+      # `<hf_repo>:<path>` hub spec (see `utils.resolve_checkpoint_path`).
+      self.backbone = models.unet.UNet(
+        self.config, vocab_size=self.vocab_size)
+      if config.eval.checkpoint_path:
+        utils.load_backbone_from_lightning_checkpoint(
+          self.backbone, config.eval.checkpoint_path,
+          use_ema=not config.eval.disable_ema)
+        # `algo.time_conditioning=False` makes `_process_sigma` feed the
+        # denoiser a constant zero time, which a `*_time_cond` checkpoint was
+        # never trained for -- it still runs, and silently scores every noise
+        # level as if it were t=0. The algo configs default it to False, so this
+        # is easy to leave off by accident.
+        if ('time_uncond' not in str(config.eval.checkpoint_path)
+            and 'time_cond' in str(config.eval.checkpoint_path)
+            and not self.config.algo.time_conditioning):
+          print('[checkpoint] WARNING: this looks like a time-conditioned '
+                'checkpoint but algo.time_conditioning=False, so the denoiser '
+                'will be given t=0 at every noise level. Pass '
+                'algo.time_conditioning=True.', flush=True)
 
     self.T = self.config.algo.T
     self.num_tokens = self.config.model.length
     self.softplus = torch.nn.Softplus()
     self.p_nucleus = self.config.sampling.p_nucleus
     # Noise Schedule
-    self.noise = LogLinear()
+    if str(self.config.noise.get('type', 'log-linear')) == 'cosine':
+      self.noise = Cosine()
+    else:
+      self.noise = LogLinear()
 
+    self.is_vision = utils.is_vision(self.config)
     self.metrics = metrics.Metrics(
       gen_ppl_eval_model_name_or_path=\
         self.config.eval.gen_ppl_eval_model_name_or_path,
       eval_ppl_batch_size=\
         self.config.eval.perplexity_batch_size,
-      compute_gm=self.config.eval.get('compute_gm', False),
+      compute_gm=(self.config.eval.get('compute_gm', False)
+                  and not self.is_vision),
       gm_eval_model_name_or_path=self.config.eval.get(
-        'gm_eval_model_name_or_path', 'gpt2'))
+        'gm_eval_model_name_or_path', 'gpt2'),
+      # Images: skip the text reference models/tokenizer entirely and build the
+      # image metric instead (see `metrics.Metrics`).
+      is_vision=self.is_vision,
+      compute_fid=(self.config.eval.get('compute_fid', True)
+                   and self.is_vision),
+      fid_feature=self.config.eval.get('fid_feature', 2048))
 
     if self.config.training.ema > 0:
       self.ema = models.ema.ExponentialMovingAverage(
@@ -174,7 +238,7 @@ class TrainerBase(L.LightningModule):
     self.fast_forward_batches = None
 
   def _validate_configuration(self):
-    assert self.config.algo.backbone in {'dit', 'hf_dit'}
+    assert self.config.algo.backbone in {'dit', 'hf_dit', 'unet'}
     if self.config.algo.parameterization == 'ar':
       assert not self.config.algo.time_conditioning
       assert self.config.prior.type == 'none'
@@ -361,6 +425,8 @@ class TrainerBase(L.LightningModule):
     self._eval_mode()
     # Buffer for GM data batches (decoded to text; see on_validation_epoch_end).
     self._gm_data_texts = []
+    # How many validation batches have gone into FID's *real* side this epoch.
+    self._fid_real_batches = 0
     assert self.metrics.valid_nlls.nll.mean_value == 0
     assert self.metrics.valid_nlls.nll.weight == 0
 
@@ -373,6 +439,15 @@ class TrainerBase(L.LightningModule):
         self._gm_data_texts) < self.config.eval.get('gm_num_batches', 4):
       self._gm_data_texts.append(
         self.tokenizer.batch_decode(batch['input_ids']))
+    # FID's real side: the first `fid_num_batches` validation images, folded in
+    # as they stream past rather than buffered (the Inception features are all
+    # the estimator keeps).
+    if (self.metrics.fid is not None
+        and self._fid_real_batches
+        < self.config.eval.get('fid_num_batches', 4)):
+      self.metrics.record_fid(
+        self.tokenizer.batch_decode(batch['input_ids']), real=True)
+      self._fid_real_batches += 1
     losses = self._loss(batch['input_ids'],
                         batch['attention_mask'])
     self.metrics.update_valid(losses.nlls, losses.prior_loss,
@@ -386,7 +461,7 @@ class TrainerBase(L.LightningModule):
     if ((self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples):
-      samples, text_samples = None, None
+      samples, text_samples, images = None, None, None
       for _sb in range(
         self.config.sampling.num_sample_batches):
         samples = self.generate_samples(
@@ -394,7 +469,14 @@ class TrainerBase(L.LightningModule):
 
         self.metrics.record_entropy(samples)
         # Decode the samples to be re-tokenized by eval model
-        text_samples = self.tokenizer.batch_decode(samples)
+        decoded = self.tokenizer.batch_decode(samples)
+        if self.is_vision:
+          # Raw pixels: `batch_decode` returns uint8 (B, 3, H, W) images, and
+          # every metric below is text-only. FID takes their place.
+          images = decoded
+          self.metrics.record_fid(images, real=False)
+          continue
+        text_samples = decoded
         if self.config.eval.compute_generative_perplexity:
           self.metrics.record_generative_perplexity(
             text_samples, self.num_tokens, self.device)
@@ -405,7 +487,9 @@ class TrainerBase(L.LightningModule):
           self.metrics.gm.accumulate(
             text_samples, self._gm_data_texts[_sb],
             self.num_tokens, self.device)
-      if text_samples is not None:
+      if self.is_vision:
+        self._log_image_metrics(images)
+      elif text_samples is not None:
         if self.trainer.global_rank == 0 and hasattr(
           self.trainer.logger, 'log_table'):
           # Log the last generated samples
@@ -461,7 +545,8 @@ class TrainerBase(L.LightningModule):
                  on_epoch=True,
                  on_step=False,
                  sync_dist=True)
-      if (self.trainer.global_rank == 0
+      if (diversity.variants is not None
+          and self.trainer.global_rank == 0
           and hasattr(self.trainer.logger, 'log_table')):
         # One row per noise draw, same decoding seed: the qualitative version
         # of `noise_div/agree_noise`.
@@ -471,6 +556,65 @@ class TrainerBase(L.LightningModule):
           data=[[k, replicate[0]]
                 for k, replicate in enumerate(diversity.variants)])
     self._train_mode()
+
+  def _log_image_metrics(self, images):
+    """Validation metrics for a raw-pixel run (`data.modality=image`).
+
+    The image-domain replacement for the text block above: everything there
+    (generative perplexity, the GPT-2 gradient moment, the decoded sample table)
+    needs a language model or a tokenizer and says nothing about pixels. What is
+    logged instead:
+
+    * `val/fid` -- Frechet Inception Distance of the generated images against
+      validation images (`metrics.Metrics.compute_fid`). Over a few batches only,
+      so it is a *relative* signal across steps, biased far above a 50k-sample
+      FID.
+    * `val/sample_entropy` -- unigram entropy of the emitted byte values, i.e.
+      how much of the palette a sample uses. Domain-agnostic (it is the same
+      statistic the text runs log) and the first thing to collapse if the
+      generator mode-collapses to flat images.
+    * `val/pred_entropy` -- entropy of the denoiser's own per-pixel
+      conditionals over the sampling trajectory, bounded by log(257) ~= 5.55.
+    * a grid of the last generated batch, for loggers with `log_image`.
+
+    `val/nll`, `val/bpd` and `val/ppl` are logged by the caller and need no
+    special casing -- for images `val/bpd` is bits per *pixel-channel*.
+    """
+    fid = self.metrics.compute_fid()
+    if fid is not None:
+      self.log('val/fid',
+               torch.as_tensor(float(fid), device=self.device),
+               on_epoch=True, on_step=False, sync_dist=True)
+    self.log('val/sample_entropy',
+             self.metrics.sample_entropy.compute(),
+             on_epoch=True, on_step=False, sync_dist=True)
+    if float(self.metrics.pred_entropy.weight) > 0:
+      self.log('val/pred_entropy',
+               self.metrics.pred_entropy.compute(),
+               on_epoch=True, on_step=False, sync_dist=True)
+    self._log_sample_images(images)
+
+  def _log_sample_images(self, images):
+    """Log a grid of generated images. Rank zero, best-effort, never fatal."""
+    if (images is None
+        or not self.config.eval.get('log_sample_images', True)
+        or self.trainer.global_rank != 0
+        or not hasattr(self.trainer.logger, 'log_image')):
+      return
+    try:
+      import torchvision
+      num = min(images.shape[0],
+                int(self.config.eval.get('sample_image_num', 16)))
+      grid = torchvision.utils.make_grid(
+        images[:num].detach().cpu(),
+        nrow=int(self.config.eval.get('sample_image_nrow', 8)),
+        padding=2)
+      self.trainer.logger.log_image(
+        key=self.config.eval.get('sample_image_key', 'val/samples'),
+        image=grid.permute(1, 2, 0).numpy(),
+        step=self.global_step)
+    except Exception as e:  # pragma: no cover - diagnostics are best-effort
+      print('[samples] image log failed: {}'.format(e), flush=True)
 
   def _log_pareto_curve(self, sample_entropy, gen_ppl):
     """Extend the run's quality/diversity Pareto curve by one point.
@@ -700,7 +844,10 @@ class TrainerBase(L.LightningModule):
         report['noise_div/decode_sensitivity'] = (1.0 - agree_decode) / span
 
     variants = None
-    if return_variants:
+    if return_variants and not self.is_vision:
+      # Skipped for images: `batch_decode` gives tensors, and every consumer of
+      # `variants` prints or tabulates them as text. The numbers above are
+      # token-level and domain-agnostic, so the probe itself still applies.
       variants = [self.tokenizer.batch_decode(replicate)
                   for replicate in noise_arm]
     return NoiseDiversity(metrics=report, variants=variants)

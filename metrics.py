@@ -242,7 +242,10 @@ class Metrics:
   def __init__(self, gen_ppl_eval_model_name_or_path=None,
                eval_ppl_batch_size=None,
                compute_gm=False,
-               gm_eval_model_name_or_path='gpt2') -> None:
+               gm_eval_model_name_or_path='gpt2',
+               is_vision=False,
+               compute_fid=False,
+               fid_feature=2048) -> None:
     metrics = torchmetrics.MetricCollection({
         'nll': NLL(), 'bpd': BPD(), 'ppl': Perplexity()})
     metrics.set_dtype(torch.float64)
@@ -254,14 +257,31 @@ class Metrics:
     self.sample_entropy = torchmetrics.aggregation.MeanMetric()
     self.pred_entropy = torchmetrics.aggregation.MeanMetric()
     self.eval_ppl_batch_size = eval_ppl_batch_size
+    self.is_vision = is_vision
     self.gm = (GradientMoment(gm_eval_model_name_or_path)
                if compute_gm else None)
     self.gen_ppl_eval_model_name_or_path = gen_ppl_eval_model_name_or_path
-    self.tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(gen_ppl_eval_model_name_or_path)
-    if self.tokenizer.pad_token is None:
-      self.tokenizer.pad_token = self.tokenizer.eos_token
-      self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+    # Frechet Inception Distance between generated and real images -- the image
+    # counterpart of generative perplexity / GM, and the only one of the three
+    # that means anything for raw pixels.
+    self.fid = None
+    self._fid_real = 0
+    self._fid_fake = 0
+    if compute_fid:
+      from torchmetrics.image.fid import FrechetInceptionDistance
+      # normalize=False: `update` takes uint8 images in [0, 255], which is
+      # exactly what `RawPixelsVisionTokenizer.batch_decode` returns.
+      self.fid = FrechetInceptionDistance(
+        feature=fid_feature, normalize=False)
+    self.tokenizer = None
+    if not is_vision:
+      # A raw-pixel run has no text reference model to load, and
+      # `gen_ppl_eval_model_name_or_path` (gpt2-large) is a 3 GB download.
+      self.tokenizer = transformers.AutoTokenizer.\
+        from_pretrained(gen_ppl_eval_model_name_or_path)
+      if self.tokenizer.pad_token is None:
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
   def to(self, *args, **kwargs):
     self.gen_ppl = self.gen_ppl.to(*args, **kwargs)
@@ -273,6 +293,8 @@ class Metrics:
     self.valid_aux = self.valid_aux.to(*args, **kwargs)
     if self.gm is not None:
       self.gm.to(*args, **kwargs)
+    if self.fid is not None:
+      self.fid = self.fid.to(*args, **kwargs)
 
   def reset(self):
     self.gen_ppl.reset()
@@ -284,6 +306,38 @@ class Metrics:
     self.valid_aux.reset()
     if self.gm is not None:
       self.gm.reset()
+    if self.fid is not None:
+      self.fid.reset()
+      self._fid_real = 0
+      self._fid_fake = 0
+
+  @torch.no_grad()
+  def record_fid(self, images, real):
+    """Fold one batch of uint8 `(B, 3, H, W)` images into the FID estimate."""
+    if self.fid is None:
+      return
+    images = images.to(device=self.fid.device, dtype=torch.uint8)
+    self.fid.update(images, real=real)
+    if real:
+      self._fid_real += images.shape[0]
+    else:
+      self._fid_fake += images.shape[0]
+
+  def fid_num_samples(self):
+    """`(real, generated)` image counts behind the current FID estimate."""
+    return self._fid_real, self._fid_fake
+
+  def compute_fid(self):
+    """FID so far, or None when either side has fewer than two images.
+
+    NOTE this is deliberately computed over a handful of batches during
+    training, where the estimator is strongly biased upward (the standard number
+    is 50k images per side). Read it as a relative signal across steps of one
+    run, not as a publishable FID.
+    """
+    if self.fid is None or min(self._fid_real, self._fid_fake) < 2:
+      return None
+    return self.fid.compute()
 
   def update_train(self, nll, aux_loss, num_tokens):
     self.train_nlls.update(nll, num_tokens)

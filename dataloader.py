@@ -11,6 +11,7 @@ import zipfile
 from typing import Optional
 
 import datasets
+import einops
 import fsspec
 import numpy as np
 import requests
@@ -21,6 +22,93 @@ import transformers
 import utils
 
 LOGGER = utils.get_logger(__name__)
+
+
+class RawPixelsVisionTokenizer:
+  """"Tokenizer" for raw-pixel image diffusion (CIFAR-10).
+
+  An image is a sequence of `3 * H * W` byte-valued tokens (channel-major, see
+  `DiscreteCIFAR10`), so no learned tokenization is involved: the identity is
+  the encoder and `batch_decode` just folds the flat sequence back into a
+  `(B, 3, H, W)` uint8 image -- which is exactly what a metric like FID takes.
+
+  Mirrors the upstream duo implementation (`s-sahoo/duo`), including the class
+  name, because the published CIFAR-10 checkpoints pickle an instance of it
+  inside their Lightning `hyper_parameters`; unpickling those resolves to this
+  class.
+  """
+
+  def __init__(self, vocab_size, image_size,
+               add_mask_token=True, add_special_tokens=False):
+    self.pad_token_id = None
+    self.pad_token = None
+    self.bos_token = None
+    self.bos_token_id = None
+    self.eos_token = None
+    self.eos_token_id = None
+    self.mask_token = None
+    self.mask_token_id = None
+    if add_mask_token:
+      # Absorbing-state diffusion: one extra category for [MASK].
+      self.mask_token = vocab_size
+      self.mask_token_id = vocab_size
+      vocab_size = vocab_size + 1
+    if add_special_tokens:
+      self.bos_token = vocab_size
+      self.bos_token_id = vocab_size
+      self.eos_token = vocab_size + 1
+      self.eos_token_id = vocab_size + 1
+      vocab_size = vocab_size + 2
+    self.vocab_size = vocab_size
+    self.image_size = image_size
+
+  def __call__(self, x):
+    return x
+
+  def batch_decode(self, x):
+    """`(B, 3 * H * W)` token ids -> `(B, 3, H, W)` uint8 images."""
+    x = einops.rearrange(x, 'b (c h w) -> b c h w', c=3,
+                         h=self.image_size)
+    return x.to(dtype=torch.uint8)
+
+  def decode(self, x):
+    x = einops.rearrange(x, '(c h w) -> h w c', c=3,
+                         h=self.image_size)
+    return x.to(dtype=torch.uint8)
+
+  def __len__(self):
+    return self.vocab_size
+
+
+class DiscreteCIFAR10(torch.utils.data.Dataset):
+  """CIFAR-10 as flat sequences of 3072 byte tokens (D3PM / duo convention)."""
+
+  def __init__(self, cache_dir, train):
+    import torchvision
+    from torchvision import transforms as th_transforms
+    self._dataset = torchvision.datasets.CIFAR10(
+      root=cache_dir, train=train, download=True)
+
+    transforms = []
+    if train:
+      transforms += [th_transforms.RandomHorizontalFlip()]
+    transforms += [
+      th_transforms.Lambda(lambda x: torch.from_numpy(np.array(x))),
+      th_transforms.Lambda(
+        lambda x: einops.rearrange(x, 'h w c -> (c h w)'))]
+    self.transform = th_transforms.Compose(transforms)
+
+  def __len__(self):
+    return len(self._dataset)
+
+  def __getitem__(self, index):
+    img, label = self._dataset[index]
+    img = self.transform(img)
+    # Every pixel is a real token: `attention_mask` is all ones, as it is for a
+    # wrapped OWT batch, so the loss reductions behave identically.
+    return {'input_ids': img.to(torch.long),
+            'labels': label,
+            'attention_mask': torch.ones_like(img)}
 
 
 def wt_detokenizer(string):
@@ -588,6 +676,11 @@ def get_dataset(dataset_name,
                 streaming=False,
                 revision : Optional[str]=None,
                 config=None):
+  if dataset_name == 'cifar10':
+    # Images need no tokenization / wrapping / caching pass: torchvision keeps
+    # its own cache under `cache_dir` and downloads on first use.
+    assert mode in ('train', 'validation'), mode
+    return DiscreteCIFAR10(cache_dir=cache_dir, train=mode == 'train')
   eos_tag = ''
   if not insert_eos:
     eos_tag = '_eosFalse'
@@ -861,6 +954,13 @@ class VocabSizeTokenizerWrapper:
 
 
 def get_tokenizer(config):
+  if config.data.tokenizer_name_or_path == 'cifar10':
+    # Raw pixels: nothing below (bos/eos/pad patching, vocab wrapping) applies.
+    # The mask token only exists for absorbing-state (masked) diffusion; the
+    # uniform-state algos keep the plain 256-category vocabulary.
+    return RawPixelsVisionTokenizer(
+      vocab_size=256, image_size=32, add_special_tokens=False,
+      add_mask_token='mdlm' in config.algo.name)
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
   elif config.data.tokenizer_name_or_path == 'bert-base-uncased':

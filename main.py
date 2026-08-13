@@ -60,10 +60,13 @@ class PeriodicStepCheckpoint(L.Callback):
 
 
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
-  if 'hf' in config.algo.backbone:
+  if 'hf' in config.algo.backbone or config.algo.backbone == 'unet':
+    # These backbones load their pretrained weights themselves, from
+    # `eval.checkpoint_path`, inside `TrainerBase.__init__` -- there is no
+    # Lightning checkpoint of *this* repo's module to restore.
     model = diffusion_model(config, tokenizer=tokenizer).to('cuda')
     return model
-  
+
   return diffusion_model.load_from_checkpoint(
     config.eval.checkpoint_path,
     tokenizer=tokenizer,
@@ -107,12 +110,20 @@ def _print_config(
 
 
 @L.pytorch.utilities.rank_zero_only
-def _print_batch(train_ds, valid_ds, tokenizer, k=64):
+def _print_batch(train_ds, valid_ds, tokenizer, k=64, is_vision=False):
   for dl_type, dl in [
     ('train', train_ds), ('valid', valid_ds)]:
     print(f'Printing {dl_type} dataloader batch.')
     batch = next(iter(dl))
     print('Batch input_ids.shape', batch['input_ids'].shape)
+    if is_vision:
+      # Raw pixels: there is nothing to decode, so report the token range
+      # instead (0..255 plus the mask id, which never appears in the data).
+      ids = batch['input_ids']
+      print('min/max/mean:', int(ids.min()), int(ids.max()),
+            float(ids.float().mean()))
+      print(f'First {k} tokens:', ids[0, :k].tolist())
+      continue
     first = batch['input_ids'][0, :k]
     last = batch['input_ids'][0, -k:]
     print(f'First {k} tokens:', tokenizer.decode(first))
@@ -263,6 +274,78 @@ def _generate_samples(diffusion_model, config, logger,
   print('Samples saved at:', samples_path)
 
 
+def _generate_images(diffusion_model, config, logger, tokenizer):
+  """`mode=sample_eval` for a raw-pixel run (`data.modality=image`).
+
+  The image counterpart of `_generate_samples`: same sampling loop, but the
+  metrics are the ones that mean something for pixels -- FID against validation
+  images, the emitted-byte unigram entropy and the denoiser's own predictive
+  entropy -- and the samples are written out as a PNG grid instead of decoded
+  text. Note the FID is over `sampling.num_sample_batches` batches, so raise
+  that (and `eval.fid_num_batches`) if you want a number worth quoting; a few
+  batches only give a strongly upward-biased estimate.
+  """
+  logger.info('Starting Image Sample Eval.')
+  model = _load_from_checkpoint(
+    diffusion_model=diffusion_model,
+    config=config,
+    tokenizer=tokenizer)
+  model.metrics.reset()
+  if config.eval.disable_ema:
+    logger.info('Disabling EMA.')
+    model.ema = None
+
+  # FID's real side: validation images, from the same shuffled loader
+  # `mode=ppl_eval` uses.
+  num_real_batches = int(config.eval.get('fid_num_batches', 4))
+  if model.metrics.fid is not None and num_real_batches > 0:
+    _, valid_ds = dataloader.get_dataloaders(
+      config, tokenizer, skip_train=True, valid_seed=config.seed)
+    for i, batch in enumerate(valid_ds):
+      model.metrics.record_fid(
+        tokenizer.batch_decode(batch['input_ids'].to(model.device)),
+        real=True)
+      if i + 1 == num_real_batches:
+        break
+
+  images = None
+  for _ in range(config.sampling.num_sample_batches):
+    samples = model.restore_model_and_sample(
+      num_steps=config.sampling.steps)
+    model.metrics.record_entropy(samples)
+    images = tokenizer.batch_decode(samples)
+    model.metrics.record_fid(images, real=False)
+
+  entropy = model.metrics.sample_entropy.compute().item()
+  print('Sample entropy:', entropy)
+  pred_entropy = 0.
+  if float(model.metrics.pred_entropy.weight) > 0:
+    pred_entropy = model.metrics.pred_entropy.compute().item()
+    print('Model predictive entropy:', pred_entropy)
+  fid = model.metrics.compute_fid()
+  if fid is not None:
+    fid = float(fid)
+    print('FID (few batches, biased):', fid)
+
+  num_real, num_generated = model.metrics.fid_num_samples()
+  samples_path = config.eval.generated_samples_path
+  with fsspec.open(samples_path, 'w') as f:
+    json.dump({'fid': fid,
+               'fid_num_real': num_real,
+               'fid_num_generated': num_generated,
+               'entropy': entropy,
+               'pred_entropy': pred_entropy}, f, indent=4)
+  print('Metrics saved at:', samples_path)
+  if images is not None:
+    import torchvision
+    grid_path = os.path.splitext(samples_path)[0] + '.png'
+    torchvision.utils.save_image(
+      images.detach().cpu().float() / 255.0,
+      grid_path,
+      nrow=int(config.eval.get('sample_image_nrow', 8)))
+    print('Samples saved at:', grid_path)
+
+
 def _noise_diversity_eval(diffusion_model, config, logger, tokenizer):
   """Sample the same batch under several input-noise draws and report how much
   the noise -- rather than the sampler -- is driving sample diversity."""
@@ -289,10 +372,12 @@ def _noise_diversity_eval(diffusion_model, config, logger, tokenizer):
   for name, value in diversity.metrics.items():
     print(f'  {name}: {value:.6f}')
   # The same row under each noise draw, decoding randomness held fixed: what
-  # `agree_noise` is measuring, in readable form.
-  print('Row 0 under each noise draw:')
-  for k, replicate in enumerate(diversity.variants):
-    print(f'  [noise {k}] {replicate[0][:200]!r}')
+  # `agree_noise` is measuring, in readable form. Not available for images (see
+  # `noise_diversity_report`), where the numbers above are the whole report.
+  if diversity.variants is not None:
+    print('Row 0 under each noise draw:')
+    for k, replicate in enumerate(diversity.variants):
+      print(f'  [noise {k}] {replicate[0][:200]!r}')
   report_path = config.eval.noise_diversity_path
   with fsspec.open(report_path, 'w') as f:
     json.dump({'metrics': diversity.metrics,
@@ -360,7 +445,8 @@ def _train(diffusion_model, config, logger, tokenizer):
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)
-  _print_batch(train_ds, valid_ds, tokenizer)
+  _print_batch(train_ds, valid_ds, tokenizer,
+               is_vision=utils.is_vision(config))
 
   if config.training.finetune_path != '':
     assert utils.fsspec_exists(config.training.finetune_path)
@@ -419,7 +505,10 @@ def main(config):
             'tokenizer': tokenizer,
             'logger': logger}
   if config.mode == 'sample_eval':
-    _generate_samples(**kwargs)
+    if utils.is_vision(config):
+      _generate_images(**kwargs)
+    else:
+      _generate_samples(**kwargs)
   elif config.mode == 'noise_diversity_eval':
     _noise_diversity_eval(**kwargs)
   elif config.mode == 'ppl_eval':

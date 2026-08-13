@@ -3,6 +3,7 @@
 .hf_cache
 test/
 outputs/
+cache_dir*/
 wandb/
 watch_folder/
 notes.md

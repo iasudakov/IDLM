@@ -290,6 +290,11 @@ class _NoiseConditionedBackbone(torch.nn.Module):
     # both cost a reduction over the whole matrix and feed back into itself).
     # Falls back to the DiT init scale if the module exposes no weight.
     embed_std = _embedding_std(embed_module)
+    # Kept as a plain float (not a submodule reference, which would duplicate
+    # the embedding's parameters in this wrapper's state_dict) so
+    # `MDLM_with_AR._student_embed_std` can report the scale the injection is
+    # measured against even when the module is not a token embedding.
+    self.embed_std = embed_std
     # Non-persistent: recomputed from the embedding at every construction, so it
     # adds no state_dict key (an old noise-conditioned checkpoint would
     # otherwise fail Lightning's strict resume with a missing key) and it is not
@@ -381,6 +386,12 @@ class _NoiseConditionedBackbone(torch.nn.Module):
     injected = self.noise_out_scale * F.linear(
       self._noise, self.effective_weight(),
       bias if gain == 1.0 else gain * bias)
+    if output.ndim == 2:
+      # Injection point without a position axis -- the UNet's time embedding,
+      # `(batch, hidden)`. `shared_noise` is forced on for it (see
+      # `_wrap_backbone_with_noise`), so the position axis has length 1 and
+      # dropping it is exact.
+      injected = injected[:, 0]
     # At gain == 0 this adds an exact zero (the forward is bit-identical to the
     # unwrapped checkpoint) but still touches `noise_proj`, so DDP does not have
     # to be told the projection is unused for the duration of the ramp's first
@@ -403,18 +414,44 @@ def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden,
                               shared_noise=False, noise_scale=1.0,
                               warmup_steps=0, hold_rms=False):
   """Locate the token-embedding module of `backbone` and wrap it so a learned
-  Gaussian-noise projection is added to the embedding residual."""
+  Gaussian-noise projection is added to the embedding residual.
+
+  A raw-pixel UNet (`algo.backbone=unet`) has no token embedding -- its input is
+  centered pixel values through a conv -- so there the noise goes into the *time
+  embedding* instead, the per-sample vector every ResBlock conditions on. That
+  makes the injection a global latent for the image rather than a per-position
+  perturbation, so `shared_noise` is forced on; the diversity it buys the
+  generator (D-MMD Sec. 6.5) is the same idea either way. Requires
+  `model.time_conditioning=True`, which is where that embedding lives.
+  """
   embed_module = None
   for name, module in backbone.named_modules():
     if name.endswith('vocab_embed'):
       embed_module = module
       break
-  assert embed_module is not None, (
-    'Could not locate a `vocab_embed` module for noise conditioning.')
+  if embed_module is None:
+    temb_modules = getattr(backbone, 'temb_modules', None)
+    assert temb_modules is not None and len(temb_modules) > 0, (
+      'Could not locate a `vocab_embed` module (text backbones) or a '
+      '`temb_modules` time embedding (image backbones) for noise '
+      'conditioning. For the UNet backbone this means '
+      'model.time_conditioning=False, which leaves nothing to inject into: '
+      'set adversarial_distill.noise_dim=0 or enable time conditioning.')
+    # The last time-embedding layer: its output *is* the conditioning vector
+    # (`UNet._time_embedding` returns it, before the class embedding is added).
+    embed_module = temb_modules[-1]
+    if not shared_noise:
+      print('[noise] no token embedding to inject into; using the time '
+            'embedding, which has no position axis, so '
+            'adversarial_distill.noise_shared is forced on.', flush=True)
+    shared_noise = True
   if hasattr(embed_module, 'embedding'):
     hidden_size = embed_module.embedding.shape[-1]
   elif hasattr(embed_module, 'embedding_dim'):
     hidden_size = embed_module.embedding_dim
+  elif hasattr(embed_module, 'out_features'):
+    # The UNet's time-embedding `nn.Linear`.
+    hidden_size = embed_module.out_features
   else:
     hidden_size = default_hidden
   return _NoiseConditionedBackbone(
@@ -1491,7 +1528,11 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
           self._embed_module_cache = module
           break
     if self._embed_module_cache is None:
-      return 0.02
+      # No token embedding: an image backbone, where the noise wrapper injects
+      # into the time embedding and recorded that module's std at construction.
+      # Without it there is nothing to measure and the DiT init constant is the
+      # only fallback left.
+      return getattr(self.backbone, 'embed_std', None) or 0.02
     return _embedding_std(self._embed_module_cache)
 
   def _clip_gradients(self, parameters, name):
