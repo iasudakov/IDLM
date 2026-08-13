@@ -180,9 +180,14 @@ built — before training starts — and torchvision fetches CIFAR-10 into
 bash scripts/train_idlm_mdlm_cifar10.sh
 ```
 
-Note `callbacks.checkpoint_monitor.monitor=val/nll` in that script: the default
-monitors `val/gen_ppl`, one of the text metrics an image run does not log, and
-Lightning raises rather than warns on a missing monitor key.
+Two flags in that script exist only because CIFAR-10 is small and imageful, and
+both fail loudly rather than silently if you drop them.
+`callbacks.checkpoint_monitor.monitor=val/nll` replaces the default
+`val/gen_ppl`, a text metric an image run does not log (Lightning raises on a
+missing monitor key). `+trainer.check_val_every_n_epoch=null` makes
+`val_check_interval` count global batches rather than batches within an epoch —
+50k images is only a few hundred batches per epoch, fewer than
+`val_check_interval=1500`, which Lightning also rejects.
 
 Because `configs/data/cifar10.yaml` sets `modality: image`, the text metrics
 (generative perplexity, the GPT-2 gradient moment, decoded sample tables) are

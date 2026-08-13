@@ -16,6 +16,18 @@
 #                                 raises rather than warns on a missing monitor
 #                                 key. val/fid also works but is noisy over a
 #                                 few batches.
+#   +trainer.check_val_every_n_epoch=null
+#                                 CIFAR-10 is 50k images, so an epoch is only a
+#                                 few hundred batches -- fewer than
+#                                 val_check_interval=1500, which Lightning
+#                                 rejects outright. With this, val_check_interval
+#                                 counts *global* batches across epoch
+#                                 boundaries (the OWT semantics) instead of
+#                                 batches within one epoch, and stays valid at
+#                                 any batch size. The `+` is required because the
+#                                 key is absent from configs/config.yaml.
+#                                 Alternative: drop val_check_interval below the
+#                                 per-epoch batch count (50000 / batch_size).
 #
 # Nothing needs pre-downloading: `eval.checkpoint_path` is a
 # `<hf_repo>:<path>` hub spec that is fetched (and cached) while the model is
@@ -70,6 +82,7 @@ python -u -m main \
   adversarial_distill.fake_frequency=1 \
   adversarial_distill.generator_num_noised_samples=1 \
   trainer.val_check_interval=1500 \
+  +trainer.check_val_every_n_epoch=null \
   trainer.limit_val_batches=0.01 \
   data.cache_dir=$SOURCE_CODE_PATH/code/cache_dir \
   logger.name='cifar10 posterior shared noised 768 lr 1e-2 top_p 1.0 noise_scale 0.0'
