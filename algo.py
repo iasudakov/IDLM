@@ -196,6 +196,72 @@ def _embedding_std(embed_module):
   return 0.02
 
 
+_TEACHER_HF_REPO_ID = 'jdeschena/duo2-cifar10'
+
+
+def _hf_download_teacher(repo_id, filename, local_dir):
+  """`hf_hub_download` with a message and a DDP-safe failure path."""
+  import huggingface_hub
+  print(f'[teacher] {filename} not found locally; downloading from '
+        f'https://huggingface.co/{repo_id} ...', flush=True)
+  target = (os.path.join(local_dir, *filename.split('/'))
+            if local_dir else None)
+  try:
+    return huggingface_hub.hf_hub_download(
+      repo_id=repo_id, filename=filename, local_dir=local_dir)
+  except Exception as exc:
+    # Every DDP rank runs this. `huggingface_hub` takes a per-file lock so the
+    # ranks serialise and the losers find the finished file, but if a loser
+    # trips over the winner's temporary state anyway, the file it wanted is
+    # already on disk (the download is moved into place atomically).
+    if target is not None and os.path.exists(target):
+      return target
+    raise RuntimeError(
+      f'could not download {filename} from {repo_id}: {exc}. Fetch it by hand '
+      f'with `bash scripts/download_cifar10_teacher.sh` (VARIANT=/STEPS= to '
+      f'pick the file) and pass the resulting path.') from exc
+
+
+def _resolve_teacher_ckpt_path(path, repo_id=_TEACHER_HF_REPO_ID):
+  """Return a local checkpoint path, fetching from the HF hub if it is missing.
+
+  `scripts/download_cifar10_teacher.sh` mirrors the released teachers into
+  `downloads/` keeping the hub repo's own layout, so a missing
+  `<root>/downloads/mdlm/cosine_time_cond/1500000.safetensors` is unambiguously
+  `mdlm/cosine_time_cond/1500000.safetensors` inside `jdeschena/duo2-cifar10`.
+  That exact correspondence is what makes fetching it automatically a lookup
+  rather than a guess, and the file lands where the script would have put it.
+
+  A path may also be written `hf://<org>/<repo>/<file>` to name a hub file
+  outright; it is cached by `huggingface_hub` in the usual place.
+
+  Only paths under a `downloads/` component are fetched. Anything else -- a
+  `.ckpt` from an earlier run, an `EmaExport` archive -- exists only locally, so
+  a missing one stays the hard error it was.
+  """
+  path = os.path.expanduser(str(path))
+  if path.startswith('hf://'):
+    org, _, rest = path[len('hf://'):].partition('/')
+    repo_name, _, filename = rest.partition('/')
+    assert filename, (
+      f'hf:// teacher path names no file inside the repo: {path} '
+      '(expected hf://<org>/<repo>/<path/to/file>)')
+    return _hf_download_teacher(f'{org}/{repo_name}', filename, None)
+  if utils.fsspec_exists(path):
+    return path
+  parts = os.path.normpath(path).split(os.sep)
+  assert 'downloads' in parts[:-1], (
+    f'adversarial_distill.teacher_ckpt_path does not exist: {path}. Only '
+    f'paths under a `downloads/` directory mirror the {repo_id} hub layout '
+    f'and can be downloaded automatically; write the path as '
+    f'`<root>/downloads/mdlm/<variant>/<steps>.safetensors`, or name the hub '
+    f'file directly as `hf://{repo_id}/mdlm/<variant>/<steps>.safetensors`.')
+  head = parts[:-1]
+  cut = len(head) - 1 - head[::-1].index('downloads')
+  local_dir = os.sep.join(parts[:cut + 1]) or os.sep
+  return _hf_download_teacher(repo_id, '/'.join(parts[cut + 1:]), local_dir)
+
+
 def _load_pretrained_backbone(backbone, path, use_ema=True):
   """Load pretrained denoiser weights into `backbone`, in place, strictly.
 
@@ -211,13 +277,15 @@ def _load_pretrained_backbone(backbone, path, use_ema=True):
     are zipped against `backbone.named_parameters()` in order; the lengths are
     asserted rather than trusted.
 
+  A path under `downloads/` that is not there yet is fetched from the hub by
+  `_resolve_teacher_ckpt_path`, so a fresh clone needs no separate download
+  step.
+
   `strict=True` on purpose: a silently-partial load would leave part of the
   "pretrained" teacher random, and the whole point of this path is that student,
   teacher and auxiliary all start from the *same known* denoiser.
   """
-  path = os.path.expanduser(str(path))
-  assert utils.fsspec_exists(path), (
-    f'adversarial_distill.teacher_ckpt_path does not exist: {path}')
+  path = _resolve_teacher_ckpt_path(path)
   if path.endswith('.safetensors'):
     import safetensors.torch
     state_dict = safetensors.torch.load_file(path, device='cpu')

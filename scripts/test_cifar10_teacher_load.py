@@ -38,9 +38,11 @@ def build_unet(vocab_size=257):
 
 
 def main():
-  path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CKPT
-  assert os.path.exists(path), (
-    f'{path} not found; run scripts/download_cifar10_teacher.sh first.')
+  # Fetches from the hub if it is not on disk, exactly as a training run would
+  # (`algo._resolve_teacher_ckpt_path`), so this gate needs no separate
+  # download step. A path outside `downloads/` still has to exist.
+  path = algo._resolve_teacher_ckpt_path(
+    sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CKPT)
 
   import safetensors.torch
   from safetensors import safe_open

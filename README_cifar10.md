@@ -18,6 +18,11 @@ path is gated on `data.modality=image` or `algo.backbone=unet`.
 bash scripts/download_cifar10_teacher.sh
 ```
 
+This step is optional: a `teacher_ckpt_path` under `downloads/` that is not on
+disk is fetched from the hub on first use (`algo._resolve_teacher_ckpt_path`),
+into the same place this script would have put it. Run the script to pre-fetch
+it, or to pick a variant without launching training.
+
 `jdeschena/duo2-cifar10` (released with the DUO repo) holds two families:
 `duo/…` = uniform-state diffusion, and **`mdlm/…` = masked / absorbing-state
 diffusion** — the process `MDLM_DMMD` distills. Variants are

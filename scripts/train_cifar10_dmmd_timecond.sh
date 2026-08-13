@@ -113,10 +113,12 @@ else
   SAMPLER_LABEL="${PREDICTOR}"
 fi
 
+# Not an error any more: a missing teacher under `downloads/` is fetched from
+# the hub by `algo._resolve_teacher_ckpt_path` at startup, into this same path.
+# A TEACHER= pointing elsewhere still fails, with that function's message.
 if [[ ! -f "${TEACHER}" ]]; then
-  echo "teacher not found: ${TEACHER}" >&2
-  echo "run: VARIANT=mdlm/cosine_time_cond bash scripts/download_cifar10_teacher.sh" >&2
-  exit 1
+  echo "[teacher] ${TEACHER} not present -- main will fetch it from"
+  echo "[teacher] https://huggingface.co/jdeschena/duo2-cifar10 on startup."
 fi
 
 CUDA_VISIBLE_DEVICES="${GPUS}" "${PYTHON}" -u -m main \

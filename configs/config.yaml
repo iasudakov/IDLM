@@ -52,6 +52,12 @@ adversarial_distill:
   # Accepts either a `.safetensors` file of raw backbone keys (e.g. the released
   # `jdeschena/duo2-cifar10` CIFAR-10 teachers, whose tensors are EMA shadow
   # params) or a Lightning `.ckpt` (the `backbone.` prefix is stripped).
+  #
+  # A `<root>/downloads/mdlm/<variant>/<steps>.safetensors` that is not on disk
+  # is downloaded from `jdeschena/duo2-cifar10` on first use -- that directory
+  # mirrors the hub repo's layout, so the path names the hub file exactly (see
+  # `algo._resolve_teacher_ckpt_path`). `hf://<org>/<repo>/<file>` names a hub
+  # file outright. Any other missing path is an error, as before.
   # '' (default) => no pretrained teacher, i.e. every existing run is unchanged.
   teacher_ckpt_path: ''
   # For a Lightning `.ckpt` only: prefer the EMA shadow parameters over the raw
