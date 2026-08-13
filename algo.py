@@ -695,7 +695,9 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
 
   def _validate_configuration(self):
     # ancestral sampling isn't desirable because it's slow
-    assert self.sampler in {'ancestral_cache', 'confidence'}
+    assert self.sampler in {
+      'ancestral_cache', 'confidence', 'remask'}
+    self._validate_remask_configuration()
 
   def _process_model_output(self, model_output, xt, sigma):
     del sigma
@@ -2186,6 +2188,14 @@ class MDLM_RL(MDLM_DMMD):
               'reordered p_x0 comes from a different latent and would make '
               'the recorded log-prob wrong. The policy is therefore trained '
               'under a different decoder than it is evaluated with; use '
+              "sampling.predictor='ancestral_cache' to keep them aligned.",
+              flush=True)
+      if self.sampler == 'remask':
+        print("[rl] sampling.predictor='remask' can send an already "
+              'revealed token back to [MASK], but the RL rollout is always '
+              'ancestral and scores a monotone trajectory, so the policy is '
+              'trained under a decoder that never revises itself and '
+              'evaluated under one that does; use '
               "sampling.predictor='ancestral_cache' to keep them aligned.",
               flush=True)
       # 'ancestral_cache' needs no warning: it only reuses `p_x0` on a step

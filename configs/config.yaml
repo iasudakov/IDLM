@@ -329,11 +329,35 @@ loader:
   pin_memory: True
 
 sampling:
-  predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic, confidence
+  predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic, confidence, remask
   steps: 1000
   noise_removal: ancestral  # 'ancestral', 'greedy', 'none'
   use_float64: True
   p_nucleus: 1.0
+  # --- predictor: remask (consistency-style decode-then-renoise) ---
+  # The ancestral predictors freeze a position the moment they reveal it, so
+  # a token committed early from an almost fully masked context is final.
+  # This one decodes *every* position each step and then renoises, so a
+  # revealed token can go back to [MASK] and be re-decoded later under a
+  # richer context. `remask_strategy` sets `sigma_t`, the probability of
+  # remasking an already revealed token (see
+  # `trainer_base.AbsorbingState._remask_update` for the derivation):
+  #   consistency -- sigma_t = 1 - alpha_s. Both branches of the update
+  #                  coincide, so the step forgets x_t entirely: decode the
+  #                  whole sequence, renoise to level s. The masked-diffusion
+  #                  analogue of consistency-model multistep sampling.
+  #   scaled      -- sigma_t = remask_eta * (1 - alpha_s), a straight
+  #                  interpolation between the plain ancestral sampler
+  #                  (eta = 0) and 'consistency' (eta = 1).
+  #   cap         -- sigma_t = remask_eta, clipped to the largest admissible
+  #                  rate (ReMDM's max-cap schedule).
+  # Every setting keeps the expected masked fraction on the schedule's
+  # 1 - alpha_t, so `steps` means the same thing as it does for `ancestral`
+  # and the two are comparable at equal step count. Costs a denoiser call on
+  # every step (no p_x0 caching), and invalidates the ELBO -- likelihood
+  # numbers from `_loss` do not describe this sampler.
+  remask_strategy: consistency  # consistency, scaled, cap
+  remask_eta: 1.0               # only read by 'scaled' and 'cap'
   # --- predictor: confidence (block-diffusion style decoding) ---
   # Which positions to commit: every masked position whose predicted
   # probability is >= `confidence_threshold`, at least `min_reveal` of
