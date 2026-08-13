@@ -228,6 +228,15 @@ a distillation run that point is the **teacher's** score — the student starts 
 an exact copy of the loaded checkpoint — so it is the baseline that says whether
 distillation is helping or hurting.
 
+Every `val/fid` point, the baseline included, is accompanied by an 8×8 grid of
+generated images logged under `eval.sample_image_key` (`val/samples`). Repeated
+calls to one key form a step-indexed series, so scrubbing it replays the
+student's samples across training. That redundancy is deliberate: FID is a single
+scalar, and a falling FID with degenerate samples is a failure mode you want to be
+able to *see*. Both the grid and the FID are echoed to stdout (`[samples]` /
+`[fid]`) so a job log shows whether they reached the tracker. Loggers without
+`log_image` (TensorBoard) skip the grid and say so.
+
 ---
 
 ## Evaluation

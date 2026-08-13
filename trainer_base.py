@@ -706,24 +706,50 @@ class TrainerBase(L.LightningModule):
       flush=True)
 
   def _log_sample_images(self, images):
-    """Log a grid of generated images. Rank zero, best-effort, never fatal."""
+    """Log a grid of generated images, once per FID evaluation.
+
+    Called from `_log_image_metrics`, so there is a grid for every `val/fid`
+    point -- including the step-0 pre-distillation baseline, which is the one
+    worth eyeballing: FID moving is only meaningful if the samples still look
+    like images. Goes to `logger.log_image` directly rather than through
+    `self.log`, which is also why it survives the sanity check (Lightning
+    discards what `self.log` collects there).
+
+    Repeated calls under one `eval.sample_image_key` become a step-indexed
+    series in trackers that support it (underdeep does; TensorBoard has no
+    `log_image` and is skipped by the `hasattr` guard), so scrubbing the key
+    replays the student's samples over training.
+
+    Rank zero, best-effort, never fatal: a tracker failure must not take a
+    training run down.
+    """
     if (images is None
         or not self.config.eval.get('log_sample_images', True)
-        or self.trainer.global_rank != 0
-        or not hasattr(self.trainer.logger, 'log_image')):
+        or self.trainer.global_rank != 0):
       return
+    if not hasattr(self.trainer.logger, 'log_image'):
+      print('[samples] logger {} has no log_image; skipping the sample grid.'
+            .format(type(self.trainer.logger).__name__), flush=True)
+      return
+    key = self.config.eval.get('sample_image_key', 'val/samples')
     try:
       import torchvision
       num = min(images.shape[0],
-                int(self.config.eval.get('sample_image_num', 16)))
+                int(self.config.eval.get('sample_image_num', 64)))
       grid = torchvision.utils.make_grid(
         images[:num].detach().cpu(),
         nrow=int(self.config.eval.get('sample_image_nrow', 8)),
         padding=2)
       self.trainer.logger.log_image(
-        key=self.config.eval.get('sample_image_key', 'val/samples'),
+        key=key,
         image=grid.permute(1, 2, 0).numpy(),
         step=self.global_step)
+      # Echoed like the `[fid]` line: without it there is no way to tell from a
+      # job log whether the grid reached the tracker.
+      print('[samples] logged a {}-image grid under {!r} at step {}{}'.format(
+        num, key, self.global_step,
+        ' [baseline, pre-distillation]'
+        if self.trainer.sanity_checking else ''), flush=True)
     except Exception as e:  # pragma: no cover - diagnostics are best-effort
       print('[samples] image log failed: {}'.format(e), flush=True)
 

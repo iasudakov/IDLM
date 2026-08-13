@@ -443,11 +443,18 @@ eval:
   fid_real_split: train
   fid_num_batches: 4  # only used when fid_num_real_images <= 0
   fid_feature: 2048  # Inception-V3 feature layer (64 / 192 / 768 / 2048)
-  # Log a grid of the last generated batch every validation, for loggers that
-  # support images (underdeep does; TensorBoard silently skips it).
+  # Log a grid of generated images once per FID evaluation -- every validation
+  # plus the step-0 baseline -- for loggers that support images (underdeep does;
+  # TensorBoard has no log_image and is skipped). Repeated calls under one key
+  # become a step-indexed series, so scrubbing it replays the samples over
+  # training. FID alone cannot tell you the samples still look like images; this
+  # is the check that can.
   log_sample_images: True
   sample_image_key: val/samples
-  sample_image_num: 16
+  # Images in the grid, and images per row. 64 in an 8x8 grid of 32x32 px is
+  # still a small picture and enough to see a collapse; capped by
+  # `loader.eval_batch_size`, since the grid is the last generated batch.
+  sample_image_num: 64
   sample_image_nrow: 8
   # Run the full sample-eval block (for images: FID, entropies, sample grid)
   # during Lightning's sanity check, i.e. BEFORE the first training step. For a
