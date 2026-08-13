@@ -49,6 +49,13 @@
 # batches of sampling.steps denoiser calls per validation -- hence
 # eval_batch_size=100 here rather than the training batch size. The real side is
 # computed once per process and reused, so 50000 is nearly free.
+#
+# No `trainer.limit_val_batches`: the OWT recipe caps it because an epoch of that
+# validation set is enormous, but CIFAR-10's test split is 10k images, i.e. ~13
+# batches per rank here, and one ELBO forward each is negligible beside the
+# sampling FID needs. Capping it also breaks at this batch size -- Lightning
+# rejects a fraction that rounds to zero batches ("0.01 * 13 < 1") -- and val/nll
+# is the checkpoint monitor, so the full split is the better signal anyway.
 
 # Cap CPU threads: this box is shared, and the dataloader / torch intra-op pools
 # would otherwise size themselves to every core on the machine.
@@ -96,7 +103,6 @@ python -u -m main \
   adversarial_distill.generator_num_noised_samples=1 \
   trainer.val_check_interval=1500 \
   +trainer.check_val_every_n_epoch=null \
-  trainer.limit_val_batches=0.01 \
   data.cache_dir=$SOURCE_CODE_PATH/code/cache_dir \
   logger.experiment=generative-models/dmmd-cifar \
   logger.name='cifar10 posterior shared noised 768 lr 1e-2 top_p 1.0 noise_scale 0.0'
