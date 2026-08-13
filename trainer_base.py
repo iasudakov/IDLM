@@ -1013,6 +1013,12 @@ class Diffusion(TrainerBase):
   def _ancestral_update(self, x, t, dt, p_x0, noise_removal_step):
     raise NotImplementedError
 
+  def _remask_update(self, x, t, dt, noise_removal_step=False):
+    raise NotImplementedError(
+      'Remasking (consistency-style) sampling is only defined for '
+      'absorbing-state (masked) diffusion; set sampling.predictor to '
+      'a sampler supported by this algo.')
+
   def _confidence_sampler(self, num_samples, num_steps, eps):
     raise NotImplementedError(
       'Confidence sampling is only defined for absorbing-state '
@@ -1057,6 +1063,13 @@ class Diffusion(TrainerBase):
           # Disable caching
           p_x0_cache = None
         x = x_next
+      elif self.sampler == 'remask':
+        # No caching here: this update rewrites *every* position, so `x`
+        # changes on essentially every step and a cached `p_x0` would be
+        # conditioned on a latent that no longer exists.
+        p_x0, x_next = self._remask_update(x=x, t=t, dt=dt)
+        self._record_pred_entropy(p_x0, x)
+        x = x_next
       else:
         x = self._analytic_update(x=x,t=t, dt=dt)
 
@@ -1066,6 +1079,10 @@ class Diffusion(TrainerBase):
       if self.sampler == 'analytic':
         x = self._denoiser_update(x=x, t=t0)
       else:
+        # Shared with `remask`: at `alpha_s = 1` its remask rate is pinned to
+        # 0 by the admissibility bound, so its update degenerates to exactly
+        # this one -- fill every remaining mask, keep what is already there.
+        # (`p_x0_cache` is None for that predictor, so the call is fresh.)
         is_fresh = p_x0_cache is None
         p_x0, x_next = self._ancestral_update(x=x, t=t0, dt=None,
                                  p_x0=p_x0_cache,
@@ -1166,6 +1183,27 @@ class AbsorbingState(Diffusion):
       assert self.parameterization in {'mean', 'subs'}
     if self.subs_masking:
       assert self.parameterization == 'mean'
+    self._validate_remask_configuration()
+
+  def _validate_remask_configuration(self):
+    """Checks for `sampling.predictor='remask'`. Split out so subclasses
+    that do not chain to `_validate_configuration` (e.g. `MDLM_with_AR`)
+    can still run them -- otherwise a typo in `remask_strategy` would only
+    surface at the first validation sampling, thousands of steps in."""
+    if self.sampler != 'remask':
+      return
+    strategy = self.config.sampling.get('remask_strategy', 'consistency')
+    assert strategy in {'consistency', 'scaled', 'cap'}, (
+      f'Unknown sampling.remask_strategy={strategy!r}; expected one of '
+      "'consistency', 'scaled', 'cap'.")
+    if strategy in {'scaled', 'cap'}:
+      eta = float(self.config.sampling.get('remask_eta', 1.0))
+      assert 0.0 <= eta <= 1.0, (
+        f'sampling.remask_eta must be in [0, 1], got {eta}.')
+    assert self.config.sampling.noise_removal != 'none', (
+      "sampling.predictor='remask' remasks tokens right up to the last "
+      'step, so it needs a final full decode; set '
+      "sampling.noise_removal to 'ancestral' or 'greedy'.")
 
   def q_xt(self, x, alpha_t, valid_tokens=None):
     """Computes the noisy sample xt.
@@ -1212,6 +1250,114 @@ class AbsorbingState(Diffusion):
     
     copy_flag = (x != self.mask_index).to(x.dtype)
     return p_x0, copy_flag * x + (1 - copy_flag) * _x
+
+  def _remask_rate(self, alpha_t, alpha_s):
+    """`sigma_t`: the probability that `_remask_update` sends an already
+    revealed token back to `[MASK]` on this step. Shape follows `alpha_t`,
+    i.e. `(batch, 1)`.
+
+    Clipped to the largest admissible value `(1 - alpha_s) / alpha_t`, above
+    which the masked branch's stay-probability would go negative -- there is
+    simply not enough mask mass at `s` left to absorb the remasked tokens.
+    """
+    strategy = self.config.sampling.get('remask_strategy', 'consistency')
+    eta = float(self.config.sampling.get('remask_eta', 1.0))
+    sigma_max = ((1 - alpha_s)
+                 / alpha_t.clamp_min(1e-9)).clamp(0.0, 1.0)
+    if strategy == 'consistency':
+      # sigma_t = 1 - alpha_s makes both branches of `_remask_update` equal,
+      # i.e. the step forgets `x_t` entirely. Always <= sigma_max.
+      sigma = 1 - alpha_s
+    elif strategy == 'scaled':
+      # Straight interpolation between the ancestral sampler (eta=0) and
+      # 'consistency' (eta=1).
+      sigma = eta * (1 - alpha_s)
+    elif strategy == 'cap':
+      # ReMDM's max-cap schedule: a constant rate, clipped where the bound
+      # bites (which it does at both ends of the trajectory).
+      sigma = torch.full_like(alpha_t, eta)
+    else:
+      raise ValueError(
+        f'Unknown sampling.remask_strategy={strategy!r}; expected one of '
+        "'consistency', 'scaled', 'cap'.")
+    return torch.minimum(sigma.clamp_min(0.0), sigma_max)
+
+  def _remask_update(self, x, t, dt, noise_removal_step=False):
+    """One step of remasking ("consistency-style") reverse sampling.
+
+    `_ancestral_update` only ever *adds* tokens: `copy_flag` freezes a
+    position the moment it is revealed, so a token committed at step 3 on
+    the strength of an almost fully masked context can never be revisited,
+    and every such mistake is carried into the final sample. That is the
+    dominant error at low step counts, where each step commits many
+    positions at once from a weak context.
+
+    This update instead decodes *every* position to a proposal `x0_hat` and
+    then renoises, so a revealed token can go back to `[MASK]` and be
+    re-decoded later under a much richer context. Per position, going from
+    `t` to `s < t`:
+
+      * revealed in `x_t`  -> `[MASK]` with probability `sigma_t`,
+                              otherwise kept (`x0_hat` reproduces it, since
+                              `_process_model_output` pins revealed
+                              positions to a one-hot);
+      * masked in `x_t`    -> `[MASK]` with probability
+                              `beta = (1 - alpha_s - alpha_t sigma_t)
+                                      / (1 - alpha_t)`,
+                              otherwise a categorical draw from `p_x0`.
+
+    `beta` is what keeps the expected masked fraction at `1 - alpha_s`
+    exactly as the schedule prescribes (`alpha_t sigma_t
+    + (1 - alpha_t) beta = 1 - alpha_s`), so `sampling.steps` means the
+    same thing here as for the ancestral predictors and the two are
+    directly comparable at equal step count. Two special values are worth
+    naming (`sampling.remask_strategy`, see `_remask_rate`):
+
+      * `sigma_t = 0` gives back `_ancestral_update` term for term;
+      * `sigma_t = 1 - alpha_s` makes both branches identical, i.e. the step
+        stops depending on `x_t` at all: decode the whole sequence, then
+        renoise it to level `s`. This is the masked-diffusion analogue of
+        multistep sampling in a continuous consistency model
+        (`x0 = f(x_t, t)`, then `x_s = x0 + sigma_s eps`), and is the
+        default.
+
+    The catch, and the reason the rate is a knob rather than a constant:
+    remasking is only worth it if the re-decode is better than what it
+    threw away. It costs a full denoiser call per step with no `p_x0`
+    caching, and under an aggressive rate a short trajectory can spend all
+    its steps churning instead of converging. It also breaks the ELBO's
+    derivation -- likelihood bounds computed with `_loss` do not describe
+    this sampler.
+    """
+    _, alpha_t = self.noise(t)
+    if noise_removal_step:
+      alpha_s = torch.ones_like(alpha_t)
+    else:
+      _, alpha_s = self.noise(t - dt)
+    assert alpha_t.ndim == 2
+
+    p_x0 = self.forward(
+      x, self._sigma_from_alphat(alpha_t)).exp()
+    if self.p_nucleus < 1:
+      # Truncate only the draw; the returned `p_x0` (and so `val/pred_
+      # entropy`) keeps reading the model's own distribution.
+      sample_probs = utils.top_k_top_p_filtering(
+        p_x0.log(), top_p=self.p_nucleus).softmax(-1)
+    else:
+      sample_probs = p_x0
+    x0_hat = sample_categorical(sample_probs)
+
+    sigma_t = self._remask_rate(alpha_t, alpha_s)
+    beta = ((1 - alpha_s - alpha_t * sigma_t)
+            / (1 - alpha_t).clamp_min(1e-9)).clamp(0.0, 1.0)
+    # (batch, 1) rates broadcast against the (batch, length) predicate.
+    mask_prob = torch.where(x == self.mask_index, beta, sigma_t)
+    remask = torch.rand(
+      x.shape, device=x.device) < mask_prob
+    x_next = torch.where(remask, self.mask_index, x0_hat)
+    if self.ignore_bos:
+      x_next[:, 0] = x[:, 0]
+    return p_x0, x_next
 
   def _denoise_x0(self, x):
     """One denoiser call on the current partially-masked `x`.
