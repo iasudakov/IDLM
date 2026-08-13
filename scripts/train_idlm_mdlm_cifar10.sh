@@ -85,5 +85,5 @@ python -u -m main \
   +trainer.check_val_every_n_epoch=null \
   trainer.limit_val_batches=0.01 \
   data.cache_dir=$SOURCE_CODE_PATH/code/cache_dir \
-  logger.experiment=generative-models/dmmd_cifar \
+  logger.experiment=generative-models/dmmd-cifar \
   logger.name='cifar10 posterior shared noised 768 lr 1e-2 top_p 1.0 noise_scale 0.0'
