@@ -171,3 +171,13 @@ cython_debug/
 .idea/
 downloads/
 outputs/
+
+# cache_dir holds dataset caches. Everything in it is ignored EXCEPT the
+# CIFAR-10 batches, which are tracked on purpose (178 MB) so a fresh checkout --
+# or a Nirvana attempt -- never spends ~6 minutes pulling them through the proxy
+# at ~500 kB/s. Re-inclusion has to be spelled out level by level: git will not
+# un-ignore a file whose parent directory is itself excluded.
+cache_dir/*
+!cache_dir/cifar10/
+cache_dir/cifar10/*
+!cache_dir/cifar10/cifar-10-batches-py/

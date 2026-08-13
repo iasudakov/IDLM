@@ -12,7 +12,14 @@ tokenizer_name_or_path: cifar10
 num_classes: 10  # 10 classes + 1 classifier-free-guidance null class
 size: 1024       # 32 * 32 pixels
 length: 3072     # 3 * 32 * 32 tokens per image
-cache_dir: ~/data/cifar10
+# The tracked in-repo copy (see .gitignore: cache_dir/cifar10/cifar-10-batches-py
+# is un-ignored on purpose), so a checkout is self-contained and no job pulls the
+# 170 MB archive through a proxy. `${hydra:runtime.cwd}` is the directory `main`
+# was launched from, *before* `hydra.job.chdir: true` moves the process into
+# `hydra.run.dir` -- plain `${cwd:}` is `os.getcwd()` and would resolve to the run
+# directory instead. Every scripts/*cifar10* launcher cd's to the repo root first.
+# Override with `data.cache_dir=...` for a copy outside the repo.
+cache_dir: ${hydra:runtime.cwd}/cache_dir/cifar10
 streaming: False
 # Text-only knobs, off for pixels: there is nothing to wrap and no sentence
 # boundary to mark.
