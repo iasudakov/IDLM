@@ -193,11 +193,27 @@ Because `configs/data/cifar10.yaml` sets `modality: image`, the text metrics
 (generative perplexity, the GPT-2 gradient moment, decoded sample tables) are
 skipped and the image ones take their place at every validation: `val/fid`,
 `val/bpd`, `val/sample_entropy`, `val/pred_entropy`, plus a grid of generated
-images for loggers that support them. `val/fid` is computed over
-`sampling.num_sample_batches` generated batches against `eval.fid_num_batches`
-validation ones — a few hundred images, not the usual 50k — so it is a relative
-signal across the steps of one run rather than a publishable FID; raise both to
-tighten it. `mode=sample_eval` writes the same numbers plus a PNG grid.
+images for loggers that support them. `mode=sample_eval` writes the same numbers
+plus a PNG grid.
+
+`val/fid` compares `eval.fid_num_gen_images` (1000) generated images against the
+Inception statistics of `eval.fid_num_real_images` (50000, the full train split —
+the reference published CIFAR-10 FIDs use). The two sides cost very different
+things, which is why they are configured separately: the real side is Inception
+forwards over fixed data, so it is computed **once per process and cached for the
+whole run**, while the generated side is re-sampled every validation at
+`1000 / loader.eval_batch_size` batches of `sampling.steps` denoiser calls — that
+is the half that bounds both the runtime and the accuracy. `val/fid_num_gen` and
+`val/fid_num_real` are logged beside it, because the estimator is biased upward at
+small counts (real vs. real at 64 images per side measures ~199 here) and the
+number means nothing without them.
+
+`eval.compute_perplexity_on_sanity=True` additionally runs that whole block
+during Lightning's sanity check, before the first optimizer step, and pushes it
+to the logger at step 0 (Lightning otherwise discards sanity-check metrics). For
+a distillation run that point is the **teacher's** score — the student starts as
+an exact copy of the loaded checkpoint — so it is the baseline that says whether
+distillation is helping or hurting.
 
 ---
 

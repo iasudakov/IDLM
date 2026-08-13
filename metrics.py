@@ -306,10 +306,29 @@ class Metrics:
     self.valid_aux.reset()
     if self.gm is not None:
       self.gm.reset()
-    if self.fid is not None:
-      self.fid.reset()
-      self._fid_real = 0
-      self._fid_fake = 0
+    # NOTE the FID's *real* side is deliberately NOT reset: the reference
+    # statistics describe the dataset, not the model, so they are accumulated
+    # once per process and reused for the whole run (see
+    # `TrainerBase._prime_fid_real_features`). Only the generated side, which
+    # depends on the current weights, is cleared. `reset_fid` wipes both.
+    self.reset_fid_fake()
+
+  def reset_fid_fake(self):
+    """Clear the generated side of the FID estimate, keeping the real side."""
+    if self.fid is None:
+      return
+    self.fid.fake_features_sum.zero_()
+    self.fid.fake_features_cov_sum.zero_()
+    self.fid.fake_features_num_samples.zero_()
+    self._fid_fake = 0
+
+  def reset_fid(self):
+    """Clear both sides, discarding the cached reference statistics."""
+    if self.fid is None:
+      return
+    self.fid.reset()
+    self._fid_real = 0
+    self._fid_fake = 0
 
   @torch.no_grad()
   def record_fid(self, images, real):
@@ -324,16 +343,24 @@ class Metrics:
       self._fid_fake += images.shape[0]
 
   def fid_num_samples(self):
-    """`(real, generated)` image counts behind the current FID estimate."""
+    """`(real, generated)` image counts behind the current FID estimate.
+
+    Local to this process. Under DDP the numbers `compute_fid` actually reduces
+    over are these times the world size, because every FID state is a plain sum
+    that torchmetrics all-reduces inside `compute()`.
+    """
     return self._fid_real, self._fid_fake
 
   def compute_fid(self):
     """FID so far, or None when either side has fewer than two images.
 
-    NOTE this is deliberately computed over a handful of batches during
-    training, where the estimator is strongly biased upward (the standard number
-    is 50k images per side). Read it as a relative signal across steps of one
-    run, not as a publishable FID.
+    Accuracy is entirely a function of how many images are behind it. The
+    estimator is biased *upward* at small counts -- measured on this code, real
+    vs. real at 64 images per side scores ~199 -- so a few batches give a number
+    that mostly reports the sample count. The reference statistics are cached, so
+    the real side is cheap to make large (`eval.fid_num_real_images`); the
+    generated side (`eval.fid_num_gen_images`) is what costs sampling and what
+    bounds the accuracy in practice.
     """
     if self.fid is None or min(self._fid_real, self._fid_fake) < 2:
       return None

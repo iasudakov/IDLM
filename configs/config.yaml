@@ -417,14 +417,31 @@ eval:
   # are skipped there; these replace them. See
   # `trainer_base.TrainerBase._log_image_metrics`.
   #
-  # Frechet Inception Distance between generated images and validation images,
-  # logged as val/fid. Cheap because it is computed over a FEW batches only:
-  # `sampling.num_sample_batches` generated batches against `fid_num_batches`
-  # validation ones, i.e. a few hundred images rather than the usual 50k. The
-  # estimator is biased upward at that size, so read val/fid as a relative
-  # signal across steps of one run, not as a publishable FID.
+  # Frechet Inception Distance between generated images and dataset images,
+  # logged as val/fid alongside val/fid_num_gen / val/fid_num_real -- the counts
+  # the estimator's bias rides on, so a number is never read without them.
+  # Measured on this code, real vs. real at 64 images per side scores ~199, i.e.
+  # at small counts val/fid mostly reports the sample count.
   compute_fid: True
-  fid_num_batches: 4
+  # Images behind each side. The two halves cost very different things:
+  #   * the real side is pure Inception forwards over the dataset, and its
+  #     statistics describe the data rather than the model, so they are computed
+  #     ONCE per process and reused for the whole run
+  #     (`TrainerBase._prime_fid_real_features`). 50000 is the full CIFAR-10
+  #     train split and the reference published FIDs are quoted against.
+  #   * the generated side costs `fid_num_gen_images / loader.eval_batch_size`
+  #     sampling batches of `sampling.steps` denoiser calls EVERY validation, and
+  #     is what actually bounds the accuracy. Raise `loader.eval_batch_size`
+  #     rather than lowering this if a validation is too slow.
+  # Set `fid_num_real_images: 0` to fall back to the old behaviour, where the
+  # real side is the first `fid_num_batches` validation batches.
+  fid_num_real_images: 50000
+  fid_num_gen_images: 1000
+  # Which split the reference statistics come from: 'train' (50k, the CIFAR-10
+  # FID convention, augmentation disabled) or 'valid' (the 10k test split).
+  # Numbers from the two are not comparable.
+  fid_real_split: train
+  fid_num_batches: 4  # only used when fid_num_real_images <= 0
   fid_feature: 2048  # Inception-V3 feature layer (64 / 192 / 768 / 2048)
   # Log a grid of the last generated batch every validation, for loggers that
   # support images (underdeep does; TensorBoard silently skips it).
@@ -432,6 +449,13 @@ eval:
   sample_image_key: val/samples
   sample_image_num: 16
   sample_image_nrow: 8
+  # Run the full sample-eval block (for images: FID, entropies, sample grid)
+  # during Lightning's sanity check, i.e. BEFORE the first training step. For a
+  # distillation run that is the pre-distillation baseline -- at step 0 the
+  # student is still exactly the loaded teacher -- so it is what every later
+  # val/fid should be read against. Lightning discards metrics logged during the
+  # sanity check, so `_log_image_metrics` pushes these straight to the logger at
+  # step 0. Needs `trainer.num_sanity_val_steps > 0`.
   compute_perplexity_on_sanity: False
   # Mean entropy (nats) of the denoiser's *own* predictive distribution
   # p_theta(x0 | x_t), averaged over every (denoiser call, still-masked

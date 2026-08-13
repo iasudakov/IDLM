@@ -83,14 +83,20 @@ class RawPixelsVisionTokenizer:
 class DiscreteCIFAR10(torch.utils.data.Dataset):
   """CIFAR-10 as flat sequences of 3072 byte tokens (D3PM / duo convention)."""
 
-  def __init__(self, cache_dir, train):
+  def __init__(self, cache_dir, train, augment=None):
     import torchvision
     from torchvision import transforms as th_transforms
     self._dataset = torchvision.datasets.CIFAR10(
       root=cache_dir, train=train, download=True)
 
+    # `augment=False` on the train split gives the plain 50k images, which is
+    # what the FID reference statistics are built from (see
+    # `TrainerBase._prime_fid_real_features`) -- a random flip per read would
+    # make those statistics depend on when they were computed.
+    if augment is None:
+      augment = train
     transforms = []
-    if train:
+    if augment:
       transforms += [th_transforms.RandomHorizontalFlip()]
     transforms += [
       th_transforms.Lambda(lambda x: torch.from_numpy(np.array(x))),

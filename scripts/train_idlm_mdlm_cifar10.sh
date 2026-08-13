@@ -35,9 +35,20 @@
 # `data.cache_dir` on the first batch. A local `.ckpt` path works there too.
 #
 # Logged at every validation (see `TrainerBase._log_image_metrics`): val/fid
-# (over a few batches -- a relative signal, not a publishable FID), val/bpd,
-# val/nll, val/sample_entropy, val/pred_entropy, plus a grid of generated
-# images.
+# over 1000 generated images against the cached statistics of the 50k CIFAR-10
+# train split, val/fid_num_gen / val/fid_num_real (the counts the estimator's
+# bias rides on), val/bpd, val/nll, val/sample_entropy, val/pred_entropy, plus a
+# grid of generated images.
+#
+# `eval.compute_perplexity_on_sanity=True` runs that whole block once during the
+# sanity check, BEFORE the first training step, and pushes it to the logger at
+# step 0. At that point the student is still exactly the loaded teacher, so it is
+# the pre-distillation baseline every later val/fid should be read against.
+#
+# The generated side is what costs time -- 1000 / eval_batch_size sampling
+# batches of sampling.steps denoiser calls per validation -- hence
+# eval_batch_size=100 here rather than the training batch size. The real side is
+# computed once per process and reused, so 50000 is nearly free.
 
 # Cap CPU threads: this box is shared, and the dataloader / torch intra-op pools
 # would otherwise size themselves to every core on the machine.
@@ -46,7 +57,7 @@ export MKL_NUM_THREADS=${MKL_NUM_THREADS:-32}
 
 python -u -m main \
   loader.batch_size=8 \
-  loader.eval_batch_size=8 \
+  loader.eval_batch_size=100 \
   loader.num_workers=1 \
   model=unet \
   data=cifar10 \
@@ -60,7 +71,9 @@ python -u -m main \
   model.length=3072 \
   eval.compute_generative_perplexity=False \
   eval.compute_fid=True \
-  eval.fid_num_batches=4 \
+  eval.fid_num_gen_images=1000 \
+  eval.fid_num_real_images=50000 \
+  eval.compute_perplexity_on_sanity=True \
   callbacks.checkpoint_monitor.monitor=val/nll \
   trainer.accumulate_grad_batches=1 \
   trainer.gradient_clip_val=null \

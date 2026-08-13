@@ -1,5 +1,6 @@
 import contextlib
 import itertools
+import math
 import typing
 from dataclasses import dataclass
 
@@ -441,8 +442,11 @@ class TrainerBase(L.LightningModule):
         self.tokenizer.batch_decode(batch['input_ids']))
     # FID's real side: the first `fid_num_batches` validation images, folded in
     # as they stream past rather than buffered (the Inception features are all
-    # the estimator keeps).
+    # the estimator keeps). Skipped entirely when `eval.fid_num_real_images > 0`,
+    # which builds a larger reference set from a dedicated pass instead (see
+    # `_prime_fid_real_features`).
     if (self.metrics.fid is not None
+        and int(self.config.eval.get('fid_num_real_images', 0) or 0) <= 0
         and self._fid_real_batches
         < self.config.eval.get('fid_num_batches', 4)):
       self.metrics.record_fid(
@@ -462,8 +466,12 @@ class TrainerBase(L.LightningModule):
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples):
       samples, text_samples, images = None, None, None
-      for _sb in range(
-        self.config.sampling.num_sample_batches):
+      if self.is_vision:
+        # Reference statistics for FID, built once and reused (they describe the
+        # dataset, not the model), before any sampling so a failure here is not
+        # paid for twice.
+        self._prime_fid_real_features()
+      for _sb in range(self._num_sample_batches()):
         samples = self.generate_samples(
           num_samples=self.config.loader.eval_batch_size)
 
@@ -565,10 +573,12 @@ class TrainerBase(L.LightningModule):
     needs a language model or a tokenizer and says nothing about pixels. What is
     logged instead:
 
-    * `val/fid` -- Frechet Inception Distance of the generated images against
-      validation images (`metrics.Metrics.compute_fid`). Over a few batches only,
-      so it is a *relative* signal across steps, biased far above a 50k-sample
-      FID.
+    * `val/fid` -- Frechet Inception Distance of `eval.fid_num_gen_images`
+      generated images against the cached reference statistics of
+      `eval.fid_num_real_images` dataset images (`metrics.Metrics.compute_fid`).
+      Accompanied by `val/fid_num_gen` / `val/fid_num_real` so a number is never
+      read without knowing what it was computed over -- the estimator's bias
+      rides entirely on those counts.
     * `val/sample_entropy` -- unigram entropy of the emitted byte values, i.e.
       how much of the palette a sample uses. Domain-agnostic (it is the same
       statistic the text runs log) and the first thing to collapse if the
@@ -581,18 +591,119 @@ class TrainerBase(L.LightningModule):
     special casing -- for images `val/bpd` is bits per *pixel-channel*.
     """
     fid = self.metrics.compute_fid()
+    num_real, num_gen = self.metrics.fid_num_samples()
+    world_size = max(getattr(self.trainer, 'world_size', 1) or 1, 1)
+    extra = {}
     if fid is not None:
-      self.log('val/fid',
-               torch.as_tensor(float(fid), device=self.device),
-               on_epoch=True, on_step=False, sync_dist=True)
-    self.log('val/sample_entropy',
-             self.metrics.sample_entropy.compute(),
-             on_epoch=True, on_step=False, sync_dist=True)
+      # `compute_fid` already reduced across ranks (every FID state is a plain
+      # sum), so this scalar is identical on each of them and `sync_dist`'s mean
+      # is a no-op rather than an average of per-rank FIDs.
+      extra['val/fid'] = float(fid)
+      extra['val/fid_num_gen'] = float(num_gen * world_size)
+      extra['val/fid_num_real'] = float(num_real * world_size)
+    extra['val/sample_entropy'] = float(self.metrics.sample_entropy.compute())
     if float(self.metrics.pred_entropy.weight) > 0:
-      self.log('val/pred_entropy',
-               self.metrics.pred_entropy.compute(),
+      extra['val/pred_entropy'] = float(self.metrics.pred_entropy.compute())
+    for name, value in extra.items():
+      self.log(name, torch.as_tensor(value, device=self.device),
                on_epoch=True, on_step=False, sync_dist=True)
+    if fid is not None and self.trainer.global_rank == 0:
+      # Echoed to stdout, not just the tracker: this is the number the run is
+      # steered by, and at the sanity check it is the pre-distillation baseline.
+      print('[fid] step={} fid={:.3f} ({} generated vs {} real images){}'.format(
+        self.global_step, float(fid), int(extra['val/fid_num_gen']),
+        int(extra['val/fid_num_real']),
+        ' [baseline, pre-distillation]'
+        if self.trainer.sanity_checking else ''), flush=True)
+    if self.trainer.sanity_checking:
+      # Lightning drops everything `self.log` collects during the sanity check
+      # (`_LoggerConnector.log_eval_end_metrics` returns early), and the sanity
+      # check is exactly where the pre-distillation baseline is measured -- at
+      # step 0 the student is still the loaded teacher. Push it to the logger
+      # directly so the run has a step-0 point to compare against.
+      self._log_metrics_directly(extra, step=0)
     self._log_sample_images(images)
+
+  def _log_metrics_directly(self, metrics, step):
+    """Send scalars straight to the logger, bypassing Lightning's collection.
+
+    Rank zero only and best-effort: used for the sanity-check baseline, which
+    Lightning would otherwise discard.
+    """
+    if self.trainer.global_rank != 0 or not self.trainer.loggers:
+      return
+    for logger in self.trainer.loggers:
+      try:
+        logger.log_metrics(metrics=dict(metrics), step=step)
+      except Exception as e:  # pragma: no cover - tracker best-effort
+        print('[metrics] direct log failed: {}'.format(e), flush=True)
+
+  def _num_sample_batches(self):
+    """How many batches of samples a validation should generate.
+
+    `sampling.num_sample_batches` unless `eval.fid_num_gen_images` asks for more:
+    FID needs a large generated set to stop being dominated by its own
+    small-sample bias, and those are the same samples, so they are generated once
+    and feed the entropy metrics and the logged grid as well. Sharded across
+    ranks, since every FID state is a sum that torchmetrics all-reduces in
+    `compute()` -- so N ranks reach the target N times faster rather than each
+    doing the full count.
+    """
+    num_batches = int(self.config.sampling.num_sample_batches)
+    target = int(self.config.eval.get('fid_num_gen_images', 0) or 0)
+    if not self.is_vision or target <= 0 or self.metrics.fid is None:
+      return num_batches
+    world_size = max(getattr(self.trainer, 'world_size', 1) or 1, 1)
+    batch_size = max(int(self.config.loader.eval_batch_size), 1)
+    per_rank = math.ceil(target / world_size)
+    return max(num_batches, math.ceil(per_rank / batch_size))
+
+  @torch.no_grad()
+  def _prime_fid_real_features(self):
+    """Accumulate FID's reference statistics from the dataset, once per process.
+
+    The real side of FID describes the *data*, so it is fixed for the whole run:
+    computing it once and keeping it (see `metrics.Metrics.reset`) makes a large
+    reference set nearly free, which matters because that is the cheap half of
+    beating the estimator's small-sample bias -- no sampling is involved, only
+    Inception forwards.
+
+    `eval.fid_real_split` picks the split. 'train' is the default and the
+    convention CIFAR-10 FIDs are quoted against (50k images); the flips of the
+    training pipeline are switched off so the statistics do not depend on when
+    they were read. 'valid' uses the 10k test split instead, which is a different
+    reference and gives systematically different numbers -- do not compare across
+    the two.
+
+    A no-op when `eval.fid_num_real_images <= 0`, where the real side comes from
+    validation batches in `validation_step` instead.
+    """
+    target = int(self.config.eval.get('fid_num_real_images', 0) or 0)
+    if self.metrics.fid is None or target <= 0:
+      return
+    if self.metrics.fid_num_samples()[0] > 0:
+      return  # already primed; the statistics never change
+    split = str(self.config.eval.get('fid_real_split', 'train'))
+    rank = max(getattr(self.trainer, 'global_rank', 0) or 0, 0)
+    world_size = max(getattr(self.trainer, 'world_size', 1) or 1, 1)
+    dataset = dataloader.DiscreteCIFAR10(
+      cache_dir=self.config.data.cache_dir,
+      train=split == 'train',
+      augment=False)
+    # Each rank walks a strided shard, so the reduced count is `target` overall.
+    indices = range(rank, min(target, len(dataset)), world_size)
+    loader = torch.utils.data.DataLoader(
+      torch.utils.data.Subset(dataset, list(indices)),
+      batch_size=max(int(self.config.loader.eval_batch_size), 1),
+      num_workers=self.config.loader.num_workers,
+      shuffle=False)
+    for batch in loader:
+      self.metrics.record_fid(
+        self.tokenizer.batch_decode(batch['input_ids'].to(self.device)),
+        real=True)
+    print('[fid] reference statistics: {} {} images (rank {} of {})'.format(
+      self.metrics.fid_num_samples()[0] * world_size, split, rank, world_size),
+      flush=True)
 
   def _log_sample_images(self, images):
     """Log a grid of generated images. Rank zero, best-effort, never fatal."""
