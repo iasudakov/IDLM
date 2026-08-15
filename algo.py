@@ -61,6 +61,7 @@ class AR(trainer_base.TrainerBase):
     return - output.gather(
       -1, output_tokens[:, :, None])[:, :, 0]
 
+  @torch.no_grad()
   def generate_samples(self, num_samples, **kwargs):
     # `num_steps` and friends are meaningless here -- AR decoding is one forward
     # per token, so the sequence length *is* the step budget.
@@ -79,18 +80,24 @@ class AR(trainer_base.TrainerBase):
       dtype=torch.long,
       device=self.device)
     x[:, 0] = start_token
-    # precompute noise
-    noise = (torch.distributions.Gumbel(0, 1)
-             .sample((num_samples, num_pred_tokens, self.vocab_size))
-             .to(self.device))
-    if self.config.sampling.use_float64:
-      noise = noise.to(torch.float64)
+    # Gumbel noise one step at a time. Precomputing the whole
+    # `(batch, length, vocab)` draw costs 790MB here and 51GB at a text vocab
+    # (50257 x 1024 x float64), and buys nothing: each step consumes exactly
+    # one slice of it and never looks back.
+    gumbel = torch.distributions.Gumbel(
+      torch.zeros((), device=self.device),
+      torch.ones((), device=self.device))
     for i in range(num_pred_tokens):
-      output = self.backbone(x[:, :i + 1], None)
-      output[:, :, self.mask_index] = self.neg_infinity
-      output = output.log_softmax(-1)
-      y = (output[:, -1, :] + noise[:, i, :]).argmax(-1)
-      x[:, i + 1] = y
+      # Only the final position is ever sampled from, so slice before the
+      # softmax rather than normalising all `i + 1` of them.
+      logits = self.backbone(x[:, :i + 1], None)[:, -1, :].float()
+      logits[:, self.mask_index] = self.neg_infinity
+      logits = logits.log_softmax(-1)
+      noise = gumbel.sample(logits.shape)
+      if self.config.sampling.use_float64:
+        logits = logits.to(torch.float64)
+        noise = noise.to(torch.float64)
+      x[:, i + 1] = (logits + noise).argmax(-1)
     if self.bos_token_id is not None:
       return x  # text: the BOS column is part of the sequence, as before
     # Images: drop the synthetic start token so the caller gets exactly
