@@ -272,55 +272,108 @@ def _eval_fid(diffusion_model, config, logger, tokenizer):
   dataset = dataloader.DiscreteCIFAR10(
     config.data.cache_dir, train=True, augment=False)
 
+  # How many images to *generate*. `null` means one per training image, i.e. the
+  # full 50k that published CIFAR-10 FIDs are quoted at; a smaller number is a
+  # cheap preview of a checkpoint, at the cost of an upward-biased score (see
+  # the note printed at the end). The reference side stays at the full split
+  # either way -- real images cost only an Inception forward, and holding the
+  # reference fixed is what makes two runs at different sample counts
+  # comparable to each other. `metrics.FID` does the same in-loop.
+  num_samples = config.eval.get('fid_eval_num_samples', None)
+  num_samples = len(dataset) if num_samples is None else int(num_samples)
+  assert 0 < num_samples <= len(dataset), (
+    f'eval.fid_eval_num_samples={num_samples} must lie in '
+    f'(0, {len(dataset)}]')
+
+  # Every rank must generate the same number of images, so that they reach the
+  # metric sync below having done the same amount of work.
+  batch_size = config.loader.eval_batch_size
+  per_step = batch_size * fabric.world_size
+  assert num_samples % per_step == 0, (
+    f'{num_samples} generated samples do not divide evenly over '
+    f'loader.eval_batch_size={batch_size} x world_size='
+    f'{fabric.world_size} = {per_step} images per step. Pick an '
+    f'eval.fid_eval_num_samples that is a multiple of {per_step}, or change '
+    f'loader.eval_batch_size.')
+
+  # A deterministic permutation, so that the subset is reproducible across runs
+  # and identical on every rank -- `L.seed_everything` has already offset the
+  # global RNG by the rank, hence the explicit generator on `config.seed`.
+  # Shuffling (rather than taking the first N) keeps the class distribution of
+  # the subset representative, which matters for class-conditional models:
+  # `generate_samples` is handed the labels of the real batch.
+  order = torch.randperm(
+    len(dataset),
+    generator=torch.Generator().manual_seed(config.seed))
+  gen_dataset = torch.utils.data.Subset(
+    dataset, order[:num_samples].tolist())
+
   sampler = DistributedSampler(
-    dataset,
+    gen_dataset,
     num_replicas=fabric.world_size,
     rank=fabric.global_rank,
     shuffle=False)
 
   loader = torch.utils.data.DataLoader(
-    dataset,
-    batch_size=config.loader.eval_batch_size,
+    gen_dataset,
+    batch_size=batch_size,
     sampler=sampler,
     num_workers=config.loader.num_workers,
     pin_memory=config.loader.pin_memory)
-  
-  # Check each GPU must generate the same number of images
-  assert len(loader) == len(loader.dataset) // loader.batch_size // fabric.world_size, \
-     f'{len(loader)=}, {len(loader.dataset)=}, {loader.batch_size=}, {fabric.world_size=}'
+
+  # The reference pass covers the whole split. Striding the indices by rank
+  # partitions it exactly, where a `DistributedSampler` would pad the tail into
+  # duplicates whenever the world size does not divide 50k.
+  ref_loader = torch.utils.data.DataLoader(
+    torch.utils.data.Subset(
+      dataset,
+      range(fabric.global_rank, len(dataset), fabric.world_size)),
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=config.loader.num_workers,
+    pin_memory=config.loader.pin_memory)
 
   fid_calculator = FrechetInceptionDistance(
     normalize=False).to(fabric.device)
   is_calculator = InceptionScore(
     normalize=False).to(fabric.device)
-  
+
+  desc = f'(Rank {fabric.global_rank}) Reference...'
+  for batch in tqdm(ref_loader, desc=desc):
+    # Reshape 1D seq -> 2D image
+    real_samples = model.tokenizer.batch_decode(
+      batch['input_ids']).to(fabric.device)
+    fid_calculator.update(real_samples, real=True)
+
   desc = f'(Rank {fabric.global_rank}) Sampling...'
   for batch in tqdm(loader, desc=desc):
-    real_samples = batch['input_ids']
     # Generate images with labels matching the true data
     labels = batch['labels']
 
     gen_samples = model.generate_samples(
-      num_samples=real_samples.shape[0], 
+      num_samples=batch['input_ids'].shape[0],
       num_steps=config.sampling.steps,
       labels=labels)
-    # Reshape 1D seq -> 2D image
     gen_samples = model.tokenizer.batch_decode(gen_samples)
-    real_samples = model.tokenizer.batch_decode(
-      real_samples).to(fabric.device)
 
     fid_calculator.update(gen_samples, real=False)
-    fid_calculator.update(real_samples, real=True)
     is_calculator.update(gen_samples)
-  
+
   fabric.barrier()
   logger.info('Done sampling. Computing FID & IS...')
   fid = fid_calculator.compute()
   incep_score = is_calculator.compute()
 
   if fabric.global_rank == 0:
-    logger.info(f'FID: {fid}')
+    logger.info(f'FID: {fid}  ({num_samples} generated samples vs '
+                f'{len(dataset)} reference images)')
     logger.info(f'IS: {incep_score}')
+    if num_samples < len(dataset):
+      logger.info(
+        f'NOTE: FID is biased upward at {num_samples} samples and is not '
+        f'comparable to published CIFAR-10 numbers, which are quoted at '
+        f'{len(dataset)}. Leave eval.fid_eval_num_samples unset for the '
+        f'comparable figure.')
   fabric.barrier()
 
 

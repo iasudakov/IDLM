@@ -105,6 +105,14 @@ eval:
   fid_num_reference: null  # null => the whole 50k train split
   fid_ref_path: ${checkpointing.save_dir}/fid_ref.pt
   fid_key: val/fid
+  # `mode=fid_eval` only: how many images to generate. null => one per training
+  # image (50k for CIFAR-10), which is the sample count published FIDs are
+  # quoted at. Set it lower for a cheap preview of a checkpoint -- the reference
+  # side stays the full split, but fewer generated samples still bias FID
+  # upward, so such a number is comparable to other runs at the same setting and
+  # not to the literature. Must be a multiple of
+  # `loader.eval_batch_size` x num_gpus, so that every rank generates equally.
+  fid_eval_num_samples: null
 
 optim:
   weight_decay: 0
