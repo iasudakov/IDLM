@@ -90,7 +90,7 @@ def resolve_checkpoint_path(path):
 
 
 def load_backbone_from_lightning_checkpoint(backbone, checkpoint_path,
-                                            use_ema=True):
+                                            use_ema=True, checkpoint=None):
   """Load a Lightning checkpoint's `backbone.*` weights into `backbone`.
 
   Used to bring the published raw-pixel checkpoints (`jdeschena/duo2-cifar10`,
@@ -104,11 +104,19 @@ def load_backbone_from_lightning_checkpoint(backbone, checkpoint_path,
   the teacher we distill from is the model whose published sample quality was
   measured. The shadow list is ordered by `parameters()`, so it is zipped
   against the checkpoint's own parameter keys in state-dict order and only used
-  when the two line up exactly.
+  when the two line up exactly. It is ordered by `parameters()` specifically,
+  so buffers (e.g. the DiT's `rotary_emb.inv_freq`) are filtered out of the
+  key list before zipping rather than shifting it.
+
+  `checkpoint` accepts an already-loaded checkpoint dict, so a caller that had
+  to open the file anyway -- `algo._load_dit_ar_backbone` reads the
+  architecture out of `hyper_parameters` -- does not pay for a second multi-GB
+  `torch.load`. `checkpoint_path` is then only used for the log line.
   """
-  checkpoint_path = resolve_checkpoint_path(checkpoint_path)
-  checkpoint = torch.load(
-    checkpoint_path, map_location='cpu', weights_only=False)
+  if checkpoint is None:
+    checkpoint_path = resolve_checkpoint_path(checkpoint_path)
+    checkpoint = torch.load(
+      checkpoint_path, map_location='cpu', weights_only=False)
   state_dict = checkpoint.get('state_dict', checkpoint)
   prefix = 'backbone.'
   weights = {key[len(prefix):]: value

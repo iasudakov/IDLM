@@ -182,6 +182,52 @@ def _load_owt_ar_backbone(model_id_or_path):
   return model
 
 
+def _load_dit_ar_backbone(checkpoint_path, vocab_size, use_ema=True):
+  """Loads a *repo-native* causal DiT AR critic from an `algo=ar` checkpoint.
+
+  The counterpart of `_load_owt_ar_backbone` for the domains where no published
+  AR model exists and one was trained here instead -- CIFAR-10 raw pixels being
+  the case this was written for (`scripts/train_cifar10_ar.sh` on the
+  `duo-cifar10` branch: `model=small`, `model.length=3072`, `algo=ar`, i.e. a
+  causal DiT over the 3072 byte tokens).
+
+  The architecture is read from the checkpoint's own `hyper_parameters.config`
+  rather than from the running config, because the two genuinely differ: a
+  CIFAR-10 distillation run has `model=unet` (the student's D3PM denoiser) and
+  `algo.causal_attention=False`, neither of which describes the critic. Taking
+  it from the checkpoint also means the recipe only has to name a path -- there
+  is no second architecture to keep in sync by hand, and a mismatch surfaces as
+  a strict-load failure here instead of as silently wrong scores later.
+
+  `vocab_size` is the *student's* vocabulary and is asserted against the
+  checkpoint's, since the critic's log-probs are consumed position-for-position
+  against `student_probs`: on CIFAR-10 both are 256 pixel values + [MASK].
+  """
+  checkpoint_path = utils.resolve_checkpoint_path(checkpoint_path)
+  checkpoint = torch.load(
+    checkpoint_path, map_location='cpu', weights_only=False)
+  hparams = checkpoint.get('hyper_parameters', None) or {}
+  assert hparams.get('config', None) is not None, (
+    f'{checkpoint_path} carries no `hyper_parameters.config`, so the AR '
+    "critic's architecture cannot be read from it. Point "
+    'adversarial_distill.ar_model_path at a checkpoint saved by this repo '
+    "(`algo=ar`), or use adversarial_distill.ar_backbone='owt'.")
+  ar_config = hparams['config']
+  assert ar_config.algo.causal_attention, (
+    f'{checkpoint_path} was trained with algo.causal_attention=False, i.e. it '
+    'is not an autoregressive model.')
+  ckpt_vocab = hparams.get('vocab_size', vocab_size)
+  assert ckpt_vocab == vocab_size, (
+    f'AR critic vocabulary ({ckpt_vocab}) does not match the student\'s '
+    f'({vocab_size}). Its next-token log-probs are scored against the '
+    'student distribution index-for-index, so the two must be the same '
+    'vocabulary.')
+  model = models.dit.DIT(ar_config, vocab_size=ckpt_vocab)
+  utils.load_backbone_from_lightning_checkpoint(
+    model, checkpoint_path, use_ema=use_ema, checkpoint=checkpoint)
+  return model
+
+
 def _embedding_std(embed_module):
   """Per-entry std of a token-embedding module's weight matrix.
 
@@ -501,15 +547,33 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       # term (no min-max, no fake steps).
       self.use_fake = getattr(self.config.adversarial_distill, 'use_fake', True)
 
+      # Which AR implementation the critics are. 'owt' = the published owt-ar
+      # `AutoModelForCausalLM` backbone (text); 'dit' = a causal DiT trained in
+      # this repo with `algo=ar`, which is what a non-text domain (CIFAR-10 raw
+      # pixels) has. Read outside the branch below because `_ar_logprobs` has to
+      # know which calling convention to use.
+      self.ar_backbone = str(getattr(
+        self.config.adversarial_distill, 'ar_backbone', 'owt')).lower()
+      assert self.ar_backbone in ('owt', 'dit'), (
+        f'Unknown adversarial_distill.ar_backbone: {self.ar_backbone} '
+        "(expected 'owt' or 'dit').")
       if self.critic_type == 'ar':
         ar_model_path = getattr(
           self.config.adversarial_distill, 'ar_model_path',
           'kuleshov-group/owt-ar')
+        assert ar_model_path, (
+          "adversarial_distill.critic_type='ar' needs "
+          'adversarial_distill.ar_model_path to point at the AR model.')
+        if self.ar_backbone == 'dit':
+          load_ar = lambda: _load_dit_ar_backbone(
+            ar_model_path, vocab_size=self.vocab_size,
+            use_ema=not self.config.eval.disable_ema)
+        else:
+          load_ar = lambda: _load_owt_ar_backbone(ar_model_path)
         # Frozen AR teacher: the pretrained data-distribution model.
-        self.teacher = _load_owt_ar_backbone(ar_model_path)
-        # Trainable AR "fake" model, from the same owt-ar weights.
-        self.fake_model = (
-          _load_owt_ar_backbone(ar_model_path) if self.use_fake else None)
+        self.teacher = load_ar()
+        # Trainable AR "fake" model, from the same AR weights.
+        self.fake_model = load_ar() if self.use_fake else None
       else:
         # Original IDLM: teacher/fake are diffusion denoisers, copied from the
         # (raw, un-noise-conditioned) student before it is wrapped below.
@@ -924,14 +988,42 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     """Per-position next-token log-probabilities from an AR backbone.
 
     Args:
-      ar_backbone: a causal `DITLegacy` backbone (teacher or fake model).
+      ar_backbone: a causal backbone (teacher or fake model) -- a `DITLegacy`
+        under `ar_backbone='owt'`, this repo's `models.dit.DIT` under `'dit'`.
       tokens: int tensor (batch, length) of a full token sequence.
 
     Returns:
       log-probs of shape (batch, length - 1, vocab_size), where index `i`
       holds `log p(tokens[i + 1] | tokens[<= i])`, aligned so that it can be
       scored against `student_probs[:, 1:]`.
+
+    Both branches return that same convention, so every caller and every
+    reduction (`_ar_cross_entropy`, `_ar_nll`, `_apply_top_p_to_teacher`, the
+    `[:, 1:]` slicing in `_reduce_token_loss`) is shared unchanged.
     """
+    if self.ar_backbone == 'dit':
+      # A repo-native `algo=ar` model. Two differences from owt-ar, both
+      # dictated by how `AR` was trained (see `AR._process_model_input` /
+      # `AR.nll`):
+      #
+      #  * it is fed a *start token* rather than the sequence shifted by one.
+      #    Images have no BOS (`RawPixelsVisionTokenizer` is built with
+      #    `add_special_tokens=False`), so `AR` reuses `mask_index` for the
+      #    slot and every input position `i` holds token `i - 1`. Feeding
+      #    `tokens[:, :-1]` directly the way the owt path does would put every
+      #    token one rotary position early -- it would run, and score garbage.
+      #    Position 0 of the output is then `log p(tokens_0 | start)`, which
+      #    this convention does not carry, so it is dropped.
+      #  * the [MASK] column is pushed to `neg_infinity` before the softmax,
+      #    exactly as `AR.nll` does, because that column is the start token's
+      #    slot and was never a prediction target during training.
+      start = torch.full_like(tokens[:, :1], self.mask_index)
+      with torch.cuda.amp.autocast(dtype=torch.float32):
+        logits = ar_backbone(
+          torch.cat([start, tokens[:, :-1]], dim=1), None)
+      logits = logits.float()
+      logits[:, :, self.mask_index] = self.neg_infinity
+      return logits.log_softmax(-1)[:, 1:]
     with torch.cuda.amp.autocast(dtype=torch.float32):
       output = ar_backbone(input_ids=tokens[:, :-1])
     logits = output.logits if hasattr(output, 'logits') else output[0]

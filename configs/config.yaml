@@ -36,8 +36,22 @@ adversarial_distill:
   # teacher term, i.e. generator loss = teacher_loss (no min-max).
   use_fake: True
   # Autoregressive teacher (and fake-model initialisation) for MDLM_with_AR.
-  # A HF hub id or a local dir with the owt-ar config.json / pytorch_model.bin.
+  # Interpreted according to `ar_backbone`.
   ar_model_path: kuleshov-group/owt-ar
+  # Which AR implementation `critic_type: ar` builds its teacher / fake from.
+  #  * 'owt' (default, text): the published `kuleshov-group/owt-ar` causal DiT.
+  #    `ar_model_path` is a HF hub id or a local dir holding that checkpoint's
+  #    config.json / pytorch_model.bin.
+  #  * 'dit': a causal DiT trained in *this* repo with `algo=ar`, for domains
+  #    with no published AR model -- CIFAR-10 raw pixels being the case it was
+  #    written for. `ar_model_path` is then a Lightning `.ckpt` (or a
+  #    `<hf_repo>:<path>` hub spec, like `eval.checkpoint_path`); the
+  #    architecture is read from its own `hyper_parameters.config`, so nothing
+  #    else has to be restated, and `eval.disable_ema` selects raw vs EMA
+  #    weights the same way it does for the student. The critic's vocabulary
+  #    must match the student's (on CIFAR-10 both are 256 pixel values +
+  #    [MASK]); a mismatch is an error rather than a silent misalignment.
+  ar_backbone: owt
   # Learning rate for the fake critic. null => fall back to optim.lr (original
   # IDLM: fake and student share optim.lr). Set e.g. 1e-4 to give the critic a
   # larger, separate LR (two-time-scale).
