@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 
@@ -30,15 +31,46 @@ omegaconf.OmegaConf.register_new_resolver(
   'div_up', lambda x, y: (x + y - 1) // y)
 
 
+@contextlib.contextmanager
+def _permissive_torch_load():
+  """Let `torch.load` read this repo's own checkpoints on torch >= 2.6.
+
+  That release flipped `weights_only` to default True, and a Lightning
+  checkpoint written here cannot be read by the restricted unpickler:
+  `save_hyperparameters` stores the OmegaConf config *and* the tokenizer object.
+  Allow-listing them is not a fixed list -- it pulls in the OmegaConf node
+  types, `typing.Any`, and then a different tokenizer class per dataset
+  (`RawPixelsVisionTokenizer` for CIFAR-10, a HF fast tokenizer for OWT, ...) --
+  so ask for the full unpickler instead. These files are our own training
+  output.
+
+  Set through the environment variable rather than a `weights_only=` argument
+  because Lightning only forwards that argument in recent versions and this has
+  to keep working on older ones. A no-op before torch 2.4, where the default was
+  already permissive.
+  """
+  key = 'TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD'
+  previous = os.environ.get(key)
+  os.environ[key] = '1'
+  try:
+    yield
+  finally:
+    if previous is None:
+      del os.environ[key]
+    else:
+      os.environ[key] = previous
+
+
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
   if 'hf' in config.algo.backbone:
     return diffusion_model(
       config, tokenizer=tokenizer).to('cuda')
-  
-  return diffusion_model.load_from_checkpoint(
-    config.eval.checkpoint_path,
-    tokenizer=tokenizer,
-    config=config)
+
+  with _permissive_torch_load():
+    return diffusion_model.load_from_checkpoint(
+      config.eval.checkpoint_path,
+      tokenizer=tokenizer,
+      config=config)
 
 
 @L.pytorch.utilities.rank_zero_only
