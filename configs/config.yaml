@@ -30,9 +30,10 @@ adversarial_distill:
   # free -- size it against how long `student_loss` takes to peak, which is how
   # long the critic needed to catch up without it. 0 disables.
   # Honoured by every algo that uses `MDLM_with_AR.training_step` -- mdlm,
-  # mdlm_dmmd and mdlm_rl. (`algo=mdlm_rl` benefits most: its critic is fit to
-  # *trajectory* samples, so warming it up also fills `_rl_buffer` before the
-  # first policy update instead of leaving it near-empty.)
+  # mdlm_dmmd and mdlm_rl. Under mdlm_rl a warmup step also rolls out fresh
+  # rather than drawing from the rollout FIFO (see `_rl_draw_buffer`), since
+  # the generator that normally refills it is not running; that makes a warmup
+  # step cost a rollout there, unlike a normal fake step.
   fake_warmup_steps: 0
   generator_num_noised_samples: 1
   # Gradient clipping inside the manual-optimization (min-max) loop. Lightning

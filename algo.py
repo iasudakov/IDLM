@@ -2840,8 +2840,18 @@ class MDLM_RL(MDLM_DMMD):
     the critic more than once (the critic takes `fake_frequency` steps per
     generator step, and the generator produces at most one rollout per
     accumulation window). Rolls out on demand when the buffer is empty.
+
+    During `fake_warmup_steps` it rolls out *every* time instead. The buffer is
+    normally refilled by generator steps, and a warmup has none -- draining it
+    would fit the critic to a single rollout's worth of sequences for the whole
+    warmup, which is overfitting one sample rather than learning the student.
+    Rolling out fresh is also exactly right there and nowhere else: the student
+    is frozen, so every rollout is an i.i.d. draw from the one distribution the
+    critic has to model. It costs one rollout per fake step, which is simply
+    what fitting a critic to a sampler costs.
     """
-    if not self._rl_buffer:
+    if (not self._rl_buffer
+        or self.trainer.global_step < self.fake_warmup_steps):
       rollout = self._rl_rollout(x0, valid_tokens)
       self._rl_push_buffer(rollout)
       return rollout.x, rollout.valid_tokens
