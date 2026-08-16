@@ -33,6 +33,19 @@
 #
 # `fake_lr` DOES transfer: the auxiliary critic keeps its own units.
 #
+# THE OTHER POLICY. `rl_policy=onestep` keeps D-MMD's *sample* -- one denoiser
+# call on a data-derived latent -- and changes only the estimator, so it is the
+# ablation that separates "RL instead of the pathwise gradient" from
+# "trajectory samples instead of one-shot ones". It is much cheaper (no
+# rollout), it trains no particular step budget, so `sampling.steps` stays free
+# and its FID is directly comparable to an `mdlm_dmmd` run at the same setting.
+# Switch with:
+#   adversarial_distill.rl_policy=onestep \
+#   adversarial_distill.rl_onestep_group_size=4 \
+#   sampling.steps=64          # whatever the D-MMD run used
+# `rl_num_steps` / `rl_grad_steps` / `rl_buffer_size` / `rl_rollout_reuse` are
+# then unused, and a warmup step costs no rollout there either.
+#
 # STEP BUDGET. `rl_num_steps` is both the rollout length and the budget the
 # student is trained to decode at, so `sampling.steps` is set to match -- the
 # policy is otherwise evaluated under a sampler it was not trained for. At 16
@@ -103,6 +116,7 @@ python -u -m main \
   adversarial_distill.critic_type=ar \
   adversarial_distill.ar_backbone=dit \
   adversarial_distill.ar_model_path="$AR_PATH" \
+  adversarial_distill.rl_policy=trajectory \
   adversarial_distill.rl_num_steps=16 \
   adversarial_distill.rl_grad_steps=1 \
   adversarial_distill.rl_baseline=leave_one_out \

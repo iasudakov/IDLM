@@ -286,6 +286,29 @@ adversarial_distill:
   # sampling.steps to the same value to evaluate what was trained. Cost is
   # linear in it: a generator micro-step is k+1 no-grad forwards plus
   # rl_grad_steps with gradient.
+  # Which distribution the policy gradient is taken over.
+  # 'trajectory' (default): the student's own k-step ancestral rollout from the
+  #   all-mask prior, so pi_eta is the deployed sampler's marginal. Uses
+  #   rl_num_steps / rl_grad_steps / rl_buffer_size / rl_rollout_reuse.
+  # 'onestep': D-MMD's sample exactly -- ONE denoiser call on a data-derived
+  #   latent, x ~ Cat(x_hat_eta(z_t)). Same samples and same reward as
+  #   algo=mdlm_dmmd; only the estimator changes from the pathwise gradient to
+  #   REINFORCE. That makes it the ablation isolating "RL instead of the
+  #   pathwise gradient" from "trajectory samples instead of one-shot ones".
+  #   Much cheaper (one student forward, no rollout) and, unlike 'trajectory',
+  #   it trains no particular step count -- so sampling.steps stays free and
+  #   the resulting FID is directly comparable to an mdlm_dmmd run.
+  #   rl_num_steps / rl_grad_steps / rl_buffer_size / rl_rollout_reuse are
+  #   unused; rl_onestep_group_size takes their place.
+  rl_policy: trajectory
+  # G: i.i.d. draws from ONE latent that the 'onestep' baseline is computed
+  # over. Grouping per latent is what makes the baseline valid -- across rows
+  # of a batch the reward mostly reflects which (x0, t) was drawn rather than
+  # which sample was better, so a batch-wide baseline subtracts the wrong
+  # thing. Must be >= 2 (one draw has no baseline and gives a zero advantage).
+  # Costs G critic forward pairs per micro-step; the student forward is shared,
+  # so raising it is the cheap way to a lower-variance baseline here.
+  rl_onestep_group_size: 4
   rl_num_steps: 16
   # M: how many of those k+1 steps are recomputed with gradient per update.
   # Every position is revealed exactly once across the trajectory, so drawing M

@@ -2294,6 +2294,28 @@ class MDLM_RL(MDLM_DMMD):
       getattr(ad, 'rl_pathwise_weight', 0.0) or 0.0)
     self.rl_buffer_size = int(getattr(ad, 'rl_buffer_size', 8) or 8)
     self.rl_rollout_reuse = int(getattr(ad, 'rl_rollout_reuse', 1) or 1)
+    # Which distribution the policy gradient is taken over.
+    #  'trajectory' -- the sampler's own k-step rollout from the all-mask
+    #    prior. `pi_eta` is the deployed sampler's marginal.
+    #  'onestep' -- D-MMD's sample exactly: one denoiser call on a *data*
+    #    -derived latent, `x ~ Cat(x_hat_eta(z_t))`. Same samples and same
+    #    reward as `algo=mdlm_dmmd`, only the estimator changes from pathwise
+    #    to REINFORCE, which is what isolates "RL instead of the pathwise
+    #    gradient" from "trajectory samples instead of one-shot ones".
+    self.rl_policy = str(getattr(ad, 'rl_policy', 'trajectory')).lower()
+    assert self.rl_policy in ('trajectory', 'onestep'), (
+      f'Unknown adversarial_distill.rl_policy: {self.rl_policy!r} '
+      "(expected 'trajectory' or 'onestep').")
+    # G: i.i.d. draws from ONE latent that the onestep baseline is computed
+    # over. Grouping per latent is what makes it valid -- across rows of a
+    # batch the reward mostly reflects which (x0, t) was drawn, not which
+    # sample was better, so a batch-wide baseline would subtract the wrong
+    # thing. Costs G critic forward pairs; the student forward is shared.
+    self.rl_onestep_group_size = int(
+      getattr(ad, 'rl_onestep_group_size', 4) or 4)
+    assert self.rl_onestep_group_size >= 2 or self.rl_policy != 'onestep', (
+      'adversarial_distill.rl_onestep_group_size must be >= 2: with one draw '
+      'per latent there is no baseline and the advantage is identically 0.')
     # Terminal time of the sampling grid. `null` => `generate_samples`'s own
     # default (1e-5), i.e. the rollout is the sampler validation decodes with.
     # Note this is NOT `training.sampling_eps` (1e-3), which floors the
@@ -2327,11 +2349,18 @@ class MDLM_RL(MDLM_DMMD):
         'sequence, and the diffusion critic has no tractable sequence '
         'log-likelihood to supply it (only an ELBO bound, which is not '
         'implemented here). Use algo=mdlm_dmmd for the diffusion critic.')
-      if self.fake_soft_target:
+      if self.fake_soft_target and self.rl_policy == 'trajectory':
         print('[rl] adversarial_distill.fake_soft_target is ignored by '
-              'algo=mdlm_rl: the auxiliary critic is fit to the hard '
-              'trajectory samples, because its log-density is what the '
-              'reward subtracts.', flush=True)
+              "algo=mdlm_rl at rl_policy='trajectory': the auxiliary critic "
+              'is fit to the hard trajectory samples, because its '
+              'log-density is what the reward subtracts. It does apply at '
+              "rl_policy='onestep', whose samples come from a single soft "
+              'prediction.', flush=True)
+      print('[rl] policy={}{}'.format(
+        self.rl_policy,
+        ', group={}'.format(self.rl_onestep_group_size)
+        if self.rl_policy == 'onestep'
+        else ', k={}'.format(self.rl_num_steps)), flush=True)
       if self.sampler == 'confidence':
         print('[rl] sampling.predictor=\'confidence\' decodes by confidence '
               'rank, but the RL rollout is always ancestral -- a cached or '
@@ -2602,7 +2631,7 @@ class MDLM_RL(MDLM_DMMD):
     del fake_logprobs
     return fake_nll - teacher_nll, teacher_nll, fake_nll
 
-  def _rl_advantage(self, reward):
+  def _rl_advantage(self, reward, group=None):
     """Group-baselined advantage, `(batch,)`, detached.
 
     The group is the local rollout batch (`rl_group_size=0`) or fixed-size
@@ -2611,13 +2640,17 @@ class MDLM_RL(MDLM_DMMD):
     group mean is a valid baseline -- this is GRPO's setting exactly, with
     the prompt being empty.
 
+    `group` overrides that size. `rl_policy='onestep'` passes it: there the
+    i.i.d. draws are the G samples from one *latent*, so the reward is laid
+    out with those adjacent and grouped by G rather than by batch row.
+
     Degenerate groups (one member, or zero reward spread) return zeros
     rather than NaNs: a group that produced identical rewards carries no
     information about which trajectory was better, so contributing nothing
     is the correct answer, not an accident to be papered over.
     """
     reward = reward.detach()
-    group = self.rl_group_size or reward.shape[0]
+    group = group or self.rl_group_size or reward.shape[0]
     group = max(1, min(group, reward.shape[0]))
     parts = []
     for chunk in torch.split(reward, group):
@@ -2785,6 +2818,9 @@ class MDLM_RL(MDLM_DMMD):
     inherited entropy-bonus plumbing (`generator_loss` ->
     `_entropy_term_sum` -> `entropy_weight * H`) applies here untouched.
     """
+    if self.rl_policy == 'onestep':
+      return self._rl_onestep_generator_loss(
+        x0, valid_tokens, current_accumulation_step)
     del current_accumulation_step  # the rollout starts from the prior, not x0
     rollout = self._rl_get_rollout(x0, valid_tokens)
     reward, teacher_nll, fake_nll = self._rl_reward(rollout.x, valid_tokens)
@@ -2795,6 +2831,84 @@ class MDLM_RL(MDLM_DMMD):
       loss = loss + self.rl_pathwise_weight * self._rl_pathwise_term(
         rollout, valid_tokens)
     return loss
+
+  def _rl_onestep_generator_loss(self, x0, valid_tokens,
+                                 current_accumulation_step):
+    """REINFORCE on D-MMD's *own* samples, `x ~ Cat(x_hat_eta(z_t))`.
+
+    Same latent, same sample, same reward as `MDLM_DMMD._generator_loss_ar`;
+    only the estimator differs. D-MMD differentiates the student's
+    probabilities while the critics' context is held fixed -- a per-position
+    surrogate that is biased for the sequence-level KL. Here the sequence is
+    sampled, scored, and credited through `grad log p_eta(x | z_t)`, which is
+    unbiased for the same quantity at the cost of variance. Isolating that
+    swap is the point: against `rl_policy='trajectory'` it separates "RL
+    instead of the pathwise gradient" from "trajectory samples instead of
+    one-shot ones", which are two changes the trajectory policy makes at once.
+
+    The baseline is over the `G = rl_onestep_group_size` draws from **one
+    latent**, never across the batch: rows differ in `(x0, t)`, so most of the
+    reward spread across a batch says which latent was drawn rather than which
+    sample was better, and a batch-wide baseline would subtract that.
+
+    Only positions masked in `z_t` are scored -- `_process_model_output` pins
+    the rest to a one-hot whose log-prob is a constant 0 -- and everything is
+    reduced to per-token nats, matching `_rl_surrogate` so `optim.lr` and
+    `entropy_weight` mean the same thing under both policies.
+
+    One student forward, shared by all G draws; the cost is G critic pairs.
+    """
+    student_probs, student_xt = self.multistep_generation(
+      x0, valid_tokens, current_accumulation_step, return_xt=True)
+    log_probs = student_probs.clamp_min(1e-12).log()
+    self._rl_record_entropy(log_probs, student_xt, valid_tokens)
+
+    # Positions the student actually predicted, i.e. the ones it acted on.
+    weight = (student_xt == self.mask_index).to(log_probs.dtype)
+    if valid_tokens is not None:
+      weight = weight * valid_tokens
+    norm = self._rl_sum_norm(valid_tokens, x0.shape[1])
+
+    detached = student_probs.detach()
+    group = max(2, self.rl_onestep_group_size)
+    rewards, teacher_nlls, fake_nlls, logps = [], [], [], []
+    for _ in range(group):
+      x = trainer_base.sample_categorical(detached)
+      x = self._preserve_prompt_tokens(x, x0, valid_tokens)
+      with torch.no_grad():
+        reward, teacher_nll, fake_nll = self._rl_reward(x, valid_tokens)
+      logp = (log_probs.gather(-1, x[..., None]).squeeze(-1)
+              * weight).sum(-1) / norm
+      rewards.append(reward)
+      teacher_nlls.append(teacher_nll)
+      fake_nlls.append(fake_nll)
+      logps.append(logp)
+
+    # (batch, G) laid out with one latent's draws adjacent, so `_rl_advantage`
+    # chunked by G baselines *within* a latent rather than across the batch.
+    reward = torch.stack(rewards, dim=-1)
+    advantage = self._rl_advantage(
+      reward.reshape(-1), group=group).reshape(reward.shape)
+    logp = torch.stack(logps, dim=-1)
+    surrogate = -(advantage.detach() * logp).mean(-1)
+
+    self._rl_record_stats(
+      reward.reshape(-1), torch.stack(teacher_nlls, -1).reshape(-1),
+      torch.stack(fake_nlls, -1).reshape(-1), logp.detach().reshape(-1),
+      advantage.reshape(-1))
+    if self.rl_pathwise_weight != 0.0:
+      # The pathwise D-MMD term at this same latent and soft prediction, i.e.
+      # literally `MDLM_DMMD`'s generator loss, converted to per-token nats.
+      teacher_logprobs = self._apply_top_p_to_teacher(
+        self._ar_logprobs(self.teacher, x))
+      pathwise = self._ar_cross_entropy(
+        teacher_logprobs, student_probs, valid_tokens)
+      if self.use_fake:
+        pathwise = pathwise - self._ar_cross_entropy(
+          self._ar_logprobs(self.fake_model, x), student_probs, valid_tokens)
+      surrogate = surrogate + self.rl_pathwise_weight * (
+        self._rl_reduced_to_per_token(pathwise, valid_tokens, x0.shape[1]))
+    return surrogate
 
   def _fake_loss_ar(self, x0, valid_tokens, current_accumulation_step):
     """Auxiliary/fake objective, fit to **trajectory** samples.
@@ -2821,6 +2935,14 @@ class MDLM_RL(MDLM_DMMD):
     changed, so `adversarial_distill.fake_lr` transfers from `mdlm_dmmd`
     unmodified. Only `optim.lr` needs revisiting.
     """
+    if self.rl_policy == 'onestep':
+      # The reward's `log p_fake` has to be the density of the distribution
+      # the student is actually sampled from, and under this policy that is
+      # the one-shot conditional -- exactly what the inherited D-MMD critic
+      # objective fits. `fake_soft_target` becomes meaningful again here,
+      # since these samples *do* come from a single soft `x_hat_eta`.
+      return super()._fake_loss_ar(
+        x0, valid_tokens, current_accumulation_step)
     del current_accumulation_step
     x_gen, buffered_valid = self._rl_draw_buffer(x0, valid_tokens)
     fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
