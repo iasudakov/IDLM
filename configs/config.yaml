@@ -18,6 +18,22 @@ adversarial_distill:
   is_distill: False
   accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   fake_frequency: 1
+  # Critic warmup: hold the student frozen for this many optimizer steps at the
+  # start of training and take only fake steps, so the critic is fitted to the
+  # *initial* student before the min-max begins. Matters most when the fake is
+  # not initialised from the student: with `critic_type: ar` it starts as a copy
+  # of the AR teacher, i.e. a model of the data rather than of the student's
+  # sampler, and the gap has to be closed by training. (With
+  # `critic_type: diffusion` the fake *is* a copy of the student, so it starts
+  # at zero gap and this buys much less.) Costs one sampler rollout plus one
+  # critic forward/backward per step, and no student progress, so it is not
+  # free -- size it against how long `student_loss` takes to peak, which is how
+  # long the critic needed to catch up without it. 0 disables.
+  # Honoured by every algo that uses `MDLM_with_AR.training_step` -- mdlm,
+  # mdlm_dmmd and mdlm_rl. (`algo=mdlm_rl` benefits most: its critic is fit to
+  # *trajectory* samples, so warming it up also fills `_rl_buffer` before the
+  # first policy update instead of leaving it near-empty.)
+  fake_warmup_steps: 0
   generator_num_noised_samples: 1
   # Gradient clipping inside the manual-optimization (min-max) loop. Lightning
   # does not apply `trainer.gradient_clip_val` when automatic_optimization is

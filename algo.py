@@ -621,6 +621,13 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       self._student_accum_counter = 0
       self.fake_frequency = self.config.adversarial_distill.fake_frequency
       self.fake_iter = 0
+      # Critic warmup: fit the fake to the *initial* student before the
+      # generator is allowed to move at all. Counted in `trainer.global_step`,
+      # which during the warmup is exactly the number of fake optimizer steps
+      # taken (no generator step happens while it is active) and is restored on
+      # resume, so a run that dies mid-warmup picks up where it left off.
+      self.fake_warmup_steps = int(getattr(
+        self.config.adversarial_distill, 'fake_warmup_steps', 0) or 0)
       # With no fake critic, every step is a generator step.
       self.is_generator_step = not self.use_fake
       self.total_loss_student = 0
@@ -1770,12 +1777,22 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self.fake_iter += 1
         self.f_loss_ar.append(self.total_loss_fake)
         self.total_loss_fake = 0
-        if self.fake_iter == self.fake_frequency:
-          self.is_generator_step = True
+        if self.fake_iter >= self.fake_frequency:
           self.fake_iter = 0
-          utils.activate_model(self.backbone)
-          utils.freeze_model(self.fake_model)
-          optimizer_student.zero_grad()
+          if self.trainer.global_step < self.fake_warmup_steps:
+            # Critic warmup: stay on fake steps. The fake is initialised from
+            # the *teacher* -- a model of the data, not of the student -- so
+            # without this the generator spends its first thousands of steps
+            # chasing a critic that is itself mid-adaptation. Holding the
+            # student frozen lets the fake converge onto the initial student
+            # first, so the min-max starts near its equilibrium instead of
+            # walking there while both sides move.
+            pass
+          else:
+            self.is_generator_step = True
+            utils.activate_model(self.backbone)
+            utils.freeze_model(self.fake_model)
+            optimizer_student.zero_grad()
 
     else:
       return super().training_step(batch, batch_idx)
