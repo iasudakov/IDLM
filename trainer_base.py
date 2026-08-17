@@ -1075,6 +1075,16 @@ class Diffusion(TrainerBase):
         t = t.chunk(self.accum_batches)[accum_step]
       else:
         t = t.chunk(self.trainer.accumulate_grad_batches)[accum_step]
+      assert t.shape[0] >= batch_dim, (
+        'loader.global_batch_size={} is too small to feed {} device(s) x {} '
+        'node(s) at loader.batch_size={}: each rank/accumulation slice gets '
+        'only {} time samples for {} rows. Raise global_batch_size to a '
+        'multiple of devices * num_nodes * batch_size (here {}), or lower '
+        'trainer.devices. Left unchecked this surfaces much later as a shape '
+        'mismatch inside q_xt.'.format(
+          self.config.loader.global_batch_size, self.trainer.num_devices,
+          self.trainer.num_nodes, batch_dim, t.shape[0], batch_dim,
+          self.trainer.num_devices * self.trainer.num_nodes * batch_dim))
       # corner case for the last datapoint
       t = t[:batch_dim]
     return t
