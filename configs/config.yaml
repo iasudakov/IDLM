@@ -35,6 +35,24 @@ adversarial_distill:
   # the generator that normally refills it is not running; that makes a warmup
   # step cost a rollout there, unlike a normal fake step.
   fake_warmup_steps: 0
+  # Curriculum on how much of x0 is masked, i.e. on how many positions the
+  # student actually generates. `t` is drawn from [sampling_eps, t_max] where
+  # t_max ramps linearly from `t_warmup_start` to 1 over `t_warmup_steps`
+  # optimizer steps. 0 disables and reproduces the previous draw exactly.
+  #
+  # Aimed at the AR critic. It scores position i conditioned on x_{<i}, so at
+  # t ~ 1 nearly the whole prefix is the student's own output and the critic is
+  # being asked for conditionals far outside its training distribution -- its
+  # scores there are meaningless rather than merely wrong, and the reward built
+  # from them steers by noise. A low t_max keeps the context mostly real data
+  # with a few generated tokens in it, which is where those conditionals can be
+  # trusted. Of no obvious use to the diffusion critic, which is trained at
+  # every noise level and so is in-distribution at any t.
+  #
+  # Only shapes the training draw; validation is unaffected, so val/nll stays
+  # comparable across the ramp.
+  t_warmup_steps: 0
+  t_warmup_start: 0.3
   generator_num_noised_samples: 1
   # Gradient clipping inside the manual-optimization (min-max) loop. Lightning
   # does not apply `trainer.gradient_clip_val` when automatic_optimization is
@@ -309,6 +327,15 @@ adversarial_distill:
   # Costs G critic forward pairs per micro-step; the student forward is shared,
   # so raising it is the cheap way to a lower-variance baseline here.
   rl_onestep_group_size: 4
+  # Per-token credit instead of one scalar advantage shared by all ~3000
+  # positions of a sample. The reward is a sum of per-position terms, so the
+  # structure is free to keep; the sparse form is about the coarsest credit
+  # assignment available and is most of why this objective needs a tiny
+  # optim.lr to stay stable. Credit for position i is the reward-to-go
+  # sum_{j>=i} r_j, since committing token i moves every AR conditional after
+  # it and none before. Baseline and advantage_norm apply per position across
+  # the G draws. rl_policy=onestep only; the trajectory policy ignores it.
+  rl_dense_reward: false
   rl_num_steps: 16
   # M: how many of those k+1 steps are recomputed with gradient per update.
   # Every position is revealed exactly once across the trajectory, so drawing M

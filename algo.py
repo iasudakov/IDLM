@@ -2313,6 +2313,10 @@ class MDLM_RL(MDLM_DMMD):
     # thing. Costs G critic forward pairs; the student forward is shared.
     self.rl_onestep_group_size = int(
       getattr(ad, 'rl_onestep_group_size', 4) or 4)
+    # Per-token credit instead of one scalar per sequence. See
+    # `_rl_onestep_dense_surrogate`.
+    self.rl_dense_reward = bool(
+      getattr(ad, 'rl_dense_reward', False))
     assert self.rl_onestep_group_size >= 2 or self.rl_policy != 'onestep', (
       'adversarial_distill.rl_onestep_group_size must be >= 2: with one draw '
       'per latent there is no baseline and the advantage is identically 0.')
@@ -2832,6 +2836,72 @@ class MDLM_RL(MDLM_DMMD):
         rollout, valid_tokens)
     return loss
 
+  @torch.no_grad()
+  def _rl_token_reward(self, x, valid_tokens):
+    """Per-position reward, `(batch, length - 1)`, in nats.
+
+    `r_i = log p_teacher(x_i | x_<i) - log p_fake(x_i | x_<i)`, i.e. exactly
+    the summand `_rl_reward` averages away. Index `i` scores token `i + 1`,
+    matching `_ar_logprobs`.
+
+    Also returns the two scalar `(batch,)` NLLs the `rl/*` diagnostics want,
+    reduced from these same tensors -- so the dense path costs exactly the
+    critic forwards the sparse one does, not double.
+    """
+    tgt = x[:, 1:, None]
+    tl = self._apply_top_p_to_teacher(self._ar_logprobs(self.teacher, x))
+    t_lp = tl.gather(-1, tgt).squeeze(-1)
+    del tl
+    r = t_lp
+    f_lp = None
+    if self.use_fake:
+      fl = self._ar_logprobs(self.fake_model, x)
+      f_lp = fl.gather(-1, tgt).squeeze(-1)
+      del fl
+      r = t_lp - f_lp
+    if valid_tokens is not None:
+      vt = valid_tokens[:, 1:]
+      r, t_lp = r * vt, t_lp * vt
+      if f_lp is not None:
+        f_lp = f_lp * vt
+    denom = self._rl_sum_norm(valid_tokens, x.shape[1] - 1)
+    teacher_nll = -t_lp.sum(-1) / denom
+    fake_nll = (-f_lp.sum(-1) / denom if f_lp is not None
+                else torch.zeros_like(teacher_nll))
+    return r, teacher_nll, fake_nll
+
+  def _rl_onestep_dense_surrogate(self, rewards, logp_tok, weight, norm):
+    """Token-level REINFORCE surrogate, `(batch,)`.
+
+    The sparse estimator hands every one of ~3000 positions the *same* scalar
+    advantage, which is about the coarsest credit assignment available and is
+    most of why this objective needs a tiny `optim.lr` to stay stable. The
+    reward is a sum of per-position terms, so that structure is free to keep.
+
+    Credit for position `i` is the **reward-to-go** `sum_{j >= i} r_j`, not
+    `r_i`. Committing token `i` changes every AR conditional downstream of it
+    but none before it, so reward-to-go is the part of the return that
+    position `i` actually influenced -- pairing `r_i` alone with
+    `grad log p(x_i)` would drop those downstream effects and be biased.
+
+    `rewards` / `logp_tok` / `weight` are `(batch, G, L-1)`; the baseline is
+    taken across the G draws *at each position*, the same leave-one-out and
+    std-normalisation rules `_rl_advantage` applies to whole sequences.
+    """
+    rtg = rewards.flip(-1).cumsum(-1).flip(-1)
+    g = rtg.shape[1]
+    if self.rl_baseline == 'none' or g < 2:
+      adv = rtg
+    elif self.rl_baseline == 'leave_one_out':
+      adv = rtg - (rtg.sum(1, keepdim=True) - rtg) / (g - 1)
+    else:
+      adv = rtg - rtg.mean(1, keepdim=True)
+    if self.rl_advantage_norm == 'std' and g >= 2:
+      std = rtg.std(1, keepdim=True)
+      adv = torch.where(std > 1e-6, adv / std.clamp_min(1e-6),
+                        torch.zeros_like(adv))
+    return -((adv.detach() * logp_tok * weight).sum(-1) / norm).mean(-1)
+
   def _rl_onestep_generator_loss(self, x0, valid_tokens,
                                  current_accumulation_step):
     """REINFORCE on D-MMD's *own* samples, `x ~ Cat(x_hat_eta(z_t))`.
@@ -2872,13 +2942,22 @@ class MDLM_RL(MDLM_DMMD):
     detached = student_probs.detach()
     group = max(2, self.rl_onestep_group_size)
     rewards, teacher_nlls, fake_nlls, logps = [], [], [], []
+    tok_rewards, tok_logps = [], []
     for _ in range(group):
       x = trainer_base.sample_categorical(detached)
       x = self._preserve_prompt_tokens(x, x0, valid_tokens)
-      with torch.no_grad():
-        reward, teacher_nll, fake_nll = self._rl_reward(x, valid_tokens)
-      logp = (log_probs.gather(-1, x[..., None]).squeeze(-1)
-              * weight).sum(-1) / norm
+      logp_tok = log_probs.gather(-1, x[..., None]).squeeze(-1)
+      if self.rl_dense_reward:
+        r_tok, teacher_nll, fake_nll = self._rl_token_reward(x, valid_tokens)
+        tok_rewards.append(r_tok)
+        # `r_tok[i]` scores token `i + 1`, so it pairs with that token's own
+        # student log-prob.
+        tok_logps.append(logp_tok[:, 1:])
+        reward = fake_nll - teacher_nll
+      else:
+        with torch.no_grad():
+          reward, teacher_nll, fake_nll = self._rl_reward(x, valid_tokens)
+      logp = (logp_tok * weight).sum(-1) / norm
       rewards.append(reward)
       teacher_nlls.append(teacher_nll)
       fake_nlls.append(fake_nll)
@@ -2890,7 +2969,12 @@ class MDLM_RL(MDLM_DMMD):
     advantage = self._rl_advantage(
       reward.reshape(-1), group=group).reshape(reward.shape)
     logp = torch.stack(logps, dim=-1)
-    surrogate = -(advantage.detach() * logp).mean(-1)
+    if self.rl_dense_reward:
+      surrogate = self._rl_onestep_dense_surrogate(
+        torch.stack(tok_rewards, dim=1), torch.stack(tok_logps, dim=1),
+        weight[:, 1:].unsqueeze(1), norm)
+    else:
+      surrogate = -(advantage.detach() * logp).mean(-1)
 
     self._rl_record_stats(
       reward.reshape(-1), torch.stack(teacher_nlls, -1).reshape(-1),

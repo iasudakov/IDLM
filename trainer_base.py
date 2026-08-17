@@ -1044,6 +1044,37 @@ class Diffusion(TrainerBase):
     assert sigma.ndim == 1, sigma.shape
     return sigma
 
+  def _t_curriculum_max(self):
+    """Upper end of the training time draw, ramped 0 -> 1 over a warmup.
+
+    `t` sets how much of `x0` is masked, hence how many positions the student
+    actually predicts. That matters specifically for an *autoregressive*
+    critic: it scores position `i` conditioned on `x_{<i}`, so at `t ~ 1`
+    almost the whole prefix is the student's own output and the critic is
+    asked for conditionals on a sequence far outside anything it was trained
+    on. Its scores there are not wrong so much as meaningless, and the reward
+    built from them steers the student by noise.
+
+    Capping `t` early keeps the critic's context mostly *real data* -- a few
+    generated tokens embedded in a true image -- which is exactly the regime
+    where its conditionals are trustworthy. The cap then anneals to 1 so the
+    objective ends up being the one we actually want.
+
+    Returns 1.0 (the previous behaviour, exactly) unless
+    `adversarial_distill.t_warmup_steps > 0`. Only shapes the *training* draw;
+    validation calls `_sample_t` with `accum_step=None` and is unaffected, so
+    `val/nll` stays comparable across the ramp.
+    """
+    steps = int(getattr(
+      self.config.adversarial_distill, 't_warmup_steps', 0) or 0)
+    if steps <= 0 or not getattr(self, 'is_adversarial_distill', False):
+      return 1.0
+    start = float(getattr(
+      self.config.adversarial_distill, 't_warmup_start', 0.3))
+    step = getattr(getattr(self, 'trainer', None), 'global_step', 0) or 0
+    frac = min(1.0, max(0.0, step / steps))
+    return start + (1.0 - start) * frac
+
   def _sample_t(self, n, accum_step):
     if accum_step is not None:
       # During training
@@ -1053,7 +1084,8 @@ class Diffusion(TrainerBase):
     if self.antithetic_sampling:
       offset = torch.arange(n, device=self.device) / n
       _eps_t = (_eps_t / n + offset) % 1
-    t = (1 - self.sampling_eps) * _eps_t + self.sampling_eps
+    t = (self._t_curriculum_max() - self.sampling_eps) * _eps_t \
+        + self.sampling_eps
     if accum_step is not None:
       t = t.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
       t = t.chunk(self.trainer.num_devices)[self.trainer.local_rank]
