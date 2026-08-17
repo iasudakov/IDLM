@@ -40,6 +40,13 @@ adversarial_distill:
   # t_max ramps linearly from `t_warmup_start` to 1 over `t_warmup_steps`
   # optimizer steps. 0 disables and reproduces the previous draw exactly.
   #
+  # UNITS: optimizer steps, like `trainer.max_steps` and `fake_warmup_steps` --
+  # NOT the batch counter the logger plots. They differ by `accum_batches`
+  # (= global_batch_size / (devices * batch_size)), which is 64 at the default
+  # global_batch_size=512 with batch_size=8. A run whose x-axis reads 100k
+  # batches has taken ~1.5k optimizer steps, so a warmup of 20k would never
+  # complete. Size these against trainer.max_steps, not against the plot.
+  #
   # Aimed at the AR critic. It scores position i conditioned on x_{<i}, so at
   # t ~ 1 nearly the whole prefix is the student's own output and the critic is
   # being asked for conditionals far outside its training distribution -- its

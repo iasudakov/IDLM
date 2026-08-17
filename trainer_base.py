@@ -1060,10 +1060,16 @@ class Diffusion(TrainerBase):
     where its conditionals are trustworthy. The cap then anneals to 1 so the
     objective ends up being the one we actually want.
 
+    Counted in `trainer.global_step`, i.e. **optimizer** steps -- not batches.
+    With `accum_batches = global_batch_size / (devices * batch_size)` those
+    differ by that factor, so a run logging 100k batches at accum 64 has taken
+    only ~1.5k optimizer steps and a warmup of 20k would never finish. Size
+    this against `trainer.max_steps`, which is compared to the same counter.
+
     Returns 1.0 (the previous behaviour, exactly) unless
-    `adversarial_distill.t_warmup_steps > 0`. Only shapes the *training* draw;
-    validation calls `_sample_t` with `accum_step=None` and is unaffected, so
-    `val/nll` stays comparable across the ramp.
+    `adversarial_distill.t_warmup_steps > 0`. `_sample_t` applies it on the
+    training draw only; validation is left at the full range so `val/nll`
+    tracks the model rather than the ramp.
     """
     steps = int(getattr(
       self.config.adversarial_distill, 't_warmup_steps', 0) or 0)
@@ -1084,8 +1090,12 @@ class Diffusion(TrainerBase):
     if self.antithetic_sampling:
       offset = torch.arange(n, device=self.device) / n
       _eps_t = (_eps_t / n + offset) % 1
-    t = (self._t_curriculum_max() - self.sampling_eps) * _eps_t \
-        + self.sampling_eps
+    # Training only. `accum_step is None` is the validation path, and letting
+    # the ramp reach it would make `val/nll` / `val/bpd` drift with the
+    # curriculum rather than with the model -- the metric would move on a
+    # frozen student.
+    t_max = self._t_curriculum_max() if accum_step is not None else 1.0
+    t = (t_max - self.sampling_eps) * _eps_t + self.sampling_eps
     if accum_step is not None:
       t = t.chunk(self.trainer.num_nodes)[self.trainer.node_rank]
       t = t.chunk(self.trainer.num_devices)[self.trainer.local_rank]
