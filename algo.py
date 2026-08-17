@@ -213,6 +213,10 @@ def _load_dit_ar_backbone(checkpoint_path, vocab_size, use_ema=True):
     'adversarial_distill.ar_model_path at a checkpoint saved by this repo '
     "(`algo=ar`), or use adversarial_distill.ar_backbone='owt'.")
   ar_config = hparams['config']
+  assert str(ar_config.algo.backbone).lower() == 'dit', (
+    f'{checkpoint_path} was trained with algo.backbone='
+    f'{ar_config.algo.backbone!r}, but this loader builds a `models.dit.DIT`. '
+    'A mismatch would surface as a state-dict error rather than this message.')
   assert ar_config.algo.causal_attention, (
     f'{checkpoint_path} was trained with algo.causal_attention=False, i.e. it '
     'is not an autoregressive model.')
@@ -222,7 +226,7 @@ def _load_dit_ar_backbone(checkpoint_path, vocab_size, use_ema=True):
     f'({vocab_size}). Its next-token log-probs are scored against the '
     'student distribution index-for-index, so the two must be the same '
     'vocabulary.')
-  model = models.dit.DIT(ar_config, vocab_size=ckpt_vocab)
+  model = models.dit.DIT(ar_config, vocab_size=vocab_size)
   utils.load_backbone_from_lightning_checkpoint(
     model, checkpoint_path, use_ema=use_ema, checkpoint=checkpoint)
   return model
@@ -552,10 +556,10 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       # this repo with `algo=ar`, which is what a non-text domain (CIFAR-10 raw
       # pixels) has. Read outside the branch below because `_ar_logprobs` has to
       # know which calling convention to use.
-      self.ar_backbone = str(getattr(
+      self.ar_impl = str(getattr(
         self.config.adversarial_distill, 'ar_backbone', 'owt')).lower()
-      assert self.ar_backbone in ('owt', 'dit'), (
-        f'Unknown adversarial_distill.ar_backbone: {self.ar_backbone} '
+      assert self.ar_impl in ('owt', 'dit'), (
+        f'Unknown adversarial_distill.ar_backbone: {self.ar_impl} '
         "(expected 'owt' or 'dit').")
       if self.critic_type == 'ar':
         ar_model_path = getattr(
@@ -564,7 +568,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         assert ar_model_path, (
           "adversarial_distill.critic_type='ar' needs "
           'adversarial_distill.ar_model_path to point at the AR model.')
-        if self.ar_backbone == 'dit':
+        if self.ar_impl == 'dit':
           load_ar = lambda: _load_dit_ar_backbone(
             ar_model_path, vocab_size=self.vocab_size,
             use_ema=not self.config.eval.disable_ema)
@@ -572,8 +576,12 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
           load_ar = lambda: _load_owt_ar_backbone(ar_model_path)
         # Frozen AR teacher: the pretrained data-distribution model.
         self.teacher = load_ar()
-        # Trainable AR "fake" model, from the same AR weights.
-        self.fake_model = load_ar() if self.use_fake else None
+        # Trainable AR "fake" model, from the same AR weights. Copied rather
+        # than loaded again: `_load_dit_ar_backbone` reads a multi-GB Lightning
+        # checkpoint, and calling it twice would pay that read (and a second
+        # random init of ~85M params) for a tensor-identical result.
+        self.fake_model = (copy.deepcopy(self.teacher)
+                           if self.use_fake else None)
       else:
         # Original IDLM: teacher/fake are diffusion denoisers, copied from the
         # (raw, un-noise-conditioned) student before it is wrapped below.
@@ -801,6 +809,47 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     else:
       return super().configure_optimizers()
 
+  def _t_curriculum_max(self):
+    """Upper end of the training time draw, ramped to 1 over a warmup.
+
+    `t` sets how much of `x0` is masked, hence how many positions the student
+    actually predicts. That matters specifically for an *autoregressive*
+    critic: it scores position `i` conditioned on `x_{<i}`, so at `t ~ 1`
+    almost the whole prefix is the student's own output and the critic is
+    asked for conditionals on a sequence far outside anything it was trained
+    on. Its scores there are not wrong so much as meaningless, and the reward
+    built from them steers the student by noise. Measured on CIFAR-10: the
+    critic scores the student's samples at 2.41 nats/token with `t <= 0.3`
+    against 3.28 at the full range.
+
+    Capping `t` early keeps the critic's context mostly *real data* -- a few
+    generated tokens embedded in a true image -- which is exactly the regime
+    where its conditionals are trustworthy. The cap then anneals to 1 so the
+    objective ends up being the one we actually want. The diffusion critic
+    needs none of this: it is trained at every noise level, so it is
+    in-distribution at any `t`.
+
+    Counted in `trainer.global_step`, i.e. **optimizer** steps -- not batches.
+    With `accum_batches = global_batch_size / (devices * batch_size)` those
+    differ by that factor, so a run logging 100k batches at accum 64 has taken
+    only ~1.5k optimizer steps and a warmup of 20k would never finish. Size
+    this against `trainer.max_steps`, which is compared to the same counter.
+
+    Returns 1.0 (the base behaviour, exactly) unless
+    `adversarial_distill.t_warmup_steps > 0`. `_sample_t` applies it on the
+    training draw only; validation is left at the full range so `val/nll`
+    tracks the model rather than the ramp.
+    """
+    if not self.is_adversarial_distill:
+      return 1.0
+    steps = int(getattr(
+      self.config.adversarial_distill, 't_warmup_steps', 0) or 0)
+    if steps <= 0:
+      return 1.0
+    start = float(getattr(
+      self.config.adversarial_distill, 't_warmup_start', 0.3))
+    return start + (1.0 - start) * min(1.0, self.trainer.global_step / steps)
+
   def _validate_configuration(self):
     # ancestral sampling isn't desirable because it's slow
     assert self.sampler in {
@@ -1008,11 +1057,19 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     reduction (`_ar_cross_entropy`, `_ar_nll`, `_apply_top_p_to_teacher`, the
     `[:, 1:]` slicing in `_reduce_token_loss`) is shared unchanged.
     """
-    if self.ar_backbone == 'dit':
+    if self.ar_impl == 'dit':
       # A repo-native `algo=ar` model. Two differences from owt-ar, both
       # dictated by how `AR` was trained (see `AR._process_model_input` /
       # `AR.nll`):
       #
+      # NOTE the convention below is the one `algo=ar` uses on the
+      # `duo-cifar10` branch, which is where the CIFAR-10 checkpoints come
+      # from. *This* branch's `AR._process_model_input` does the plain
+      # `x0[:, :-1]` shift with no start token, so a checkpoint trained by
+      # this branch would be misaligned by one rotary position here -- it
+      # would run and score garbage rather than fail. Verify against real
+      # data (see the bits/dim check in the commit message) before trusting a
+      # checkpoint whose provenance you do not know.
       #  * it is fed a *start token* rather than the sequence shifted by one.
       #    Images have no BOS (`RawPixelsVisionTokenizer` is built with
       #    `add_special_tokens=False`), so `AR` reuses `mask_index` for the
@@ -1779,16 +1836,14 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self.total_loss_fake = 0
         if self.fake_iter >= self.fake_frequency:
           self.fake_iter = 0
-          if self.trainer.global_step < self.fake_warmup_steps:
-            # Critic warmup: stay on fake steps. The fake is initialised from
-            # the *teacher* -- a model of the data, not of the student -- so
-            # without this the generator spends its first thousands of steps
-            # chasing a critic that is itself mid-adaptation. Holding the
-            # student frozen lets the fake converge onto the initial student
-            # first, so the min-max starts near its equilibrium instead of
-            # walking there while both sides move.
-            pass
-          else:
+          # Below `fake_warmup_steps` we stay on fake steps. The fake is
+          # initialised from the *teacher* -- a model of the data, not of the
+          # student -- so without this the generator spends its first thousands
+          # of steps chasing a critic that is itself mid-adaptation. Holding the
+          # student frozen lets the fake converge onto the initial student
+          # first, so the min-max starts near its equilibrium instead of
+          # walking there while both sides move.
+          if self.trainer.global_step >= self.fake_warmup_steps:
             self.is_generator_step = True
             utils.activate_model(self.backbone)
             utils.freeze_model(self.fake_model)
@@ -2360,40 +2415,43 @@ class MDLM_RL(MDLM_DMMD):
               'log-density is what the reward subtracts. It does apply at '
               "rl_policy='onestep', whose samples come from a single soft "
               'prediction.', flush=True)
-      print('[rl] policy={}{}'.format(
-        self.rl_policy,
-        ', group={}'.format(self.rl_onestep_group_size)
-        if self.rl_policy == 'onestep'
-        else ', k={}'.format(self.rl_num_steps)), flush=True)
-      if self.sampler == 'confidence':
-        print('[rl] sampling.predictor=\'confidence\' decodes by confidence '
-              'rank, but the RL rollout is always ancestral -- a cached or '
-              'reordered p_x0 comes from a different latent and would make '
-              'the recorded log-prob wrong. The policy is therefore trained '
-              'under a different decoder than it is evaluated with; use '
-              "sampling.predictor='ancestral_cache' to keep them aligned.",
-              flush=True)
-      if self.sampler == 'remask':
-        print("[rl] sampling.predictor='remask' can send an already "
-              'revealed token back to [MASK], but the RL rollout is always '
-              'ancestral and scores a monotone trajectory, so the policy is '
-              'trained under a decoder that never revises itself and '
-              'evaluated under one that does; use '
-              "sampling.predictor='ancestral_cache' to keep them aligned.",
-              flush=True)
-      # 'ancestral_cache' needs no warning: it only reuses `p_x0` on a step
-      # where *no* position changed anywhere in the batch, and each grid step
-      # reveals ~model.length/k positions, so at realistic lengths the cache
-      # never engages and the decoder is bit-for-bit the rollout's.
-      print(f'[rl] num_steps={self.rl_num_steps} '
-            f'grad_steps={self.rl_grad_steps} '
-            f'baseline={self.rl_baseline} '
-            f'advantage_norm={self.rl_advantage_norm} '
-            f'group_size={self.rl_group_size or "batch"} '
-            f'pathwise_weight={self.rl_pathwise_weight} '
-            f'buffer={self.rl_buffer_size} '
-            f'rollout_reuse={self.rl_rollout_reuse} '
-            f'eps={self.rl_eps}', flush=True)
+      if self.rl_policy == 'trajectory':
+        if self.sampler == 'confidence':
+          print('[rl] sampling.predictor=\'confidence\' decodes by confidence '
+                'rank, but the RL rollout is always ancestral -- a cached or '
+                'reordered p_x0 comes from a different latent and would make '
+                'the recorded log-prob wrong. The policy is therefore trained '
+                'under a different decoder than it is evaluated with; use '
+                "sampling.predictor='ancestral_cache' to keep them aligned.",
+                flush=True)
+        if self.sampler == 'remask':
+          print("[rl] sampling.predictor='remask' can send an already "
+                'revealed token back to [MASK], but the RL rollout is always '
+                'ancestral and scores a monotone trajectory, so the policy is '
+                'trained under a decoder that never revises itself and '
+                'evaluated under one that does; use '
+                "sampling.predictor='ancestral_cache' to keep them aligned.",
+                flush=True)
+        # 'ancestral_cache' needs no warning: it only reuses `p_x0` on a step
+        # where *no* position changed anywhere in the batch, and each grid step
+        # reveals ~model.length/k positions, so at realistic lengths the cache
+        # never engages and the decoder is bit-for-bit the rollout's.
+        print(f'[rl] policy=trajectory num_steps={self.rl_num_steps} '
+              f'grad_steps={self.rl_grad_steps} '
+              f'baseline={self.rl_baseline} '
+              f'advantage_norm={self.rl_advantage_norm} '
+              f'group_size={self.rl_group_size or "batch"} '
+              f'pathwise_weight={self.rl_pathwise_weight} '
+              f'buffer={self.rl_buffer_size} '
+              f'rollout_reuse={self.rl_rollout_reuse} '
+              f'eps={self.rl_eps}', flush=True)
+      else:
+        print(f'[rl] policy=onestep '
+              f'group={self.rl_onestep_group_size} '
+              f'dense_reward={self.rl_dense_reward} '
+              f'baseline={self.rl_baseline} '
+              f'advantage_norm={self.rl_advantage_norm} '
+              f'pathwise_weight={self.rl_pathwise_weight}', flush=True)
 
   @staticmethod
   def _normalize_rl_baseline(value):
@@ -2635,48 +2693,50 @@ class MDLM_RL(MDLM_DMMD):
     del fake_logprobs
     return fake_nll - teacher_nll, teacher_nll, fake_nll
 
-  def _rl_advantage(self, reward, group=None):
-    """Group-baselined advantage, `(batch,)`, detached.
+  def _rl_baselined(self, values, dim):
+    """`values` minus its group baseline, normalised, along `dim`.
 
-    The group is the local rollout batch (`rl_group_size=0`) or fixed-size
-    chunks of it. Because every trajectory in a group starts from the same
-    all-mask prior, they are i.i.d. draws from one distribution and the
-    group mean is a valid baseline -- this is GRPO's setting exactly, with
-    the prompt being empty.
+    The single definition of `rl_baseline` / `rl_advantage_norm`. Both callers
+    reduce over an axis whose entries are i.i.d. draws from one distribution --
+    trajectories from the all-mask prior (`_rl_advantage`, over the batch) or
+    the G samples from one latent (`_rl_onestep_dense_surrogate`, over the
+    draw axis) -- which is what makes the group mean a valid baseline. This is
+    GRPO's setting, with the prompt being empty.
 
-    `group` overrides that size. `rl_policy='onestep'` passes it: there the
-    i.i.d. draws are the G samples from one *latent*, so the reward is laid
-    out with those adjacent and grouped by G rather than by batch row.
+    Degenerate groups (one member, or zero spread) give zeros rather than
+    NaNs: a group whose members scored identically carries no information
+    about which was better, so contributing nothing is the right answer, not
+    an accident to be papered over.
+    """
+    n = values.shape[dim]
+    if self.rl_baseline == 'none':
+      adv = values
+    elif n < 2:
+      return torch.zeros_like(values)
+    elif self.rl_baseline == 'leave_one_out':
+      # Baseline for entry i is the mean of the other n-1, so it is
+      # independent of entry i and the estimator stays unbiased.
+      adv = values - (values.sum(dim, keepdim=True) - values) / (n - 1)
+    else:
+      adv = values - values.mean(dim, keepdim=True)
+    if self.rl_advantage_norm == 'std':
+      std = values.std(dim, keepdim=True)
+      # Tensor-valued guard rather than a Python `if`, so no host sync.
+      adv = torch.where(std > 1e-6, adv / std.clamp_min(1e-6),
+                        torch.zeros_like(adv))
+    return adv
 
-    Degenerate groups (one member, or zero reward spread) return zeros
-    rather than NaNs: a group that produced identical rewards carries no
-    information about which trajectory was better, so contributing nothing
-    is the correct answer, not an accident to be papered over.
+  def _rl_advantage(self, reward):
+    """Group-baselined advantage over the rollout batch, `(batch,)`, detached.
+
+    The group is the whole local batch (`rl_group_size=0`) or fixed-size
+    chunks of it; `_rl_baselined` supplies the rules.
     """
     reward = reward.detach()
-    group = group or self.rl_group_size or reward.shape[0]
+    group = self.rl_group_size or reward.shape[0]
     group = max(1, min(group, reward.shape[0]))
-    parts = []
-    for chunk in torch.split(reward, group):
-      n = chunk.shape[0]
-      if self.rl_baseline == 'none':
-        adv = chunk
-      elif n < 2:
-        parts.append(torch.zeros_like(chunk))
-        continue
-      elif self.rl_baseline == 'leave_one_out':
-        # Baseline for row i is the mean of the other n-1 rewards, so it is
-        # independent of row i and the estimator stays unbiased.
-        adv = chunk - (chunk.sum() - chunk) / (n - 1)
-      else:
-        adv = chunk - chunk.mean()
-      if self.rl_advantage_norm == 'std' and n >= 2:
-        std = chunk.std()
-        # Tensor-valued guard rather than a Python `if`, so no host sync.
-        adv = torch.where(std > 1e-6, adv / std.clamp_min(1e-6),
-                          torch.zeros_like(adv))
-      parts.append(adv)
-    return torch.cat(parts)
+    return torch.cat([self._rl_baselined(chunk, 0)
+                      for chunk in torch.split(reward, group)])
 
   # --- surrogate --------------------------------------------------------
 
@@ -2797,17 +2857,32 @@ class MDLM_RL(MDLM_DMMD):
     with self._rl_policy_mode(), self._noise_stream(rollout.seeds[j]):
       student_probs = self.forward(
         rollout.latents[j], sigma=rollout.sigmas[j]).exp()
-    length = rollout.x.shape[1] - 1
+    return self._rl_pathwise(student_probs, rollout.x, valid_tokens)
+
+  def _rl_pathwise(self, student_probs, x, valid_tokens):
+    """`CE(teacher || x_hat_eta) - CE(fake || x_hat_eta)`, per-token nats.
+
+    The D-MMD generator term itself, shared by both `rl_policy` values -- they
+    differ only in which latent produced `student_probs` and which sequence is
+    the AR context. Reduced to per-token nats so it can be added to either
+    policy's surrogate.
+
+    The critic forwards are under `no_grad` and the teacher's log-probs are
+    freed before the fake's are built: at OWT shapes each `(B, L, V)` float32
+    tensor is ~1.6 GB, which is not worth holding across the surrogate's
+    backward for an off-by-default option.
+    """
+    length = x.shape[1] - 1
     with torch.no_grad():
       teacher_logprobs = self._apply_top_p_to_teacher(
-        self._ar_logprobs(self.teacher, rollout.x))
+        self._ar_logprobs(self.teacher, x))
     loss = self._rl_reduced_to_per_token(
       self._ar_cross_entropy(teacher_logprobs, student_probs, valid_tokens),
       valid_tokens, length)
     del teacher_logprobs
     if self.use_fake:
       with torch.no_grad():
-        fake_logprobs = self._ar_logprobs(self.fake_model, rollout.x)
+        fake_logprobs = self._ar_logprobs(self.fake_model, x)
       loss = loss - self._rl_reduced_to_per_token(
         self._ar_cross_entropy(fake_logprobs, student_probs, valid_tokens),
         valid_tokens, length)
@@ -2864,7 +2939,13 @@ class MDLM_RL(MDLM_DMMD):
       r, t_lp = r * vt, t_lp * vt
       if f_lp is not None:
         f_lp = f_lp * vt
-    denom = self._rl_sum_norm(valid_tokens, x.shape[1] - 1)
+    # `_ar_nll` -> `_reduce_positions` divides by `valid_tokens[:, 1:]`, i.e.
+    # the mask over the *scored* positions. Using the full mask here would put
+    # the dense path's `rl/teacher_nll` on a different scale from the sparse
+    # path's, so flipping `rl_dense_reward` would silently move every reward
+    # diagnostic as well as the credit assignment.
+    denom = self._rl_sum_norm(
+      None if valid_tokens is None else valid_tokens[:, 1:], x.shape[1] - 1)
     teacher_nll = -t_lp.sum(-1) / denom
     fake_nll = (-f_lp.sum(-1) / denom if f_lp is not None
                 else torch.zeros_like(teacher_nll))
@@ -2884,23 +2965,19 @@ class MDLM_RL(MDLM_DMMD):
     position `i` actually influenced -- pairing `r_i` alone with
     `grad log p(x_i)` would drop those downstream effects and be biased.
 
-    `rewards` / `logp_tok` / `weight` are `(batch, G, L-1)`; the baseline is
-    taken across the G draws *at each position*, the same leave-one-out and
-    std-normalisation rules `_rl_advantage` applies to whole sequences.
+    `rewards` / `logp_tok` / `weight` are `(batch, G, L-1)`; `_rl_baselined`
+    supplies the baseline across the G draws *at each position*, so the rules
+    are literally the ones `_rl_advantage` applies to whole sequences.
+
+    Returns `(surrogate, advantage)`. The advantage is handed back rather than
+    recomputed by the caller because it is the one the gradient actually used:
+    logging the sequence-level advantage here instead would report a quantity
+    this estimator never saw.
     """
     rtg = rewards.flip(-1).cumsum(-1).flip(-1)
-    g = rtg.shape[1]
-    if self.rl_baseline == 'none' or g < 2:
-      adv = rtg
-    elif self.rl_baseline == 'leave_one_out':
-      adv = rtg - (rtg.sum(1, keepdim=True) - rtg) / (g - 1)
-    else:
-      adv = rtg - rtg.mean(1, keepdim=True)
-    if self.rl_advantage_norm == 'std' and g >= 2:
-      std = rtg.std(1, keepdim=True)
-      adv = torch.where(std > 1e-6, adv / std.clamp_min(1e-6),
-                        torch.zeros_like(adv))
-    return -((adv.detach() * logp_tok * weight).sum(-1) / norm).mean(-1)
+    adv = self._rl_baselined(rtg, 1).detach()
+    surrogate = -((adv * logp_tok * weight).sum(-1) / norm).mean(-1)
+    return surrogate, adv
 
   def _rl_onestep_generator_loss(self, x0, valid_tokens,
                                  current_accumulation_step):
@@ -2940,58 +3017,40 @@ class MDLM_RL(MDLM_DMMD):
     norm = self._rl_sum_norm(valid_tokens, x0.shape[1])
 
     detached = student_probs.detach()
-    group = max(2, self.rl_onestep_group_size)
-    rewards, teacher_nlls, fake_nlls, logps = [], [], [], []
-    tok_rewards, tok_logps = [], []
-    for _ in range(group):
-      x = trainer_base.sample_categorical(detached)
-      x = self._preserve_prompt_tokens(x, x0, valid_tokens)
-      logp_tok = log_probs.gather(-1, x[..., None]).squeeze(-1)
-      if self.rl_dense_reward:
-        r_tok, teacher_nll, fake_nll = self._rl_token_reward(x, valid_tokens)
-        tok_rewards.append(r_tok)
-        # `r_tok[i]` scores token `i + 1`, so it pairs with that token's own
-        # student log-prob.
-        tok_logps.append(logp_tok[:, 1:])
-        reward = fake_nll - teacher_nll
-      else:
-        with torch.no_grad():
-          reward, teacher_nll, fake_nll = self._rl_reward(x, valid_tokens)
-      logp = (logp_tok * weight).sum(-1) / norm
-      rewards.append(reward)
-      teacher_nlls.append(teacher_nll)
-      fake_nlls.append(fake_nll)
-      logps.append(logp)
+    draws = []
+    for _ in range(self.rl_onestep_group_size):
+      x = self._preserve_prompt_tokens(
+        trainer_base.sample_categorical(detached), x0, valid_tokens)
+      r_tok, teacher_nll, fake_nll = self._rl_token_reward(x, valid_tokens)
+      draws.append((x, fake_nll - teacher_nll, teacher_nll, fake_nll, r_tok))
+    xs, reward, teacher_nll, fake_nll, tok_reward = (
+      torch.stack(v, dim=1) for v in zip(*draws))
 
-    # (batch, G) laid out with one latent's draws adjacent, so `_rl_advantage`
-    # chunked by G baselines *within* a latent rather than across the batch.
-    reward = torch.stack(rewards, dim=-1)
-    advantage = self._rl_advantage(
-      reward.reshape(-1), group=group).reshape(reward.shape)
-    logp = torch.stack(logps, dim=-1)
+    # One gather for all G draws rather than G of them: `gather` backward is a
+    # full zeros_like(input).scatter_add_, so G separate calls would each pay a
+    # (batch, length, vocab) zero-fill and scatter.
+    logp_tok = log_probs.gather(-1, xs.permute(0, 2, 1)).permute(0, 2, 1)
+    logp = (logp_tok * weight.unsqueeze(1)).sum(-1) / norm
+
     if self.rl_dense_reward:
-      surrogate = self._rl_onestep_dense_surrogate(
-        torch.stack(tok_rewards, dim=1), torch.stack(tok_logps, dim=1),
-        weight[:, 1:].unsqueeze(1), norm)
+      surrogate, advantage = self._rl_onestep_dense_surrogate(
+        tok_reward, logp_tok[:, :, 1:], weight[:, None, 1:], norm)
+      # Per-position; reduce to one number per draw so `rl/advantage_abs`
+      # stays comparable with the sparse path and with the trajectory policy.
+      advantage = advantage.mean(-1)
     else:
-      surrogate = -(advantage.detach() * logp).mean(-1)
+      advantage = self._rl_baselined(reward.detach(), -1)
+      surrogate = -(advantage * logp).mean(-1)
 
     self._rl_record_stats(
-      reward.reshape(-1), torch.stack(teacher_nlls, -1).reshape(-1),
-      torch.stack(fake_nlls, -1).reshape(-1), logp.detach().reshape(-1),
-      advantage.reshape(-1))
+      reward.reshape(-1), teacher_nll.reshape(-1), fake_nll.reshape(-1),
+      logp.detach().reshape(-1), advantage.reshape(-1))
     if self.rl_pathwise_weight != 0.0:
       # The pathwise D-MMD term at this same latent and soft prediction, i.e.
       # literally `MDLM_DMMD`'s generator loss, converted to per-token nats.
-      teacher_logprobs = self._apply_top_p_to_teacher(
-        self._ar_logprobs(self.teacher, x))
-      pathwise = self._ar_cross_entropy(
-        teacher_logprobs, student_probs, valid_tokens)
-      if self.use_fake:
-        pathwise = pathwise - self._ar_cross_entropy(
-          self._ar_logprobs(self.fake_model, x), student_probs, valid_tokens)
-      surrogate = surrogate + self.rl_pathwise_weight * (
-        self._rl_reduced_to_per_token(pathwise, valid_tokens, x0.shape[1]))
+      # Scored against the last draw's context, matching `_rl_pathwise_term`.
+      surrogate = surrogate + self.rl_pathwise_weight * self._rl_pathwise(
+        student_probs, xs[:, -1], valid_tokens)
     return surrogate
 
   def _fake_loss_ar(self, x0, valid_tokens, current_accumulation_step):

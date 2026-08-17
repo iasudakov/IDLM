@@ -1045,41 +1045,13 @@ class Diffusion(TrainerBase):
     return sigma
 
   def _t_curriculum_max(self):
-    """Upper end of the training time draw, ramped 0 -> 1 over a warmup.
+    """Upper end of the training time draw; 1.0 unless a subclass ramps it.
 
-    `t` sets how much of `x0` is masked, hence how many positions the student
-    actually predicts. That matters specifically for an *autoregressive*
-    critic: it scores position `i` conditioned on `x_{<i}`, so at `t ~ 1`
-    almost the whole prefix is the student's own output and the critic is
-    asked for conditionals on a sequence far outside anything it was trained
-    on. Its scores there are not wrong so much as meaningless, and the reward
-    built from them steers the student by noise.
-
-    Capping `t` early keeps the critic's context mostly *real data* -- a few
-    generated tokens embedded in a true image -- which is exactly the regime
-    where its conditionals are trustworthy. The cap then anneals to 1 so the
-    objective ends up being the one we actually want.
-
-    Counted in `trainer.global_step`, i.e. **optimizer** steps -- not batches.
-    With `accum_batches = global_batch_size / (devices * batch_size)` those
-    differ by that factor, so a run logging 100k batches at accum 64 has taken
-    only ~1.5k optimizer steps and a warmup of 20k would never finish. Size
-    this against `trainer.max_steps`, which is compared to the same counter.
-
-    Returns 1.0 (the previous behaviour, exactly) unless
-    `adversarial_distill.t_warmup_steps > 0`. `_sample_t` applies it on the
-    training draw only; validation is left at the full range so `val/nll`
-    tracks the model rather than the ramp.
+    Overridden by `MDLM_with_AR`, where a masking curriculum is meaningful.
+    Here `t` spans the full schedule, which is what every non-distillation
+    algo wants.
     """
-    steps = int(getattr(
-      self.config.adversarial_distill, 't_warmup_steps', 0) or 0)
-    if steps <= 0 or not getattr(self, 'is_adversarial_distill', False):
-      return 1.0
-    start = float(getattr(
-      self.config.adversarial_distill, 't_warmup_start', 0.3))
-    step = getattr(getattr(self, 'trainer', None), 'global_step', 0) or 0
-    frac = min(1.0, max(0.0, step / steps))
-    return start + (1.0 - start) * frac
+    return 1.0
 
   def _sample_t(self, n, accum_step):
     if accum_step is not None:
