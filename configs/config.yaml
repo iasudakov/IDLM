@@ -343,6 +343,15 @@ adversarial_distill:
   # it and none before. Baseline and advantage_norm apply per position across
   # the G draws. rl_policy=onestep only; the trajectory policy ignores it.
   rl_dense_reward: false
+  # Width of the credit window used by rl_dense_reward. 0 (default) sums the
+  # reward to the end of the sequence -- unbiased, but it weights position i by
+  # (L - i). Measured on CIFAR-10, that hands 55.6% of the gradient to the red
+  # channel, where the channel-major layout leaves the critic worst (4.79
+  # bits/token vs 2.12 on blue) without leaving it more informative (NLL spread
+  # 1.85 vs 1.67). A finite window weights every position equally and keeps
+  # credit local; it also avoids early positions all collapsing onto the same
+  # sequence-level advantage, which is the sparse estimator reappearing.
+  rl_reward_horizon: 0
   rl_num_steps: 16
   # M: how many of those k+1 steps are recomputed with gradient per update.
   # Every position is revealed exactly once across the trajectory, so drawing M

@@ -2951,6 +2951,44 @@ class MDLM_RL(MDLM_DMMD):
                 else torch.zeros_like(teacher_nll))
     return r, teacher_nll, fake_nll
 
+  def _rl_reward_to_go(self, rewards):
+    """Credit each position gets from the rewards at and after it.
+
+    Full reward-to-go (`rl_reward_horizon=0`) sums to the end of the sequence.
+    That is the unbiased choice, but on this data it concentrates the gradient
+    badly. Two measurements, on CIFAR-10 with the `algo=ar` critic:
+
+      * the critic is not uniformly competent. `DiscreteCIFAR10` is laid out
+        channel-major, so the model predicts the whole red channel with no
+        colour context: 4.79 bits/token there against 2.12 on blue, while the
+        NLL *spread* across images is flat (1.85 vs 1.67) -- so the red third
+        is harder, not more informative.
+      * summing to the end weights position `i` by `L - i`, which hands 55.6%
+        of all credit to that worst-modelled third and 11.1% to the best, with
+        the first token counted 3071x the last.
+
+    A finite window fixes both. It weights every position equally (each reward
+    appears in exactly `W` terms, bar the tail) and keeps the credit local,
+    which also removes a subtler degeneracy: for small `i` the full sum is
+    dominated by the ~3000 terms it shares with position 0, so early positions
+    all receive essentially the *sequence-level* advantage -- the sparse
+    estimator this method exists to replace, reappearing over the first half
+    of every sequence.
+
+    `W` trades bias against locality: an AR conditional's dependence on a token
+    decays with distance, so a window a few hundred wide keeps the terms that
+    matter and drops the ones that are mostly noise.
+    """
+    w = int(getattr(
+      self.config.adversarial_distill, 'rl_reward_horizon', 0) or 0)
+    length = rewards.shape[-1]
+    if w <= 0 or w >= length:
+      return rewards.flip(-1).cumsum(-1).flip(-1)
+    cum = torch.cumsum(rewards, -1)
+    cum = torch.cat([torch.zeros_like(cum[..., :1]), cum], -1)
+    idx = torch.arange(length, device=rewards.device)
+    return cum[..., (idx + w).clamp(max=length)] - cum[..., idx]
+
   def _rl_onestep_dense_surrogate(self, rewards, logp_tok, weight, norm):
     """Token-level REINFORCE surrogate, `(batch,)`.
 
@@ -2974,7 +3012,7 @@ class MDLM_RL(MDLM_DMMD):
     logging the sequence-level advantage here instead would report a quantity
     this estimator never saw.
     """
-    rtg = rewards.flip(-1).cumsum(-1).flip(-1)
+    rtg = self._rl_reward_to_go(rewards)
     adv = self._rl_baselined(rtg, 1).detach()
     surrogate = -((adv * logp_tok * weight).sum(-1) / norm).mean(-1)
     return surrogate, adv
