@@ -10,7 +10,7 @@ defaults:
   - /algo: duo_base
   - /logger: underdeep
 
-mode: train  # train / ppl_eval / sample_eval / noise_diversity_eval
+mode: train  # train / ppl_eval / sample_eval / noise_diversity_eval / fid_eval
 debug: False
 seed: 1
 

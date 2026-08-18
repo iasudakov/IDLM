@@ -471,7 +471,25 @@ class TrainerBase(L.LightningModule):
         # dataset, not the model), before any sampling so a failure here is not
         # paid for twice.
         self._prime_fid_real_features()
-      for _sb in range(self._num_sample_batches()):
+      # Decorrelate the sampler across ranks. Lightning seeds every process
+      # with `config.seed`, so without this each rank draws the SAME prior and
+      # the same Gumbel noise and therefore generates *identical* images:
+      # `world_size` copies of one batch. Duplicating data leaves its mean and
+      # covariance unchanged, so FID stays at the single-rank value no matter
+      # how many GPUs are added -- measured, 2 ranks x 1000 images reported
+      # 77.6, the 1000-image number, where 2000 distinct images give 60.9.
+      #
+      # Scoped to the sampling loop with `fork_rng` rather than offsetting the
+      # global seed the way `s-sahoo/duo` does, because `_sample_t` draws
+      # `global_batch_size` times on every rank and hands each one a different
+      # chunk -- that stratification silently breaks if the ranks stop drawing
+      # the same numbers.
+      _rank = max(getattr(self.trainer, 'global_rank', 0) or 0, 0)
+      with torch.random.fork_rng(devices=[self.device]):
+       if _rank:
+        torch.manual_seed(int(self.config.seed) + 7919 * _rank
+                          + int(self.global_step))
+       for _sb in range(self._num_sample_batches()):
         samples = self.generate_samples(
           num_samples=self.config.loader.eval_batch_size)
 

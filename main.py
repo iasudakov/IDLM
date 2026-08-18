@@ -416,6 +416,125 @@ def _eval_ppl(diffusion_model, config, logger, tokenizer):
   trainer.validate(model, valid_ds)
 
 
+def _eval_fid(diffusion_model, config, logger, tokenizer):
+  """`mode=fid_eval` -- the CIFAR-10 FID/IS protocol from `s-sahoo/duo`.
+
+  The in-training `val/fid` answers "is this run improving"; this answers "what
+  number do I quote". It follows duo's `_eval_fid` so the two are comparable:
+
+    * the real side is the **train** split, all 50k of it -- duo's comment is
+      "Like in flow matching papers: FID against train". `val/fid` defaults to
+      the same split but lets you shrink it.
+    * exactly one generated image per real image, so the two sides are equal
+      by construction rather than by two independent config knobs.
+    * Inception Score is reported alongside, as duo does.
+
+  Two deliberate departures from duo:
+
+    * generation is **unconditional**. duo passes each batch's labels into
+      `generate_samples` with `sampling.guid_weight`; this repo's samplers have
+      no label path, and `models.unet.UNet` substitutes the label-dropout row,
+      which is the unconditional embedding its checkpoint was trained with.
+      Numbers here are therefore unconditional FID and are NOT comparable to
+      duo's published class-conditional ones.
+    * the FID states are explicitly all-reduced before `compute()`. torchmetrics
+      does not sync this metric here -- two ranks each holding 1000 images
+      report the 1000-image value -- so without it an N-GPU run silently scores
+      one shard and carries N times the small-sample bias.
+
+  `data.cache_dir`, `eval.checkpoint_path`, `sampling.steps` and
+  `sampling.predictor` mean what they do everywhere else.
+  """
+  import torchmetrics
+  logger.info('Starting FID eval (duo protocol: 1:1 against the train split).')
+  assert utils.is_vision(config), (
+      'mode=fid_eval is for raw-pixel image runs (data.modality=image); '
+      'use mode=ppl_eval or sample_eval for text.')
+
+  fabric = L.Fabric(accelerator=config.trainer.accelerator,
+                    devices=config.trainer.devices,
+                    num_nodes=config.trainer.num_nodes)
+  fabric.launch()
+  L.seed_everything(config.seed + fabric.global_rank)
+
+  model = _load_from_checkpoint(diffusion_model=diffusion_model,
+                                config=config, tokenizer=tokenizer)
+  model.to(fabric.device)
+  if config.eval.disable_ema:
+    logger.info('Disabling EMA.')
+    model.ema = None
+  model._eval_mode()
+
+  # Real images: the train split, unshuffled and un-augmented so the reference
+  # statistics describe the dataset rather than when they were read.
+  ds = dataloader.DiscreteCIFAR10(
+      cache_dir=config.data.cache_dir, train=True, augment=False)
+  sampler = None
+  if fabric.world_size > 1:
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        ds, num_replicas=fabric.world_size, rank=fabric.global_rank,
+        shuffle=False, drop_last=True)
+  batch_size = int(config.loader.eval_batch_size)
+  loader = torch.utils.data.DataLoader(
+      ds, batch_size=batch_size, sampler=sampler, shuffle=False,
+      num_workers=config.loader.num_workers, drop_last=True)
+
+  fid = torchmetrics.image.fid.FrechetInceptionDistance(
+      feature=int(config.eval.get('fid_feature', 2048)),
+      normalize=False).to(fabric.device)
+  inception = torchmetrics.image.inception.InceptionScore(
+      normalize=False).to(fabric.device)
+
+  n = 0
+  for batch in loader:
+    real = batch['input_ids'].to(fabric.device)
+    with torch.no_grad():
+      gen = model.generate_samples(num_samples=real.shape[0])
+    fid.update(model.tokenizer.batch_decode(real).to(torch.uint8), real=True)
+    gen = model.tokenizer.batch_decode(gen).to(torch.uint8)
+    fid.update(gen, real=False)
+    inception.update(gen)
+    n += real.shape[0]
+    if fabric.global_rank == 0 and n % (batch_size * 10) == 0:
+      print(f'[fid_eval] {n * fabric.world_size} images', flush=True)
+
+  if fabric.world_size > 1:
+    fabric.barrier()
+    _all_reduce_metric_states(fid)
+    _all_reduce_metric_states(inception)
+  fid_value = float(fid.compute())
+  is_mean, is_std = inception.compute()
+  if fabric.global_rank == 0:
+    print(f'[fid_eval] FID={fid_value:.3f}  IS={float(is_mean):.3f}'
+          f'+-{float(is_std):.3f}  ({n * fabric.world_size} generated vs '
+          f'{n * fabric.world_size} real, {config.sampling.steps} steps, '
+          'unconditional)', flush=True)
+  return fid_value
+
+
+def _all_reduce_metric_states(metric):
+  """Sum a torchmetric's states across ranks, in place.
+
+  Every state of `FrechetInceptionDistance` and `InceptionScore` reduces with
+  `dim_zero_sum` (checked against `metric._reductions`), so summing is exactly
+  the estimator one rank holding all the images would have had. List-valued
+  states are gathered instead, since those concatenate rather than add.
+  """
+  import torch.distributed as dist
+  if not (dist.is_available() and dist.is_initialized()):
+    return
+  world = dist.get_world_size()
+  for name in metric._defaults:
+    value = getattr(metric, name)
+    if isinstance(value, torch.Tensor):
+      dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    elif isinstance(value, list):
+      gathered = [None] * world
+      dist.all_gather_object(gathered, value)
+      setattr(metric, name, [t.to(value[0].device) if hasattr(t, 'to') else t
+                             for part in gathered for t in part])
+
+
 def _train(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Training.')
   # wandb_logger = None
@@ -513,6 +632,8 @@ def main(config):
     _noise_diversity_eval(**kwargs)
   elif config.mode == 'ppl_eval':
     _eval_ppl(**kwargs)
+  elif config.mode == 'fid_eval':
+    _eval_fid(**kwargs)
   else:
     _train(**kwargs)
 
