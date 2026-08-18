@@ -528,6 +528,14 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
 
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
+    # How `_reduce_positions` folds a per-token loss over positions when
+    # there is no prompt mask. Set unconditionally: `_reduce_positions` also
+    # runs for plain `algo=mdlm` training, not only under distillation.
+    self._loss_reduction = str(getattr(
+      self.config.adversarial_distill, 'loss_reduction', 'sum')).lower()
+    assert self._loss_reduction in ('sum', 'mean'), (
+      'adversarial_distill.loss_reduction must be "sum" or "mean"; got '
+      f'{self._loss_reduction!r}.')
     self._validate_configuration()
     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
     # Resolved lazily by `_student_embed_std` for the noise diagnostics.
@@ -1130,7 +1138,10 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     """
     if loss_mask is None:
       if valid_tokens is None:
-        return per_token_loss.sum(-1)
+        total = per_token_loss.sum(-1)
+        if self._loss_reduction == 'mean':
+          total = total / max(per_token_loss.shape[-1], 1)
+        return total
       per_token_loss = per_token_loss * valid_tokens
       return per_token_loss.sum(-1) / valid_tokens.sum(-1).clamp_min(1)
     weights = (loss_mask if valid_tokens is None

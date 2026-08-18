@@ -60,6 +60,27 @@ adversarial_distill:
   # comparable across the ramp.
   t_warmup_steps: 0
   t_warmup_start: 0.3
+  # How a per-token loss is folded over positions when there is no prompt mask
+  # (`valid_tokens is None` -- every dataset here except tiny_gsm).
+  # 'sum' (default, historical): add over all `model.length` positions. Losses
+  #   are then ~model.length x per-token nats; with the diffusion critic's ELBO
+  #   weight w(s) = dalpha_s/(1-alpha_s) on top, `fake_loss` reads ~1e8 on
+  #   CIFAR-10 and `grad_norm_*` ~2e4.
+  # 'mean': divide by the position count, so every loss reads in per-token nats
+  #   and is directly comparable with the RL path (which already normalises).
+  #
+  # WHAT MOVES WITH IT. Adam is scale-invariant per parameter -- m/sqrt(v) is
+  # unchanged when the loss is divided by a constant -- so `optim.lr` and
+  # `fake_lr` do NOT need rescaling, and switching is close to a no-op for
+  # training. What is NOT scale-invariant:
+  #   * `adversarial_distill.gradient_clipping_val`. At 'sum' the norms are
+  #     ~2e4, so the default 1.0 clips by ~4 orders of magnitude; at 'mean'
+  #     they are ~6, so the same 1.0 barely clips. Rescale it by model.length
+  #     (or turn clipping off) when switching, or the run silently changes.
+  #   * any threshold read against a raw loss value.
+  # Note `fake_loss` is dominated by a constant either way with the diffusion
+  # critic and `fake_soft_target=True` -- see NOTE 2 on `fake_soft_target`.
+  loss_reduction: sum
   generator_num_noised_samples: 1
   # Gradient clipping inside the manual-optimization (min-max) loop. Lightning
   # does not apply `trainer.gradient_clip_val` when automatic_optimization is
@@ -482,6 +503,12 @@ training:
   ema: 0.9999
   antithetic_sampling: True
   importance_sampling: False
+  # Floor on the training time draw: `t ~ U(sampling_eps, t_max)`. Also the
+  # knob that bounds the diffusion critic's ELBO weight, since
+  # w(s) = dalpha_s/(1-alpha_s) diverges as s -> 0 and is ~1e3 at 1e-3. Raise
+  # it (e.g. 1e-2) to tame the loss scale and the gradient variance; the cost
+  # is that the student is never trained at the highest noise levels, which are
+  # exactly the ones a few-step sampler starts from.
   sampling_eps: 1e-3
   change_of_variables: False
   loss_precision: 'bf16'  # bf16, float32, float64
