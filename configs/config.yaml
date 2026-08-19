@@ -598,6 +598,26 @@ training:
   change_of_variables: False
   loss_precision: 'bf16'  # bf16, float32, float64
   finetune_path: ''
+  # Mask layout for the *plain* ELBO training loss (`Diffusion.nll`'s own
+  # `q_xt` call) -- the sampling-time and DMMD-distillation-time counterparts
+  # are `sampling.mask_layout` and `adversarial_distill.dmmd_mask_layout`.
+  # 'random' (default): i.i.d. per-position masking, as always. 'suffix':
+  # a warmup-training knob for `sampling.mask_layout=suffix` raster-order
+  # sampling -- that sampler reveals positions left-to-right, and the
+  # published i.i.d.-masked checkpoints never saw a large *contiguous*
+  # masked block during their own pretraining (every masked pixel always had
+  # scattered real neighbours nearby), which is why they collapse to a
+  # degenerate constant prediction there instead of a plausible one. Setting
+  # this to 'suffix' fine-tunes on exactly that conditioning pattern directly,
+  # with the plain (non-adversarial) ELBO loss -- a far more stable objective
+  # to learn a new input distribution under than the D-MMD min-max loop,
+  # which is why this is a *separate* warmup phase and not folded into
+  # `dmmd_mask_layout` itself. Point a DMMD run's `eval.checkpoint_path` at
+  # the resulting checkpoint before switching `dmmd_mask_layout=suffix` on,
+  # so the student starts in-distribution for the corruption it will be
+  # distilled under, rather than learning both "what suffix conditioning
+  # looks like" and "how to match the critic" at once.
+  mask_layout: random
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
