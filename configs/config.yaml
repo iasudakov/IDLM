@@ -193,6 +193,22 @@ adversarial_distill:
   # 'renoise' ('t'): original IDLM, re-noise student_probs to an independent
   # time t. Lets the two schemes be A/B-tested with everything else fixed.
   dmmd_mask_sampling: posterior
+  # Which positions get masked, in both dmmd_mask_sampling modes. 'random'
+  # (default, historical): each eligible position is masked independently, the
+  # same i.i.d. draw q_xt uses everywhere else. 'suffix' ('postfix'): the
+  # masked positions are a single contiguous block at the *end* of the
+  # sequence (or, with a prompt mask, the end of the valid_tokens==1 span) --
+  # the prefix stays unmasked/revealed at both z_t and the re-noised/posterior
+  # z_s. The boundary is set deterministically from alpha
+  # (round((1 - alpha) * n_eligible) masked positions), not drawn at random,
+  # so the z_s boundary is automatically <= the z_t one (alpha_s >= alpha_t)
+  # and the posterior only ever reveals the positions immediately left of the
+  # current mask -- no separate reveal step is needed the way 'random' needs
+  # one. For text this is prefix-conditioned generation/training -- a clean
+  # prompt, generated continuation as one contiguous block after it -- rather
+  # than the scattered masked-LM-style gaps 'random' produces throughout the
+  # sequence.
+  dmmd_mask_layout: random
   # D-MMD Sec. 3.3 top-p (nucleus) teacher distillation (algo=mdlm_dmmd). The
   # teacher target is restricted to the top-p nucleus so the student mode-seeks.
   # >= 1 disables it (teacher target unchanged); the paper's best masked-text
@@ -381,6 +397,23 @@ loader:
 
 sampling:
   predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic, confidence, remask
+  # Which positions the 'ancestral'/'ancestral_cache' predictors reveal at
+  # each step, i.e. the sampling-time counterpart of
+  # `adversarial_distill.dmmd_mask_layout`. 'random' (default, historical):
+  # revealed positions are whichever the per-position categorical draw
+  # happens to land on -- unconstrained order. 'suffix': the revealed set is
+  # forced to be a growing *prefix* -- at each step, exactly the frontmost
+  # still-masked positions up to `AbsorbingState._suffix_mask_boundary(alpha_s,
+  # length)` are revealed (values still drawn from p_x0; only which positions
+  # get committed is deterministic), so the trajectory only ever visits
+  # states with a clean prefix / masked suffix -- prefix-conditioned
+  # generation for text. Only meaningful when evaluating a model trained with
+  # `dmmd_mask_layout=suffix` -- with the default 'random' training layout,
+  # forcing a prefix reveal order at sampling time feeds the model
+  # conditioning patterns (an arbitrary clean prefix, masked suffix) it never
+  # trained on, same as the reverse mismatch. Not implemented for 'analytic',
+  # 'confidence' or 'remask'.
+  mask_layout: random  # random, suffix
   steps: 1000
   noise_removal: ancestral  # 'ancestral', 'greedy', 'none'
   use_float64: True
@@ -440,6 +473,27 @@ training:
   change_of_variables: False
   loss_precision: 'bf16'  # bf16, float32, float64
   finetune_path: ''
+  # Mask layout for the *plain* ELBO training loss (`Diffusion.nll`'s own
+  # `q_xt` call) -- the sampling-time and DMMD-distillation-time counterparts
+  # are `sampling.mask_layout` and `adversarial_distill.dmmd_mask_layout`.
+  # 'random' (default): i.i.d. per-position masking, as always. 'suffix': a
+  # warmup-training knob for `sampling.mask_layout=suffix` prefix-conditioned
+  # sampling -- that sampler reveals positions left-to-right (start of the
+  # sequence first), and a checkpoint pretrained under i.i.d. masking never
+  # saw a large *contiguous* masked block during its own pretraining (every
+  # masked token always had scattered real neighbours nearby), which is why
+  # it collapses to a degenerate constant prediction there instead of a
+  # plausible continuation. Setting this to 'suffix' fine-tunes on exactly
+  # that conditioning pattern directly, with the plain (non-adversarial) ELBO
+  # loss -- a far more stable objective to learn a new input distribution
+  # under than the D-MMD min-max loop, which is why this is a *separate*
+  # warmup phase and not folded into `dmmd_mask_layout` itself. Point a DMMD
+  # run's `eval.checkpoint_path` at the resulting checkpoint before switching
+  # `dmmd_mask_layout=suffix` on, so the student starts in-distribution for
+  # the corruption it will be distilled under, rather than learning both
+  # "what prefix conditioning looks like" and "how to match the critic" at
+  # once.
+  mask_layout: random
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.

@@ -129,6 +129,33 @@ class TrainerBase(L.LightningModule):
     else:
       self.vocab_size = vocab_size
     self.sampler = self.config.sampling.predictor
+    # Sampling-time mask layout for 'ancestral'/'ancestral_cache' -- see the
+    # config key. Not read by any other predictor.
+    layout = str(self.config.sampling.get('mask_layout', 'random')).lower()
+    if layout in ('random', 'iid'):
+      self.sampling_mask_layout = 'random'
+    elif layout in ('suffix', 'postfix', 'block'):
+      self.sampling_mask_layout = 'suffix'
+      assert self.sampler in ('ancestral', 'ancestral_cache'), (
+        "sampling.mask_layout='suffix' is only implemented for "
+        f"sampling.predictor in ('ancestral', 'ancestral_cache'), got "
+        f'{self.sampler!r}.')
+    else:
+      raise ValueError(
+        f'Unknown sampling.mask_layout: {layout!r} '
+        "(expected one of 'random' or 'suffix'/'postfix').")
+    # Plain-ELBO training-time mask layout -- the warmup counterpart of
+    # `sampling.mask_layout`, read by `Diffusion.nll` only. See the config key.
+    train_layout = str(
+      self.config.training.get('mask_layout', 'random')).lower()
+    if train_layout in ('random', 'iid'):
+      self.training_mask_layout = 'random'
+    elif train_layout in ('suffix', 'postfix', 'block'):
+      self.training_mask_layout = 'suffix'
+    else:
+      raise ValueError(
+        f'Unknown training.mask_layout: {train_layout!r} '
+        "(expected one of 'random' or 'suffix'/'postfix').")
     self.antithetic_sampling = self.config.training.antithetic_sampling
     self.parameterization = self.config.algo.parameterization
     if self.config.algo.backbone == 'dit':
@@ -816,7 +843,7 @@ class Diffusion(TrainerBase):
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
 
-    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    xt = self._layout_q_xt(x0, alpha_t, valid_tokens=valid_tokens)
     log_x_theta = self.forward(xt, sigma=sigma)
     utils.print_nans(log_x_theta, 'model_output')
     return self.nll_per_token(
@@ -1049,6 +1076,65 @@ class AbsorbingState(Diffusion):
       xt[:, 0] = x[:, 0]
     return xt
 
+  def _layout_q_xt(self, x, alpha, valid_tokens=None):
+    """`q_xt`, or its `training.mask_layout='suffix'` counterpart -- whichever
+    `self.training_mask_layout` selects. Used by the plain ELBO loss
+    (`Diffusion.nll`) only; `algo.MDLM_DMMD._dmmd_q_xt` is the equivalent for
+    the D-MMD distillation loss, keyed on the separate
+    `adversarial_distill.dmmd_mask_layout`.
+    """
+    if self.training_mask_layout == 'random':
+      return self.q_xt(x, alpha, valid_tokens=valid_tokens)
+    move = self._suffix_mask_indices(alpha, x, valid_tokens=valid_tokens)
+    xt = torch.where(move, self.mask_index, x)
+    if self.ignore_bos:
+      xt[:, 0] = x[:, 0]
+    return xt
+
+  def _suffix_mask_boundary(self, alpha, length, valid_tokens=None):
+    """Per-example rank (float, shape `(batch, 1)`) such that eligible
+    positions ranked `>= boundary` are the contiguous-suffix masked block a
+    'suffix' mask layout uses -- shared by `algo.MDLM_DMMD`'s
+    `dmmd_mask_layout` (training), `Diffusion.nll`'s `training.mask_layout`
+    (plain-ELBO warmup training) and `_ancestral_update`'s
+    `sampling.mask_layout` (sampling), so all three stay exactly consistent.
+    Eligible positions are every position when `valid_tokens is None`, else
+    the `valid_tokens==1` subset counted in sequence order -- a prompt-masked
+    prefix then yields a suffix over the *answer* span, not over raw sequence
+    indices.
+
+    Deterministic in `alpha`: no randomness, so calling this at `alpha_t` and
+    `alpha_s` (`alpha_t <= alpha_s`) gives nested masks -- the `alpha_s` block
+    is a subset of the `alpha_t` one -- with no separate reveal step needed.
+
+    For text (`data=openwebtext-split` and similar), a 'suffix' layout means
+    the masked block is the *end* of the token sequence and the clean part is
+    the *start* -- i.e. this is prefix-conditioned ("continue this text")
+    generation/training, not the usual token-order-agnostic masked-LM setup.
+    """
+    if valid_tokens is None:
+      n_eligible = torch.full_like(alpha, float(length))
+    else:
+      n_eligible = valid_tokens.sum(-1, keepdim=True).to(alpha.dtype)
+    num_masked = ((1.0 - alpha) * n_eligible).round()
+    return n_eligible - num_masked
+
+  def _suffix_mask_indices(self, alpha, x, valid_tokens=None):
+    """Boolean `(batch, length)`, True at the 'suffix'-layout positions to
+    mask -- see `_suffix_mask_boundary`.
+    """
+    length = x.shape[-1]
+    if valid_tokens is None:
+      rank = torch.arange(length, device=x.device, dtype=alpha.dtype)
+      rank = rank.unsqueeze(0).expand(x.shape[0], -1)
+    else:
+      rank = (valid_tokens.cumsum(-1) - 1).to(alpha.dtype)
+    boundary = self._suffix_mask_boundary(alpha, length, valid_tokens)
+    move = rank >= boundary
+    if valid_tokens is not None:
+      move = move & valid_tokens.bool()
+    return move
+
   def prior_sample(self, *batch_dims):
     return self.mask_index * torch.ones(
       * batch_dims, dtype=torch.int64, device=self.device)
@@ -1070,13 +1156,30 @@ class AbsorbingState(Diffusion):
     if p_x0 is None:
       p_x0 = self.forward(
         x, self._sigma_from_alphat(alpha_t)).exp()
-    
-    q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
-    q_xs[:, :, self.mask_index] = 1 - alpha_s
-    _x = sample_categorical(q_xs)
-    
+
+    if self.sampling_mask_layout == 'suffix':
+      # Deterministic reveal: extend the clean prefix to
+      # `_suffix_mask_boundary(alpha_s)`, drawing the newly committed
+      # positions' values from p_x0 -- everything from `boundary_s` on stays
+      # `[MASK]` regardless of what the model would have proposed there.
+      # Mirrors `algo.MDLM_DMMD._dmmd_posterior`'s 'suffix' branch exactly,
+      # with p_x0 standing in for the training-time hard student sample.
+      length = x.shape[-1]
+      boundary_s = self._suffix_mask_boundary(alpha_s, length)
+      rank = torch.arange(
+        length, device=x.device, dtype=alpha_s.dtype).unsqueeze(0).expand(
+        x.shape[0], -1)
+      keep_masked = rank >= boundary_s
+      x_hat = sample_categorical(p_x0)
+      target = torch.where(
+        keep_masked, torch.full_like(x, self.mask_index), x_hat)
+    else:
+      q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
+      q_xs[:, :, self.mask_index] = 1 - alpha_s
+      target = sample_categorical(q_xs)
+
     copy_flag = (x != self.mask_index).to(x.dtype)
-    return p_x0, copy_flag * x + (1 - copy_flag) * _x
+    return p_x0, copy_flag * x + (1 - copy_flag) * target
 
   def _remask_rate(self, alpha_t, alpha_s):
     """`sigma_t`: the probability that `_remask_update` sends an already
