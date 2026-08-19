@@ -1924,7 +1924,7 @@ class MDLM_DMMD(MDLM_with_AR):
   This subclasses `MDLM_with_AR` and inherits *all* of its machinery unchanged
   (optimizers, EMA, checkpointing, the fake/generator min-max schedule, the AR
   critic, generator input-noise conditioning, samplers, ...). It only replaces
-  the diffusion-critic loss to add two features from the paper, each independently
+  the diffusion-critic loss to add three features, each independently
   toggleable so their effect on training can be compared:
 
   1. Mask sampling scheme -- `adversarial_distill.dmmd_mask_sampling`:
@@ -1953,6 +1953,17 @@ class MDLM_DMMD(MDLM_with_AR):
      `adversarial_distill.top_p` (>= 1 disables) and `.top_p_delta`. Top-p also
      applies to the AR critic's teacher; the posterior mask sampling is specific
      to the diffusion critic.
+
+  3. Mask layout -- `adversarial_distill.dmmd_mask_layout`, orthogonal to
+     `dmmd_mask_sampling` above and honoured by both of its modes. 'random'
+     (default): every `z_t`/`z_s` masked position is drawn i.i.d., same as
+     `q_xt`. 'suffix': the masked positions are a single contiguous block at
+     the end of the sequence -- the prefix is always unmasked, at both `z_t`
+     and `z_s` -- with the boundary set deterministically from alpha rather
+     than by a per-position coin flip. Aimed at CIFAR-10's raster-order pixel
+     sequence, where this is a spatial inpainting-style split (top rows given,
+     bottom rows generated) instead of salt-and-pepper masking. See
+     `_suffix_mask_boundary`.
   """
 
   def __init__(self, config, tokenizer):
@@ -1979,6 +1990,19 @@ class MDLM_DMMD(MDLM_with_AR):
       raise ValueError(
         f'Unknown adversarial_distill.dmmd_mask_sampling: {mode!r} '
         "(expected one of 'posterior'/'s' or 'renoise'/'t').")
+    # Spatial layout of which positions get masked. 'random' (default): the
+    # i.i.d. per-position draw q_xt uses. 'suffix': a contiguous block at the
+    # end of the sequence, boundary set deterministically from alpha. See the
+    # config key.
+    layout = str(getattr(ad, 'dmmd_mask_layout', 'random')).lower()
+    if layout in ('random', 'iid'):
+      self.dmmd_mask_layout = 'random'
+    elif layout in ('suffix', 'postfix', 'block'):
+      self.dmmd_mask_layout = 'suffix'
+    else:
+      raise ValueError(
+        f'Unknown adversarial_distill.dmmd_mask_layout: {layout!r} '
+        "(expected one of 'random' or 'suffix'/'postfix').")
 
   def _dmmd_sample_t(self, s):
     """Generation time `t` one D-MMD step above the critic time `s`.
@@ -2000,15 +2024,46 @@ class MDLM_DMMD(MDLM_with_AR):
     delta = torch.rand_like(s) / self.dmmd_num_steps
     return (s + delta).clamp(max=1.0)
 
-  def _dmmd_posterior(self, z_t, x_hard, alpha_t, alpha_s):
+  def _dmmd_q_xt(self, x, alpha, valid_tokens=None):
+    """`q_xt`, or its `dmmd_mask_layout='suffix'` counterpart -- whichever
+    `self.dmmd_mask_layout` selects. Same call sites, same semantics, so every
+    `q_xt` caller in `_dmmd_generate` can route through this instead.
+    `_suffix_mask_boundary`/`_suffix_mask_indices` live on
+    `trainer_base.AbsorbingState` (inherited), shared with
+    `_ancestral_update`'s `sampling.mask_layout='suffix'` so training and
+    sampling use exactly the same boundary formula.
+    """
+    if self.dmmd_mask_layout == 'random':
+      return self.q_xt(x, alpha, valid_tokens=valid_tokens)
+    move = self._suffix_mask_indices(alpha, x, valid_tokens=valid_tokens)
+    xt = torch.where(move, self.mask_index, x)
+    if self.ignore_bos:
+      xt[:, 0] = x[:, 0]
+    return xt
+
+  def _dmmd_posterior(self, z_t, x_hard, alpha_t, alpha_s, valid_tokens=None):
     """Masked-diffusion posterior sample `z_s ~ q(z_s | z_t, x_hard)`.
 
     Mirrors `AbsorbingState._ancestral_update` (a reverse step from `t` to `s`)
     but conditions on the *hard* student sample `x_hard` instead of a soft model
     prediction: positions already revealed in `z_t` are kept, and each still-
-    masked position is revealed to `x_hard` with probability
-    `(alpha_s - alpha_t) / (1 - alpha_t)`, otherwise stays masked.
+    masked position is revealed to `x_hard`.
+
+    `dmmd_mask_layout='random'` (default): reveal each still-masked position
+    independently with probability `(alpha_s - alpha_t) / (1 - alpha_t)`.
+    `='suffix'`: no per-position draw -- `_suffix_mask_boundary(alpha_s)` gives
+    the `z_s` mask directly (nested inside `z_t`'s by construction, since
+    `alpha_s >= alpha_t`), and the positions that leave the mask between `z_t`
+    and `z_s` are exactly the ones revealed to `x_hard`.
     """
+    if self.dmmd_mask_layout == 'suffix':
+      mask_s = self._suffix_mask_indices(alpha_s, z_t, valid_tokens=valid_tokens)
+      if self.ignore_bos:
+        mask_s = mask_s.clone()
+        mask_s[:, 0] = False
+      newly_revealed = (z_t == self.mask_index) & ~mask_s
+      masked = torch.full_like(z_t, self.mask_index)
+      return torch.where(mask_s, masked, torch.where(newly_revealed, x_hard, z_t))
     reveal_prob = ((alpha_s - alpha_t) / (1 - alpha_t)).clamp(0.0, 1.0)
     reveal = torch.rand(z_t.shape, device=z_t.device) < reveal_prob
     newly_revealed = (z_t == self.mask_index) & reveal
@@ -2048,7 +2103,7 @@ class MDLM_DMMD(MDLM_with_AR):
       # `MDLM_with_AR._fake_loss_diffusion`).
       x_hard = trainer_base.sample_categorical(student_probs.detach())
       x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
-      xt = self.q_xt(x_hard, alpha_t, valid_tokens=valid_tokens)
+      xt = self._dmmd_q_xt(x_hard, alpha_t, valid_tokens=valid_tokens)
       xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
       return student_probs, xt, alpha_t, dalpha_t, x_hard, student_xt
 
@@ -2066,7 +2121,7 @@ class MDLM_DMMD(MDLM_with_AR):
     assert alpha_t.ndim == 2 and alpha_s.ndim == 2
 
     # Generate the student prediction at the (noisier) generation latent z_t.
-    z_t = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    z_t = self._dmmd_q_xt(x0, alpha_t, valid_tokens=valid_tokens)
     sigma_t = self._sigma_from_alphat(alpha_t)
     if detach_student:
       with torch.no_grad():
@@ -2078,7 +2133,8 @@ class MDLM_DMMD(MDLM_with_AR):
     # Hard student sample -> posterior "sampling of masks" to the critic latent.
     x_hard = trainer_base.sample_categorical(student_probs.detach())
     x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
-    z_s = self._dmmd_posterior(z_t, x_hard, alpha_t, alpha_s)
+    z_s = self._dmmd_posterior(z_t, x_hard, alpha_t, alpha_s,
+                               valid_tokens=valid_tokens)
     z_s = self._preserve_prompt_tokens(z_s, x0, valid_tokens)
     return student_probs, z_s, alpha_s, dalpha_s, x_hard, z_t
 
@@ -2350,12 +2406,24 @@ class MDLM_RL(MDLM_DMMD):
     self.rl_num_steps = int(getattr(ad, 'rl_num_steps', 16) or 16)
     # M: how many of those steps are recomputed with gradient per update.
     self.rl_grad_steps = int(getattr(ad, 'rl_grad_steps', 1) or 1)
+    self.rl_score_acted_only = bool(
+      getattr(ad, 'rl_score_acted_only', False))
     self.rl_baseline = self._normalize_rl_baseline(
       getattr(ad, 'rl_baseline', 'leave_one_out'))
     self.rl_advantage_norm = self._normalize_rl_advantage_norm(
       getattr(ad, 'rl_advantage_norm', 'std'))
     # 0 => the whole local rollout batch is one group.
     self.rl_group_size = int(getattr(ad, 'rl_group_size', 0) or 0)
+    # Whether the leave-one-out / group-mean baseline pools rewards across
+    # every DDP rank before subtracting it, instead of each rank baselining
+    # only against its own `loader.batch_size` trajectories. Off by default:
+    # every prior single-GPU run measured `rl_group_size` against the local
+    # batch, and turning this on changes what that number means under
+    # `trainer.devices>1` (a "group" of 8 becomes 8 groups of 8 pooled into
+    # one). At `devices=1` this is an exact no-op (`self.all_gather` on one
+    # rank returns its own tensor unchanged), so it is safe to leave on for
+    # single-GPU debugging.
+    self.rl_gather_baseline = bool(getattr(ad, 'rl_gather_baseline', False))
     self.rl_pathwise_weight = float(
       getattr(ad, 'rl_pathwise_weight', 0.0) or 0.0)
     self.rl_buffer_size = int(getattr(ad, 'rl_buffer_size', 8) or 8)
@@ -2379,6 +2447,16 @@ class MDLM_RL(MDLM_DMMD):
     # thing. Costs G critic forward pairs; the student forward is shared.
     self.rl_onestep_group_size = int(
       getattr(ad, 'rl_onestep_group_size', 4) or 4)
+    # Which samples the *fake* critic is fit to, independently of what the
+    # generator is optimised on. See the config key.
+    self.rl_fake_samples = str(
+      getattr(ad, 'rl_fake_samples', 'auto')).lower()
+    assert self.rl_fake_samples in ('auto', 'onestep', 'trajectory'), (
+      f'Unknown adversarial_distill.rl_fake_samples: {self.rl_fake_samples!r} '
+      "(expected 'auto', 'onestep' or 'trajectory').")
+    if self.rl_fake_samples == 'auto':
+      self.rl_fake_samples = self.rl_policy
+    self._rl_fake_draws = 0
     # Per-token credit instead of one scalar per sequence. See
     # `_rl_onestep_dense_surrogate`.
     self.rl_dense_reward = bool(
@@ -2452,6 +2530,7 @@ class MDLM_RL(MDLM_DMMD):
               f'baseline={self.rl_baseline} '
               f'advantage_norm={self.rl_advantage_norm} '
               f'group_size={self.rl_group_size or "batch"} '
+              f'gather_baseline={self.rl_gather_baseline} '
               f'pathwise_weight={self.rl_pathwise_weight} '
               f'buffer={self.rl_buffer_size} '
               f'rollout_reuse={self.rl_rollout_reuse} '
@@ -2581,10 +2660,29 @@ class MDLM_RL(MDLM_DMMD):
     device = x0.device
     k = self.rl_num_steps
     eps = self.rl_eps
-    x = self.prior_sample(batch_size, length)
+    # Data-anchored partial rollout. `_t_curriculum_max` returns 1.0 with the
+    # curriculum off, which reproduces the all-mask prior exactly. Below 1 the
+    # trajectory starts from a *real* image masked to that level and the grid
+    # is shortened to match, so the policy only ever acts on the positions it
+    # would have acted on anyway -- the rest stay clamped to `x0`.
+    #
+    # This is the trajectory analogue of the one-shot masking curriculum, and
+    # it exists for the same measured reason: the AR critic scores a full
+    # generation at 4.48 nats/token but a mostly-real sequence at 3.2, so
+    # early rollouts from the all-mask prior land exactly where its
+    # conditionals are least meaningful. Positions revealed by the initial
+    # masking never enter `reveals`, so they carry no score -- they are
+    # context, not actions.
+    t_start = float(self._t_curriculum_max())
+    if t_start < 1.0:
+      _, alpha_start = self.noise(
+        torch.full((batch_size,), t_start, device=device))
+      x = self.q_xt(x0, alpha_start.unsqueeze(-1), valid_tokens=valid_tokens)
+    else:
+      x = self.prior_sample(batch_size, length)
     x = self._preserve_prompt_tokens(x, x0, valid_tokens)
-    timesteps = torch.linspace(1, eps, k + 1, device=device)
-    dt = (1 - eps) / k
+    timesteps = torch.linspace(t_start, eps, k + 1, device=device)
+    dt = (t_start - eps) / k
 
     num_calls = k + 1  # k grid steps + the terminal noise-removal step
     latents = torch.empty((num_calls, batch_size, length),
@@ -2673,7 +2771,7 @@ class MDLM_RL(MDLM_DMMD):
       valid_tokens, tokens.shape[1] - 1)
 
   @torch.no_grad()
-  def _rl_reward(self, x, valid_tokens):
+  def _rl_reward(self, x, valid_tokens, score_mask=None):
     """`(reward, teacher_nll, fake_nll)`, each `(batch,)` in per-token nats.
 
     `reward = log p_teacher(x) - log p_fake(x) = fake_nll - teacher_nll`.
@@ -2692,15 +2790,19 @@ class MDLM_RL(MDLM_DMMD):
     which is still a usable (if mode-seeking) objective; `fake_nll` is then
     reported as 0.
     """
+    # `score_mask` restricts which positions the reward averages over; the AR
+    # context is untouched, so anchoring's benefit is kept.
+    mask = valid_tokens if score_mask is None else (
+      score_mask if valid_tokens is None else score_mask * valid_tokens)
     teacher_logprobs = self._apply_top_p_to_teacher(
       self._ar_logprobs(self.teacher, x))
-    teacher_nll = self._rl_per_token_nll(teacher_logprobs, x, valid_tokens)
+    teacher_nll = self._rl_per_token_nll(teacher_logprobs, x, mask)
     del teacher_logprobs
     if not self.use_fake:
       fake_nll = torch.zeros_like(teacher_nll)
       return -teacher_nll, teacher_nll, fake_nll
     fake_logprobs = self._ar_logprobs(self.fake_model, x)
-    fake_nll = self._rl_per_token_nll(fake_logprobs, x, valid_tokens)
+    fake_nll = self._rl_per_token_nll(fake_logprobs, x, mask)
     del fake_logprobs
     return fake_nll - teacher_nll, teacher_nll, fake_nll
 
@@ -2742,8 +2844,28 @@ class MDLM_RL(MDLM_DMMD):
 
     The group is the whole local batch (`rl_group_size=0`) or fixed-size
     chunks of it; `_rl_baselined` supplies the rules.
+
+    With `rl_gather_baseline=True` under `trainer.devices>1`, "local batch"
+    means every rank's rollout batch pooled together (`self.all_gather`),
+    not just this rank's `loader.batch_size` trajectories. Without it, each
+    of the `devices` ranks computes its own baseline from only its own local
+    batch -- e.g. `loader.batch_size=8` at `devices=8` means the effective
+    group size stays 8 no matter how many GPUs are added, and a single
+    high-reward outlier on one rank goes un-baselined by the other 7 ranks'
+    trajectories before DDP averages its gradient into the global update.
+    Pooling first gives every rank the same, `devices`x larger, lower-
+    variance baseline -- the same total data, just not thrown away.
     """
     reward = reward.detach()
+    if self.rl_gather_baseline and self.trainer.world_size > 1:
+      gathered = self.all_gather(reward)  # (world_size, local_batch)
+      world_size, local_batch = gathered.shape
+      flat = gathered.reshape(-1)
+      group = self.rl_group_size or flat.shape[0]
+      group = max(1, min(group, flat.shape[0]))
+      baselined = torch.cat([self._rl_baselined(chunk, 0)
+                             for chunk in torch.split(flat, group)])
+      return baselined.reshape(world_size, local_batch)[self.trainer.global_rank]
     group = self.rl_group_size or reward.shape[0]
     group = max(1, min(group, reward.shape[0]))
     return torch.cat([self._rl_baselined(chunk, 0)
@@ -2913,7 +3035,19 @@ class MDLM_RL(MDLM_DMMD):
         x0, valid_tokens, current_accumulation_step)
     del current_accumulation_step  # the rollout starts from the prior, not x0
     rollout = self._rl_get_rollout(x0, valid_tokens)
-    reward, teacher_nll, fake_nll = self._rl_reward(rollout.x, valid_tokens)
+    score_mask = None
+    if self.rl_score_acted_only:
+      # Score only the positions the policy actually wrote. Under a
+      # data-anchored rollout the rest are real tokens clamped from `x0`:
+      # teacher and fake both model them well, so they add ~0 to
+      # `fake_nll - teacher_nll` while diluting the mean, and since they
+      # differ per image they enter the leave-one-out advantage as noise
+      # instead of cancelling. Measured at `t_warmup_start=0.15`:
+      # teacher_nll 2.23 vs fake_nll 2.25, i.e. reward +0.015 -- no signal.
+      # They remain AR *context* either way; they just stop being scored.
+      score_mask = rollout.reveals.any(0).to(torch.float32)
+    reward, teacher_nll, fake_nll = self._rl_reward(
+      rollout.x, valid_tokens, score_mask=score_mask)
     advantage = self._rl_advantage(reward)
     loss, logp = self._rl_surrogate(rollout, advantage, valid_tokens)
     self._rl_record_stats(reward, teacher_nll, fake_nll, logp, advantage)
@@ -3127,7 +3261,7 @@ class MDLM_RL(MDLM_DMMD):
     changed, so `adversarial_distill.fake_lr` transfers from `mdlm_dmmd`
     unmodified. Only `optim.lr` needs revisiting.
     """
-    if self.rl_policy == 'onestep':
+    if self.rl_policy == 'onestep' and self.rl_fake_samples != 'trajectory':
       # The reward's `log p_fake` has to be the density of the distribution
       # the student is actually sampled from, and under this policy that is
       # the one-shot conditional -- exactly what the inherited D-MMD critic
@@ -3164,7 +3298,14 @@ class MDLM_RL(MDLM_DMMD):
     critic has to model. It costs one rollout per fake step, which is simply
     what fitting a critic to a sampler costs.
     """
-    if (not self._rl_buffer
+    # With `rl_policy='onestep'` the generator produces no rollouts, so a FIFO
+    # filled once would freeze the critic onto a single stale batch. Refresh it
+    # every `rl_buffer_size` draws, which amortises the rollout's k+1 forwards
+    # over that many fake steps while keeping the samples current.
+    self._rl_fake_draws += 1
+    stale = (self.rl_policy == 'onestep'
+             and self._rl_fake_draws % max(1, self.rl_buffer_size) == 0)
+    if (not self._rl_buffer or stale
         or self.trainer.global_step < self.fake_warmup_steps):
       rollout = self._rl_rollout(x0, valid_tokens)
       self._rl_push_buffer(rollout)

@@ -58,6 +58,17 @@ adversarial_distill:
   #
   # Only shapes the training draw; validation is unaffected, so val/nll stays
   # comparable across the ramp.
+  #
+  # LIVE on `rl_policy: trajectory` as of the data-anchored partial rollout:
+  # `_rl_rollout` starts the trajectory from a *real* image masked to
+  # `_t_curriculum_max()` and runs `linspace(t_max, eps, k+1)`, instead of
+  # always starting from the all-mask prior at t=1. Positions revealed by that
+  # initial masking are clamped to `x0` and never enter `reveals`, so they are
+  # context for the AR critic rather than scored actions. At `t_warmup_steps:
+  # 0` the hook returns 1.0 and the rollout is bit-identical to the old
+  # all-mask behaviour. Applies to `rl_policy: onestep` and to the
+  # pathwise `algo=mdlm_dmmd`, where it is the largest single effect measured
+  # (35.1 -> 30.0 at 10k-image FID on CIFAR-10).
   t_warmup_steps: 0
   t_warmup_start: 0.3
   # How a per-token loss is folded over positions when there is no prompt mask
@@ -270,6 +281,21 @@ adversarial_distill:
   # 'renoise' ('t'): original IDLM, re-noise student_probs to an independent
   # time t. Lets the two schemes be A/B-tested with everything else fixed.
   dmmd_mask_sampling: posterior
+  # Which positions get masked, in both dmmd_mask_sampling modes. 'random'
+  # (default, historical): each eligible position is masked independently, the
+  # same i.i.d. draw q_xt uses everywhere else. 'suffix' ('postfix'): the
+  # masked positions are a single contiguous block at the *end* of the
+  # sequence (or, with a prompt mask, the end of the valid_tokens==1 span) --
+  # the prefix stays unmasked/revealed at both z_t and the re-noised/posterior
+  # z_s. The boundary is set deterministically from alpha
+  # (round((1 - alpha) * n_eligible) masked positions), not drawn at random,
+  # so the z_s boundary is automatically <= the z_t one (alpha_s >= alpha_t)
+  # and the posterior only ever reveals the positions immediately left of the
+  # current mask -- no separate reveal step is needed the way 'random' needs
+  # one. Aimed at CIFAR-10's raster-order pixel sequence, where a suffix mask
+  # is a spatial top-rows-given/bottom-rows-generated split rather than the
+  # salt-and-pepper pattern 'random' produces.
+  dmmd_mask_layout: random
   # D-MMD Sec. 3.3 top-p (nucleus) teacher distillation (algo=mdlm_dmmd). The
   # teacher target is restricted to the top-p nucleus so the student mode-seeks.
   # >= 1 disables it (teacher target unchanged); the paper's best masked-text
@@ -373,6 +399,24 @@ adversarial_distill:
   # credit local; it also avoids early positions all collapsing onto the same
   # sequence-level advantage, which is the sparse estimator reappearing.
   rl_reward_horizon: 0
+  # Which samples the FAKE critic is fit to, decoupled from what the generator
+  # is optimised on. 'auto' (default) follows rl_policy, reproducing the
+  # previous behaviour exactly: one-shot draws under 'onestep', rollouts under
+  # 'trajectory'.
+  #
+  # The argument for 'trajectory' regardless of policy: `log p_fake` stands in
+  # for the student's intractable `log pi_eta` in the reward, and `pi_eta` is
+  # the k-step sampler's marginal -- not the one-shot conditional. Fit to
+  # one-shot draws, the reward measures the gap between the teacher and a model
+  # of something the student never emits. Setting this to 'trajectory' with
+  # `rl_policy: onestep` isolates that claim: the generator keeps the cheap
+  # one-shot objective while the critic sees what the sampler actually produces.
+  #
+  # Cost: the generator produces no rollouts under 'onestep', so the FIFO is
+  # refreshed every `rl_buffer_size` fake steps, amortising one rollout's k+1
+  # denoiser forwards over that many steps. `fake_soft_target` does not apply to
+  # trajectory samples (there is no single soft x_hat_eta they came from).
+  rl_fake_samples: auto
   rl_num_steps: 16
   # M: how many of those k+1 steps are recomputed with gradient per update.
   # Every position is revealed exactly once across the trajectory, so drawing M
@@ -388,6 +432,20 @@ adversarial_distill:
   # yields an exactly-zero gradient for that micro-step. That is unbiased, not
   # a bug -- the step's true contribution really is ~0 -- and `rl/logp` logging
   # exactly 0.0 is the tell. Raise M if losing ~6% of updates matters.
+  # Average the reward over only the positions the policy actually wrote,
+  # instead of over all `model.length` positions. Meaningful only alongside a
+  # data-anchored rollout (`t_warmup_steps > 0` under `rl_policy: trajectory`),
+  # where the unwritten positions are real tokens clamped from `x0`. Those are
+  # modelled well by teacher and fake alike, so they contribute ~0 to
+  # `fake_nll - teacher_nll` while diluting the mean, and because they differ
+  # per image they enter the leave-one-out advantage as noise rather than
+  # cancelling. Measured at `t_warmup_start: 0.15`: teacher_nll 2.23 against
+  # fake_nll 2.25, a reward of +0.015 -- no usable signal at all, against
+  # -0.10 for the unanchored control. The clamped positions stay in the AR
+  # critic's *context* either way; this only stops them being scored content.
+  # Note the reward changes scale when switched on (a mean over the written
+  # positions, not over the whole sequence), so `optim.lr` may need revisiting.
+  rl_score_acted_only: false
   rl_grad_steps: 1
   # Baseline subtracted from the reward, over the group of trajectories (they
   # all start from the same all-mask prior, so they are i.i.d. and the group
@@ -413,6 +471,17 @@ adversarial_distill:
   # some magnitude information; use rl_advantage_norm='none' if you want the
   # reward gap itself to drive the step size.
   rl_group_size: 0
+  # Pool rewards across every DDP rank (via LightningModule.all_gather) before
+  # computing the group baseline, instead of each rank baselining only against
+  # its own loader.batch_size trajectories. False (default) keeps every
+  # single-GPU run's behaviour bit-for-bit -- at trainer.devices=1 this is a
+  # no-op either way. At devices>1 it matters: without it, the effective
+  # baseline group size stays loader.batch_size no matter how many GPUs are
+  # added, so an outlier reward on one rank goes un-baselined by the other
+  # ranks' trajectories before DDP averages its gradient into the global
+  # update -- a plausible source of the occasional large grad_norm_student
+  # spikes seen only at trainer.devices>1 and never in single-GPU runs.
+  rl_gather_baseline: false
   # Mix the D-MMD *pathwise* generator term back in, evaluated at one of the
   # trajectory's own latents with the rolled-out sequence as AR context. 0
   # (default) => pure policy gradient and nothing extra is built. The pathwise
@@ -448,6 +517,22 @@ loader:
 
 sampling:
   predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic, confidence, remask
+  # Which positions the 'ancestral'/'ancestral_cache' predictors reveal at
+  # each step, i.e. the sampling-time counterpart of
+  # `adversarial_distill.dmmd_mask_layout`. 'random' (default, historical):
+  # revealed positions are whichever the per-position categorical draw
+  # happens to land on -- unconstrained order. 'suffix': the revealed set is
+  # forced to be a growing *prefix* -- at each step, exactly the frontmost
+  # still-masked positions up to `AbsorbingState._suffix_mask_boundary(alpha_s,
+  # length)` are revealed (values still drawn from p_x0; only which positions
+  # get committed is deterministic), so the trajectory only ever visits
+  # states with a clean prefix / masked suffix. Only meaningful when
+  # evaluating a model trained with `dmmd_mask_layout=suffix` -- with the
+  # default 'random' training layout, forcing a prefix reveal order at
+  # sampling time feeds the model conditioning patterns (an arbitrary clean
+  # prefix, masked suffix) it never trained on, same as the reverse mismatch.
+  # Not implemented for 'analytic', 'confidence' or 'remask'.
+  mask_layout: random  # random, suffix
   steps: 1000
   noise_removal: ancestral  # 'ancestral', 'greedy', 'none'
   use_float64: True
