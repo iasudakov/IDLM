@@ -174,6 +174,18 @@ class TrainerBase(L.LightningModule):
       raise ValueError(
         f'Unknown sampling.mask_layout: {layout!r} '
         "(expected one of 'random' or 'suffix'/'postfix').")
+    # Plain-ELBO training-time mask layout -- the warmup counterpart of
+    # `sampling.mask_layout`, read by `Diffusion.nll` only. See the config key.
+    train_layout = str(
+      self.config.training.get('mask_layout', 'random')).lower()
+    if train_layout in ('random', 'iid'):
+      self.training_mask_layout = 'random'
+    elif train_layout in ('suffix', 'postfix', 'block'):
+      self.training_mask_layout = 'suffix'
+    else:
+      raise ValueError(
+        f'Unknown training.mask_layout: {train_layout!r} '
+        "(expected one of 'random' or 'suffix'/'postfix').")
     self.antithetic_sampling = self.config.training.antithetic_sampling
     self.parameterization = self.config.algo.parameterization
     if self.config.algo.backbone == 'dit':
@@ -1163,7 +1175,7 @@ class Diffusion(TrainerBase):
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
 
-    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    xt = self._layout_q_xt(x0, alpha_t, valid_tokens=valid_tokens)
     log_x_theta = self.forward(xt, sigma=sigma)
     utils.print_nans(log_x_theta, 'model_output')
     return self.nll_per_token(
@@ -1392,6 +1404,21 @@ class AbsorbingState(Diffusion):
     if valid_tokens is not None:
       move_indices = move_indices & valid_tokens.bool()
     xt = torch.where(move_indices, self.mask_index, x)
+    if self.ignore_bos:
+      xt[:, 0] = x[:, 0]
+    return xt
+
+  def _layout_q_xt(self, x, alpha, valid_tokens=None):
+    """`q_xt`, or its `training.mask_layout='suffix'` counterpart -- whichever
+    `self.training_mask_layout` selects. Used by the plain ELBO loss
+    (`Diffusion.nll`) only; `algo.MDLM_DMMD._dmmd_q_xt` is the equivalent for
+    the D-MMD distillation loss, keyed on the separate
+    `adversarial_distill.dmmd_mask_layout`.
+    """
+    if self.training_mask_layout == 'random':
+      return self.q_xt(x, alpha, valid_tokens=valid_tokens)
+    move = self._suffix_mask_indices(alpha, x, valid_tokens=valid_tokens)
+    xt = torch.where(move, self.mask_index, x)
     if self.ignore_bos:
       xt[:, 0] = x[:, 0]
     return xt
