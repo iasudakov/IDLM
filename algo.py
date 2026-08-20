@@ -536,6 +536,21 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     assert self._loss_reduction in ('sum', 'mean'), (
       'adversarial_distill.loss_reduction must be "sum" or "mean"; got '
       f'{self._loss_reduction!r}.')
+    # Spatial layout of the *distillation* student's masked latents. Parsed
+    # here rather than in `MDLM_DMMD` because `multistep_generation` (this
+    # class) is the masking path for every distillation policy, `MDLM_RL`'s
+    # included -- keying it off a subclass attribute would make the flag a
+    # silent no-op for `algo=mdlm_rl` and for `dmmd_mask_sampling=renoise`.
+    layout = str(getattr(
+      self.config.adversarial_distill, 'dmmd_mask_layout', 'random')).lower()
+    if layout in ('random', 'iid'):
+      self.dmmd_mask_layout = 'random'
+    elif layout in ('suffix', 'postfix', 'block'):
+      self.dmmd_mask_layout = 'suffix'
+    else:
+      raise ValueError(
+        f'Unknown adversarial_distill.dmmd_mask_layout: {layout!r} '
+        "(expected one of 'random' or 'suffix'/'postfix').")
     self._validate_configuration()
     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
     # Resolved lazily by `_student_embed_std` for the noise diagnostics.
@@ -975,6 +990,23 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       return tokens
     return torch.where(valid_tokens.bool(), tokens, x0)
 
+  def _dmmd_q_xt(self, x, alpha, valid_tokens=None):
+    """`q_xt`, or its `dmmd_mask_layout='suffix'` counterpart -- whichever
+    `self.dmmd_mask_layout` selects. Same call sites, same semantics, so every
+    `q_xt` caller in `_dmmd_generate` can route through this instead.
+    `_suffix_mask_boundary`/`_suffix_mask_indices` live on
+    `trainer_base.AbsorbingState` (inherited), shared with
+    `_ancestral_update`'s `sampling.mask_layout='suffix'` so training and
+    sampling use exactly the same boundary formula.
+    """
+    if self.dmmd_mask_layout == 'random':
+      return self.q_xt(x, alpha, valid_tokens=valid_tokens)
+    move = self._suffix_mask_indices(alpha, x, valid_tokens=valid_tokens)
+    xt = torch.where(move, self.mask_index, x)
+    if self.ignore_bos:
+      xt[:, 0] = x[:, 0]
+    return xt
+
   def multistep_generation(self, x0, valid_tokens,
                            current_accumulation_step, return_xt=False):
     """The student's one-shot prediction at a random noise level.
@@ -990,7 +1022,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
 
-    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    xt = self._dmmd_q_xt(x0, alpha_t, valid_tokens=valid_tokens)
 
     log_x_theta = self.forward(xt, sigma=sigma)
     student_probs = log_x_theta.exp()
@@ -1472,7 +1504,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     # so the comparison isolates the target.
     x_hard = trainer_base.sample_categorical(student_probs)
     x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
-    xt = self.q_xt(x_hard, alpha_t, valid_tokens=valid_tokens)
+    xt = self._dmmd_q_xt(x_hard, alpha_t, valid_tokens=valid_tokens)
     xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
 
     with torch.cuda.amp.autocast(dtype=torch.float32):
@@ -1990,19 +2022,8 @@ class MDLM_DMMD(MDLM_with_AR):
       raise ValueError(
         f'Unknown adversarial_distill.dmmd_mask_sampling: {mode!r} '
         "(expected one of 'posterior'/'s' or 'renoise'/'t').")
-    # Spatial layout of which positions get masked. 'random' (default): the
-    # i.i.d. per-position draw q_xt uses. 'suffix': a contiguous block at the
-    # end of the sequence, boundary set deterministically from alpha. See the
-    # config key.
-    layout = str(getattr(ad, 'dmmd_mask_layout', 'random')).lower()
-    if layout in ('random', 'iid'):
-      self.dmmd_mask_layout = 'random'
-    elif layout in ('suffix', 'postfix', 'block'):
-      self.dmmd_mask_layout = 'suffix'
-    else:
-      raise ValueError(
-        f'Unknown adversarial_distill.dmmd_mask_layout: {layout!r} '
-        "(expected one of 'random' or 'suffix'/'postfix').")
+    # `dmmd_mask_layout` is parsed by `MDLM_with_AR.__init__`, which every
+    # distillation policy inherits -- see the note there.
 
   def _dmmd_sample_t(self, s):
     """Generation time `t` one D-MMD step above the critic time `s`.
@@ -2024,22 +2045,6 @@ class MDLM_DMMD(MDLM_with_AR):
     delta = torch.rand_like(s) / self.dmmd_num_steps
     return (s + delta).clamp(max=1.0)
 
-  def _dmmd_q_xt(self, x, alpha, valid_tokens=None):
-    """`q_xt`, or its `dmmd_mask_layout='suffix'` counterpart -- whichever
-    `self.dmmd_mask_layout` selects. Same call sites, same semantics, so every
-    `q_xt` caller in `_dmmd_generate` can route through this instead.
-    `_suffix_mask_boundary`/`_suffix_mask_indices` live on
-    `trainer_base.AbsorbingState` (inherited), shared with
-    `_ancestral_update`'s `sampling.mask_layout='suffix'` so training and
-    sampling use exactly the same boundary formula.
-    """
-    if self.dmmd_mask_layout == 'random':
-      return self.q_xt(x, alpha, valid_tokens=valid_tokens)
-    move = self._suffix_mask_indices(alpha, x, valid_tokens=valid_tokens)
-    xt = torch.where(move, self.mask_index, x)
-    if self.ignore_bos:
-      xt[:, 0] = x[:, 0]
-    return xt
 
   def _dmmd_posterior(self, z_t, x_hard, alpha_t, alpha_s, valid_tokens=None):
     """Masked-diffusion posterior sample `z_s ~ q(z_s | z_t, x_hard)`.
@@ -2677,7 +2682,8 @@ class MDLM_RL(MDLM_DMMD):
     if t_start < 1.0:
       _, alpha_start = self.noise(
         torch.full((batch_size,), t_start, device=device))
-      x = self.q_xt(x0, alpha_start.unsqueeze(-1), valid_tokens=valid_tokens)
+      x = self._dmmd_q_xt(x0, alpha_start.unsqueeze(-1),
+                          valid_tokens=valid_tokens)
     else:
       x = self.prior_sample(batch_size, length)
     x = self._preserve_prompt_tokens(x, x0, valid_tokens)
