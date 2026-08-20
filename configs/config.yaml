@@ -533,6 +533,20 @@ sampling:
   # prefix, masked suffix) it never trained on, same as the reverse mismatch.
   # Not implemented for 'analytic', 'confidence' or 'remask'.
   mask_layout: random  # random, suffix
+  # Only read when mask_layout=suffix. null (default): the boundary advances
+  # by whatever the noise schedule implies between t and s each step
+  # (`AbsorbingState._suffix_mask_boundary`) -- typically several dozen
+  # positions per step at ordinary step counts, and still occasional
+  # 2-position bursts even at steps == model.length, since that boundary is
+  # `round((1-alpha) * length)` and alpha's density isn't perfectly uniform
+  # in step index. A positive integer N instead advances the boundary by
+  # exactly N positions every regular step, independent of the schedule
+  # entirely -- set N=1 with `sampling.steps >= model.length` for true
+  # one-token-at-a-time sequential decoding: every commit conditions on every
+  # previously committed position, with no simultaneous, uncoordinated draws
+  # within a step at all. The forced final noise-removal step still always
+  # completes the reveal regardless of this setting.
+  suffix_step_size: null
   steps: 1000
   noise_removal: ancestral  # 'ancestral', 'greedy', 'none'
   use_float64: True

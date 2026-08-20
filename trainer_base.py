@@ -1484,14 +1484,36 @@ class AbsorbingState(Diffusion):
         x, self._sigma_from_alphat(alpha_t)).exp()
 
     if self.sampling_mask_layout == 'suffix':
-      # Deterministic reveal: extend the clean prefix to
-      # `_suffix_mask_boundary(alpha_s)`, drawing the newly committed
-      # positions' values from p_x0 -- everything from `boundary_s` on stays
-      # `[MASK]` regardless of what the model would have proposed there.
-      # Mirrors `algo.MDLM_DMMD._dmmd_posterior`'s 'suffix' branch exactly,
-      # with p_x0 standing in for the training-time hard student sample.
+      # Deterministic reveal: extend the clean prefix to `boundary_s`,
+      # drawing the newly committed positions' values from p_x0 --
+      # everything from `boundary_s` on stays `[MASK]` regardless of what
+      # the model would have proposed there. Mirrors
+      # `algo.MDLM_DMMD._dmmd_posterior`'s 'suffix' branch exactly, with
+      # p_x0 standing in for the training-time hard student sample.
+      #
+      # `sampling.suffix_step_size`, if set, bypasses the alpha-schedule-
+      # derived boundary (`_suffix_mask_boundary`, which reveals however many
+      # positions the *noise schedule* implies between t and s -- typically
+      # several dozen at ordinary step counts, and still occasional
+      # 2-position bursts even at `sampling.steps == length` from rounding)
+      # and instead advances the boundary by exactly this many positions
+      # every regular step, independent of the schedule. `suffix_step_size=1`
+      # with `sampling.steps >= length` gives true one-token-at-a-time
+      # sequential decoding: every commit conditions on every previously
+      # committed position, with no simultaneous, uncoordinated draws at all.
+      # The forced noise-removal step (`noise_removal_step=True`) always
+      # completes the reveal regardless of `step_size`, exactly as it does
+      # for the schedule-derived boundary.
       length = x.shape[-1]
-      boundary_s = self._suffix_mask_boundary(alpha_s, length)
+      step_size = getattr(self.config.sampling, 'suffix_step_size', None)
+      if noise_removal_step:
+        boundary_s = torch.full_like(alpha_s, float(length))
+      elif step_size:
+        boundary_t = (x != self.mask_index).sum(
+          -1, keepdim=True).to(alpha_s.dtype)
+        boundary_s = (boundary_t + step_size).clamp(max=float(length))
+      else:
+        boundary_s = self._suffix_mask_boundary(alpha_s, length)
       rank = torch.arange(
         length, device=x.device, dtype=alpha_s.dtype).unsqueeze(0).expand(
         x.shape[0], -1)
