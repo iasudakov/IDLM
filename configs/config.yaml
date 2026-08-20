@@ -699,6 +699,20 @@ eval:
   # `loader.eval_batch_size`, since the grid is the last generated batch.
   sample_image_num: 64
   sample_image_nrow: 8
+  # Per-position predictive-NLL diagnostic (`_log_position_nll_heatmap`). Once
+  # per validation, re-masks one held-back validation batch under BOTH
+  # `random` and `suffix` layouts and reports the mean NLL each position gets
+  # when it is actually masked. Logs three scalars -- val/pos_nll_random,
+  # val/pos_nll_suffix, val/pos_nll_gap -- and, for image runs, a heatmap
+  # under `position_nll_key`: one row per layout, one panel per colour channel
+  # (the token order is `(c h w)`, so index i is channel i // (H*W) -- a
+  # suffix mask covers whole channels, NOT a raster sweep of the image).
+  # The gap is the point: it is what a suffix-trained checkpoint pays when it
+  # is then sampled under the random layout, in nats, trackable over training.
+  # Costs 2 * position_nll_draws forward passes per validation, no backward.
+  position_nll_heatmap: False
+  position_nll_draws: 8
+  position_nll_key: 'val/position_nll'
   # Run the full sample-eval block (for images: FID, entropies, sample grid)
   # during Lightning's sanity check, i.e. BEFORE the first training step. For a
   # distillation run that is the pre-distillation baseline -- at step 0 the

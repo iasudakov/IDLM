@@ -455,6 +455,9 @@ class TrainerBase(L.LightningModule):
     self._gm_data_texts = []
     # How many validation batches have gone into FID's *real* side this epoch.
     self._fid_real_batches = 0
+    # One batch held back for the per-position NLL heatmap (see
+    # `_log_position_nll_heatmap`); None disables it for this epoch.
+    self._pos_nll_batch = None
     assert self.metrics.valid_nlls.nll.mean_value == 0
     assert self.metrics.valid_nlls.nll.weight == 0
 
@@ -479,6 +482,11 @@ class TrainerBase(L.LightningModule):
       self.metrics.record_fid(
         self.tokenizer.batch_decode(batch['input_ids']), real=True)
       self._fid_real_batches += 1
+    # Hold the first batch back for the per-position NLL maps, which need raw
+    # `x0` to re-mask under both layouts at the end of the epoch.
+    if (self._pos_nll_batch is None
+        and self.config.eval.get('position_nll_heatmap', False)):
+      self._pos_nll_batch = batch['input_ids'].clone()
     losses = self._loss(batch['input_ids'],
                         batch['attention_mask'])
     self.metrics.update_valid(losses.nlls, losses.prior_loss,
@@ -489,6 +497,9 @@ class TrainerBase(L.LightningModule):
     for k, v in self.metrics.valid_nlls.items():
       self.log(name=k,  value=v.compute(), on_step=False,
                on_epoch=True, sync_dist=True)
+    hook = getattr(self, '_log_position_nll_heatmap', None)
+    if hook is not None:
+      hook()
     if ((self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples):
@@ -1422,6 +1433,135 @@ class AbsorbingState(Diffusion):
     if self.ignore_bos:
       xt[:, 0] = x[:, 0]
     return xt
+
+  @torch.no_grad()
+  def _position_nll_maps(self, x0, valid_tokens=None, num_draws=8):
+    """Mean predictive NLL *per position*, under each mask layout separately.
+
+    Returns `{'random': (length,), 'suffix': (length,)}` in nats.
+
+    The point of the per-position resolution: `training.mask_layout=suffix` /
+    `dmmd_mask_layout=suffix` mask position `i` only when
+    `alpha <= i/length`, and MDLM's ELBO only puts loss on *masked* positions,
+    so the gradient a position receives under a suffix layout is wildly
+    position-dependent (measured on the cosine schedule at
+    `training.sampling_eps=1e-2`: ~1% of draws for position 0 against ~100%
+    for the last position). A single scalar `val/nll` averages that structure
+    away; this keeps it.
+
+    Each position is normalised by *how often it was actually masked*, not by
+    the number of draws, so a rarely-masked position is not flattered by all
+    the draws where it contributed no loss at all. Positions never masked
+    across `num_draws` come back as NaN and are rendered as gaps rather than
+    as zeros, which would read as "perfectly predicted".
+
+    Deliberately unweighted: no `dalpha_t / (1 - alpha_t)` ELBO factor, so
+    these are raw predictive nats, comparable between the two layouts and
+    across positions rather than dominated by whichever draws landed near
+    `alpha -> 1`.
+    """
+    maps = {}
+    for layout in ('random', 'suffix'):
+      total = torch.zeros(x0.shape[-1], device=x0.device, dtype=torch.float32)
+      count = torch.zeros_like(total)
+      for _ in range(num_draws):
+        t = torch.rand(x0.shape[0], 1, device=x0.device)
+        t = (1 - self.sampling_eps) * t + self.sampling_eps
+        _, alpha_t = self.noise(t.squeeze(-1))
+        alpha_t = alpha_t.unsqueeze(-1)
+        if layout == 'suffix':
+          move = self._suffix_mask_indices(
+            alpha_t, x0, valid_tokens=valid_tokens)
+          xt = torch.where(move, self.mask_index, x0)
+        else:
+          xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+        log_p = self.forward(xt, sigma=self._sigma_from_alphat(alpha_t))
+        nll = - torch.gather(
+          log_p, dim=-1, index=x0[:, :, None]).squeeze(-1)
+        masked = (xt == self.mask_index).float()
+        total += (nll.float() * masked).sum(0)
+        count += masked.sum(0)
+      maps[layout] = torch.where(count > 0, total / count,
+                                 torch.full_like(total, float('nan')))
+    return maps
+
+  def _render_position_nll_heatmap(self, maps):
+    """`maps` -> an HWC uint8 figure: one row per layout, one panel per colour
+    channel, on a shared colour scale so the two layouts are comparable by eye.
+
+    Panels are per *channel* because the token order is `(c h w)` (see
+    `dataloader`'s vision tokenizer): index `i` is channel `i // (H*W)`, not a
+    raster scan of the image. A single 32x32 panel would silently blend the
+    three channels' very different statistics into one picture.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    size = int(getattr(self.tokenizer, 'image_size', 32))
+    layouts = ('random', 'suffix')
+    finite = torch.cat([m[torch.isfinite(m)] for m in maps.values()])
+    vmin = float(torch.quantile(finite, 0.02))
+    vmax = float(torch.quantile(finite, 0.98))
+    fig, axes = plt.subplots(2, 3, figsize=(9, 6.4))
+    for r, layout in enumerate(layouts):
+      grid = maps[layout].detach().cpu().reshape(3, size, size)
+      for c in range(3):
+        ax = axes[r][c]
+        im = ax.imshow(grid[c].numpy(), vmin=vmin, vmax=vmax,
+                       cmap='magma', interpolation='nearest')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if r == 0:
+          ax.set_title('RGB'[c] + ' channel', fontsize=10)
+        if c == 0:
+          ax.set_ylabel(f'{layout} mask', fontsize=10)
+    mean_r = float(torch.nanmean(maps['random']))
+    mean_s = float(torch.nanmean(maps['suffix']))
+    fig.suptitle('per-position predictive NLL (nats)   '
+                 f'random={mean_r:.3f}  suffix={mean_s:.3f}  '
+                 f'gap={mean_r - mean_s:+.3f}', fontsize=11)
+    fig.colorbar(im, ax=axes, shrink=0.8)
+    fig.canvas.draw()
+    image = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+    plt.close(fig)
+    return image
+
+  def _log_position_nll_heatmap(self):
+    """Log the per-position NLL maps, once per validation.
+
+    Rank zero, best-effort, never fatal -- same contract as
+    `_log_sample_images` / `_log_pareto_curve`: a plotting or tracker failure
+    must not take a training run down. Costs `2 * eval.position_nll_draws`
+    forward passes on one buffered validation batch and no backward.
+    """
+    if not self.config.eval.get('position_nll_heatmap', False):
+      return
+    x0 = getattr(self, '_pos_nll_batch', None)
+    if x0 is None or self.trainer.global_rank != 0:
+      return
+    try:
+      maps = self._position_nll_maps(
+        x0.to(self.device),
+        num_draws=int(self.config.eval.get('position_nll_draws', 8)))
+      mean_r = float(torch.nanmean(maps['random']))
+      mean_s = float(torch.nanmean(maps['suffix']))
+      # The scalars are the trackable part: the gap is what a suffix-trained
+      # checkpoint pays when it is then sampled under the random layout.
+      for name, value in (('val/pos_nll_random', mean_r),
+                          ('val/pos_nll_suffix', mean_s),
+                          ('val/pos_nll_gap', mean_r - mean_s)):
+        self.log(name, torch.as_tensor(value, device=self.device),
+                 on_epoch=True, on_step=False, rank_zero_only=True)
+      print('[pos_nll] step={} random={:.4f} suffix={:.4f} gap={:+.4f}'.format(
+        self.global_step, mean_r, mean_s, mean_r - mean_s), flush=True)
+      if not self.is_vision or not hasattr(self.trainer.logger, 'log_image'):
+        return
+      self.trainer.logger.log_image(
+        key=self.config.eval.get('position_nll_key', 'val/position_nll'),
+        image=self._render_position_nll_heatmap(maps),
+        step=self.global_step)
+    except Exception as e:  # pragma: no cover - diagnostics are best-effort
+      print('[pos_nll] heatmap failed: {}'.format(e), flush=True)
 
   def prior_sample(self, *batch_dims):
     return self.mask_index * torch.ones(
