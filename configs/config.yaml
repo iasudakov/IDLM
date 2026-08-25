@@ -66,10 +66,24 @@ adversarial_distill:
   mmd_feature_layer: null
   mmd_feature_layer_weights: null
 
-  # Samples per state for the leave-one-out baseline. Must be >= 2: with one
-  # there is no baseline, and an unbaselined score estimator on a reward this
-  # large is pure variance. Costs one critic forward per sample.
+  # Samples drawn per state, each costing one critic forward. At >= 2 the
+  # group's own leave-one-out mean is the baseline. 1 is allowed and is the
+  # cheap end -- a quarter the critic cost of 4 -- but it has no second sample
+  # at the same state, so the baseline has to come from somewhere else.
   mmd_group_size: 4
+
+  # Which control variate removes the reward's offset.
+  #   auto  -- group when mmd_group_size >= 2, none when it is 1
+  #   group -- leave-one-out within the group; the lowest-variance option,
+  #            since every member was drawn at the same state
+  #   batch -- leave-one-out across the other sequences in the batch. Unbiased
+  #            and free, but noisier: those rows carry different x0 and
+  #            different masking, so their rewards measure different things.
+  #   none  -- subtract nothing. Still unbiased, but the pseudo-Huber reward is
+  #            a negative distance, so every advantage is negative and every
+  #            update pushes down whatever the student sampled. For measuring
+  #            what the baseline is worth, not for training.
+  mmd_baseline: auto
 
   accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   fake_frequency: 1

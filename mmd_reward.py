@@ -252,6 +252,36 @@ def summed_paired_reward(features, batch, selected, indices, weights):
   return total, active, per_layer
 
 
+def batch_advantages(reward, active):
+  """Leave-one-out advantages over the *batch* axis, for a group of one.
+
+  With `group_size=1` there is no second sample at the same state, so the
+  group baseline does not exist. The other sequences in the batch are the
+  next best comparison set: `A_i = r_i - mean_{j != i, active} r_j`, which is
+  still independent of the sample it scores and so still unbiased.
+
+  It is a noisier baseline than the group one, and not for a subtle reason:
+  those rows carry different `x0` and different masking fractions, so their
+  rewards are not measurements of the same quantity. It removes the reward's
+  overall offset -- which is what matters most here, since the pseudo-Huber
+  reward is a negative distance and therefore always <= 0, so an unbaselined
+  advantage is negative for every sample and pushes down every sequence the
+  student wrote regardless of how good it was.
+
+  Inactive rows are excluded from the baseline rather than counted as zero,
+  which would drag it toward 0 by however many rows scored nothing.
+  """
+  if reward.shape[0] < 2:
+    raise ValueError(
+      'batch_advantages needs at least 2 sequences in the batch when '
+      f'group_size=1, got {reward.shape[0]}; there is no baseline otherwise')
+  weight = active.to(reward.dtype).unsqueeze(-1)      # (batch, 1)
+  count = weight.sum(dim=0, keepdim=True)             # (1, 1)
+  total = (reward * weight).sum(dim=0, keepdim=True)  # (1, group)
+  loo = (total - reward * weight) / (count - weight).clamp_min(1.0)
+  return reward - loo
+
+
 def group_advantages(reward):
   """Leave-one-out advantages over the last (group) axis.
 
@@ -363,7 +393,8 @@ class FrozenARFeatures(_LayeredFeatures):
 
 
 def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
-                       group_size, eos_id, reward_weight=1.0):
+                       group_size, eos_id, reward_weight=1.0,
+                       baseline='auto'):
   """REINFORCE loss driving the student toward the clean answer's AR features.
 
   `group_size` hard answers are drawn from the student's differentiable
@@ -386,15 +417,33 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     selected: `(batch, length)` bool; the positions the student generated (the
       masked ones), which are also the only ones scored.
     critic: a `FrozenARFeatures`.
-    group_size: samples per state. Must be >= 2 -- leave-one-out has no
-      baseline with one, and an unbaselined score estimator on a reward this
-      large is pure variance.
+    group_size: samples per state. At >= 2 the group's own leave-one-out mean
+      is the baseline. At 1 there is no second sample at the same state, so
+      `baseline` decides what stands in; the sampling cost falls with the
+      group, since each member costs one critic forward.
+    baseline: which control variate subtracts off the reward's offset.
+      `auto` picks `group` when group_size >= 2 and `none` when it is 1.
+      `batch` uses the other sequences in the batch -- unbiased, free, but
+      noisier, since those rows carry different `x0`. `none` subtracts
+      nothing, which is still unbiased but leaves every advantage negative
+      (the reward is a negative distance), so every update pushes down
+      whatever was sampled; it is for measuring the baseline's worth, not for
+      training.
 
   Returns `(loss, stats)`; `loss` already carries `reward_weight`.
   """
-  if group_size < 2:
-    raise ValueError('mmd group_size must be >= 2 for a leave-one-out '
-                     f'baseline, got {group_size}')
+  if group_size < 1:
+    raise ValueError(f'mmd group_size must be >= 1, got {group_size}')
+  if baseline not in ('auto', 'group', 'batch', 'none'):
+    raise ValueError('mmd_baseline must be auto|group|batch|none, got '
+                     f'{baseline!r}')
+  if baseline == 'auto':
+    baseline = 'group' if group_size > 1 else 'none'
+  if baseline == 'group' and group_size < 2:
+    raise ValueError('mmd_baseline=group needs group_size >= 2 -- '
+                     'leave-one-out has no baseline within a group of one; '
+                     'use baseline=none (the default at group_size=1) or '
+                     'baseline=batch')
   batch, length, _ = student_probs.shape
   selected = selected.bool()
 
@@ -422,7 +471,15 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     reward = torch.stack(rewards, dim=-1)          # (batch, group)
     active = actives[0]                            # identical across the group
 
-    advantage = group_advantages(reward)
+    if baseline == 'group':
+      advantage = group_advantages(reward)
+    elif baseline == 'batch':
+      advantage = batch_advantages(reward, active)
+    else:  # 'none'
+      # Unbiased, but the reward is a negative distance, so every advantage is
+      # negative and each update pushes down whatever was sampled. Kept for
+      # measuring what the baseline is worth, not for training.
+      advantage = reward
     advantage = torch.where(active.unsqueeze(-1), advantage,
                             torch.zeros_like(advantage))
 

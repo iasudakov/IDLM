@@ -375,7 +375,8 @@ class MDLM(trainer_base.AbsorbingState):
       student_probs, x0, selected, self._mmd_critic,
       group_size=cfg.mmd_group_size,
       eos_id=self.tokenizer.eos_token_id,
-      reward_weight=cfg.mmd_reward_weight)
+      reward_weight=cfg.mmd_reward_weight,
+      baseline=str(cfg.get('mmd_baseline', 'auto')))
     self.log_dict(stats, on_step=True, on_epoch=False, sync_dist=True)
     return loss
 
