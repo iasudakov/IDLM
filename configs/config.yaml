@@ -8,6 +8,7 @@ defaults:
   - /lr_scheduler: constant_warmup
   - /prior: none
   - /algo: duo_base
+  - /logger: underdeep
 
 mode: train  # train / ppl_eval / sample_eval
 debug: False
@@ -93,11 +94,6 @@ trainer:
 #     - ${data.train}
 #     - ${data.valid}
 #     - ${algo.name}
-
-logger:
-  _target_: lightning.pytorch.loggers.TensorBoardLogger
-  save_dir: ${cwd:}/tb_logs
-  name: duo
 
 hydra:
   run:

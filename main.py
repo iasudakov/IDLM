@@ -207,7 +207,7 @@ def _train(diffusion_model, config, logger, tokenizer):
   #   wandb_logger = L.pytorch.loggers.WandbLogger(
   #     config=omegaconf.OmegaConf.to_object(config),
   #     **config.wandb)
-  tensorboard_logger = hydra.utils.instantiate(config.logger)
+  train_logger = hydra.utils.instantiate(config.logger)
 
   if (config.checkpointing.resume_from_ckpt
       and config.checkpointing.resume_ckpt_path is not None
@@ -246,7 +246,7 @@ def _train(diffusion_model, config, logger, tokenizer):
     default_root_dir=os.getcwd(),
     callbacks=callbacks,
     strategy=hydra.utils.instantiate(config.strategy),
-    logger=tensorboard_logger,
+    logger=train_logger,
     enable_progress_bar=False if config.debug else True)
   trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
 

@@ -316,10 +316,15 @@ class TrainerBase(L.LightningModule):
           # Log the last generated samples
           text_samples = text_samples[
             : self.config.sampling.num_sample_log]
+          # Stable key + explicit `step`: a tracker turns repeated calls
+          # under one title into a step-indexed series, so baking the step
+          # into the title instead lands every validation as its own
+          # unrelated table.
           self.trainer.logger.log_table(
-            key=f'samples@global_step{self.global_step}',
+            key='val/samples',
             columns=['Generated Samples'],
-            data=[[s] for s in text_samples])
+            data=[[s] for s in text_samples],
+            step=self.global_step)
         if self.config.eval.compute_generative_perplexity:
           self.log('val/gen_ppl',
                    self.metrics.gen_ppl.compute(),
