@@ -348,7 +348,14 @@ class TrainerBase(L.LightningModule):
     # budget, so it must not run before `val/gen_ppl` and `val/sample_entropy`
     # above have been read off. `on_validation_epoch_start` resets again, so
     # leaving it dirty here is harmless.
-    self._log_owt_pareto()
+    try:
+      self._log_owt_pareto()
+    except Exception as e:
+      # A diagnostic must never take the run down with it. The sweep samples at
+      # budgets the main loop never uses (2 steps, say), so it can fail where
+      # ordinary validation does not -- and it sits inside the validation of
+      # runs measured in days.
+      print(f'[owt-pareto] sweep failed, continuing: {e}', flush=True)
     self._train_mode()
 
   def _log_owt_pareto(self):
