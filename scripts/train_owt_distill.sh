@@ -40,15 +40,18 @@ export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 
 # --- batch size ------------------------------------------------------- #
 
-# The recipe pins accumulate_grad_batches, so the effective batch is
-# devices * batch_size * accum -- i.e. it CHANGES WITH THE GPU COUNT unless
-# accumulation compensates. Held at EFFECTIVE_BATCH so a 4-GPU host and an
-# 8-GPU host train the same model.
+# `trainer.accumulate_grad_batches` MUST stay 1 here. Distillation runs under
+# manual optimization (the min-max loop steps two optimizers itself), and
+# Lightning refuses automatic accumulation in that mode:
+#   "Automatic gradient accumulation is not supported for manual optimization"
+# Accumulation instead goes through `adversarial_distill.accum_batches`, which
+# defaults to div_up(loader.global_batch_size, devices * batch_size) -- so the
+# effective batch is already pinned to `global_batch_size` (512) whatever the
+# GPU count, and nothing here needs to compensate for it.
 BATCH_SIZE="${BATCH_SIZE:-8}"
-EFFECTIVE_BATCH="${EFFECTIVE_BATCH:-64}"
-ACCUM="$(python -c "import math;print(max(1, math.ceil(${EFFECTIVE_BATCH} / (${NUM_GPUS} * ${BATCH_SIZE}))))")"
-echo "devices=${NUM_GPUS} batch_size=${BATCH_SIZE} accum=${ACCUM}" \
-     "-> effective $(( NUM_GPUS * BATCH_SIZE * ACCUM ))"
+GLOBAL_BATCH="${GLOBAL_BATCH:-512}"
+echo "devices=${NUM_GPUS} batch_size=${BATCH_SIZE} global_batch=${GLOBAL_BATCH}" \
+     "-> accum_batches $(python -c "import math;print(math.ceil(${GLOBAL_BATCH}/(${NUM_GPUS}*${BATCH_SIZE})))") per optimizer step"
 
 # --- tracker ---------------------------------------------------------- #
 
@@ -69,7 +72,8 @@ python -u -m main \
   eval.checkpoint_path='kuleshov-group/mdlm-owt' \
   model.length="${LENGTH:-1024}" \
   eval.compute_generative_perplexity=True \
-  trainer.accumulate_grad_batches="${ACCUM}" \
+  loader.global_batch_size="${GLOBAL_BATCH}" \
+  trainer.accumulate_grad_batches=1 \
   trainer.gradient_clip_val=null \
   trainer.precision=32 \
   training.loss_precision=float32 \

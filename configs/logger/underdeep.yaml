@@ -6,7 +6,7 @@
 # tracker installed trains exactly as it did before.
 # Switch back to the authors' logger with `logger=tensorboard`.
 _target_: underdeep_logger.UnderdeepLogger
-experiment: generative-models/idlm
+experiment: generative-models/owt
 name: ${algo.name}
 save_dir: ${checkpointing.save_dir}
 # Resume the same tracker run whenever training itself resumes, so an
