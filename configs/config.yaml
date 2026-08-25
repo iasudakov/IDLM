@@ -52,6 +52,14 @@ adversarial_distill:
   # never saw a clean sequence. Ignored by `mmd_feature_source: ar` -- a causal
   # LM did see clean text, so masking there would inject a difference into a
   # comparison meant to isolate what the student wrote.
+  #
+  # Set 0.0 to feed the teacher whole, unmasked sentences instead: the masking
+  # is `rand < noise_level`, so nothing is dropped and the features are read off
+  # the clean rows. That is what the TinyGSM runs used, and it costs nothing
+  # extra here -- with `dmd_weight=0` the teacher is already resident and
+  # otherwise unused, where `mmd_feature_source: ar` loads a second model.
+  # Verified on OWT: the blocks resolve through the `hf_dit` wrapper and the
+  # reward stays monotone in corruption size.
   mmd_noise_level: 0.1
 
   # Which block's hidden states to read. `null` is the middle one: late layers
