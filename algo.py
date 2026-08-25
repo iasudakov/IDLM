@@ -146,12 +146,16 @@ class MDLM(trainer_base.AbsorbingState):
       self._fake_accum_counter = 0
       self._student_accum_counter = 0
       self.fake_frequency = self.config.adversarial_distill.fake_frequency
-      self.fake_iter = 0 
-      self.is_generator_step = False
+      self.fake_iter = 0
+      # Upstream starts on a fake step so the critic is warm before the
+      # generator first consults it. With dmd_weight=0 there is no critic to
+      # warm, and starting there would train one nothing reads.
+      self.is_generator_step = not bool(getattr(
+        self.config.adversarial_distill, 'dmd_weight', 1.0))
       self.total_loss_student = 0
       self.total_loss_fake = 0
       self.f_loss_ar = []
-  
+
   def configure_optimizers(self):
     if self.config.adversarial_distill.is_distill:
       optimizer_student = torch.optim.AdamW(
@@ -205,8 +209,16 @@ class MDLM(trainer_base.AbsorbingState):
   def on_train_start(self):
     if self.is_adversarial_distill:
       self.ema_fake.move_shadow_params_to_device(self.device)
-      utils.activate_model(self.fake_model)
-      utils.freeze_model(self.backbone)
+      # Upstream opens on a fake step, so it hands the gradient to the critic
+      # and freezes the student. With dmd_weight=0 there is no fake phase and
+      # the very first step is the generator's, which would otherwise find its
+      # own parameters frozen and produce a loss with no grad_fn at all.
+      if bool(getattr(self.config.adversarial_distill, 'dmd_weight', 1.0)):
+        utils.activate_model(self.fake_model)
+        utils.freeze_model(self.backbone)
+      else:
+        utils.activate_model(self.backbone)
+        utils.freeze_model(self.fake_model)
     super().on_train_start()
 
   def on_load_checkpoint(self, checkpoint):
@@ -240,7 +252,8 @@ class MDLM(trainer_base.AbsorbingState):
       return tokens
     return torch.where(valid_tokens.bool(), tokens, x0)
 
-  def multistep_generation(self, x0, valid_tokens, current_accumulation_step):
+  def multistep_generation(self, x0, valid_tokens, current_accumulation_step,
+                           return_xt=False):
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
@@ -251,7 +264,12 @@ class MDLM(trainer_base.AbsorbingState):
 
     log_x_theta = self.forward(xt, sigma=sigma)
     student_probs = log_x_theta.exp()
-    return self._preserve_prompt_probs(student_probs, x0, valid_tokens)
+    student_probs = self._preserve_prompt_probs(student_probs, x0, valid_tokens)
+    # `return_xt` exists for the MMD reward: the positions masked in `xt` are
+    # exactly the ones the student wrote, and so the only ones worth scoring.
+    if return_xt:
+      return student_probs, xt
+    return student_probs
 
   def q_xt_with_probs(self, student_probs, alpha_t, x0=None, valid_tokens=None):
     mask_probs = torch.zeros_like(student_probs)
@@ -272,9 +290,113 @@ class MDLM(trainer_base.AbsorbingState):
       return loss.sum(-1) / denom
     return loss.sum(-1)
 
+  @property
+  def _mmd_critic(self):
+    """The frozen feature map, built on first use.
+
+    Constructed lazily so a run with `mmd_reward_weight=0` never downloads or
+    holds it, and the published objective stays exactly as upstream wrote it.
+    """
+    if getattr(self, '_mmd_critic_cached', None) is None:
+      import mmd_reward
+      cfg = self.config.adversarial_distill
+      source = getattr(cfg, 'mmd_feature_source', 'ar')
+      if source == 'ar':
+        # `kuleshov-group/owt-ar`: a causal DiT trained on the student's exact
+        # corpus and vocabulary. Independent of the model being distilled,
+        # unlike the diffusion teacher, and it *did* see clean sequences --
+        # hence noise_level=0, since masking would inject a difference into a
+        # comparison meant to isolate what the student wrote.
+        backbone = mmd_reward.load_owt_ar_backbone(
+          str(cfg.mmd_ar_model), self.device)
+        self._mmd_critic_cached = mmd_reward.FrozenBackboneFeatures(
+          backbone, self.mask_index,
+          layer_index=cfg.mmd_feature_layer,
+          layer_weights=cfg.get('mmd_feature_layer_weights', None),
+          noise_level=0.0)
+        what = f'owt-ar {cfg.mmd_ar_model} (clean, no masking)'
+      elif source == 'diffusion':
+        # The teacher is a frozen copy of the student taken before training:
+        # already in memory, same vocabulary, and its features are about this
+        # corpus rather than about text at large. A denoiser never saw a clean
+        # sequence, so both rows are lightly masked first.
+        self._mmd_critic_cached = mmd_reward.FrozenBackboneFeatures(
+          self.teacher, self.mask_index,
+          layer_index=cfg.mmd_feature_layer,
+          layer_weights=cfg.get('mmd_feature_layer_weights', None),
+          noise_level=cfg.mmd_noise_level)
+        what = f'diffusion teacher (noise={cfg.mmd_noise_level})'
+      else:
+        raise ValueError('adversarial_distill.mmd_feature_source must be '
+                         f'ar|diffusion, got {source!r}')
+      print(f'[mmd] {what}, block '
+            f'{self._mmd_critic_cached.layer_description}, '
+            f'per-sequence reward, group={cfg.mmd_group_size}, '
+            f'weight={cfg.mmd_reward_weight}', flush=True)
+    return self._mmd_critic_cached
+
+  def _mmd_content_mask(self, x0, valid_tokens):
+    """Which positions carry real content worth pooling features over.
+
+    Unconditional OpenWebText (`valid_tokens is None`) is packed text: `wrap`
+    concatenates documents and cuts the stream into fixed rows, so every
+    position is content and there is no padding. In particular EOS is a
+    *document separator* that recurs inside a row rather than a terminator --
+    the conditional branch below stops at the first one, which on OWT would
+    throw away most of every sequence.
+    """
+    if valid_tokens is None:
+      return torch.ones_like(x0, dtype=torch.bool)
+
+    # Conditional data (TinyGSM): real answer content only -- not padding, and
+    # not past the answer's end. EOS doubles as BOS in that tokenizer, so the
+    # search for the end is confined to `valid_tokens`, which is already zero
+    # across the prompt. The terminator itself is kept; knowing where to stop
+    # is part of the answer.
+    content = valid_tokens.bool()
+    pad_id = self.tokenizer.pad_token_id
+    if pad_id is not None:
+      content = content & x0.ne(pad_id)
+    eos_id = self.tokenizer.eos_token_id
+    if eos_id is not None:
+      is_eos = x0.eq(eos_id) & content
+      seen = F.pad(is_eos.cumsum(dim=1)[:, :-1], (1, 0))
+      content = content & seen.eq(0)
+    return content
+
+  def _mmd_term(self, x0, valid_tokens, student_probs, xt):
+    """The paired feature reward as a REINFORCE term, or zero."""
+    import mmd_reward
+    cfg = self.config.adversarial_distill
+    selected = (xt == self.mask_index) & self._mmd_content_mask(x0, valid_tokens)
+    if not bool(selected.any()):
+      return student_probs.new_zeros(())
+    loss, stats = mmd_reward.mmd_reinforce_loss(
+      student_probs, x0, selected, self._mmd_critic,
+      group_size=cfg.mmd_group_size,
+      eos_id=self.tokenizer.eos_token_id,
+      reward_weight=cfg.mmd_reward_weight)
+    self.log_dict(stats, on_step=True, on_epoch=False, sync_dist=True)
+    return loss
+
   def generator_loss(self, x0, valid_tokens, current_accumulation_step):
-    student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
-    
+    cfg = self.config.adversarial_distill
+    mmd_weight = getattr(cfg, 'mmd_reward_weight', 0.0)
+    dmd_weight = getattr(cfg, 'dmd_weight', 1.0)
+    assert mmd_weight or dmd_weight, (
+      'adversarial_distill.dmd_weight and mmd_reward_weight are both 0, which '
+      'leaves the generator with no objective at all.')
+    if mmd_weight:
+      student_probs, mmd_xt = self.multistep_generation(
+        x0, valid_tokens, current_accumulation_step, return_xt=True)
+    else:
+      student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
+
+    if not dmd_weight:
+      # MMD-only: the teacher/fake pair is never consulted, so their two
+      # forwards are skipped rather than computed and multiplied by zero.
+      return self._mmd_term(x0, valid_tokens, student_probs, mmd_xt)
+
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
@@ -296,10 +418,13 @@ class MDLM(trainer_base.AbsorbingState):
     with torch.cuda.amp.autocast(dtype=torch.float32):
       model_output_fake = self.fake_model(xt, sigma)
     logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
-    fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs, 
+    fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs,
                                 alpha_t=alpha_t, dalpha_t=dalpha_t,
                                 valid_tokens=valid_tokens)
-    return teacher_loss - fake_loss
+    loss = dmd_weight * (teacher_loss - fake_loss)
+    if mmd_weight:
+      loss = loss + self._mmd_term(x0, valid_tokens, student_probs, mmd_xt)
+    return loss
 
   def fake_loss(self, x0, valid_tokens, current_accumulation_step):
     with torch.no_grad():
@@ -372,12 +497,23 @@ class MDLM(trainer_base.AbsorbingState):
         _maybe_save_periodic_checkpoint(self)
 
       if finish_iter and self.is_generator_step:
-        self.is_generator_step = False
-        utils.activate_model(self.fake_model)
-        utils.freeze_model(self.backbone)
-        optimizer_fake.zero_grad()
+        # With dmd_weight=0 nothing reads the fake critic, so handing it half
+        # the steps would burn compute training a model the loss ignores. Stay
+        # in generator mode instead.
+        train_fake = bool(getattr(
+          self.config.adversarial_distill, 'dmd_weight', 1.0))
+        self.is_generator_step = not train_fake
+        if train_fake:
+          utils.activate_model(self.fake_model)
+          utils.freeze_model(self.backbone)
+          optimizer_fake.zero_grad()
+        # `f_loss_ar` stays empty when there is no fake phase, and
+        # `torch.stack([])` raises rather than logging nothing.
+        stats = {"student_loss": self.total_loss_student}
+        if self.f_loss_ar:
+          stats["fake_loss"] = torch.stack(self.f_loss_ar).mean()
         self.log_dict(
-            {"student_loss": self.total_loss_student, "fake_loss": torch.stack(self.f_loss_ar).mean()},
+            stats,
             prog_bar=True,
             on_step=True,
             on_epoch=False,

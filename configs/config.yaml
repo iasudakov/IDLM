@@ -16,6 +16,61 @@ seed: 1
 
 adversarial_distill:
   is_distill: False
+
+  # --- Distillation objective -----------------------------------------------
+  # The generator loss is `dmd_weight * (teacher - fake) + mmd_reward_weight *
+  # REINFORCE(feature reward)`. Defaults reproduce the published objective
+  # exactly: DMD alone, the MMD critic never built or downloaded.
+  dmd_weight: 1.0
+
+  # --- Paired AR feature reward (ported from the TinyGSM branch) -------------
+  # A frozen model used as a fixed *feature map* rather than a likelihood
+  # critic: run it over the clean row and over the student's sample, mean-pool
+  # one middle block's hidden states, and reward the student for closing the
+  # gap under a pseudo-Huber distance. Optimized by REINFORCE with a
+  # leave-one-out baseline over `mmd_group_size` samples drawn at the same
+  # state. See `mmd_reward.py`.
+  #
+  # 0 disables it entirely -- the feature map is never even loaded.
+  mmd_reward_weight: 0.0
+
+  # Which frozen model supplies the features.
+  #   ar        -- `kuleshov-group/owt-ar`, a causal DiT on the student's exact
+  #                corpus and vocabulary (50258 ids, matching mdlm-owt token for
+  #                token). Independent of the model being distilled.
+  #   diffusion -- the frozen teacher already in memory. Cheaper, but it
+  #                measures the reward in the student's own feature space.
+  mmd_feature_source: ar
+
+  # HF hub id (or a local dir with the same config.json / pytorch_model.bin).
+  # Loaded via the vendored `models/backbone_dit_legacy.py`, because the
+  # published remote code imports transformers.models.qwen3, which this
+  # environment's transformers 4.38.2 does not have.
+  mmd_ar_model: kuleshov-group/owt-ar
+
+  # Masking applied to BOTH rows before reading the diffusion teacher, which
+  # never saw a clean sequence. Ignored by `mmd_feature_source: ar` -- a causal
+  # LM did see clean text, so masking there would inject a difference into a
+  # comparison meant to isolate what the student wrote.
+  mmd_noise_level: 0.1
+
+  # Which block's hidden states to read. `null` is the middle one: late layers
+  # specialize toward the next-token head and early ones barely differ from the
+  # embedding, so neither end says much about whether two sequences *mean* the
+  # same thing. Both owt-ar and mdlm-owt have 12 blocks, so null resolves to 6.
+  #
+  # A list asks for a summed reward, one pseudo-Huber term per block. Mind the
+  # scale spread: on the TinyGSM teacher the reward per corrupted token grew
+  # ~6x per four blocks, which makes an unweighted sum very nearly the deepest
+  # block alone. Use `mmd_feature_layer_weights` to put terms on equal footing.
+  mmd_feature_layer: null
+  mmd_feature_layer_weights: null
+
+  # Samples per state for the leave-one-out baseline. Must be >= 2: with one
+  # there is no baseline, and an unbaselined score estimator on a reward this
+  # large is pure variance. Costs one critic forward per sample.
+  mmd_group_size: 4
+
   accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   fake_frequency: 1
   gradient_clipping_val: 1.0
