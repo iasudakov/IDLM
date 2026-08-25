@@ -1,4 +1,6 @@
 import itertools
+import json
+import os
 from dataclasses import dataclass
 
 import hydra.utils
@@ -13,6 +15,12 @@ import metrics
 import models
 import utils
 from ipdb import set_trace as debug
+
+
+# `pareto/owt_step_*` plots perplexity against entropy, but the tracker indexes
+# a series by an integer step. Entropy is carried at this fixed scale, so an x
+# of 5062 reads as entropy 5.062.
+_ENTROPY_X_SCALE = 1000
 
 
 @dataclass
@@ -336,7 +344,142 @@ class TrainerBase(L.LightningModule):
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)
+    # Deliberately last: the sweep reuses `self.metrics` and resets it per
+    # budget, so it must not run before `val/gen_ppl` and `val/sample_entropy`
+    # above have been read off. `on_validation_epoch_start` resets again, so
+    # leaving it dirty here is harmless.
+    self._log_owt_pareto()
     self._train_mode()
+
+  def _log_owt_pareto(self):
+    """Sample at several step budgets and record the fluency/diversity curve.
+
+    One denoising-step count gives one (entropy, perplexity) point; the set of
+    them is the frontier this checkpoint sits on. Opt-in via
+    `eval.owt_pareto_steps`, because the sweep costs the sum of its budgets in
+    extra sampling -- [2,4,8,16,32,64] is 126 forward passes per batch on top of
+    the validation that already ran.
+    """
+    config = self.config.eval
+    budgets = config.get('owt_pareto_steps', None)
+    if not budgets or self.trainer.sanity_checking:
+      return
+    every = int(config.get('owt_pareto_every_n_validations', 1) or 1)
+    self._owt_pareto_count = getattr(self, '_owt_pareto_count', 0) + 1
+    if (self._owt_pareto_count - 1) % every:
+      return
+    if not self.config.eval.compute_generative_perplexity:
+      print('[owt-pareto] skipped: needs eval.compute_generative_perplexity',
+            flush=True)
+      return
+
+    budgets = sorted({int(b) for b in budgets})
+    num_batches = int(config.get('owt_pareto_num_batches', 0) or
+                      self.config.sampling.num_sample_batches)
+    curve = []
+    for budget in budgets:
+      # Fresh accumulators per budget: torchmetrics aggregate until reset, so
+      # without this every point would carry the previous budgets' samples too
+      # and the curve would flatten into a running average.
+      self.metrics.reset()
+      for _ in range(num_batches):
+        samples = self.generate_samples(
+          num_samples=self.config.loader.eval_batch_size,
+          num_steps=budget)
+        self.metrics.record_entropy(samples)
+        self.metrics.record_generative_perplexity(
+          self.tokenizer.batch_decode(samples), self.num_tokens, self.device)
+      point = {'steps': budget,
+               'entropy': float(self.metrics.sample_entropy.compute()),
+               'gen_ppl': float(self.metrics.gen_ppl.compute())}
+      curve.append(point)
+      print(f"[owt-pareto] step {self.global_step} budget {budget}: "
+            f"gen_ppl {point['gen_ppl']:.2f} entropy {point['entropy']:.4f}",
+            flush=True)
+    self._publish_owt_pareto(curve)
+
+  def _publish_owt_pareto(self, curve):
+    """Log one checkpoint's frontier: scalar series, trends, and the figure."""
+    for point in curve:
+      # Per-budget trends against the *training* step, so each budget also reads
+      # as an ordinary curve over the run.
+      tag = f"{point['steps']:g}"
+      self.log(f'val/gen_ppl_s{tag}',
+               torch.tensor(point['gen_ppl'], device=self.device),
+               on_epoch=True, on_step=False, sync_dist=False,
+               rank_zero_only=True)
+      self.log(f'val/entropy_s{tag}',
+               torch.tensor(point['entropy'], device=self.device),
+               on_epoch=True, on_step=False, sync_dist=False,
+               rank_zero_only=True)
+
+    if self.trainer.global_rank != 0:
+      return
+    logger = self.trainer.logger
+    if logger is None:
+      return
+    # The frontier itself, as a series whose x-axis is sample entropy rather
+    # than the training step -- the same pair of axes the figure draws, so the
+    # native scalar graph and `pareto/frontier` tell the same story. `self.log`
+    # cannot express that (it always stamps the trainer's step), so go through
+    # the logger's own `log_metrics`, which passes `step` straight through. One
+    # series per checkpoint, since a single graph cannot hold two curves.
+    #
+    # The tracker indexes points by an integer step, and entropy is a float
+    # around 5, so it is carried at fixed scale: an x of 5062 means entropy
+    # 5.062. Three decimals separates budgets that sit ~0.05 apart with room to
+    # spare, and keeps the axis monotone in entropy.
+    series = f'pareto/owt_step_{self.global_step}'
+    for point in curve:
+      try:
+        logger.log_metrics({series: point['gen_ppl']},
+                           step=int(round(point['entropy']
+                                          * _ENTROPY_X_SCALE)))
+      except Exception as e:  # pragma: no cover - tracker best-effort
+        print(f'[owt-pareto] scalar log failed: {e}', flush=True)
+        break
+
+    history_path = os.path.join(self.config.checkpointing.save_dir,
+                                'owt_pareto_history.json')
+    run_uid = getattr(logger, 'version', '') or ''
+    if getattr(self, '_owt_pareto_history', None) is None:
+      # A *resumed* run resumes the same tracker run, so the figure has to pick
+      # up the curves the earlier process drew. A fresh run reusing the same
+      # save_dir must not -- it would graft the previous run's frontiers onto
+      # this one's plot. The run uid tells the two cases apart.
+      self._owt_pareto_history = {}
+      if os.path.exists(history_path):
+        try:
+          with open(history_path) as f:
+            stored = json.load(f)
+          if stored.get('run_uid') == run_uid:
+            self._owt_pareto_history = {int(k): v
+                                        for k, v in stored['curves'].items()}
+          else:
+            print('[owt-pareto] ignoring history from a different run '
+                  f"({stored.get('run_uid')!r} != {run_uid!r})", flush=True)
+        except Exception as e:  # pragma: no cover
+          print(f'[owt-pareto] history read failed: {e}', flush=True)
+    self._owt_pareto_history[int(self.global_step)] = curve
+    try:
+      os.makedirs(self.config.checkpointing.save_dir, exist_ok=True)
+      with open(history_path, 'w') as f:
+        json.dump({'run_uid': run_uid, 'curves': self._owt_pareto_history},
+                  f, indent=2)
+    except Exception as e:  # pragma: no cover
+      print(f'[owt-pareto] history write failed: {e}', flush=True)
+
+    if not hasattr(logger, 'log_image'):
+      return
+    try:
+      import owt_pareto_plot
+      image = owt_pareto_plot.render(
+        self._owt_pareto_history,
+        reference=owt_pareto_plot.load_reference(
+          self.config.eval.get('owt_pareto_reference', None)))
+      logger.log_image('pareto/frontier', image, step=self.global_step)
+    except Exception as e:  # pragma: no cover - plotting is best-effort
+      print(f'[owt-pareto] figure failed: {e}', flush=True)
 
   def configure_optimizers(self):
     optimizer = torch.optim.AdamW(

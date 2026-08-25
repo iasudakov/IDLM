@@ -115,6 +115,28 @@ eval:
   generate_samples: True
   generated_samples_path: ${cwd:}/samples.json
 
+  # --- Sampling-steps frontier (quality vs diversity) -----------------------
+  # Sample the checkpoint at each of these denoising-step budgets and record
+  # generative perplexity against sample entropy, drawing the frontier as
+  # `pareto/frontier`. Both axes are needed: perplexity alone falls when the
+  # model collapses onto generic text, and entropy falling with it is the tell.
+  #
+  # `null` disables the sweep. It is opt-in because it costs the SUM of the
+  # budgets in extra sampling -- [2,4,8,16,32,64] is 126 forward passes per
+  # batch, on top of the validation that already ran. Requires
+  # `eval.compute_generative_perplexity=True`; it is skipped with a message
+  # otherwise, since perplexity is one of the two axes.
+  owt_pareto_steps: null          # e.g. [2, 4, 8, 16, 32, 64]
+  # Run the sweep on every Nth validation, to keep a cheap validation cadence
+  # while still tracking the frontier.
+  owt_pareto_every_n_validations: 1
+  # Batches per budget; 0 means follow `sampling.num_sample_batches`. More
+  # batches steady the perplexity estimate, at linear cost.
+  owt_pareto_num_batches: 0
+  # Optional JSON frontier drawn as a fixed dashed baseline, in the same point
+  # format ({steps, entropy, gen_ppl}). Missing file simply omits it.
+  owt_pareto_reference: null
+
 optim:
   weight_decay: 0
   lr: 3e-4
