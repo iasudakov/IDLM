@@ -527,18 +527,31 @@ class TrainerBase(L.LightningModule):
 
   def _publish_owt_pareto(self, curve):
     """Log one checkpoint's frontier: scalar series, trends, and the figure."""
+    def _scalar(name, value):
+      self.log(name, torch.tensor(float(value), device=self.device),
+               on_epoch=True, on_step=False, sync_dist=False,
+               rank_zero_only=True)
+
     for point in curve:
       # Per-budget trends against the *training* step, so each budget also reads
       # as an ordinary curve over the run.
       tag = f"{point['steps']:g}"
-      self.log(f'val/gen_ppl_s{tag}',
-               torch.tensor(point['gen_ppl'], device=self.device),
-               on_epoch=True, on_step=False, sync_dist=False,
-               rank_zero_only=True)
-      self.log(f'val/entropy_s{tag}',
-               torch.tensor(point['entropy'], device=self.device),
-               on_epoch=True, on_step=False, sync_dist=False,
-               rank_zero_only=True)
+      _scalar(f'val/gen_ppl_s{tag}', point['gen_ppl'])
+      _scalar(f'val/entropy_s{tag}', point['entropy'])
+      # The spread across seeds, as its own series. The figure already draws it
+      # as error bars, but those cannot be read off a tracker's scalar view --
+      # and the spread is what decides whether a move in the mean is real. It
+      # is also worth watching in its own right: a spread that grows over
+      # training says the sampler is becoming erratic, which the mean hides.
+      #
+      # Logged only when several seeds actually ran. At one seed `_std` is
+      # identically 0, and a flat zero line invites being read as "no
+      # variance measured" rather than "variance not measured". Since
+      # `owt_pareto_seeds` is fixed for a run, the set of series stays stable
+      # within it rather than appearing and vanishing between validations.
+      if int(point.get('seeds', 1)) > 1:
+        _scalar(f'val/gen_ppl_s{tag}_std', point.get('gen_ppl_std', 0.0))
+        _scalar(f'val/entropy_s{tag}_std', point.get('entropy_std', 0.0))
 
     if self.trainer.global_rank != 0:
       return
