@@ -483,9 +483,19 @@ class TrainerBase(L.LightningModule):
     cuda_rng = (torch.cuda.get_rng_state_all()
                 if torch.cuda.is_available() else None)
     try:
+      # Gradient Moment per budget, when it is on and there is real text to
+      # compare against. Worth the cost precisely here: gen_ppl is the frontier
+      # axis most vulnerable to collapse -- a degenerate sampler scores *better*
+      # on it -- and GM is the one number in this sweep that moves the right way
+      # when that happens. Cheap budgets are where collapse shows up first.
+      gm_on = bool(self.config.eval.get('owt_gm', False))
+      gm_refs = getattr(self, '_gm_ref_texts', None) or []
+      if gm_on and not gm_refs:
+        print('[owt-pareto] GM requested but no reference rows; '
+              'skipping GM per budget', flush=True)
       curve = []
       for budget in budgets:
-        entropies, perplexities = [], []
+        entropies, perplexities, moments = [], [], []
         for repeat in range(seeds):
           if seeds > 1:
             # 9973 is prime, so budgets and repeats cannot collide onto a
@@ -496,29 +506,51 @@ class TrainerBase(L.LightningModule):
           # repeats' samples too and the curve would flatten into a running
           # average.
           self.metrics.reset()
+          texts = []
           for _ in range(num_batches):
             samples = self.generate_samples(
               num_samples=self.config.loader.eval_batch_size,
               num_steps=budget)
             self.metrics.record_entropy(samples)
+            decoded = self.tokenizer.batch_decode(samples)
+            if gm_on and gm_refs:
+              texts.extend(decoded)
             self.metrics.record_generative_perplexity(
-              self.tokenizer.batch_decode(samples), self.num_tokens,
-              self.device)
+              decoded, self.num_tokens, self.device)
           entropies.append(float(self.metrics.sample_entropy.compute()))
           perplexities.append(float(self.metrics.gen_ppl.compute()))
+          if gm_on and gm_refs:
+            # Scored per seed rather than on the pooled samples, so GM is
+            # averaged the same way entropy and perplexity are and its spread
+            # means the same thing as theirs.
+            try:
+              gm = self.metrics.record_gradient_moment(
+                texts, gm_refs, max_length=self.num_tokens,
+                batch_size=int(self.config.eval.get('gm_eval_batch_size', 4)),
+                device=self.device)
+            except Exception as e:
+              print(f'[owt-pareto] GM failed at budget {budget}: {e}',
+                    flush=True)
+              gm = None
+            if gm is not None:
+              moments.append(float(gm['centered_gm']))
         point = {'steps': budget,
                  'entropy': _mean(entropies),
                  'gen_ppl': _mean(perplexities),
                  'entropy_std': _std(entropies),
                  'gen_ppl_std': _std(perplexities),
                  'seeds': seeds}
+        if moments:
+          point['gm'] = _mean(moments)
+          point['gm_std'] = _std(moments)
         curve.append(point)
         spread = ('' if seeds < 2 else
                   f" +/- {point['gen_ppl_std']:.2f} / "
                   f"{point['entropy_std']:.4f} over {seeds} seeds")
+        gm_txt = '' if 'gm' not in point else f" gm {point['gm']:+.4e}"
         print(f"[owt-pareto] step {self.global_step} budget {budget}: "
               f"gen_ppl {point['gen_ppl']:.2f} entropy {point['entropy']:.4f}"
-              f"{spread}", flush=True)
+              f"{gm_txt}{spread}", flush=True)
     finally:
       torch.set_rng_state(cpu_rng)
       if cuda_rng is not None:
@@ -552,6 +584,10 @@ class TrainerBase(L.LightningModule):
       if int(point.get('seeds', 1)) > 1:
         _scalar(f'val/gen_ppl_s{tag}_std', point.get('gen_ppl_std', 0.0))
         _scalar(f'val/entropy_s{tag}_std', point.get('entropy_std', 0.0))
+      if 'gm' in point:
+        _scalar(f'val/gm_s{tag}', point['gm'])
+        if int(point.get('seeds', 1)) > 1:
+          _scalar(f'val/gm_s{tag}_std', point.get('gm_std', 0.0))
 
     if self.trainer.global_rank != 0:
       return
