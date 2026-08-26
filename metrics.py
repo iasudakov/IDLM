@@ -171,7 +171,11 @@ class Metrics:
     if getattr(self, '_eval_model', None) is None:
       model = transformers.AutoModelForCausalLM.from_pretrained(
         self.gen_ppl_eval_model_name_or_path).eval()
-      self._eval_model = model.to(device)
+      # llama2 is left where `from_pretrained` put it, matching what
+      # `record_generative_perplexity` has always done for that path.
+      if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
+        model = model.to(device)
+      self._eval_model = model
     return self._eval_model
 
   def record_gradient_moment(self, samples_texts, data_texts, max_length,
@@ -239,10 +243,13 @@ class Metrics:
     device='cuda') -> None:
     
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    eval_model = transformers.AutoModelForCausalLM.from_pretrained(
-      self.gen_ppl_eval_model_name_or_path).eval()
-    if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
-      eval_model = eval_model.to(device)
+    # Cached rather than reloaded per call. This used to run `from_pretrained`
+    # on every invocation -- 18.6s of disk for gpt2-large, once per sample
+    # batch, every validation. The Pareto sweep multiplies that by budgets and
+    # seeds: [2,4,8,16,32,64] x 2 batches x 5 seeds is 60 reloads, ~19 minutes
+    # of pure model loading per validation. The model is frozen and in eval
+    # mode, so reusing it is numerically identical.
+    eval_model = self._ensure_eval_model(device)
     # Re-tokenize using eval model's tokenizer
     if retokenize:
       (samples, attn_mask,
