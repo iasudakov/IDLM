@@ -34,6 +34,25 @@ adversarial_distill:
   # 0 disables it entirely -- the feature map is never even loaded.
   mmd_reward_weight: 0.0
 
+  # What a sampled answer is scored ON. The group sampling, the leave-one-out
+  # baseline and the REINFORCE surrogate are identical either way; only the
+  # reward function changes.
+  #   feature -- pooled-feature distance to x0 under a frozen model. A
+  #              similarity to one particular reference, which is why the
+  #              TinyGSM probe finds it close to a soft edit distance.
+  #   idlm    -- the ELBO log-density ratio nll_fake(x) - nll_teacher(x), the
+  #              same quantity DMD differentiates, reached by a score estimator
+  #              instead. Judges the sample on its own merits rather than
+  #              against a reference, and needs no feature map, so
+  #              mmd_feature_source / mmd_feature_layer / mmd_ar_model are all
+  #              ignored. It needs a TRAINED fake -- an untrained one is still a
+  #              copy of the teacher and the ratio collapses to ~0 for every
+  #              sample -- so the fake phase keeps running even at
+  #              dmd_weight=0, which for the feature reward switches it off.
+  #              `dmd_weight=0` with this reward therefore means: train the fake
+  #              as usual, but give the generator only the REINFORCE term.
+  mmd_reward_type: feature
+
   # Which frozen model supplies the features.
   #   ar        -- `kuleshov-group/owt-ar`, a causal DiT on the student's exact
   #                corpus and vocabulary (50258 ids, matching mdlm-owt token for

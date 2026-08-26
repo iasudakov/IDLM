@@ -119,6 +119,86 @@ class AR(trainer_base.TrainerBase):
     return None
 
 
+class IdlmRatioReward:
+  """Score a hard sample by the IDLM teacher/fake log-density ratio.
+
+  A drop-in for the feature critic: same `paired_reward` signature, so
+  `mmd_reward.mmd_reinforce_loss` drives it with the same group sampling and
+  leave-one-out baseline. What changes is what a sample is scored *on*.
+
+  The feature reward asks "do the frozen AR's pooled features of this sample
+  match those of `x0`" -- a similarity to one particular reference answer. This
+  asks the question IDLM's own objective asks: under the ELBO, how much more
+  likely is this sample under the frozen teacher than under the fake model that
+  tracks the student. That is a judgement about the sample's own quality rather
+  than its distance to a reference, so it does not inherit the feature reward's
+  ceiling of behaving like a soft edit distance.
+
+  It is also the same quantity DMD differentiates, reached by a score estimator
+  instead. DMD pushes `student_probs` directly through the teacher and fake and
+  differentiates; this samples hard tokens, scores them, and lets REINFORCE
+  carry the gradient. Slower and noisier, but it scores what the student
+  actually emits rather than its soft relaxation -- which is the whole reason
+  the group machinery exists.
+
+  `clean_tokens` is accepted and ignored: unlike the paired feature reward this
+  is an absolute score, not a comparison against `x0`.
+  """
+
+  # `mmd_reinforce_loss` inspects this to decide whether to log a per-layer
+  # breakdown; there are no layers here.
+  resolved_layers = []
+  layer_description = 'idlm-ratio'
+
+  def __init__(self, algo):
+    self.algo = algo
+
+  @torch.no_grad()
+  def paired_reward(self, clean_tokens, generated_tokens, selected, eos_id,
+                    return_per_layer=False):
+    del clean_tokens, eos_id  # absolute score; nothing to compare or remap
+    algo = self.algo
+    x = generated_tokens
+    valid = selected.to(x.dtype)
+
+    # One noise level for the whole group draw, so the samples being ranked
+    # against each other are scored under identical conditions -- a per-sample
+    # `t` would let an easy noise level outrank a good answer.
+    t = algo._sample_t(x.shape[0], 0)
+    dalpha_t, alpha_t = algo.noise(t)
+    alpha_t = alpha_t.unsqueeze(-1)
+    sigma = algo._process_sigma(algo._sigma_from_alphat(alpha_t))
+    xt = algo.q_xt(x, alpha_t, valid_tokens=valid)
+
+    onehot = F.one_hot(x, num_classes=algo.vocab_size).to(torch.float32)
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+      logits_teacher = algo._process_model_output(
+        model_output=algo.teacher(xt, sigma), xt=xt, sigma=sigma)
+      logits_fake = algo._process_model_output(
+        model_output=algo.fake_model(xt, sigma), xt=xt, sigma=sigma)
+    nll_teacher = algo.nll_per_token_with_probs(
+      logits_teacher, xt, onehot, alpha_t=alpha_t, dalpha_t=dalpha_t,
+      valid_tokens=valid)
+    nll_fake = algo.nll_per_token_with_probs(
+      logits_fake, xt, onehot, alpha_t=alpha_t, dalpha_t=dalpha_t,
+      valid_tokens=valid)
+
+    # Sign, since the helper's name invites getting this backwards: it computes
+    # `sum(x * log p) * dalpha_t / (1 - alpha_t)`, and `LogLinear` returns
+    # `dalpha_t = -(1 - eps)`, i.e. negative. The negative factor flips the
+    # log-likelihood, so what comes back is a positive NLL after all.
+    #
+    # The generator minimises `nll_teacher - nll_fake`, which makes a sample
+    # likelier under the teacher and unlikelier under the fake. The reward to
+    # MAXIMISE is therefore that quantity negated.
+    reward = (nll_fake - nll_teacher).float()
+    active = selected.any(dim=1)
+    reward = torch.where(active, reward, torch.zeros_like(reward))
+    if return_per_layer:
+      return reward, active, {}
+    return reward, active
+
+
 class MDLM(trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
@@ -150,8 +230,7 @@ class MDLM(trainer_base.AbsorbingState):
       # Upstream starts on a fake step so the critic is warm before the
       # generator first consults it. With dmd_weight=0 there is no critic to
       # warm, and starting there would train one nothing reads.
-      self.is_generator_step = not bool(getattr(
-        self.config.adversarial_distill, 'dmd_weight', 1.0))
+      self.is_generator_step = not self._needs_fake_phase()
       self.total_loss_student = 0
       self.total_loss_fake = 0
       self.f_loss_ar = []
@@ -213,7 +292,7 @@ class MDLM(trainer_base.AbsorbingState):
       # and freezes the student. With dmd_weight=0 there is no fake phase and
       # the very first step is the generator's, which would otherwise find its
       # own parameters frozen and produce a loss with no grad_fn at all.
-      if bool(getattr(self.config.adversarial_distill, 'dmd_weight', 1.0)):
+      if self._needs_fake_phase():
         utils.activate_model(self.fake_model)
         utils.freeze_model(self.backbone)
       else:
@@ -290,6 +369,22 @@ class MDLM(trainer_base.AbsorbingState):
       return loss.sum(-1) / denom
     return loss.sum(-1)
 
+  def _needs_fake_phase(self):
+    """Whether the fake critic still has to be trained.
+
+    `dmd_weight=0` normally means nothing reads the fake, so its phase is
+    skipped. `mmd_reward_type=idlm` breaks that inference: the reward *is*
+    `nll_fake - nll_teacher`, so an untrained fake stays a copy of the teacher
+    and the reward collapses to ~0 for every sample -- a silent null run rather
+    than a crash. Both gates consult this instead of `dmd_weight` directly so
+    they cannot disagree.
+    """
+    cfg = self.config.adversarial_distill
+    if bool(getattr(cfg, 'dmd_weight', 1.0)):
+      return True
+    return (str(getattr(cfg, 'mmd_reward_type', 'feature')) == 'idlm'
+            and bool(getattr(cfg, 'mmd_reward_weight', 0.0)))
+
   @property
   def _mmd_critic(self):
     """The frozen feature map, built on first use.
@@ -300,6 +395,18 @@ class MDLM(trainer_base.AbsorbingState):
     if getattr(self, '_mmd_critic_cached', None) is None:
       import mmd_reward
       cfg = self.config.adversarial_distill
+      kind = str(getattr(cfg, 'mmd_reward_type', 'feature'))
+      if kind not in ('feature', 'idlm'):
+        raise ValueError('adversarial_distill.mmd_reward_type must be '
+                         f'feature|idlm, got {kind!r}')
+      if kind == 'idlm':
+        # Scores samples by the teacher/fake ratio instead of by feature
+        # distance to x0, so no feature map is built at all.
+        self._mmd_critic_cached = IdlmRatioReward(self)
+        print(f'[mmd] IDLM teacher/fake log-density ratio, per-sequence '
+              f'reward, group={cfg.mmd_group_size}, '
+              f'weight={cfg.mmd_reward_weight}', flush=True)
+        return self._mmd_critic_cached
       source = getattr(cfg, 'mmd_feature_source', 'ar')
       if source == 'ar':
         # `kuleshov-group/owt-ar`: a causal DiT trained on the student's exact
@@ -501,8 +608,7 @@ class MDLM(trainer_base.AbsorbingState):
         # With dmd_weight=0 nothing reads the fake critic, so handing it half
         # the steps would burn compute training a model the loss ignores. Stay
         # in generator mode instead.
-        train_fake = bool(getattr(
-          self.config.adversarial_distill, 'dmd_weight', 1.0))
+        train_fake = self._needs_fake_phase()
         self.is_generator_step = not train_fake
         if train_fake:
           utils.activate_model(self.fake_model)
