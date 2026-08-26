@@ -161,6 +161,76 @@ class Metrics:
       self.sample_entropy.update(entropy)
 
   @torch.no_grad()
+  def _ensure_eval_model(self, device='cuda'):
+    """The reference LM, loaded once and kept.
+
+    `record_generative_perplexity` reloads it per call, which is merely slow
+    there. Gradient Moment backprops through it, so reloading 774M parameters
+    per evaluation would dominate the metric's cost outright.
+    """
+    if getattr(self, '_eval_model', None) is None:
+      model = transformers.AutoModelForCausalLM.from_pretrained(
+        self.gen_ppl_eval_model_name_or_path).eval()
+      self._eval_model = model.to(device)
+    return self._eval_model
+
+  def record_gradient_moment(self, samples_texts, data_texts, max_length,
+                             batch_size=4, device='cuda'):
+    """Gradient Moment (arXiv:2603.20155): `||E_samples[grad L] - E_data[grad L]||^2`.
+
+    Ported from yrELF's `metrics_utils.Metrics.record_gradient_moment`, so the
+    numbers are comparable with that project's.
+
+    The reason to pay for it: it backprops through the reference LM, so unlike
+    generative perplexity it is not gamed by low-entropy or mode-collapsed
+    sampling. That failure is not hypothetical here -- an OWT run of this repo
+    drove gen_ppl from 68 to 11.9 while sample entropy fell and held-out NLL
+    rose, i.e. gen_ppl improved precisely because the model was collapsing.
+
+    One GM pair is `2 * batch_size` rows per side, each split in half
+    internally; the halves' inner product is what makes the squared norm
+    unbiased. Returns None when there are too few rows to form one pair, or
+    when the `gradient_moment` package is not installed -- it is an optional
+    sibling repo, and a missing one must not take the run down.
+    """
+    try:
+      from gradient_moment import evaluate, make_generative_llm_metrics
+      from gradient_moment.huggingface import text_causal_lm_forward
+    except ImportError as e:
+      print(f'[gm] skipped: gradient_moment not installed ({e}). '
+            'pip install -e /path/to/gradient-moment --no-deps', flush=True)
+      return None
+
+    model = self._ensure_eval_model(device)
+    pair_rows = 2 * batch_size
+    n = (min(len(samples_texts), len(data_texts)) // pair_rows) * pair_rows
+    if n == 0:
+      print(f'[gm] need >= {pair_rows} sample/data rows, skipping', flush=True)
+      return None
+    samples_texts, data_texts = samples_texts[:n], data_texts[:n]
+
+    def _tok(texts):
+      enc = self.tokenizer(
+        texts, return_tensors='pt', return_token_type_ids=False,
+        truncation=True, padding=True, max_length=max_length)
+      return {'input_ids': enc['input_ids'].to(device).long(),
+              'attention_mask': enc['attention_mask'].to(device).float()}
+
+    batches = [(_tok(samples_texts[i:i + pair_rows]),
+                _tok(data_texts[i:i + pair_rows]))
+               for i in range(0, n, pair_rows)]
+    forward_fn = text_causal_lm_forward(model, self.tokenizer.eos_token_id)
+    metric = make_generative_llm_metrics(forward_fn, model)
+    # `torch.enable_grad` because this runs inside validation, where Lightning
+    # has already switched gradients off -- and the whole metric is a gradient.
+    with torch.enable_grad():
+      results = evaluate([metric], batches)
+    gm = results[metric.name]
+    return {'centered_gm': gm['centered_gm']['mean'],
+            'uncentered_gm_samples': gm['uncentered_gm_samples']['mean'],
+            'uncentered_gm_data': gm['uncentered_gm_data']['mean'],
+            'n_pairs': gm['centered_gm']['n']}
+
   def record_generative_perplexity(
     self,
     text_samples: typing.List[str],

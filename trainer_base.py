@@ -300,12 +300,17 @@ class TrainerBase(L.LightningModule):
 
   def on_validation_epoch_start(self):
     self.metrics.reset()
+    # Gradient Moment compares the reference LM's gradient on our samples
+    # against its gradient on REAL text, so a fresh batch of held-out rows has
+    # to be collected alongside the usual validation.
+    self._gm_ref_texts = []
     self._eval_mode()
     assert self.metrics.valid_nlls.nll.mean_value == 0
     assert self.metrics.valid_nlls.nll.weight == 0
 
   def validation_step(self, batch, batch_idx):
     del batch_idx
+    self._collect_gm_reference(batch)
     losses = self._loss(batch['input_ids'],
                         batch['attention_mask'])
     self.metrics.update_valid(losses.nlls, losses.prior_loss,
@@ -320,6 +325,10 @@ class TrainerBase(L.LightningModule):
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples):
       samples, text_samples = None, None
+      # Gradient Moment scores a POOL of samples against a pool of real rows,
+      # so unlike the per-batch metrics it needs them kept rather than
+      # overwritten each iteration.
+      gm_samples = []
       for _ in range(
         self.config.sampling.num_sample_batches):
         samples = self.generate_samples(
@@ -328,6 +337,8 @@ class TrainerBase(L.LightningModule):
         self.metrics.record_entropy(samples)
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
+        if self.config.eval.get('owt_gm', False):
+          gm_samples.extend(text_samples)
         if self.config.eval.compute_generative_perplexity:
           self.metrics.record_generative_perplexity(
             text_samples, self.num_tokens, self.device)
@@ -357,6 +368,8 @@ class TrainerBase(L.LightningModule):
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)
+      # Before the Pareto sweep, which resets `self.metrics` per budget.
+      self._log_gradient_moment(gm_samples)
     # Deliberately last: the sweep reuses `self.metrics` and resets it per
     # budget, so it must not run before `val/gen_ppl` and `val/sample_entropy`
     # above have been read off. `on_validation_epoch_start` resets again, so
@@ -370,6 +383,58 @@ class TrainerBase(L.LightningModule):
       # runs measured in days.
       print(f'[owt-pareto] sweep failed, continuing: {e}', flush=True)
     self._train_mode()
+
+  def _collect_gm_reference(self, batch):
+    """Keep a capped sample of real validation text for Gradient Moment.
+
+    Decoding is not free, so this stops as soon as `gm_eval_samples` rows are
+    held and does nothing at all when the metric is off.
+    """
+    if not self.config.eval.get('owt_gm', False):
+      return
+    wanted = int(self.config.eval.get('gm_eval_samples', 64))
+    held = getattr(self, '_gm_ref_texts', None)
+    if held is None:
+      self._gm_ref_texts = held = []
+    if len(held) >= wanted:
+      return
+    ids = batch['input_ids'][: wanted - len(held)]
+    held.extend(self.tokenizer.batch_decode(ids))
+
+  def _log_gradient_moment(self, sample_texts):
+    """Score the samples against real data by Gradient Moment, and log it.
+
+    Kept separate from generative perplexity because it answers the question
+    perplexity cannot: gen_ppl rewards text the reference LM finds predictable,
+    which a collapsing model produces *more* of, so it can improve while the
+    model degrades. GM compares gradients against real data, so collapse moves
+    it the right way.
+    """
+    if not self.config.eval.get('owt_gm', False):
+      return
+    refs = getattr(self, '_gm_ref_texts', None) or []
+    if not sample_texts or not refs:
+      print('[gm] no samples or no reference rows, skipping', flush=True)
+      return
+    try:
+      results = self.metrics.record_gradient_moment(
+        sample_texts, refs, max_length=self.num_tokens,
+        batch_size=int(self.config.eval.get('gm_eval_batch_size', 4)),
+        device=self.device)
+    except Exception as e:
+      # A diagnostic must not take down a run measured in days.
+      print(f'[gm] failed, continuing: {e}', flush=True)
+      return
+    if results is None:
+      return
+    print(f"[gm] step {self.global_step}: centered {results['centered_gm']:+.4e} "
+          f"(n_pairs={results['n_pairs']})", flush=True)
+    for key, name in (('centered_gm', 'val/gm'),
+                      ('uncentered_gm_samples', 'val/gm_uncentered_samples'),
+                      ('uncentered_gm_data', 'val/gm_uncentered_data')):
+      self.log(name, torch.tensor(float(results[key]), device=self.device),
+               on_epoch=True, on_step=False, sync_dist=False,
+               rank_zero_only=True)
 
   def _log_owt_pareto(self):
     """Sample at several step budgets and record the fluency/diversity curve.
