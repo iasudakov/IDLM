@@ -27,6 +27,39 @@ omegaconf.OmegaConf.register_new_resolver(
   'div_up', lambda x, y: (x + y - 1) // y)
 
 
+def _warn_if_resume_unreachable(config, logger):
+  """Say so when resume is configured but nothing will write the file it wants.
+
+  `resume_ckpt_path` defaults to `checkpoints/last.ckpt`, which only the
+  `checkpoint_every_n_steps` callback writes, and only when `save_last` is on.
+  Turn `save_last` off -- the shipped TinyGSM scripts do, and it is an easy
+  thing to copy -- and resume degrades in the worst possible way: the job
+  restores its snapshot, finds no checkpoint, starts from step 0, and reports
+  nothing wrong. Numbered `step=*.ckpt` files may be sitting right beside the
+  path it looked for.
+
+  A warning rather than an error: wanting checkpoints without wanting resume is
+  a legitimate configuration, and this runs on every start including the ones
+  that never get preempted.
+  """
+  if not config.checkpointing.get('resume_from_ckpt', False):
+    return
+  wanted = config.checkpointing.get('resume_ckpt_path', None)
+  if not wanted or not str(wanted).endswith('last.ckpt'):
+    return
+  callbacks = config.get('callbacks', None) or {}
+  every_n = callbacks.get('checkpoint_every_n_steps', None) or {}
+  monitor = callbacks.get('checkpoint_monitor', None) or {}
+  if every_n.get('save_last', False) or monitor.get('save_last', False):
+    return
+  logger.warning(
+    f'resume_from_ckpt is on and resume_ckpt_path is {wanted}, but no '
+    'checkpoint callback has save_last=True, so that file will never be '
+    'written and every restart will silently begin from step 0. Set '
+    'callbacks.checkpoint_every_n_steps.save_last=True, or point '
+    'checkpointing.resume_ckpt_path at a file something does write.')
+
+
 class SnapshotSync(L.Callback):
   """Push the run directory to the snapshot store after validation.
 
@@ -245,6 +278,7 @@ def _train(diffusion_model, config, logger, tokenizer):
   snapshot = bool(config.checkpointing.get('snapshot', True))
   snapshot_dir = os.fspath(config.checkpointing.save_dir)
   nirvana_snapshot.restore(snapshot_dir, enabled=snapshot)
+  _warn_if_resume_unreachable(config, logger)
 
   if (config.checkpointing.resume_from_ckpt
       and config.checkpointing.resume_ckpt_path is not None
