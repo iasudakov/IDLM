@@ -11,6 +11,7 @@ import torch
 
 import algo
 import dataloader
+import nirvana_snapshot
 import utils
 from ipdb import set_trace as debug
 
@@ -26,14 +27,40 @@ omegaconf.OmegaConf.register_new_resolver(
   'div_up', lambda x, y: (x + y - 1) // y)
 
 
+class SnapshotSync(L.Callback):
+  """Push the run directory to the snapshot store after validation.
+
+  `PeriodicStepCheckpoint` pushes its own writes, but Lightning's
+  `ModelCheckpoint` callbacks save on validation and know nothing about
+  snapshots. `on_validation_end` runs after they have written, which is the
+  first hook where the new file is actually on disk -- `on_save_checkpoint`
+  fires *before* the write and would push the previous state.
+  """
+
+  def __init__(self, snapshot_dir, enabled=True):
+    self.snapshot_dir = os.fspath(snapshot_dir)
+    self.enabled = bool(enabled)
+
+  def on_validation_end(self, trainer, pl_module):
+    if trainer.sanity_checking or not trainer.is_global_zero:
+      return
+    nirvana_snapshot.save(self.snapshot_dir, enabled=self.enabled,
+                          reason=f'validation step={trainer.global_step}')
+
+
 class PeriodicStepCheckpoint(L.Callback):
   """Save deterministic checkpoints every N completed train batches."""
 
-  def __init__(self, dirpath, every_n_train_steps):
+  def __init__(self, dirpath, every_n_train_steps, snapshot_dir=None,
+               snapshot=False):
     self.dirpath = os.fspath(dirpath)
     self.every_n_train_steps = int(every_n_train_steps)
     self._completed_train_batches = 0
     self._last_saved_step = 0
+    # The snapshot covers the whole run directory, not just `dirpath`, so that
+    # a restored job also gets its logs and tracker metadata back.
+    self.snapshot_dir = os.fspath(snapshot_dir or dirpath)
+    self.snapshot = bool(snapshot)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     if self.every_n_train_steps <= 0:
@@ -56,6 +83,8 @@ class PeriodicStepCheckpoint(L.Callback):
       print(
         f'Saved periodic checkpoint at train_batch={save_step}: {ckpt_path}',
         flush=True)
+      nirvana_snapshot.save(self.snapshot_dir, enabled=self.snapshot,
+                            reason=f'periodic step={save_step}')
 
 
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
@@ -209,11 +238,20 @@ def _train(diffusion_model, config, logger, tokenizer):
   #     **config.wandb)
   train_logger = hydra.utils.instantiate(config.logger)
 
+  # Before the existence check below, not after: on a restarted preemptible
+  # job the local disk is empty and this is what puts `last.ckpt` back on it.
+  # Check first and the run starts from scratch with a full snapshot sitting
+  # unused, silently losing every step of prior training.
+  snapshot = bool(config.checkpointing.get('snapshot', True))
+  snapshot_dir = os.fspath(config.checkpointing.save_dir)
+  nirvana_snapshot.restore(snapshot_dir, enabled=snapshot)
+
   if (config.checkpointing.resume_from_ckpt
       and config.checkpointing.resume_ckpt_path is not None
       and utils.fsspec_exists(
         config.checkpointing.resume_ckpt_path)):
     ckpt_path = config.checkpointing.resume_ckpt_path
+    logger.info(f'Resuming from {ckpt_path}')
   else:
     ckpt_path = None
 
@@ -225,7 +263,10 @@ def _train(diffusion_model, config, logger, tokenizer):
     if config.checkpointing.get('use_periodic_train_batch_checkpoint', False):
       callbacks.append(PeriodicStepCheckpoint(
         os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
-        config.callbacks.checkpoint_every_n_steps.every_n_train_steps))
+        config.callbacks.checkpoint_every_n_steps.every_n_train_steps,
+        snapshot_dir=snapshot_dir, snapshot=snapshot))
+    if snapshot:
+      callbacks.append(SnapshotSync(snapshot_dir, enabled=True))
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)

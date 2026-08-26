@@ -275,4 +275,15 @@ checkpointing:
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
+  # Persist `save_dir` across preemptions via Nirvana's snapshot store, the way
+  # yrDiT's training scripts do: restore once at startup, push after every
+  # checkpoint write. A preempted job comes back with an empty local disk, so
+  # without this `resume_ckpt_path` never exists and every restart silently
+  # begins from step 0.
+  #
+  # Safe to leave on everywhere: `yt_tools` only exists inside the Nirvana job
+  # image, and off it every call is a no-op. Failures on either side are
+  # reported and swallowed -- a snapshot problem should cost progress, not the
+  # run.
+  snapshot: true
   use_periodic_train_batch_checkpoint: false
