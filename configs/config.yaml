@@ -174,6 +174,19 @@ eval:
   # Batches per budget; 0 means follow `sampling.num_sample_batches`. More
   # batches steady the perplexity estimate, at linear cost.
   owt_pareto_num_batches: 0
+  # Seeded repeats per budget, averaged, with the spread drawn as error bars.
+  # 1 keeps the old single-shot behaviour and seeds nothing.
+  #
+  # This is not just "sample more" -- raising `owt_pareto_num_batches` would
+  # also shrink the error bars. Fixing the seeds makes every checkpoint draw
+  # the SAME noise, so a shift in the frontier between checkpoints reflects the
+  # model changing rather than one validation getting luckier draws. Since the
+  # plot exists to show which way the frontier is MOVING, that paired
+  # comparison matters more than the raw variance.
+  #
+  # Cost is linear: 5 seeds is 5x the sweep. Pair it with
+  # `owt_pareto_every_n_validations` to keep the total in check.
+  owt_pareto_seeds: 1
   # Optional JSON frontier drawn as a fixed dashed baseline, in the same point
   # format ({steps, entropy, gen_ppl}). Missing file simply omits it.
   owt_pareto_reference: null

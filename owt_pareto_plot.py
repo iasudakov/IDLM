@@ -75,9 +75,20 @@ def render(history, reference=None, reference_label='Teacher (mdlm-owt)',
     # Ordered by sampling budget, so the line traces the frontier rather than
     # zig-zagging in whatever order the sweep happened to finish.
     points = sorted(points, key=lambda p: p['steps'])
-    ax.plot([p['entropy'] for p in points],
-            [p['gen_ppl'] for p in points],
-            marker='.', linewidth=1.2, color=cmap(norm(step / 1000)), zorder=2)
+    x = [p['entropy'] for p in points]
+    y = [p['gen_ppl'] for p in points]
+    # Error bars where the sweep averaged several seeds. Drawn rather than
+    # omitted because they are what says whether two frontiers actually
+    # differ -- without them a gap of one noise width reads as progress.
+    xerr = [p.get('entropy_std', 0.0) for p in points]
+    yerr = [p.get('gen_ppl_std', 0.0) for p in points]
+    colour = cmap(norm(step / 1000))
+    if any(xerr) or any(yerr):
+      ax.errorbar(x, y, xerr=xerr, yerr=yerr, marker='.', linewidth=1.2,
+                  color=colour, ecolor=colour, elinewidth=0.9, capsize=2,
+                  alpha=0.95, zorder=2)
+    else:
+      ax.plot(x, y, marker='.', linewidth=1.2, color=colour, zorder=2)
 
   if reference:
     points = sorted(reference, key=lambda p: p['steps'])

@@ -23,6 +23,19 @@ from ipdb import set_trace as debug
 _ENTROPY_X_SCALE = 1000
 
 
+def _mean(values):
+  return float(sum(values) / len(values)) if values else 0.0
+
+
+def _std(values):
+  """Sample standard deviation; 0 for fewer than two values."""
+  if len(values) < 2:
+    return 0.0
+  mean = _mean(values)
+  return float((sum((v - mean) ** 2 for v in values)
+                / (len(values) - 1)) ** 0.5)
+
+
 @dataclass
 class Loss:
   loss: torch.FloatTensor
@@ -383,26 +396,68 @@ class TrainerBase(L.LightningModule):
     budgets = sorted({int(b) for b in budgets})
     num_batches = int(config.get('owt_pareto_num_batches', 0) or
                       self.config.sampling.num_sample_batches)
-    curve = []
-    for budget in budgets:
-      # Fresh accumulators per budget: torchmetrics aggregate until reset, so
-      # without this every point would carry the previous budgets' samples too
-      # and the curve would flatten into a running average.
-      self.metrics.reset()
-      for _ in range(num_batches):
-        samples = self.generate_samples(
-          num_samples=self.config.loader.eval_batch_size,
-          num_steps=budget)
-        self.metrics.record_entropy(samples)
-        self.metrics.record_generative_perplexity(
-          self.tokenizer.batch_decode(samples), self.num_tokens, self.device)
-      point = {'steps': budget,
-               'entropy': float(self.metrics.sample_entropy.compute()),
-               'gen_ppl': float(self.metrics.gen_ppl.compute())}
-      curve.append(point)
-      print(f"[owt-pareto] step {self.global_step} budget {budget}: "
-            f"gen_ppl {point['gen_ppl']:.2f} entropy {point['entropy']:.4f}",
-            flush=True)
+    seeds = max(1, int(config.get('owt_pareto_seeds', 1) or 1))
+
+    # Repeats are *seeded*, not merely repeated. Averaging more samples would
+    # shrink the error bars either way, but fixing the seeds also makes every
+    # checkpoint draw the SAME noise, which turns the frontier's movement
+    # between checkpoints into a paired comparison: a shift then reflects the
+    # model changing rather than one validation getting luckier draws. That
+    # matters more than the raw variance here, since the question the plot
+    # answers is which direction the frontier is moving.
+    #
+    # The seed carries the rank, so data-parallel ranks still draw different
+    # samples -- seeding them identically would make the extra ranks redundant
+    # rather than additional evidence.
+    base_seed = int(getattr(self.config, 'seed', 0) or 0)
+    rank = self.trainer.global_rank
+
+    # Sampling here must not perturb the training RNG stream, or enabling the
+    # sweep would silently change the trajectory of the run it is measuring.
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = (torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available() else None)
+    try:
+      curve = []
+      for budget in budgets:
+        entropies, perplexities = [], []
+        for repeat in range(seeds):
+          if seeds > 1:
+            # 9973 is prime, so budgets and repeats cannot collide onto a
+            # shared seed the way `base + repeat + budget` would.
+            torch.manual_seed(base_seed + 9973 * (repeat + 1) + rank)
+          # Fresh accumulators per repeat: torchmetrics aggregate until reset,
+          # so without this each point would carry the previous budgets' and
+          # repeats' samples too and the curve would flatten into a running
+          # average.
+          self.metrics.reset()
+          for _ in range(num_batches):
+            samples = self.generate_samples(
+              num_samples=self.config.loader.eval_batch_size,
+              num_steps=budget)
+            self.metrics.record_entropy(samples)
+            self.metrics.record_generative_perplexity(
+              self.tokenizer.batch_decode(samples), self.num_tokens,
+              self.device)
+          entropies.append(float(self.metrics.sample_entropy.compute()))
+          perplexities.append(float(self.metrics.gen_ppl.compute()))
+        point = {'steps': budget,
+                 'entropy': _mean(entropies),
+                 'gen_ppl': _mean(perplexities),
+                 'entropy_std': _std(entropies),
+                 'gen_ppl_std': _std(perplexities),
+                 'seeds': seeds}
+        curve.append(point)
+        spread = ('' if seeds < 2 else
+                  f" +/- {point['gen_ppl_std']:.2f} / "
+                  f"{point['entropy_std']:.4f} over {seeds} seeds")
+        print(f"[owt-pareto] step {self.global_step} budget {budget}: "
+              f"gen_ppl {point['gen_ppl']:.2f} entropy {point['entropy']:.4f}"
+              f"{spread}", flush=True)
+    finally:
+      torch.set_rng_state(cpu_rng)
+      if cuda_rng is not None:
+        torch.cuda.set_rng_state_all(cuda_rng)
     self._publish_owt_pareto(curve)
 
   def _publish_owt_pareto(self, curve):
