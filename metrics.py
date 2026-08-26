@@ -201,8 +201,11 @@ class Metrics:
       from gradient_moment import evaluate, make_generative_llm_metrics
       from gradient_moment.huggingface import text_causal_lm_forward
     except ImportError as e:
-      print(f'[gm] skipped: gradient_moment not installed ({e}). '
-            'pip install -e /path/to/gradient-moment --no-deps', flush=True)
+      # `gradient_moment/` is vendored at the repo root, so this should not
+      # fire; it stays as a guard for a truncated checkout rather than as a
+      # prompt to install anything.
+      print(f'[gm] skipped: gradient_moment not importable ({e}). '
+            'It is vendored at the repo root -- check the checkout.', flush=True)
       return None
 
     model = self._ensure_eval_model(device)
