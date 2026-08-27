@@ -93,6 +93,25 @@ adversarial_distill:
   mmd_feature_layer: null
   mmd_feature_layer_weights: null
 
+  # How the two feature sets are compared.
+  #   linear -- pool both sides and score the difference with pseudo-Huber.
+  #             This is what an MMD with a LINEAR kernel reduces to: it sees
+  #             the means and nothing else, so a sample matching the clean row
+  #             on average is free regardless of its shape.
+  #   rbf    -- Gaussian-kernel MMD^2 between the per-position feature
+  #             distributions, unbiased (self-pairs removed). Sensitive to more
+  #             than the mean, which is the point given the probe's finding
+  #             that the linear reward behaves close to a soft edit distance.
+  # Computed by `mmd_rbf.py`, which reduces the three pair sums a tile at a
+  # time and never materialises the (batch, length, length) Gram matrix.
+  mmd_kernel: linear
+  # Kernel bandwidth as `alpha = 1 / (2 sigma^2)`. `null` measures it per call
+  # by the median heuristic on the REAL branch -- a bandwidth fitted to the
+  # student would drift as the student does, making the reward a moving target.
+  mmd_rbf_alpha: null
+  # Tile edge for the blocked kernel; 0 sizes it from a 256MB scratch budget.
+  mmd_rbf_block_size: 0
+
   # Samples drawn per state, each costing one critic forward. At >= 2 the
   # group's own leave-one-out mean is the baseline. 1 is allowed and is the
   # cheap end -- a quarter the critic cost of 4 -- but it has no second sample

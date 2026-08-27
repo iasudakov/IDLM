@@ -35,6 +35,8 @@ import os
 
 import torch
 
+import mmd_rbf
+
 # yrOPDLM's MMD_PSEUDO_HUBER_C. Kept at its value there so rewards are comparable.
 PSEUDO_HUBER_C = 0.001
 
@@ -219,14 +221,111 @@ def sequence_pooled_delta(clean, generated, selected):
   return gen_mean - clean_mean, selected.any(dim=1)
 
 
-def paired_sequence_reward(clean, generated, selected):
-  """One pseudo-Huber reward per sequence; rows selecting nothing score zero."""
+def median_alpha(feat, selected, max_samples=512, generator=None):
+  """`alpha = 1 / (2 * sigma^2)` from the median pairwise squared distance.
+
+  The standard bandwidth heuristic, measured on the REAL branch only, so it
+  never needs a gradient and never moves with the student. A bandwidth fitted to
+  the student's own features would drift as the student does, which turns the
+  reward into a moving target.
+
+  Subsampled because the median needs every pair: at `length` 1024 the exact
+  version is the N^2 matrix this module exists to avoid. 512 samples give
+  ~131k pairs, far more than the median needs to be stable.
+
+  Falls back to `alpha = 1` when the distances degenerate -- an all-masked row,
+  or identical features -- so a zero median cannot divide by zero.
+  """
+  valid = feat[selected.bool()]
+  if valid.shape[0] < 2:
+    return 1.0
+  if valid.shape[0] > max_samples:
+    idx = torch.randperm(valid.shape[0], device=valid.device,
+                         generator=generator)[:max_samples]
+    valid = valid[idx]
+  d2 = torch.cdist(valid.float(), valid.float()).pow_(2)
+  # Off-diagonal only: the diagonal is exactly 0 and would drag the median down
+  # by however many samples were drawn.
+  n = d2.shape[0]
+  off = d2[~torch.eye(n, dtype=torch.bool, device=d2.device)]
+  med = off.median()
+  if not torch.isfinite(med) or med <= 0:
+    return 1.0
+  return float(1.0 / (2.0 * med))
+
+
+def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0):
+  """`-MMD^2` per sequence under a Gaussian kernel, over the scored positions.
+
+  The linear-kernel reward compares the two feature sets by their MEANS, which
+  is all a linear kernel can see -- `sequence_pooled_delta` is literally that
+  mean difference. An RBF kernel compares the distributions, so a sample that
+  matches the clean row on average but not in shape is no longer free.
+
+  Both sets are the per-position features of one sequence, weighted by
+  `selected`; masked positions carry weight 0 and contribute nothing to any of
+  the three sums, so no masking of the kernel itself is needed.
+
+  The unbiased estimator, with the self-pairs removed:
+
+      MMD^2 = (S_xx - n)/(n(n-1)) + (S_yy - n)/(n(n-1)) - 2 S_xy/n^2
+
+  `- n` is exact rather than approximate: the weights are 0/1, so the diagonal
+  contributes `sum_i w_i^2 k(x_i, x_i)` = `sum_i w_i` = `n`. Rows with fewer
+  than two scored positions have no unbiased estimate at all and are reported
+  inactive rather than given a fabricated 0.
+
+  Returns `(reward, active)`, matching the linear path.
+  """
+  weights = selected.to(torch.float32)
+  n = weights.sum(dim=1)
+  active = n >= 2
+  if not bool(active.any()):
+    zeros = clean.new_zeros(clean.shape[0], dtype=torch.float32)
+    return zeros, active
+
+  real = clean.detach().float()
+  fake = generated.detach().float()
+  if alpha is None:
+    alpha = median_alpha(real, selected)
+
+  s_xx, s_yy, s_xy = mmd_rbf.rbf_pair_sums(
+    real, fake, weights, alpha, block_size=block_size)
+
+  safe_n = n.clamp_min(2.0)
+  pairs = safe_n * (safe_n - 1.0)
+  square = safe_n * safe_n
+  mmd2 = ((s_xx - safe_n) / pairs
+          + (s_yy - safe_n) / pairs
+          - 2.0 * s_xy / square)
+  # A sampling estimator of a squared quantity can come out slightly negative;
+  # clamping keeps the reward a true distance rather than letting noise read as
+  # "better than identical".
+  reward = -mmd2.clamp_min(0.0)
+  return torch.where(active, reward, torch.zeros_like(reward)), active
+
+
+def paired_sequence_reward(clean, generated, selected, kernel='linear',
+                           alpha=None, block_size=0):
+  """One reward per sequence; rows selecting nothing score zero.
+
+  `kernel='linear'` is the original: pool both sides and score the difference
+  with pseudo-Huber, which is what a linear kernel's MMD reduces to.
+  `kernel='rbf'` compares the two feature distributions instead. See
+  `rbf_sequence_reward`.
+  """
+  if kernel == 'rbf':
+    return rbf_sequence_reward(clean, generated, selected, alpha=alpha,
+                               block_size=block_size)
+  if kernel != 'linear':
+    raise ValueError(f'mmd_kernel must be linear|rbf, got {kernel!r}')
   delta, active = sequence_pooled_delta(clean, generated, selected)
   reward = pseudo_huber_reward(delta)
   return torch.where(active, reward, torch.zeros_like(reward)), active
 
 
-def summed_paired_reward(features, batch, selected, indices, weights):
+def summed_paired_reward(features, batch, selected, indices, weights,
+                         kernel='linear', alpha=None, block_size=0):
   """`R = sum_l w_l * R_l` over the requested blocks.
 
   Args:
@@ -246,7 +345,8 @@ def summed_paired_reward(features, batch, selected, indices, weights):
   for index, weight in zip(indices, weights):
     stacked = features[index]
     reward, active = paired_sequence_reward(
-      stacked[:batch], stacked[batch:], selected)
+      stacked[:batch], stacked[batch:], selected, kernel=kernel,
+      alpha=alpha, block_size=block_size)
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight
   return total, active, per_layer
@@ -300,6 +400,12 @@ def group_advantages(reward):
 
 class _LayeredFeatures:
   """Shared bookkeeping for the two feature maps: which blocks, at what weight."""
+
+  # Set by the critics' constructors; kept on the shared base so both feature
+  # maps get the plumbing instead of each threading its own copy.
+  kernel = 'linear'
+  rbf_alpha = None
+  rbf_block_size = 0
 
   def _resolve_layers(self, core, layer_index, layer_weights):
     self.layer_index = layer_index
@@ -386,7 +492,9 @@ class FrozenARFeatures(_LayeredFeatures):
       [attention_mask, attention_mask], dim=0)
     feats = self.features(stacked, eos_id, attention_mask=mask)
     reward, active, per_layer = summed_paired_reward(
-      feats, batch, selected, self.resolved_layers, self.layer_weights)
+      feats, batch, selected, self.resolved_layers, self.layer_weights,
+      kernel=self.kernel, alpha=self.rbf_alpha,
+      block_size=self.rbf_block_size)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
@@ -572,7 +680,9 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     with capture_layer_hidden(self.denoiser, self.layer_index) as (feats, _):
       self.denoiser(stacked, sigma)
     reward, active, per_layer = summed_paired_reward(
-      feats, batch, selected, self.resolved_layers, self.layer_weights)
+      feats, batch, selected, self.resolved_layers, self.layer_weights,
+      kernel=self.kernel, alpha=self.rbf_alpha,
+      block_size=self.rbf_block_size)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active

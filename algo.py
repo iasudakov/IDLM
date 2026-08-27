@@ -436,9 +436,18 @@ class MDLM(trainer_base.AbsorbingState):
       else:
         raise ValueError('adversarial_distill.mmd_feature_source must be '
                          f'ar|diffusion, got {source!r}')
+      kernel = str(cfg.get('mmd_kernel', 'linear'))
+      if kernel not in ('linear', 'rbf'):
+        raise ValueError('adversarial_distill.mmd_kernel must be linear|rbf, '
+                         f'got {kernel!r}')
+      self._mmd_critic_cached.kernel = kernel
+      self._mmd_critic_cached.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
+      self._mmd_critic_cached.rbf_block_size = int(
+        cfg.get('mmd_rbf_block_size', 0) or 0)
       print(f'[mmd] {what}, block '
             f'{self._mmd_critic_cached.layer_description}, '
-            f'per-sequence reward, group={cfg.mmd_group_size}, '
+            f'{kernel} kernel, per-sequence reward, '
+            f'group={cfg.mmd_group_size}, '
             f'weight={cfg.mmd_reward_weight}', flush=True)
     return self._mmd_critic_cached
 
