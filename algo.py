@@ -444,9 +444,12 @@ class MDLM(trainer_base.AbsorbingState):
       self._mmd_critic_cached.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
       self._mmd_critic_cached.rbf_block_size = int(
         cfg.get('mmd_rbf_block_size', 0) or 0)
+      self._mmd_critic_cached.kernel_batch_size = max(
+        1, int(cfg.get('mmd_kernel_batch_size', 1) or 1))
       print(f'[mmd] {what}, block '
             f'{self._mmd_critic_cached.layer_description}, '
-            f'{kernel} kernel, per-sequence reward, '
+            f'{kernel} kernel, '
+            f'rows of {self._mmd_critic_cached.kernel_batch_size}, '
             f'group={cfg.mmd_group_size}, '
             f'weight={cfg.mmd_reward_weight}', flush=True)
     return self._mmd_critic_cached

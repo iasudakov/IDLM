@@ -111,6 +111,23 @@ adversarial_distill:
   mmd_rbf_alpha: null
   # Tile edge for the blocked kernel; 0 sizes it from a 256MB scratch budget.
   mmd_rbf_block_size: 0
+  # How many sequences share one kernel row. The row is the unit the statistic
+  # is computed over for BOTH kernels -- linear pools it to one mean, rbf takes
+  # its valid tokens as the sample set -- so this decides the granularity:
+  #   1            -- one comparison per sequence (the default, unchanged)
+  #   N            -- N sequences matched as a group; all N share the reward
+  #   batch_size   -- the whole batch as a single pooled distribution
+  #
+  # Widening is a trade, not a free win. A row of N can be satisfied by samples
+  # that SWAP content between its sequences: two answers exchanged pool to the
+  # same mean and hold the same token multiset, so neither kernel can tell.
+  # What it buys is N times the tokens behind the statistic, and for rbf N^2
+  # times the pairs. Must divide the per-device batch size.
+  #
+  # The reward stays per sequence whatever this is -- REINFORCE multiplies each
+  # sequence's advantage by its own log-probability -- so a row's reward is
+  # simply shared by the sequences in it, which coarsens credit assignment.
+  mmd_kernel_batch_size: 1
 
   # Samples drawn per state, each costing one critic forward. At >= 2 the
   # group's own leave-one-out mean is the baseline. 1 is allowed and is the

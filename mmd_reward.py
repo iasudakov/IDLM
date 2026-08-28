@@ -305,27 +305,77 @@ def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0):
   return torch.where(active, reward, torch.zeros_like(reward)), active
 
 
+def merge_kernel_rows(clean, generated, selected, rows_of):
+  """Fold `rows_of` adjacent sequences into one kernel row.
+
+  The ROW is the unit the statistic is computed over, for both kernels: the
+  linear kernel pools it to one mean, and the rbf kernel takes its valid tokens
+  as the sample set. So merging N sequences means the reward stops asking "does
+  this sample match its own clean row" and starts asking "does this GROUP of
+  samples match that group of clean rows" -- a distribution match over N
+  sequences rather than N separate comparisons.
+
+  That is a real trade, not a free widening. A row of N sequences can be
+  satisfied by samples that swap content between them: two rows whose answers
+  are exchanged pool to the same mean and hold the same token multiset, so
+  neither kernel can tell them apart. What it buys is a statistic with N times
+  the tokens behind it, which for rbf means N^2 times the pairs.
+
+  Returns the folded views; `rows_of=1` returns the inputs untouched.
+  """
+  if rows_of <= 1:
+    return clean, generated, selected
+  batch = clean.shape[0]
+  if batch % rows_of:
+    raise ValueError(
+      f'mmd_kernel_batch_size={rows_of} does not divide the batch size '
+      f'{batch}; a row would straddle the end of the batch')
+  rows = batch // rows_of
+  return (clean.reshape(rows, -1, clean.shape[-1]),
+          generated.reshape(rows, -1, generated.shape[-1]),
+          selected.reshape(rows, -1))
+
+
 def paired_sequence_reward(clean, generated, selected, kernel='linear',
-                           alpha=None, block_size=0):
+                           alpha=None, block_size=0, rows_of=1):
   """One reward per sequence; rows selecting nothing score zero.
 
   `kernel='linear'` is the original: pool both sides and score the difference
   with pseudo-Huber, which is what a linear kernel's MMD reduces to.
   `kernel='rbf'` compares the two feature distributions instead. See
   `rbf_sequence_reward`.
+
+  `rows_of > 1` computes the statistic over that many sequences at once (see
+  `merge_kernel_rows`) and hands every sequence in a row its row's reward.
+  REINFORCE multiplies each sequence's advantage by ITS OWN log-probability, so
+  the return has to stay per sequence whatever the row size -- the row only
+  changes what the number means, not its shape.
   """
+  batch = clean.shape[0]
+  clean, generated, selected = merge_kernel_rows(
+    clean, generated, selected, rows_of)
   if kernel == 'rbf':
-    return rbf_sequence_reward(clean, generated, selected, alpha=alpha,
-                               block_size=block_size)
-  if kernel != 'linear':
+    reward, active = rbf_sequence_reward(clean, generated, selected,
+                                         alpha=alpha, block_size=block_size)
+  elif kernel == 'linear':
+    delta, active = sequence_pooled_delta(clean, generated, selected)
+    reward = pseudo_huber_reward(delta)
+    reward = torch.where(active, reward, torch.zeros_like(reward))
+  else:
     raise ValueError(f'mmd_kernel must be linear|rbf, got {kernel!r}')
-  delta, active = sequence_pooled_delta(clean, generated, selected)
-  reward = pseudo_huber_reward(delta)
-  return torch.where(active, reward, torch.zeros_like(reward)), active
+  if rows_of > 1:
+    # Every sequence in a row carries that row's reward. The group baseline
+    # then subtracts a per-row quantity from a per-row quantity, so the
+    # advantage is still well defined -- it is just shared.
+    reward = reward.repeat_interleave(rows_of)
+    active = active.repeat_interleave(rows_of)
+    assert reward.shape[0] == batch
+  return reward, active
 
 
 def summed_paired_reward(features, batch, selected, indices, weights,
-                         kernel='linear', alpha=None, block_size=0):
+                         kernel='linear', alpha=None, block_size=0,
+                         rows_of=1):
   """`R = sum_l w_l * R_l` over the requested blocks.
 
   Args:
@@ -346,7 +396,7 @@ def summed_paired_reward(features, batch, selected, indices, weights,
     stacked = features[index]
     reward, active = paired_sequence_reward(
       stacked[:batch], stacked[batch:], selected, kernel=kernel,
-      alpha=alpha, block_size=block_size)
+      alpha=alpha, block_size=block_size, rows_of=rows_of)
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight
   return total, active, per_layer
@@ -406,6 +456,7 @@ class _LayeredFeatures:
   kernel = 'linear'
   rbf_alpha = None
   rbf_block_size = 0
+  kernel_batch_size = 1
 
   def _resolve_layers(self, core, layer_index, layer_weights):
     self.layer_index = layer_index
@@ -494,7 +545,7 @@ class FrozenARFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_paired_reward(
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
-      block_size=self.rbf_block_size)
+      block_size=self.rbf_block_size, rows_of=self.kernel_batch_size)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
@@ -682,7 +733,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_paired_reward(
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
-      block_size=self.rbf_block_size)
+      block_size=self.rbf_block_size, rows_of=self.kernel_batch_size)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
