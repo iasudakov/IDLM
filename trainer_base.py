@@ -421,6 +421,10 @@ class TrainerBase(L.LightningModule):
       # ordinary validation does not -- and it sits inside the validation of
       # runs measured in days.
       print(f'[owt-pareto] sweep failed, continuing: {e}', flush=True)
+    try:
+      self._log_owt_pareto_temperature()
+    except Exception as e:
+      print(f'[owt-pareto-temp] sweep failed, continuing: {e}', flush=True)
     self._train_mode()
 
   def _collect_gm_reference(self, batch):
@@ -695,6 +699,171 @@ class TrainerBase(L.LightningModule):
       logger.log_image('pareto/frontier', image, step=self.global_step)
     except Exception as e:  # pragma: no cover - plotting is best-effort
       print(f'[owt-pareto] figure failed: {e}', flush=True)
+
+  def _log_owt_pareto_temperature(self):
+    """Sweep the sampler's temperature at this checkpoint.
+
+    `_log_owt_pareto` varies the CHECKPOINT at a fixed sampler and answers "is
+    the frontier moving the right way". This varies the SAMPLER at a fixed
+    checkpoint, and having both is what lets a move be attributed: a frontier
+    that drops may only mean the model got sharper, and the tell is whether the
+    new point sits below the checkpoint's own temperature curve or merely
+    somewhere along it. The budget sweep cannot answer that at any number of
+    checkpoints, because it never draws the curve the point would sit on.
+
+    Off unless `eval.owt_pareto_temp_every_n_validations` is set, and it should
+    stay off for most runs: the cost is `len(eval.pareto_temperatures)` times
+    the budget sweep this runs on top of -- 5 x 126 forward passes per batch for
+    the documented budget list, which is not a diagnostic to run every
+    validation. The temperatures themselves come from `eval.pareto_temperatures`
+    rather than a knob of their own, so a sweep is configured the same way here
+    and in `mode=pareto_eval`.
+    """
+    config = self.config.eval
+    every = int(config.get('owt_pareto_temp_every_n_validations', 0) or 0)
+    temperatures = config.get('pareto_temperatures', None)
+    budgets = config.get('owt_pareto_steps', None)
+    if not every or not temperatures or not budgets:
+      return
+    if self.trainer.sanity_checking:
+      return
+    # Its own counter, not the budget sweep's: the two cadences are set
+    # independently and sharing a counter would couple them.
+    self._owt_pareto_temp_count = getattr(
+      self, '_owt_pareto_temp_count', 0) + 1
+    if (self._owt_pareto_temp_count - 1) % every:
+      return
+    if not config.compute_generative_perplexity:
+      print('[owt-pareto-temp] skipped: needs '
+            'eval.compute_generative_perplexity', flush=True)
+      return
+
+    # `sweep` SPLITS its sample count across ranks; `_log_owt_pareto` has every
+    # rank draw `num_batches` and pools them. Scaling by the world size is what
+    # makes the two protocols agree, so the T=1 point measured here is the same
+    # measurement as the budget sweep's point at that budget rather than a
+    # smaller one that merely sits near it.
+    world_size = max(1, int(getattr(self.trainer, 'world_size', 1) or 1))
+    num_batches = int(config.get('owt_pareto_num_batches', 0) or
+                      self.config.sampling.num_sample_batches) * world_size
+    seeds = max(1, int(config.get('owt_pareto_seeds', 1) or 1))
+
+    # Sampling here must not perturb the training RNG stream, or enabling the
+    # sweep would silently change the trajectory of the run it is measuring.
+    # `sweep` seeds per (repeat, budget, rank) and never per checkpoint, so
+    # every validation draws the SAME noise -- which is what makes the movement
+    # across checkpoints a paired comparison rather than a lucky draw.
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = (torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available() else None)
+    try:
+      import pareto_temperature
+      curves, _ = pareto_temperature.sweep(
+        self,
+        temperatures=list(temperatures),
+        budgets=sorted({int(b) for b in budgets}),
+        seeds=seeds,
+        num_batches=num_batches,
+        batch_size=self.config.loader.eval_batch_size,
+        max_length=self.num_tokens,
+        # No text kept: the training tracker already carries samples from
+        # ordinary validation, and a table per validation would bury them.
+        keep_samples=0)
+    finally:
+      torch.set_rng_state(cpu_rng)
+      if cuda_rng is not None:
+        torch.cuda.set_rng_state_all(cuda_rng)
+    self._publish_owt_pareto_temperature(curves)
+
+  def _publish_owt_pareto_temperature(self, curves):
+    """Log this checkpoint's temperature fan, and its history over the run.
+
+    Two figures, because the sweep has three dimensions and no single axes holds
+    them: `pareto/temperature_frontier` is this checkpoint alone, one curve per
+    budget, and `pareto/temperature_by_checkpoint` is one panel per budget with
+    one line per checkpoint, which is where the run's progress actually reads.
+    """
+    def _scalar(name, value):
+      self.log(name, torch.tensor(float(value), device=self.device),
+               on_epoch=True, on_step=False, sync_dist=False,
+               rank_zero_only=True)
+
+    # One series per (budget, temperature) against the TRAINING step. The
+    # eval-mode sweep indexes the same numbers by temperature instead, which
+    # cannot work here: every validation would write the same handful of x
+    # values, and the graph would be a pile of overwrites rather than a trend.
+    for temperature, curve in curves.items():
+      for point in curve:
+        tag = f"s{point['steps']:g}_t{float(temperature):g}"
+        _scalar(f'val/gen_ppl_{tag}', point['gen_ppl'])
+        _scalar(f'val/entropy_{tag}', point['entropy'])
+
+    if self.trainer.global_rank != 0:
+      return
+    logger = self.trainer.logger
+    if logger is None:
+      return
+
+    history_path = os.path.join(self.config.checkpointing.save_dir,
+                                'owt_pareto_temp_history.json')
+    run_uid = getattr(logger, 'version', '') or ''
+    if getattr(self, '_owt_pareto_temp_history', None) is None:
+      # Same rule as the budget sweep's history: a RESUMED run continues the
+      # same tracker run and must pick up the curves the earlier process drew,
+      # while a fresh run reusing the save_dir must not graft them onto its own
+      # figure. The run uid is what tells the two apart.
+      self._owt_pareto_temp_history = {}
+      if os.path.exists(history_path):
+        try:
+          with open(history_path) as f:
+            stored = json.load(f)
+          if stored.get('run_uid') == run_uid:
+            self._owt_pareto_temp_history = {
+              int(k): v for k, v in stored['curves'].items()}
+          else:
+            print('[owt-pareto-temp] ignoring history from a different run '
+                  f"({stored.get('run_uid')!r} != {run_uid!r})", flush=True)
+        except Exception as e:  # pragma: no cover
+          print(f'[owt-pareto-temp] history read failed: {e}', flush=True)
+    # Keyed by `%g`, because JSON keys are strings and `str(0.7000000001)` is
+    # not a temperature anyone set. `_by_budget` parses the key back either way.
+    self._owt_pareto_temp_history[int(self.global_step)] = {
+      f'{float(t):g}': curve for t, curve in curves.items()}
+    try:
+      os.makedirs(self.config.checkpointing.save_dir, exist_ok=True)
+      with open(history_path, 'w') as f:
+        json.dump({'run_uid': run_uid,
+                   'curves': self._owt_pareto_temp_history}, f, indent=2)
+    except Exception as e:  # pragma: no cover
+      print(f'[owt-pareto-temp] history write failed: {e}', flush=True)
+
+    if not hasattr(logger, 'log_image'):
+      return
+    try:
+      import owt_pareto_plot
+      reference = owt_pareto_plot.load_reference(
+        self.config.eval.get('owt_pareto_reference', None))
+      logger.log_image(
+        'pareto/temperature_frontier',
+        owt_pareto_plot.render_temperature(
+          curves, reference=reference,
+          subtitle=f'training step {self.global_step}'),
+        step=self.global_step)
+      history = sorted(self._owt_pareto_temp_history.items())
+      # One checkpoint is not a progression, and the grid would say nothing the
+      # fan above has not already said.
+      if len(history) > 1:
+        logger.log_image(
+          'pareto/temperature_by_checkpoint',
+          owt_pareto_plot.render_checkpoints(
+            [{'short': f'{step / 1000:g}k',
+              'label': f'training step {step}',
+              'curves': stored} for step, stored in history],
+            reference=reference,
+            title='Fluency vs diversity: temperature at each checkpoint'),
+          step=self.global_step)
+    except Exception as e:  # pragma: no cover - plotting is best-effort
+      print(f'[owt-pareto-temp] figure failed: {e}', flush=True)
 
   def configure_optimizers(self):
     optimizer = torch.optim.AdamW(

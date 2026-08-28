@@ -291,6 +291,23 @@ eval:
   # Budgets, seeds and batches come from the `owt_pareto_*` knobs above, so a
   # sweep is configured the same way in both places.
   pareto_temperatures: [0.7, 0.8, 0.9, 1.0, 2.0]
+  # Run that same temperature sweep DURING training, on every Nth validation.
+  # 0 is off, which is the right default: it costs `len(pareto_temperatures)`
+  # times the budget sweep it runs on top of, so with the documented budget list
+  # one validation would spend 5 x 126 forward passes per batch on it.
+  #
+  # Two figures appear when it is on. `pareto/temperature_frontier` is the
+  # current checkpoint's fan -- the figure `mode=pareto_eval` draws -- and
+  # `pareto/temperature_by_checkpoint` stacks every checkpoint swept so far,
+  # one panel per budget and one line per checkpoint, which is where a run's
+  # progress actually reads. Scalars land as
+  # `val/gen_ppl_s{budget}_t{temperature}` and `val/entropy_...`, so there are
+  # `budgets x temperatures` of each: keep both lists short.
+  #
+  # Budgets, seeds and batches come from the `owt_pareto_*` knobs above, and
+  # the sample count per point matches the budget sweep's, so the T=1 curve is
+  # directly comparable to the frontier `pareto/frontier` draws.
+  owt_pareto_temp_every_n_validations: 0
   # The trained student to evaluate: a Lightning `.ckpt` written by training.
   # `eval.checkpoint_path` stays what it is during training -- the HF id the
   # `hf_dit` backbone is BUILT from -- and this supplies the trained weights on
