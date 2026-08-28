@@ -235,7 +235,7 @@ def _generate_samples(diffusion_model, config, logger,
   print('Samples saved at:', samples_path)
 
 
-def _load_student_weights(model, config, logger):
+def _load_student_weights(model, config, logger, path=None):
   """Put a trained student's weights into a model built from the HF teacher.
 
   `algo.backbone=hf_dit` builds the architecture from `eval.checkpoint_path` --
@@ -249,8 +249,14 @@ def _load_student_weights(model, config, logger):
   training curves describe. `eval.disable_ema=True` asks for the raw weights.
 
   Returns a short label naming what was loaded, for the figure and the JSON.
+
+  `path` overrides `eval.student_ckpt_path`, which is how a multi-checkpoint
+  sweep walks a list: the architecture is built once and only the weights are
+  swapped, since every checkpoint in a sweep shares the `hf_dit` backbone that
+  `eval.checkpoint_path` names.
   """
-  path = config.eval.get('student_ckpt_path', '') or ''
+  if path is None:
+    path = config.eval.get('student_ckpt_path', '') or ''
   if not path:
     logger.info('No eval.student_ckpt_path: evaluating '
                 f'{config.eval.checkpoint_path} as built.')
@@ -305,23 +311,96 @@ def _init_distributed():
   return torch.distributed.get_rank(), world_size, local_rank
 
 
+def _pareto_checkpoints(config):
+  """The checkpoints this sweep covers, in the order they will be drawn.
+
+  `eval.student_ckpt_paths` wins whenever it is set; `eval.student_ckpt_path`
+  is the single-checkpoint spelling and stays the fallback, so every command
+  written before the list existed still means what it meant. An empty string
+  is a legal ENTRY, not a terminator: it names the model as
+  `eval.checkpoint_path` builds it, i.e. the teacher, which is the baseline the
+  students in the same list are read against.
+  """
+  paths = list(config.eval.get('student_ckpt_paths', None) or [])
+  if paths:
+    return [str(p) for p in paths]
+  return [str(config.eval.get('student_ckpt_path', '') or '')]
+
+
+def _short_labels(paths):
+  """Compact, unique legend names for a list of checkpoint paths.
+
+  The basename's stem is what a reader recognises -- `step=00014000` -- and for
+  the usual case, one run's checkpoint directory, that is the whole answer. Two
+  runs collide on it, so the name widens leftwards a path component at a time
+  until the names separate, skipping any component every path shares:
+  `checkpoints` is in all of them and discriminates nothing, so the pair reads
+  `run_a/step=00014000` rather than `run_a/checkpoints/step=00014000`. An index
+  is the last resort. Uniqueness matters beyond the legend, because these also
+  name the tracker series.
+  """
+  parts = [[c for c in os.path.abspath(path).split(os.sep) if c] if path
+           else ['teacher'] for path in paths]
+  for piece in parts:
+    # Only the file loses its extension; the directories keep their names.
+    piece[-1] = os.path.splitext(piece[-1])[0]
+
+  def render(depths):
+    return ['/'.join(piece[-d] for d in sorted(depths, reverse=True)
+                     if len(piece) >= d) for piece in parts]
+
+  deepest = max(len(piece) for piece in parts)
+  depths, depth = [1], 1
+  labels = render(depths)
+  while len(set(labels)) < len(labels) and depth < deepest:
+    depth += 1
+    # Only over the paths that reach this far: a short entry (`teacher`) would
+    # otherwise make a shared component look like a distinguishing one.
+    column = {piece[-depth] for piece in parts if len(piece) >= depth}
+    if len(column) < 2:
+      continue
+    depths.append(depth)
+    labels = render(depths)
+
+  seen = collections.Counter()
+  for i, label in enumerate(labels):
+    seen[label] += 1
+    if seen[label] > 1:
+      labels[i] = f'{label}#{seen[label]}'
+  return labels
+
+
 def _pareto_eval(diffusion_model, config, logger, tokenizer):
-  """Sweep a checkpoint over sampling temperatures and step budgets."""
+  """Sweep checkpoints over sampling temperatures and step budgets."""
   rank, world_size, local_rank = _init_distributed()
-  if rank == 0:
-    logger.info('Starting temperature Pareto eval.'
-                + (f' Sharded over {world_size} ranks.'
-                   if world_size > 1 else ''))
   temperatures = config.eval.get('pareto_temperatures', None)
   budgets = config.eval.get('owt_pareto_steps', None)
   assert temperatures, 'set eval.pareto_temperatures, e.g. [0.7,1.0,2.0]'
   assert budgets, 'set eval.owt_pareto_steps, e.g. [8,16,32]'
+  paths = _pareto_checkpoints(config)
+  shorts = _short_labels(paths)
+  if rank == 0:
+    logger.info(f'Starting temperature Pareto eval over {len(paths)} '
+                'checkpoint(s).'
+                + (f' Sharded over {world_size} ranks.'
+                   if world_size > 1 else ''))
 
+  # Built once for the whole list: every checkpoint in a sweep is the same
+  # architecture -- `eval.checkpoint_path` names it -- so only the weights need
+  # swapping, and rebuilding per checkpoint would re-download the hub config
+  # and re-allocate the model for nothing.
   model = _load_from_checkpoint(
     diffusion_model=diffusion_model, config=config, tokenizer=tokenizer)
-  label = _load_student_weights(model, config, logger)
   model = model.to(f'cuda:{local_rank}')
   model.eval()
+  # An empty entry means "the model as built". That is only true before a
+  # student has been loaded over it, so when the baseline is not first in the
+  # list, keep a pristine CPU copy to restore from. Built only when the list
+  # actually asks for it, since it is a second copy of the weights.
+  pristine = None
+  if len(paths) > 1 and any(not p for p in paths):
+    pristine = {k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()}
 
   # One tracker run, not one per rank: `logger.force_new_run=true` would
   # otherwise open `world_size` runs and scatter the sweep across all of them.
@@ -332,29 +411,39 @@ def _pareto_eval(diffusion_model, config, logger, tokenizer):
       tracker.log_hyperparams({
         'eval/temperatures': str(list(temperatures)),
         'eval/steps': str(list(budgets)),
-        'eval/checkpoint': label,
+        'eval/checkpoints': ', '.join(shorts),
         'eval/world_size': world_size})
     except Exception as e:  # pragma: no cover - tracker best-effort
       print(f'[pareto-temp] hyperparam log failed: {e}', flush=True)
 
-  curves, samples = pareto_temperature.sweep(
-    model,
-    temperatures=temperatures,
-    budgets=budgets,
-    seeds=config.eval.get('owt_pareto_seeds', 1),
-    num_batches=(config.eval.get('owt_pareto_num_batches', 0)
-                 or config.sampling.num_sample_batches),
-    batch_size=config.loader.eval_batch_size,
-    max_length=config.model.length)
+  sweeps = []
+  for index, (path, short) in enumerate(zip(paths, shorts)):
+    if not path and pristine is not None:
+      model.load_state_dict(pristine, strict=True)
+    label = _load_student_weights(model, config, logger, path=path)
+    if rank == 0 and len(paths) > 1:
+      print(f'[pareto-temp] === checkpoint {index + 1}/{len(paths)}: '
+            f'{short} -- {label} ===', flush=True)
+    curves, samples = pareto_temperature.sweep(
+      model,
+      temperatures=temperatures,
+      budgets=budgets,
+      seeds=config.eval.get('owt_pareto_seeds', 1),
+      num_batches=(config.eval.get('owt_pareto_num_batches', 0)
+                   or config.sampling.num_sample_batches),
+      batch_size=config.loader.eval_batch_size,
+      max_length=config.model.length)
+    sweeps.append({'label': label, 'short': short, 'path': path,
+                   'curves': curves, 'samples': samples})
+
   if world_size > 1:
     # Hold the other ranks until rank 0 is done: tearing the group down while a
     # collective is outstanding is what turns a finished sweep into a hang.
     torch.distributed.barrier()
   if rank == 0:
-    pareto_temperature.publish(
-      curves, samples, tracker,
+    pareto_temperature.publish_many(
+      sweeps, tracker,
       save_dir=os.fspath(config.checkpointing.save_dir),
-      checkpoint_label=label,
       reference=owt_pareto_plot.load_reference(
         config.eval.get('owt_pareto_reference', None)))
     tracker.finalize('success')

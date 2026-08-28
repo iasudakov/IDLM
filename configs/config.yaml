@@ -297,6 +297,16 @@ eval:
   # top of it. Empty evaluates whatever `checkpoint_path` alone produces, i.e.
   # the teacher, which is how you measure the baseline curve.
   student_ckpt_path: ''
+  # Several checkpoints in one sweep, compared on the same axes. Takes
+  # precedence over `student_ckpt_path` when non-empty; an empty string as an
+  # ENTRY means "the model as built", i.e. the teacher, so it can sit in the
+  # list alongside the students it is the baseline for.
+  #
+  # Every checkpoint is driven through the same temperatures, budgets and
+  # seeds, in the same order, so the comparison is paired the way the
+  # temperatures already are: a gap between two checkpoints' curves is the
+  # weights differing, not one of them drawing luckier noise.
+  student_ckpt_paths: []
 
 optim:
   weight_decay: 0

@@ -1,4 +1,4 @@
-"""Sweep one finished checkpoint over sampling temperatures and step budgets.
+"""Sweep finished checkpoints over sampling temperatures and step budgets.
 
 `trainer_base._log_owt_pareto` answers "is this run's frontier moving the right
 way" -- it holds the sampler fixed and varies the checkpoint. This answers the
@@ -176,23 +176,81 @@ def sweep(model, temperatures, budgets, seeds=1, num_batches=1,
   return curves, samples
 
 
+def _keyed(mapping):
+  """Temperature-keyed dict with JSON-safe keys: `0.7`, not `0.7000000001`."""
+  return {f'{float(t):g}': v for t, v in (mapping or {}).items()}
+
+
+def _slug(name):
+  """Tracker-safe series name.
+
+  Metric keys end up in URLs and filenames, and `step=00014000` is exactly the
+  label a checkpoint hands you -- with exactly the character a query string
+  reads as a separator.
+  """
+  return ''.join(c if (c.isalnum() or c in '-_.') else '_'
+                 for c in (name or '')) or 'ckpt'
+
+
 def publish(curves, samples, logger, save_dir, checkpoint_label,
             reference=None, json_name='pareto_temperature.json'):
-  """Write the sweep to disk and to the tracker.
+  """Publish one checkpoint's sweep. Thin wrapper over `publish_many`."""
+  return publish_many(
+    [{'label': checkpoint_label, 'short': checkpoint_label,
+      'curves': curves, 'samples': samples}],
+    logger, save_dir=save_dir, reference=reference, json_name=json_name)
 
-  Three views, because no single one answers everything:
-    * the figure -- all curves on one axes, which is how the trade-off is read;
-    * `gen_ppl`/`entropy` against the step budget, one series per temperature,
-      which is how you read "what does temperature cost me at 8 steps";
-    * the frontier itself, x-axis entropy, which is the figure as scrubbable
-      scalars.
+
+def publish_many(sweeps, logger, save_dir, reference=None,
+                 json_name='pareto_temperature.json'):
+  """Write one or more checkpoints' sweeps to disk and to the tracker.
+
+  Several views, because no single one answers everything:
+    * per checkpoint, the temperature fan -- every budget on one axes, which is
+      how the trade-off is read for a model in isolation;
+    * across checkpoints, one panel per budget -- which is how you read "did
+      the newer checkpoint move the frontier, or has it only learnt to sample
+      sharper", the question a single checkpoint's figure cannot answer;
+    * `gen_ppl`/`entropy` against temperature, one series per budget, i.e. what
+      sharpening costs at a fixed price;
+    * the frontier itself against entropy, the figure as scrubbable scalars.
+
+  With a single sweep every series and image key is unprefixed, exactly as it
+  was before this took a list, so a dashboard built on those keys keeps working.
+
+  Args:
+    sweeps: `[{'label', 'short', 'path', 'curves', 'samples'}, ...]`, in the
+      order they should be drawn.
+    logger: tracker, or None to write only the JSON.
+    save_dir: directory for the JSON.
+    reference: optional frontier drawn dashed under every figure.
+    json_name: basename for the JSON.
+
+  Returns:
+    The JSON path, or None if there was nothing to publish.
   """
+  sweeps = [dict(s) for s in (sweeps or []) if s.get('curves')]
+  if not sweeps:
+    print('[pareto-temp] nothing to publish', flush=True)
+    return None
+  multi = len(sweeps) > 1
+
+  first = sweeps[0]
+  payload = {
+    # The first sweep is repeated flat as well as under `sweeps`, so
+    # `owt_pareto_plot.load_reference` and anything else reading the old
+    # one-checkpoint layout still finds a frontier where it looks for one.
+    'checkpoint': first.get('label'),
+    'curves': _keyed(first.get('curves')),
+    'samples': _keyed(first.get('samples')),
+    # Kept so `python -m pareto_temperature <json>` can redraw and re-publish
+    # everything without paying for the sampling again.
+    'sweeps': [{'label': s.get('label'),
+                'short': s.get('short') or s.get('label'),
+                'path': s.get('path', ''),
+                'curves': _keyed(s.get('curves')),
+                'samples': _keyed(s.get('samples'))} for s in sweeps]}
   path = os.path.join(save_dir, json_name)
-  payload = {'checkpoint': checkpoint_label,
-             'curves': {f'{t:g}': curve for t, curve in curves.items()},
-             # Kept so `python -m pareto_temperature <json>` can redraw and
-             # re-publish everything without paying for the sampling again.
-             'samples': {f'{t:g}': texts for t, texts in (samples or {}).items()}}
   try:
     os.makedirs(save_dir, exist_ok=True)
     with open(path, 'w') as f:
@@ -204,47 +262,61 @@ def publish(curves, samples, logger, save_dir, checkpoint_label,
   if logger is None:
     return path
 
-  # Grouped by budget, like the figure: a series is one step count, and its
-  # x-axis is the temperature walking along that budget's frontier.
-  by_budget = collections.defaultdict(list)
-  for temperature, curve in curves.items():
-    for point in curve:
-      by_budget[int(point['steps'])].append(
-        dict(point, temperature=float(temperature)))
+  for sweep in sweeps:
+    short = sweep.get('short') or sweep.get('label') or ''
+    suffix = f'_{_slug(short)}' if multi else ''
+    # Grouped by budget, like the figure: a series is one step count, and its
+    # x-axis is the temperature walking along that budget's frontier.
+    by_budget = collections.defaultdict(list)
+    for temperature, curve in sweep['curves'].items():
+      for point in curve:
+        by_budget[int(point['steps'])].append(
+          dict(point, temperature=float(temperature)))
 
-  for budget, points in sorted(by_budget.items()):
-    points = sorted(points, key=lambda p: p['temperature'])
-    tag = f'S{budget}'
-    for point in points:
-      # x-axis is temperature (scaled to an integer): what sharpening costs at
-      # this budget, read one budget at a time.
-      _log(logger, {f'pareto_temp/gen_ppl_{tag}': point['gen_ppl'],
-                    f'pareto_temp/entropy_{tag}': point['entropy']},
-           step=int(round(point['temperature'] * _TEMP_X_SCALE)))
-    for point in points:
-      # x-axis is entropy: the frontier, as the figure draws it. Separate loop
-      # because it is a different step axis, and interleaving the two would
-      # leave the tracker's series non-monotone in their own x.
-      _log(logger, {f'pareto_temp/frontier_{tag}': point['gen_ppl']},
-           step=int(round(point['entropy'] * _ENTROPY_X_SCALE)))
+    for budget, points in sorted(by_budget.items()):
+      points = sorted(points, key=lambda p: p['temperature'])
+      tag = f'S{budget}{suffix}'
+      for point in points:
+        # x-axis is temperature (scaled to an integer): what sharpening costs
+        # at this budget, read one budget at a time.
+        _log(logger, {f'pareto_temp/gen_ppl_{tag}': point['gen_ppl'],
+                      f'pareto_temp/entropy_{tag}': point['entropy']},
+             step=int(round(point['temperature'] * _TEMP_X_SCALE)))
+      for point in points:
+        # x-axis is entropy: the frontier, as the figure draws it. Separate
+        # loop because it is a different step axis, and interleaving the two
+        # would leave the tracker's series non-monotone in their own x.
+        _log(logger, {f'pareto_temp/frontier_{tag}': point['gen_ppl']},
+             step=int(round(point['entropy'] * _ENTROPY_X_SCALE)))
 
-  if samples and hasattr(logger, 'log_table'):
-    rows = [[f'{t:g}', text]
-            for t, texts in sorted(samples.items()) for text in texts]
+    samples = sweep.get('samples')
+    if samples and hasattr(logger, 'log_table'):
+      rows = [[f'{float(t):g}', text]
+              for t, texts in sorted(samples.items(), key=lambda kv: float(kv[0]))
+              for text in texts]
+      try:
+        logger.log_table(key=f'pareto_temp/samples{suffix}',
+                         columns=['temperature', 'sample'], data=rows, step=0)
+      except Exception as e:  # pragma: no cover - best-effort
+        print(f'[pareto-temp] sample table failed: {e}', flush=True)
+
+    if hasattr(logger, 'log_image'):
+      try:
+        image = owt_pareto_plot.render_temperature(
+          sweep['curves'], reference=reference,
+          subtitle=sweep.get('label') or short)
+        logger.log_image(f'pareto/temperature_frontier{suffix}', image, step=0)
+      except Exception as e:  # pragma: no cover - plotting is best-effort
+        print(f'[pareto-temp] figure failed for {short}: {e}', flush=True)
+
+  if multi and hasattr(logger, 'log_image'):
     try:
-      logger.log_table(key='pareto_temp/samples',
-                       columns=['temperature', 'sample'], data=rows, step=0)
-    except Exception as e:  # pragma: no cover - best-effort
-      print(f'[pareto-temp] sample table failed: {e}', flush=True)
-
-  if hasattr(logger, 'log_image'):
-    try:
-      image = owt_pareto_plot.render_temperature(
-        curves, reference=reference, subtitle=checkpoint_label)
-      logger.log_image('pareto/temperature_frontier', image, step=0)
-      print('[pareto-temp] figure logged', flush=True)
+      logger.log_image('pareto/checkpoint_frontier',
+                       owt_pareto_plot.render_checkpoints(
+                         sweeps, reference=reference), step=0)
     except Exception as e:  # pragma: no cover - plotting is best-effort
-      print(f'[pareto-temp] figure failed: {e}', flush=True)
+      print(f'[pareto-temp] comparison figure failed: {e}', flush=True)
+  print(f'[pareto-temp] published {len(sweeps)} checkpoint(s)', flush=True)
   return path
 
 
@@ -256,12 +328,28 @@ def _log(logger, metrics, step):
 
 
 def load(path):
-  """Read a sweep back from its JSON, keyed the way `sweep` returns it."""
+  """Read a sweep back from its JSON, in `publish_many`'s list form.
+
+  Accepts both layouts: a JSON written before this took a list carries only the
+  flat `curves`/`samples`, and reads back as a one-element list.
+  """
   with open(path) as f:
     data = json.load(f)
-  curves = {float(t): points for t, points in data.get('curves', {}).items()}
-  samples = {float(t): texts for t, texts in (data.get('samples') or {}).items()}
-  return curves, samples, data.get('checkpoint', os.path.basename(path))
+  entries = data.get('sweeps') or [{'label': data.get('checkpoint'),
+                                    'curves': data.get('curves', {}),
+                                    'samples': data.get('samples') or {}}]
+  sweeps = []
+  for entry in entries:
+    label = entry.get('label') or os.path.basename(path)
+    sweeps.append({
+      'label': label,
+      'short': entry.get('short') or label,
+      'path': entry.get('path', ''),
+      'curves': {float(t): points
+                 for t, points in (entry.get('curves') or {}).items()},
+      'samples': {float(t): texts
+                  for t, texts in (entry.get('samples') or {}).items()}})
+  return sweeps
 
 
 def _cli(argv=None):
@@ -286,14 +374,22 @@ def _cli(argv=None):
                       help='write the figure only, publish nothing')
   args = parser.parse_args(argv)
 
-  curves, samples, checkpoint = load(args.json_path)
+  sweeps = load(args.json_path)
   save_dir = os.path.dirname(os.path.abspath(args.json_path))
   reference = owt_pareto_plot.load_reference(args.reference)
+  name = (sweeps[0]['label'] if len(sweeps) == 1
+          else ' vs '.join(s['short'] for s in sweeps))
 
   if args.png:
     import matplotlib.pyplot as plt
-    plt.imsave(args.png, owt_pareto_plot.render_temperature(
-      curves, reference=reference, subtitle=checkpoint))
+    # The comparison grid when the JSON holds several checkpoints, the single
+    # fan when it holds one -- same choice `publish_many` makes.
+    image = (owt_pareto_plot.render_checkpoints(sweeps, reference=reference)
+             if len(sweeps) > 1 else
+             owt_pareto_plot.render_temperature(
+               sweeps[0]['curves'], reference=reference,
+               subtitle=sweeps[0]['label']))
+    plt.imsave(args.png, image)
     print(f'[pareto-temp] wrote {args.png}', flush=True)
 
   if args.no_tracker:
@@ -302,11 +398,10 @@ def _cli(argv=None):
   import underdeep_logger
   logger = underdeep_logger.UnderdeepLogger(
     experiment=args.experiment,
-    name=args.name or f'pareto-temp {checkpoint}',
+    name=args.name or f'pareto-temp {name}',
     save_dir=save_dir, resume=False, force_new_run=True)
-  publish(curves, samples, logger, save_dir=save_dir,
-          checkpoint_label=checkpoint, reference=reference,
-          json_name=os.path.basename(args.json_path))
+  publish_many(sweeps, logger, save_dir=save_dir, reference=reference,
+               json_name=os.path.basename(args.json_path))
   logger.finalize('success')
 
 

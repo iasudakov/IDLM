@@ -29,6 +29,21 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 
+def _log_safe_yerr(y, yerr):
+  """Asymmetric error bars that survive a log y-axis.
+
+  A symmetric bar whose lower end reaches zero or below cannot be drawn on a
+  log scale: matplotlib keeps the point but drops the axis limit to the bottom
+  of the world, which rescales the figure until every curve is a flat line at
+  the top. The downward half is therefore capped at one decade -- enough to
+  read "the spread is as large as the value" without the axis paying three
+  decades for it -- and the upward half is left untouched. Real sweeps have a
+  spread far below their mean and never reach the cap.
+  """
+  yerr = [e or 0.0 for e in yerr]
+  return [[min(e, max(v, 0.0) * 0.9) for v, e in zip(y, yerr)], yerr]
+
+
 def load_reference(path, reference_temperature=1.0):
   """Read a reference frontier, or None if there is not one to draw.
 
@@ -107,9 +122,9 @@ def render(history, reference=None, reference_label='Teacher (mdlm-owt)',
     yerr = [p.get('gen_ppl_std', 0.0) for p in points]
     colour = cmap(norm(step / 1000))
     if any(xerr) or any(yerr):
-      ax.errorbar(x, y, xerr=xerr, yerr=yerr, marker='.', linewidth=1.2,
-                  color=colour, ecolor=colour, elinewidth=0.9, capsize=2,
-                  alpha=0.95, zorder=2)
+      ax.errorbar(x, y, xerr=xerr, yerr=_log_safe_yerr(y, yerr), marker='.',
+                  linewidth=1.2, color=colour, ecolor=colour, elinewidth=0.9,
+                  capsize=2, alpha=0.95, zorder=2)
     else:
       ax.plot(x, y, marker='.', linewidth=1.2, color=colour, zorder=2)
 
@@ -188,12 +203,7 @@ def render_temperature(curves, reference=None,
   if not curves:
     raise ValueError('nothing to plot: no temperature curves')
 
-  # A sweep straight out of `sweep()` is float-keyed; one read back from its
-  # own JSON is string-keyed, and `'1'` is not `str(1.0)`.
-  by_budget = collections.defaultdict(list)
-  for key, points in curves.items():
-    for point in points:
-      by_budget[int(point['steps'])].append(dict(point, temperature=float(key)))
+  by_budget = _by_budget(curves)
   budgets = sorted(by_budget)
 
   fig, ax = plt.subplots(figsize=(8.5, 6), dpi=110)
@@ -214,8 +224,8 @@ def render_temperature(curves, reference=None,
     style = dict(marker='o', markersize=4.5, linewidth=1.8, color=colour,
                  label=f'{budget} steps', zorder=3)
     if any(xerr) or any(yerr):
-      ax.errorbar(x, y, xerr=xerr, yerr=yerr, ecolor=colour, elinewidth=0.9,
-                  capsize=2, alpha=0.95, **style)
+      ax.errorbar(x, y, xerr=xerr, yerr=_log_safe_yerr(y, yerr), ecolor=colour,
+                  elinewidth=0.9, capsize=2, alpha=0.95, **style)
     else:
       ax.plot(x, y, **style)
     _annotate_temperatures(ax, points)
@@ -247,6 +257,136 @@ def render_temperature(curves, reference=None,
   image = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
   plt.close(fig)
   return image
+
+
+def _by_budget(curves):
+  """Regroup `{temperature: [point, ...]}` into `{budget: [point, ...]}`.
+
+  A sweep straight out of `sweep()` is float-keyed; one read back from its own
+  JSON is string-keyed, and `'1'` is not `str(1.0)` -- so the temperature is
+  parsed here rather than trusted as a key, and carried onto each point.
+  """
+  by_budget = collections.defaultdict(list)
+  for key, points in (curves or {}).items():
+    for point in points:
+      by_budget[int(point['steps'])].append(dict(point, temperature=float(key)))
+  return by_budget
+
+
+def render_checkpoints(sweeps, reference=None,
+                       reference_label='Teacher (mdlm-owt)',
+                       title='Fluency vs diversity: checkpoints at each step budget'):
+  """One panel per step budget, one temperature curve per checkpoint.
+
+  The single-checkpoint figure (`render_temperature`) puts the budgets on one
+  axes because the budget is what you are choosing between. With several
+  checkpoints that axes would carry `checkpoints x budgets` lines and the
+  comparison that matters -- same budget, different weights -- would be the one
+  the reader has to disentangle. So the budget becomes the panel and the
+  checkpoint becomes the line: within a panel, every curve was drawn at the
+  same price, and the one nearest the bottom-right is simply better.
+
+  Panels share both axes, so a budget's whole fan can still be compared against
+  another budget's by eye, which is what `render_temperature` was for.
+
+  Args:
+    sweeps: `[{'short'|'label', 'curves'}, ...]`, drawn in the order given --
+      which for a training progression means oldest first, and the colour ramp
+      follows it.
+    reference: optional frontier `[{'steps', 'entropy', 'gen_ppl'}, ...]`,
+      drawn dashed black in every panel.
+    reference_label: legend entry for it.
+    title: figure title.
+
+  Returns:
+    (H, W, 3) uint8 array, what `UnderdeepLogger.log_image` takes.
+  """
+  sweeps = [s for s in (sweeps or []) if s.get('curves')]
+  if not sweeps:
+    raise ValueError('nothing to plot: no checkpoint sweeps')
+
+  grouped = [_by_budget(s['curves']) for s in sweeps]
+  budgets = sorted({b for g in grouped for b in g})
+  ncols = min(len(budgets), 3)
+  nrows = -(-len(budgets) // ncols)
+  fig, axes = plt.subplots(nrows, ncols, figsize=(4.7 * ncols, 4.3 * nrows),
+                           dpi=110, sharex=True, sharey=True, squeeze=False)
+  flat = [ax for row in axes for ax in row]
+  cmap = plt.get_cmap('viridis')
+  colours = [cmap(0.12 + 0.76 * (i / max(len(sweeps) - 1, 1)))
+             for i in range(len(sweeps))]
+
+  for ax, budget in zip(flat, budgets):
+    for sweep, group, colour in zip(sweeps, grouped, colours):
+      points = sorted(group.get(budget, []), key=lambda p: p['temperature'])
+      if not points:
+        continue
+      x = [p['entropy'] for p in points]
+      y = [p['gen_ppl'] for p in points]
+      xerr = [p.get('entropy_std', 0.0) or 0.0 for p in points]
+      yerr = [p.get('gen_ppl_std', 0.0) or 0.0 for p in points]
+      style = dict(marker='o', markersize=4, linewidth=1.7, color=colour,
+                   label=sweep.get('short') or sweep.get('label'), zorder=3)
+      if any(xerr) or any(yerr):
+        ax.errorbar(x, y, xerr=xerr, yerr=_log_safe_yerr(y, yerr),
+                    ecolor=colour, elinewidth=0.8, capsize=2, alpha=0.95,
+                    **style)
+      else:
+        ax.plot(x, y, **style)
+      # Only the ends: every curve walks the same temperature list in the same
+      # direction, so two labels orient the whole line, and labelling all of
+      # them would put `checkpoints x temperatures` strings in one panel.
+      _annotate_endpoints(ax, points)
+    if reference:
+      ref = sorted(reference, key=lambda p: p['steps'])
+      ax.plot([p['entropy'] for p in ref], [p['gen_ppl'] for p in ref],
+              marker='D', markersize=4, linestyle='--', color='black',
+              linewidth=1.4, label=reference_label, zorder=4)
+    ax.set_title(f'{budget} denoising steps', fontsize=10)
+    ax.set_yscale('log')
+    ax.grid(alpha=0.25, which='both', zorder=0)
+
+  for ax in flat[len(budgets):]:
+    ax.set_visible(False)
+  for ax in axes[-1]:
+    ax.set_xlabel('Sample entropy  (higher = more varied)')
+  for row in axes:
+    row[0].set_ylabel('Generative perplexity  (lower)')
+
+  # One legend for the figure, not one per panel: the series are identical
+  # across panels, so per-panel legends would repeat themselves n times and eat
+  # the space the curves need.
+  handles, labels = flat[0].get_legend_handles_labels()
+  ncol = max(min(len(labels), 4), 1)
+  legend_rows = -(-len(labels) // ncol)
+  fig.suptitle(title, fontweight='bold')
+  fig.legend(handles, labels, loc='lower center', fontsize=9, ncol=ncol,
+             frameon=False)
+  # Room reserved at the bottom for that legend; `tight_layout` alone would lay
+  # the panels over it.
+  fig.tight_layout(rect=(0, 0.03 + 0.035 * legend_rows, 1, 0.96))
+  fig.canvas.draw()
+  image = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+  plt.close(fig)
+  return image
+
+
+def _annotate_endpoints(ax, points):
+  """Label a curve's coldest and hottest marker, each pointing outwards.
+
+  Both ends share `_annotate_temperatures`' offset in the single-checkpoint
+  figure, which is fine there because the curves are far apart. Here several
+  curves crowd the same panel, so the left label is pushed left and the right
+  one right, away from the line rather than across it.
+  """
+  ends = [(points[0], -7, 'right')]
+  if len(points) > 1:
+    ends.append((points[-1], 7, 'left'))
+  for point, dx, align in ends:
+    ax.annotate(f"T={point['temperature']:g}",
+                (point['entropy'], point['gen_ppl']),
+                textcoords='offset points', xytext=(dx, -3), ha=align,
+                fontsize=7.5, color='0.35')
 
 
 def _annotate_temperatures(ax, points):
