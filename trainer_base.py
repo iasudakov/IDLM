@@ -108,6 +108,8 @@ class TrainerBase(L.LightningModule):
     self.num_tokens = self.config.model.length
     self.softplus = torch.nn.Softplus()
     self.p_nucleus = self.config.sampling.p_nucleus
+    self.sampling_temperature = float(
+      self.config.sampling.get('temperature', 1.0) or 1.0)
     # Noise Schedule
     self.noise = LogLinear()
 
@@ -166,6 +168,24 @@ class TrainerBase(L.LightningModule):
       self.ema.restore(self._get_parameters())
     self.backbone.train()
     self.noise.train()
+
+  def _apply_checkpoint_ema_to_backbone_state(self, state_dict, checkpoint):
+    """Overwrite the raw backbone weights in `state_dict` with the EMA ones.
+
+    A checkpoint carries both: `state_dict` holds the live parameters and
+    `ema.shadow_params` a parallel list in `backbone.named_parameters()` order.
+    Every number a run reports is measured on the EMA copy (`_eval_mode`
+    swaps it in), so an eval that reads `state_dict` alone quietly scores a
+    different model from the one the curves describe.
+    """
+    ema_state = checkpoint.get('ema', None)
+    if not (ema_state and 'shadow_params' in ema_state):
+      return
+    for (name, _), shadow in zip(
+        self.backbone.named_parameters(), ema_state['shadow_params']):
+      key = f'backbone.{name}'
+      if key in state_dict:
+        state_dict[key] = shadow.detach().clone().to(state_dict[key].dtype)
 
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
@@ -258,6 +278,25 @@ class TrainerBase(L.LightningModule):
     super().optimizer_step(*args, **kwargs)
     if self.ema:
       self.ema.update(self._get_parameters())
+
+  def _temper(self, log_p_x0):
+    """Sharpen or flatten the denoiser's x0 prediction.
+
+    Takes and returns LOG-probabilities, renormalised, so callers can keep
+    treating the result as `p(x0 | x_t)`. At temperature 1 the tensor is handed
+    straight back: the published sampler must stay bit-identical when the knob
+    is untouched.
+
+    Safe on the absorbing parameterisation's hard rows. `MDLM
+    ._process_model_output` pins already-unmasked positions to `0` for the
+    observed token and `neg_infinity` elsewhere; dividing that by any
+    temperature in a sane range leaves it one-hot after renormalisation, so a
+    committed token cannot be un-committed by tempering. The same holds for the
+    mask token's suppressed column.
+    """
+    if self.sampling_temperature == 1.0:
+      return log_p_x0
+    return (log_p_x0 / self.sampling_temperature).log_softmax(dim=-1)
 
   def _process_sigma(self, sigma):
     raise NotImplementedError
@@ -984,8 +1023,8 @@ class AbsorbingState(Diffusion):
       _, alpha_s = self.noise(t - dt)
     assert alpha_t.ndim == 2
     if p_x0 is None:
-      p_x0 = self.forward(
-        x, self._sigma_from_alphat(alpha_t)).exp()
+      p_x0 = self._temper(self.forward(
+        x, self._sigma_from_alphat(alpha_t))).exp()
     
     q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
     q_xs[:, :, self.mask_index] = 1 - alpha_s

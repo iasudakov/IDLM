@@ -19,6 +19,7 @@ Kept out of `trainer_base` so that module needs no matplotlib import, and pure
 (history in, pixels out) so it can be tested without a GPU or a tracker.
 """
 
+import collections
 import json
 import os
 
@@ -28,7 +29,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 
-def load_reference(path):
+def load_reference(path, reference_temperature=1.0):
   """Read a reference frontier, or None if there is not one to draw.
 
   A missing file is not an error -- the reference is optional garnish, and a run
@@ -42,7 +43,29 @@ def load_reference(path):
   except Exception as e:  # pragma: no cover - best-effort garnish
     print(f'[owt-pareto] reference unreadable ({e})', flush=True)
     return None
+  if isinstance(data, dict) and 'curves' in data:
+    return _curve_at_temperature(data['curves'], reference_temperature)
   return data.get('points', data) if isinstance(data, dict) else data
+
+
+def _curve_at_temperature(curves, temperature):
+  """Pick one temperature's frontier out of a `pareto_temperature.json`.
+
+  A temperature sweep has no single frontier, so drawing one underneath another
+  run means choosing which sampler to compare against. T=1 -- the untouched
+  sampler -- is the honest default: it is what the checkpoint would be reported
+  at, and comparing a student's whole temperature fan against a teacher already
+  sharpened to T=0.7 would flatter the teacher for free.
+  """
+  keyed = {}
+  for key, points in (curves or {}).items():
+    try:
+      keyed[float(key)] = points
+    except (TypeError, ValueError):
+      continue
+  if not keyed:
+    return None
+  return keyed[min(keyed, key=lambda t: abs(t - temperature))]
 
 
 def render(history, reference=None, reference_label='Teacher (mdlm-owt)',
@@ -128,3 +151,108 @@ def _annotate_steps(ax, points):
                 (point['entropy'], point['gen_ppl']),
                 textcoords='offset points', xytext=(6, -3),
                 fontsize=8, color='0.35')
+
+
+def render_temperature(curves, reference=None,
+                       reference_label='Teacher (mdlm-owt)',
+                       title='Fluency vs diversity: temperature at each step budget',
+                       subtitle=None):
+  """Draw one frontier per step budget, with temperature walking along it.
+
+  Grouped by BUDGET, not by temperature, because the budget is the thing you
+  are actually choosing between: given 8 steps, temperature is the dial you
+  still have, and the question is what the whole reachable frontier looks like
+  at that price. A curve per temperature would answer the mirror question and
+  put the interesting comparison -- 8 steps against 32 -- between the lines
+  rather than along them.
+
+  Each marker is labelled with the temperature that produced it, so a vertical
+  read at fixed entropy gives what the extra compute buys, and a horizontal
+  read at fixed perplexity gives how much sharpening substitutes for it.
+
+  Axes are deliberately the same as `render` -- entropy right, perplexity down,
+  log y -- so a temperature figure and a training figure can be laid side by
+  side without re-reading the axes.
+
+  Args:
+    curves: {temperature: [{'steps', 'entropy', 'gen_ppl', ...}, ...]}, i.e.
+      exactly what `pareto_temperature.sweep` returns. Regrouped internally.
+    reference: optional frontier in the same point format, drawn dashed black.
+    reference_label: legend entry for it.
+    title: figure title.
+    subtitle: small line under the title, e.g. which checkpoint this is.
+
+  Returns:
+    (H, W, 3) uint8 array, what `UnderdeepLogger.log_image` takes.
+  """
+  if not curves:
+    raise ValueError('nothing to plot: no temperature curves')
+
+  # A sweep straight out of `sweep()` is float-keyed; one read back from its
+  # own JSON is string-keyed, and `'1'` is not `str(1.0)`.
+  by_budget = collections.defaultdict(list)
+  for key, points in curves.items():
+    for point in points:
+      by_budget[int(point['steps'])].append(dict(point, temperature=float(key)))
+  budgets = sorted(by_budget)
+
+  fig, ax = plt.subplots(figsize=(8.5, 6), dpi=110)
+  # Sequential, dark-to-light with the budget: more compute reads as further
+  # along one axis, which is what a budget is. (`render` uses the same family
+  # for the training-step colourbar.)
+  cmap = plt.get_cmap('viridis')
+  positions = ({b: i / max(len(budgets) - 1, 1)
+                for i, b in enumerate(budgets)})
+
+  for budget in budgets:
+    points = sorted(by_budget[budget], key=lambda p: p['temperature'])
+    x = [p['entropy'] for p in points]
+    y = [p['gen_ppl'] for p in points]
+    xerr = [p.get('entropy_std', 0.0) or 0.0 for p in points]
+    yerr = [p.get('gen_ppl_std', 0.0) or 0.0 for p in points]
+    colour = cmap(0.15 + 0.7 * positions[budget])
+    style = dict(marker='o', markersize=4.5, linewidth=1.8, color=colour,
+                 label=f'{budget} steps', zorder=3)
+    if any(xerr) or any(yerr):
+      ax.errorbar(x, y, xerr=xerr, yerr=yerr, ecolor=colour, elinewidth=0.9,
+                  capsize=2, alpha=0.95, **style)
+    else:
+      ax.plot(x, y, **style)
+    _annotate_temperatures(ax, points)
+
+  if reference:
+    points = sorted(reference, key=lambda p: p['steps'])
+    ax.plot([p['entropy'] for p in points],
+            [p['gen_ppl'] for p in points],
+            marker='D', markersize=5, linestyle='--', color='black',
+            linewidth=1.6, label=reference_label, zorder=4)
+    _annotate_steps(ax, points)
+
+  ax.set_xlabel('Sample entropy  (higher = more varied)')
+  ax.set_ylabel('Generative perplexity  (lower = more fluent)')
+  # `pad` leaves the subtitle a line of its own; without it the two overlap.
+  ax.set_title(title, fontweight='bold', pad=20 if subtitle else 6)
+  if subtitle:
+    # Under the title rather than in the legend: it names the checkpoint, which
+    # is context for the whole figure, not one more series to compare.
+    ax.text(0.5, 1.005, subtitle, transform=ax.transAxes, ha='center',
+            va='bottom', fontsize=8.5, color='0.35')
+  ax.set_yscale('log')
+  ax.grid(alpha=0.25, which='both', zorder=0)
+  ax.legend(loc='best', fontsize=9, title='Denoising budget',
+            title_fontsize=9)
+
+  fig.tight_layout()
+  fig.canvas.draw()
+  image = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+  plt.close(fig)
+  return image
+
+
+def _annotate_temperatures(ax, points):
+  """Label each marker with the sampling temperature that produced it."""
+  for point in points:
+    ax.annotate(f"T={point['temperature']:g}",
+                (point['entropy'], point['gen_ppl']),
+                textcoords='offset points', xytext=(6, -3),
+                fontsize=7.5, color='0.35')

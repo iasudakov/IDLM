@@ -164,6 +164,17 @@ loader:
 sampling:
   predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic
   steps: 1000
+  # Softmax temperature on the denoiser's x0 prediction, applied inside the
+  # ancestral update before the posterior is formed. 1.0 is exactly the
+  # published sampler -- the tempering is skipped outright, not computed with a
+  # scale of one -- so this defaults to a no-op.
+  #
+  # Deliberately NOT applied to the posterior `q(x_s | x_t)`. That distribution
+  # mixes the model's belief with the schedule's "stay masked" mass `1 - alpha_s`,
+  # and tempering the mixture would rescale the unmasking rate too, i.e. quietly
+  # change how many tokens each step commits. Tempering `p(x0 | x_t)` changes
+  # only what the model believes, leaving the schedule intact.
+  temperature: 1.0
   noise_removal: ancestral  # 'ancestral', 'greedy', 'none'
   use_float64: True
   p_nucleus: 1.0
@@ -263,6 +274,29 @@ eval:
   # Optional JSON frontier drawn as a fixed dashed baseline, in the same point
   # format ({steps, entropy, gen_ppl}). Missing file simply omits it.
   owt_pareto_reference: null
+
+  # --- Temperature sweep (`mode=pareto_eval`) --------------------------------
+  # One finished checkpoint, swept over sampling temperatures instead of over
+  # training steps: each temperature draws its own (entropy, gen_ppl) frontier
+  # across `owt_pareto_steps`, and the figure puts them on one axes.
+  #
+  # Where the training-time sweep asks "is this run's frontier moving the right
+  # way", this asks the question you can only ask once training is done: at a
+  # fixed step budget, what does trading the sampler's sharpness buy. Low
+  # temperature sharpens `p(x0|x_t)` -- more fluent, less varied, down and to the
+  # LEFT; high temperature the other way. A student that beats its teacher only
+  # by being sharper is visible here as a curve that sits on the teacher's own
+  # temperature line rather than below it.
+  #
+  # Budgets, seeds and batches come from the `owt_pareto_*` knobs above, so a
+  # sweep is configured the same way in both places.
+  pareto_temperatures: [0.7, 0.8, 0.9, 1.0, 2.0]
+  # The trained student to evaluate: a Lightning `.ckpt` written by training.
+  # `eval.checkpoint_path` stays what it is during training -- the HF id the
+  # `hf_dit` backbone is BUILT from -- and this supplies the trained weights on
+  # top of it. Empty evaluates whatever `checkpoint_path` alone produces, i.e.
+  # the teacher, which is how you measure the baseline curve.
+  student_ckpt_path: ''
 
 optim:
   weight_decay: 0

@@ -1,3 +1,4 @@
+import collections
 import json
 import os
 
@@ -12,6 +13,8 @@ import torch
 import algo
 import dataloader
 import nirvana_snapshot
+import owt_pareto_plot
+import pareto_temperature
 import utils
 from ipdb import set_trace as debug
 
@@ -231,6 +234,135 @@ def _generate_samples(diffusion_model, config, logger,
                'generated_seqs': all_samples}, f, indent=4)
   print('Samples saved at:', samples_path)
 
+
+def _load_student_weights(model, config, logger):
+  """Put a trained student's weights into a model built from the HF teacher.
+
+  `algo.backbone=hf_dit` builds the architecture from `eval.checkpoint_path` --
+  an HF hub id -- so that path cannot also carry the trained student. This
+  loads the Lightning `.ckpt` written by training on top of it.
+
+  Which weights: the EMA ones by default, because those are what every number
+  the run reported was measured on. A checkpoint stores BOTH -- `state_dict`
+  holds the raw live parameters, `ema` holds the shadow copy -- and reading
+  `state_dict` alone silently evaluates a different model from the one the
+  training curves describe. `eval.disable_ema=True` asks for the raw weights.
+
+  Returns a short label naming what was loaded, for the figure and the JSON.
+  """
+  path = config.eval.get('student_ckpt_path', '') or ''
+  if not path:
+    logger.info('No eval.student_ckpt_path: evaluating '
+                f'{config.eval.checkpoint_path} as built.')
+    return f'{config.eval.checkpoint_path} (no student ckpt)'
+  assert utils.fsspec_exists(path), f'no such checkpoint: {path}'
+  # Training wrote these on a newer `tokenizers` than this env pins, and every
+  # checkpoint embeds a pickled tokenizer under `hyper_parameters`.
+  with utils.tolerant_checkpoint_load():
+    checkpoint = torch.load(path, map_location='cpu')
+  state_dict = collections.OrderedDict(
+    (k, v) for k, v in checkpoint['state_dict'].items()
+    # A distillation checkpoint carries the frozen teacher and the fake critic
+    # alongside the student; only the student is being evaluated.
+    if not k.startswith(('teacher.', 'fake_model.')))
+  use_ema = not config.eval.disable_ema and 'ema' in checkpoint
+  if use_ema:
+    model._apply_checkpoint_ema_to_backbone_state(state_dict, checkpoint)
+  missing, unexpected = model.load_state_dict(state_dict, strict=False)
+  if missing:
+    logger.warning(f'{len(missing)} missing keys, first: {missing[:3]}')
+  if unexpected:
+    logger.warning(f'{len(unexpected)} unexpected keys, '
+                   f'first: {unexpected[:3]}')
+  # `_eval_mode` would otherwise copy this freshly-built model's own shadow
+  # params over the weights just loaded. The EMA choice is already baked in
+  # above, so take that path out of the picture entirely.
+  model.ema = None
+  step = checkpoint.get('global_step', '?')
+  which = 'ema' if use_ema else 'raw'
+  logger.info(f'Loaded {which} weights from {path} (global_step={step}).')
+  return f'{os.path.basename(path)} @ step {step} ({which})'
+
+
+def _init_distributed():
+  """Join the torchrun process group, if this process was launched by one.
+
+  `mode=pareto_eval` runs no Lightning trainer -- the sweep is a plain loop --
+  so nothing else would set this up. All distribution has to buy here is that
+  the ranks split the samples and the metrics all-reduce; there is no gradient
+  and so no need for DDP to wrap the model.
+
+  Returns `(rank, world_size, local_rank)`, and `(0, 1, 0)` for an ordinary
+  single-process run.
+  """
+  world_size = int(os.environ.get('WORLD_SIZE', 1))
+  if world_size <= 1:
+    return 0, 1, 0
+  local_rank = int(os.environ.get('LOCAL_RANK', 0))
+  torch.cuda.set_device(local_rank)
+  if not torch.distributed.is_initialized():
+    torch.distributed.init_process_group(backend='nccl')
+  return torch.distributed.get_rank(), world_size, local_rank
+
+
+def _pareto_eval(diffusion_model, config, logger, tokenizer):
+  """Sweep a checkpoint over sampling temperatures and step budgets."""
+  rank, world_size, local_rank = _init_distributed()
+  if rank == 0:
+    logger.info('Starting temperature Pareto eval.'
+                + (f' Sharded over {world_size} ranks.'
+                   if world_size > 1 else ''))
+  temperatures = config.eval.get('pareto_temperatures', None)
+  budgets = config.eval.get('owt_pareto_steps', None)
+  assert temperatures, 'set eval.pareto_temperatures, e.g. [0.7,1.0,2.0]'
+  assert budgets, 'set eval.owt_pareto_steps, e.g. [8,16,32]'
+
+  model = _load_from_checkpoint(
+    diffusion_model=diffusion_model, config=config, tokenizer=tokenizer)
+  label = _load_student_weights(model, config, logger)
+  model = model.to(f'cuda:{local_rank}')
+  model.eval()
+
+  # One tracker run, not one per rank: `logger.force_new_run=true` would
+  # otherwise open `world_size` runs and scatter the sweep across all of them.
+  tracker = None
+  if rank == 0:
+    tracker = hydra.utils.instantiate(config.logger)
+    try:
+      tracker.log_hyperparams({
+        'eval/temperatures': str(list(temperatures)),
+        'eval/steps': str(list(budgets)),
+        'eval/checkpoint': label,
+        'eval/world_size': world_size})
+    except Exception as e:  # pragma: no cover - tracker best-effort
+      print(f'[pareto-temp] hyperparam log failed: {e}', flush=True)
+
+  curves, samples = pareto_temperature.sweep(
+    model,
+    temperatures=temperatures,
+    budgets=budgets,
+    seeds=config.eval.get('owt_pareto_seeds', 1),
+    num_batches=(config.eval.get('owt_pareto_num_batches', 0)
+                 or config.sampling.num_sample_batches),
+    batch_size=config.loader.eval_batch_size,
+    max_length=config.model.length)
+  if world_size > 1:
+    # Hold the other ranks until rank 0 is done: tearing the group down while a
+    # collective is outstanding is what turns a finished sweep into a hang.
+    torch.distributed.barrier()
+  if rank == 0:
+    pareto_temperature.publish(
+      curves, samples, tracker,
+      save_dir=os.fspath(config.checkpointing.save_dir),
+      checkpoint_label=label,
+      reference=owt_pareto_plot.load_reference(
+        config.eval.get('owt_pareto_reference', None)))
+    tracker.finalize('success')
+  if world_size > 1:
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
+
+
 def _eval_ppl(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Perplexity Eval.')
 
@@ -331,7 +463,10 @@ def _train(diffusion_model, config, logger, tokenizer):
 def main(config):
   """Main entry point for training."""
   L.seed_everything(config.seed)
-  _print_config(config, resolve=True, save_cfg=True)
+  # `save_cfg` writes a file into the run dir; under torchrun every rank shares
+  # that dir, so let one of them write it rather than eight racing on it.
+  if int(os.environ.get('RANK', 0)) == 0:
+    _print_config(config, resolve=True, save_cfg=True)
   
   logger = utils.get_logger(__name__)
   tokenizer = dataloader.get_tokenizer(config)
@@ -362,6 +497,8 @@ def main(config):
     _generate_samples(**kwargs)
   elif config.mode == 'ppl_eval':
     _eval_ppl(**kwargs)
+  elif config.mode == 'pareto_eval':
+    _pareto_eval(**kwargs)
   else:
     _train(**kwargs)
 

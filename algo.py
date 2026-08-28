@@ -938,7 +938,7 @@ class DUO_BASE(trainer_base.UniformState):
     assert alpha_t.ndim == 2
     
     q_xs = self._compute_posterior(
-      x=self.forward(x, sigma_t).exp(),
+      x=self._temper(self.forward(x, sigma_t)).exp(),
       xt=x,
       alpha_s=alpha_s,
       alpha_t=alpha_t)
@@ -1246,16 +1246,6 @@ class DUO(DUO_BASE):
     fake_loss = self.nll_per_token_with_probs(logits_fake, xt_usdm, student_probs, 
                                 alpha_t=usdm_alpha_t, dalpha_t=usdm_dalpha_t)
     return self._masked_mean(fake_loss, valid_tokens)
-
-  def _apply_checkpoint_ema_to_backbone_state(self, state_dict, checkpoint):
-    ema_state = checkpoint.get('ema', None)
-    if not (ema_state and 'shadow_params' in ema_state):
-      return
-    for (name, _), shadow in zip(
-        self.backbone.named_parameters(), ema_state['shadow_params']):
-      key = f'backbone.{name}'
-      if key in state_dict:
-        state_dict[key] = shadow.detach().clone().to(state_dict[key].dtype)
 
   def _backbone_shadow_params_from_state(self, state_dict):
     shadow_params = []
