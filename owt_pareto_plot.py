@@ -29,19 +29,16 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 
-def _log_safe_yerr(y, yerr):
-  """Asymmetric error bars that survive a log y-axis.
+def _nonneg_yerr(y, yerr):
+  """Error bars clipped so they never reach below zero.
 
-  A symmetric bar whose lower end reaches zero or below cannot be drawn on a
-  log scale: matplotlib keeps the point but drops the axis limit to the bottom
-  of the world, which rescales the figure until every curve is a flat line at
-  the top. The downward half is therefore capped at one decade -- enough to
-  read "the spread is as large as the value" without the axis paying three
-  decades for it -- and the upward half is left untouched. Real sweeps have a
-  spread far below their mean and never reach the cap.
+  Perplexity is non-negative, so a symmetric bar wider than its own value would
+  draw the spread into a region the quantity cannot occupy and stretch the axis
+  down to make room for it. The downward half stops at zero; the upward half is
+  untouched, so the drawn extent is still the measured one wherever it can be.
   """
   yerr = [e or 0.0 for e in yerr]
-  return [[min(e, max(v, 0.0) * 0.9) for v, e in zip(y, yerr)], yerr]
+  return [[min(e, max(v, 0.0)) for v, e in zip(y, yerr)], yerr]
 
 
 def load_reference(path, reference_temperature=1.0):
@@ -122,7 +119,7 @@ def render(history, reference=None, reference_label='Teacher (mdlm-owt)',
     yerr = [p.get('gen_ppl_std', 0.0) for p in points]
     colour = cmap(norm(step / 1000))
     if any(xerr) or any(yerr):
-      ax.errorbar(x, y, xerr=xerr, yerr=_log_safe_yerr(y, yerr), marker='.',
+      ax.errorbar(x, y, xerr=xerr, yerr=_nonneg_yerr(y, yerr), marker='.',
                   linewidth=1.2, color=colour, ecolor=colour, elinewidth=0.9,
                   capsize=2, alpha=0.95, zorder=2)
     else:
@@ -143,9 +140,10 @@ def render(history, reference=None, reference_label='Teacher (mdlm-owt)',
   ax.set_xlabel('Sample entropy  (higher = more varied)')
   ax.set_ylabel('Generative perplexity  (lower = more fluent)')
   ax.set_title(title, fontweight='bold')
-  # Perplexity at 2 steps can be orders of magnitude above the 64-step value,
-  # which on a linear axis flattens the whole interesting end of the curve.
-  ax.set_yscale('log')
+  # Linear y, so a perplexity gap reads as a distance and is worth the same
+  # wherever on the axis it sits. What that costs is the low-budget end: a
+  # 2-step point can sit an order of magnitude above the 64-step one and
+  # compresses the rest of the curve against the floor.
   ax.grid(alpha=0.25, which='both', zorder=0)
 
   bar = fig.colorbar(
@@ -186,7 +184,7 @@ def render_temperature(curves, reference=None,
   read at fixed perplexity gives how much sharpening substitutes for it.
 
   Axes are deliberately the same as `render` -- entropy right, perplexity down,
-  log y -- so a temperature figure and a training figure can be laid side by
+  linear y -- so a temperature figure and a training figure can be laid side by
   side without re-reading the axes.
 
   Args:
@@ -224,7 +222,7 @@ def render_temperature(curves, reference=None,
     style = dict(marker='o', markersize=4.5, linewidth=1.8, color=colour,
                  label=f'{budget} steps', zorder=3)
     if any(xerr) or any(yerr):
-      ax.errorbar(x, y, xerr=xerr, yerr=_log_safe_yerr(y, yerr), ecolor=colour,
+      ax.errorbar(x, y, xerr=xerr, yerr=_nonneg_yerr(y, yerr), ecolor=colour,
                   elinewidth=0.9, capsize=2, alpha=0.95, **style)
     else:
       ax.plot(x, y, **style)
@@ -247,7 +245,6 @@ def render_temperature(curves, reference=None,
     # is context for the whole figure, not one more series to compare.
     ax.text(0.5, 1.005, subtitle, transform=ax.transAxes, ha='center',
             va='bottom', fontsize=8.5, color='0.35')
-  ax.set_yscale('log')
   ax.grid(alpha=0.25, which='both', zorder=0)
   ax.legend(loc='best', fontsize=9, title='Denoising budget',
             title_fontsize=9)
@@ -286,8 +283,12 @@ def render_checkpoints(sweeps, reference=None,
   checkpoint becomes the line: within a panel, every curve was drawn at the
   same price, and the one nearest the bottom-right is simply better.
 
-  Panels share both axes, so a budget's whole fan can still be compared against
-  another budget's by eye, which is what `render_temperature` was for.
+  Panels share the entropy axis but NOT the perplexity one. On a linear scale a
+  shared range would be set by the cheapest budget, whose perplexity runs
+  several times higher, and the expensive panels would flatten into a line at
+  the floor -- losing exactly the within-panel comparison the grid exists for.
+  Read across panels off the tick labels; `render_temperature` puts the budgets
+  on one axes when it is budgets that are being compared.
 
   Args:
     sweeps: `[{'short'|'label', 'curves'}, ...]`, drawn in the order given --
@@ -310,13 +311,14 @@ def render_checkpoints(sweeps, reference=None,
   ncols = min(len(budgets), 3)
   nrows = -(-len(budgets) // ncols)
   fig, axes = plt.subplots(nrows, ncols, figsize=(4.7 * ncols, 4.3 * nrows),
-                           dpi=110, sharex=True, sharey=True, squeeze=False)
+                           dpi=110, sharex=True, sharey=False, squeeze=False)
   flat = [ax for row in axes for ax in row]
   cmap = plt.get_cmap('viridis')
   colours = [cmap(0.12 + 0.76 * (i / max(len(sweeps) - 1, 1)))
              for i in range(len(sweeps))]
 
   for ax, budget in zip(flat, budgets):
+    labelled = False
     for sweep, group, colour in zip(sweeps, grouped, colours):
       points = sorted(group.get(budget, []), key=lambda p: p['temperature'])
       if not points:
@@ -328,23 +330,31 @@ def render_checkpoints(sweeps, reference=None,
       style = dict(marker='o', markersize=4, linewidth=1.7, color=colour,
                    label=sweep.get('short') or sweep.get('label'), zorder=3)
       if any(xerr) or any(yerr):
-        ax.errorbar(x, y, xerr=xerr, yerr=_log_safe_yerr(y, yerr),
+        ax.errorbar(x, y, xerr=xerr, yerr=_nonneg_yerr(y, yerr),
                     ecolor=colour, elinewidth=0.8, capsize=2, alpha=0.95,
                     **style)
       else:
         ax.plot(x, y, **style)
-      # Only the ends: every curve walks the same temperature list in the same
-      # direction, so two labels orient the whole line, and labelling all of
-      # them would put `checkpoints x temperatures` strings in one panel.
-      _annotate_endpoints(ax, points)
-    if reference:
-      ref = sorted(reference, key=lambda p: p['steps'])
-      ax.plot([p['entropy'] for p in ref], [p['gen_ppl'] for p in ref],
-              marker='D', markersize=4, linestyle='--', color='black',
-              linewidth=1.4, label=reference_label, zorder=4)
+      # Two labels, on ONE curve. Every curve here walks the same temperature
+      # list in the same direction, so a single labelled pair orients the whole
+      # panel; labelling every curve stacks its neighbours' text at the cold
+      # end, which is exactly where the checkpoints converge.
+      if not labelled:
+        _annotate_endpoints(ax, points)
+        labelled = True
+    # Only the reference's point AT THIS BUDGET. The saved frontier walks step
+    # counts, so drawing all of it in every panel would put two marks in each
+    # that were measured at a price the panel is not about.
+    here = [p for p in (reference or []) if p['steps'] == budget]
+    if here:
+      ax.plot([p['entropy'] for p in here], [p['gen_ppl'] for p in here],
+              marker='D', markersize=6, linestyle='none', color='black',
+              label=reference_label, zorder=4)
     ax.set_title(f'{budget} denoising steps', fontsize=10)
-    ax.set_yscale('log')
     ax.grid(alpha=0.25, which='both', zorder=0)
+    # Room inside the axes for the outward-pointing endpoint labels, which
+    # otherwise run off the left and right edges.
+    ax.margins(x=0.12)
 
   for ax in flat[len(budgets):]:
     ax.set_visible(False)
@@ -352,6 +362,10 @@ def render_checkpoints(sweeps, reference=None,
     ax.set_xlabel('Sample entropy  (higher = more varied)')
   for row in axes:
     row[0].set_ylabel('Generative perplexity  (lower)')
+  # Independent y scales, so every panel needs its own numbers, not just the
+  # leftmost column's.
+  for ax in flat[:len(budgets)]:
+    ax.tick_params(axis='y', labelleft=True)
 
   # One legend for the figure, not one per panel: the series are identical
   # across panels, so per-panel legends would repeat themselves n times and eat
