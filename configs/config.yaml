@@ -219,6 +219,12 @@ eval:
   # Both null (the default) is the old behaviour exactly, and neither applies
   # outside `mode=train` -- `ppl_eval` and friends validate once at step 0.
   #
+  # Mind the checkpoint monitor: `callbacks.checkpoint_monitor` watches
+  # `val/gen_ppl`, which a window stops logging outside itself, and Lightning
+  # raises the moment a monitored metric is missing. `main` refuses that
+  # combination at startup rather than mid-run; drop the callback with
+  # `'~callbacks.checkpoint_monitor'` or point it at `val/nll`.
+  #
   # Both are in `global_step`, i.e. OPTIMIZER steps -- one per global batch,
   # whatever `accumulate_grad_batches` and the device count make that. Same
   # units as `trainer.max_steps`, as the checkpoint callback's

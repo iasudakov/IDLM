@@ -123,6 +123,47 @@ class PeriodicStepCheckpoint(L.Callback):
                             reason=f'periodic step={save_step}')
 
 
+# Logged at every validation, whatever `eval.eval_step_range` says: they come
+# from the held-out NLL, which the window deliberately leaves running.
+_ALWAYS_LOGGED_VAL_METRICS = ('val/nll', 'val/bpd', 'val/ppl')
+
+
+def _check_eval_window_monitors(config, callbacks):
+  """Refuse a checkpoint monitor the eval window will starve.
+
+  `eval.eval_step_range` / `eval.eval_at_steps` skip the generative half of
+  validation outside the window, so `val/gen_ppl`, `val/sample_entropy` and
+  everything the Pareto sweeps log simply do not exist at those validations.
+  A `ModelCheckpoint` monitoring one of them then raises
+  `MisconfigurationException` at the FIRST validation outside the window --
+  a crash from a diagnostic knob, hours into a run, with a message that points
+  at the checkpoint callback rather than at the window that caused it.
+
+  Caught here instead, before a single training step is taken.
+  """
+  window = config.eval.get('eval_step_range', None)
+  at_steps = config.eval.get('eval_at_steps', None)
+  if window is None and at_steps is None:
+    return
+  offenders = []
+  for callback in callbacks:
+    if not isinstance(callback, L.pytorch.callbacks.ModelCheckpoint):
+      continue
+    monitor = getattr(callback, 'monitor', None)
+    if monitor and monitor not in _ALWAYS_LOGGED_VAL_METRICS:
+      offenders.append(monitor)
+  if not offenders:
+    return
+  which = ', '.join(f'{m!r}' for m in sorted(set(offenders)))
+  raise ValueError(
+    f'ModelCheckpoint monitors {which}, but eval.eval_step_range / '
+    'eval.eval_at_steps skip the generative evaluation outside the window, so '
+    'that metric is not logged at every validation and Lightning raises the '
+    'moment one is missed. Either drop the monitoring callback '
+    "('~callbacks.checkpoint_monitor'), point it at a metric the window never "
+    f'gates ({", ".join(_ALWAYS_LOGGED_VAL_METRICS)}), or clear the window.')
+
+
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
   if 'hf' in config.algo.backbone:
     model = diffusion_model(config, tokenizer=tokenizer).to('cuda')
@@ -522,6 +563,7 @@ def _train(diffusion_model, config, logger, tokenizer):
         snapshot_dir=snapshot_dir, snapshot=snapshot))
     if snapshot:
       callbacks.append(SnapshotSync(snapshot_dir, enabled=True))
+    _check_eval_window_monitors(config, callbacks)
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)
