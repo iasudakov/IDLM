@@ -1,3 +1,4 @@
+import collections
 import itertools
 import json
 import os
@@ -836,6 +837,60 @@ class TrainerBase(L.LightningModule):
                    'curves': self._owt_pareto_temp_history}, f, indent=2)
     except Exception as e:  # pragma: no cover
       print(f'[owt-pareto-temp] history write failed: {e}', flush=True)
+
+    # Everything below publishes the sweep as *numbers* as well as pictures.
+    # `pareto/temperature_frontier` is an image, and an image cannot answer
+    # "what was gen_ppl at T=0.9, 16 steps, at training step 3000" -- it has to
+    # be read off a pixel. The per-(budget, temperature) scalars above answer
+    # that one series at a time; these two answer it in a form that parses.
+    by_budget = collections.defaultdict(list)
+    for temperature, curve in curves.items():
+      for point in curve:
+        by_budget[int(point['steps'])].append(
+          dict(point, temperature=float(temperature)))
+
+    # The frontier itself, as scalars, exactly as `_publish_owt_pareto` logs
+    # the budget frontier: x is entropy at fixed scale (5062 means 5.062), y is
+    # gen_ppl, one series per budget per checkpoint. `self.log` cannot express
+    # it -- it always stamps the trainer's step -- so this goes through the
+    # logger's own `log_metrics`, which passes `step` straight through. Named
+    # per checkpoint because a single series cannot hold two curves: reusing
+    # one would have every validation overwrite the same handful of x values.
+    for budget, points in sorted(by_budget.items()):
+      series = f'pareto/temp_step_{self.global_step}_s{budget}'
+      for point in sorted(points, key=lambda p: p['entropy']):
+        try:
+          logger.log_metrics({series: point['gen_ppl']},
+                             step=int(round(point['entropy']
+                                            * _ENTROPY_X_SCALE)))
+        except Exception as e:  # pragma: no cover - tracker best-effort
+          print(f'[owt-pareto-temp] frontier log failed: {e}', flush=True)
+          break
+
+    # And the whole sweep as one table per validation: the exact values at
+    # full precision, including the spreads and the seed count that the scalar
+    # series drop, in a single place that a script can pull down and parse.
+    # Stable key + explicit `step`, so the tracker keeps them as one
+    # step-indexed series rather than a pile of unrelated tables.
+    if hasattr(logger, 'log_table'):
+      rows = []
+      for temperature, curve in sorted(curves.items(),
+                                       key=lambda kv: float(kv[0])):
+        for point in sorted(curve, key=lambda p: int(p['steps'])):
+          rows.append([int(self.global_step), float(temperature),
+                       int(point['steps']), float(point['entropy']),
+                       float(point['gen_ppl']),
+                       float(point.get('entropy_std', 0.0)),
+                       float(point.get('gen_ppl_std', 0.0)),
+                       int(point.get('seeds', 1))])
+      try:
+        logger.log_table(
+          key='pareto/temperature_values',
+          columns=['train_step', 'temperature', 'steps', 'entropy',
+                   'gen_ppl', 'entropy_std', 'gen_ppl_std', 'seeds'],
+          data=rows, step=self.global_step)
+      except Exception as e:  # pragma: no cover - tracker best-effort
+        print(f'[owt-pareto-temp] value table failed: {e}', flush=True)
 
     if not hasattr(logger, 'log_image'):
       return
