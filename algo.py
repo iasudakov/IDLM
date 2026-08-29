@@ -508,10 +508,19 @@ class MDLM(trainer_base.AbsorbingState):
               self.config.optim.beta2),
         eps=self.config.optim.eps,
         weight_decay=self.config.optim.weight_decay)
-      
+
+      # The critic chases a moving student, so it need not share the
+      # generator's (often tiny) learning rate -- the two-time-scale setup.
+      # `null` keeps the original IDLM behaviour of one shared `optim.lr`.
+      # It matters most with `mmd_reward_type=idlm`, where the reward IS
+      # `nll_fake - nll_teacher`: a critic that cannot keep up stays a copy of
+      # the teacher and the reward collapses to ~0 for every sample.
+      fake_lr = self.config.adversarial_distill.get('fake_lr', None)
+      if fake_lr is None:
+        fake_lr = self.config.optim.lr
       optimizer_fake = torch.optim.AdamW(
         self.fake_model.parameters(),
-        lr=self.config.optim.lr,
+        lr=float(fake_lr),
         betas=(self.config.optim.beta1,
               self.config.optim.beta2),
         eps=self.config.optim.eps,

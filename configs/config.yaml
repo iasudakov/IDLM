@@ -221,6 +221,18 @@ adversarial_distill:
 
   accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   fake_frequency: 1
+  # Learning rate for the fake critic. null => fall back to optim.lr (original
+  # IDLM: fake and student share one rate). The critic chases a moving student
+  # rather than converging to a fixed target, so it can want a larger, separate
+  # rate -- the two-time-scale setup.
+  #
+  # It matters most with `mmd_reward_type=idlm`, where the reward IS
+  # `nll_fake - nll_teacher`: a critic that cannot keep up with the student
+  # stays a copy of the teacher, the ratio collapses to ~0 for every sample,
+  # and the run is a silent null rather than a crash. Watch `mmd/reward` and
+  # `mmd/reward_spread` -- both near zero means the critic, not the generator,
+  # is the thing that is stuck.
+  fake_lr: null
   gradient_clipping_val: 1.0
 
 loader:
