@@ -345,6 +345,10 @@ class TrainerBase(L.LightningModule):
     # to be collected alongside the usual validation.
     self._gm_ref_texts = []
     self._eval_mode()
+    # Decided once per validation rather than per call: `global_step` does not
+    # move during the loop, and re-deciding would print the skip line once per
+    # validation batch.
+    self._gen_eval_active = self._generative_eval_active()
     assert self.metrics.valid_nlls.nll.mean_value == 0
     assert self.metrics.valid_nlls.nll.weight == 0
 
@@ -361,6 +365,13 @@ class TrainerBase(L.LightningModule):
     for k, v in self.metrics.valid_nlls.items():
       self.log(name=k,  value=v.compute(), on_step=False,
                on_epoch=True, sync_dist=True)
+    # The held-out NLL above is cheap and it is the loss curve, so it runs at
+    # the trainer's cadence throughout. Everything below is the expensive half
+    # -- sampling, gen_ppl, Gradient Moment, both Pareto sweeps -- and that is
+    # what `eval.eval_step_range` / `eval.eval_at_steps` gate.
+    if not getattr(self, '_gen_eval_active', True):
+      self._train_mode()
+      return
     if ((self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples):
@@ -428,6 +439,106 @@ class TrainerBase(L.LightningModule):
       print(f'[owt-pareto-temp] sweep failed, continuing: {e}', flush=True)
     self._train_mode()
 
+  def _generative_eval_active(self):
+    """Whether this validation should pay for the generative evaluation.
+
+    Sampling, generative perplexity, Gradient Moment and both Pareto sweeps
+    cost minutes per validation; the held-out NLL costs seconds. So the
+    trainer's `val_check_interval` is really two cadences fused into one, and a
+    run that wants the expensive half often has to buy it everywhere.
+
+    These two knobs separate them. When the interesting part of a run is
+    already known -- which checkpoints matter, or which stretch of training --
+    restricting the expensive half to it is what makes a dense
+    `val_check_interval` affordable: an evaluation every 50 steps inside the
+    window, and none outside it.
+
+      * `eval.eval_step_range`: `[start, end]`, inclusive, in training steps.
+        Either bound may be null for an open end.
+      * `eval.eval_at_steps`: the exact steps to evaluate at. A step only fires
+        if a validation actually lands on it, i.e. entries have to be multiples
+        of `val_check_interval / accumulate_grad_batches`; ones that are not
+        are reported once rather than silently never firing.
+
+    Both read `self.global_step`, which counts OPTIMIZER steps -- one per
+    global batch, whatever `accumulate_grad_batches` and the device count make
+    that -- so they are in the same units as `trainer.max_steps`, as
+    `ModelCheckpoint.every_n_train_steps`, and as the x-axis of every metric
+    the run logs. They are NOT in micro-batches, which is what
+    `val_check_interval` counts.
+
+    Both are null by default and both being null is the old behaviour exactly.
+    Set together they must BOTH admit the step. Never applied outside `fit`:
+    `mode=ppl_eval` and friends run one validation at step 0, and a window
+    written for a training run would silently turn them into no-ops.
+    """
+    config = self.config.eval
+    window = config.get('eval_step_range', None)
+    at_steps = config.get('eval_at_steps', None)
+    if window is None and at_steps is None:
+      return True
+    state_fn = getattr(getattr(self.trainer, 'state', None), 'fn', None)
+    if str(getattr(state_fn, 'value', state_fn)) != 'fit':
+      return True
+
+    step = int(self.global_step)
+    reason = None
+    if window is not None:
+      window = list(window)
+      assert len(window) == 2, (
+        f'eval.eval_step_range must be [start, end], got {window!r}')
+      start, end = window
+      if start is not None and step < int(start):
+        reason = f'step {step} is before eval.eval_step_range start {start}'
+      elif end is not None and step > int(end):
+        reason = f'step {step} is past eval.eval_step_range end {end}'
+    if reason is None and at_steps is not None:
+      wanted = sorted({int(s) for s in at_steps})
+      self._warn_unreachable_eval_steps(wanted)
+      if step not in wanted:
+        reason = f'step {step} is not in eval.eval_at_steps'
+    if reason is None:
+      return True
+    if self.trainer.global_rank == 0:
+      print(f'[eval-window] skipping generative eval: {reason}', flush=True)
+    return False
+
+  def _warn_unreachable_eval_steps(self, wanted):
+    """Say so, once, when an `eval.eval_at_steps` entry can never fire.
+
+    Validation only lands on some steps, so a step that is not one of them is
+    never a step this method is called at -- and the failure mode is silence,
+    which reads exactly like "the sweep is broken".
+
+    Which steps those are needs one conversion. `eval_at_steps` is in
+    `global_step`, i.e. OPTIMIZER steps -- one per global batch, the same axis
+    as `trainer.max_steps` and as every logged metric. `val_check_interval` is
+    not: Lightning compares it against `batch_idx`, which counts MICRO-batches
+    (`_should_check_val_fx`). The two coincide only at
+    `accumulate_grad_batches=1`; at 2, `val_check_interval=250` is a validation
+    every 125 optimizer steps.
+    """
+    if getattr(self, '_eval_at_steps_checked', False):
+      return
+    self._eval_at_steps_checked = True
+    interval = getattr(self.trainer, 'val_check_interval', None)
+    # A float is a fraction of an epoch, which says nothing about which steps
+    # validation lands on; only the integer form is checkable.
+    if not isinstance(interval, int) or interval <= 0:
+      return
+    accum = int(getattr(self.trainer, 'accumulate_grad_batches', 1) or 1)
+    if accum > 1 and interval % accum:
+      # Validation then lands on optimizer steps that are not evenly spaced,
+      # and guessing which would be worse than saying nothing.
+      return
+    cadence = max(1, interval // max(1, accum))
+    stranded = [s for s in wanted if s % cadence]
+    if stranded and self.trainer.global_rank == 0:
+      print(f'[eval-window] eval.eval_at_steps {stranded} are not multiples '
+            f'of the validation cadence ({cadence} optimizer steps = '
+            f'val_check_interval {interval} / accumulate_grad_batches {accum})'
+            ' and will never fire', flush=True)
+
   def _collect_gm_reference(self, batch):
     """Keep a capped sample of real validation text for Gradient Moment.
 
@@ -435,6 +546,10 @@ class TrainerBase(L.LightningModule):
     held and does nothing at all when the metric is off.
     """
     if not self.config.eval.get('owt_gm', False):
+      return
+    # The rows only feed Gradient Moment, which the window may have switched
+    # off for this validation; decoding them anyway would be pure waste.
+    if not getattr(self, '_gen_eval_active', True):
       return
     wanted = int(self.config.eval.get('gm_eval_samples', 64))
     held = getattr(self, '_gm_ref_texts', None)

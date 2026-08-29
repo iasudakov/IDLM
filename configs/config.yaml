@@ -203,6 +203,39 @@ eval:
   generate_samples: True
   generated_samples_path: ${cwd:}/samples.json
 
+  # --- Where the expensive evaluation runs -----------------------------------
+  # `trainer.val_check_interval` fuses two very different cadences: the
+  # held-out NLL, which is seconds, and the generative evaluation -- sampling,
+  # gen_ppl, entropy, Gradient Moment, both Pareto sweeps -- which is minutes.
+  # Wanting the second one often therefore means buying it across the whole
+  # run.
+  #
+  # These two split them apart. The NLL keeps running at the trainer's cadence
+  # throughout; the generative half runs only where these admit it. That is
+  # what makes a dense `val_check_interval` affordable: set it to 50 and a
+  # window of interest gets an evaluation every 50 steps while the rest of the
+  # run pays for none.
+  #
+  # Both null (the default) is the old behaviour exactly, and neither applies
+  # outside `mode=train` -- `ppl_eval` and friends validate once at step 0.
+  #
+  # Both are in `global_step`, i.e. OPTIMIZER steps -- one per global batch,
+  # whatever `accumulate_grad_batches` and the device count make that. Same
+  # units as `trainer.max_steps`, as the checkpoint callback's
+  # `every_n_train_steps`, and as the x-axis of every metric the run logs.
+  # NOT micro-batches, which is the unit `trainer.val_check_interval` counts.
+  #
+  # Inclusive `[start, end]`; either bound may be null for an open end, so
+  # `[3000, null]` reads as "everything from step 3000 on".
+  eval_step_range: null           # e.g. [1000, 2000]
+  # Or name the steps outright, when the checkpoints of interest are already
+  # known. A step only fires if a validation lands on it, and validation lands
+  # every `val_check_interval / accumulate_grad_batches` optimizer steps -- so
+  # entries must be multiples of that. Ones that are not are reported at the
+  # first validation rather than silently never firing. Set together with
+  # `eval_step_range`, both have to admit the step.
+  eval_at_steps: null             # e.g. [1000, 2000, 4000]
+
   # --- Gradient Moment (arXiv:2603.20155) -----------------------------------
   # `||E_samples[grad L] - E_data[grad L]||^2` under the `gen_ppl` reference LM:
   # how far the gradient our samples give it sits from the gradient real text
