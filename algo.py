@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 import metrics
+import mmd_reward
 import trainer_base
 import utils
 import hydra.utils
@@ -684,6 +685,26 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       self._entropy_bonus_sum = None
       self._entropy_bonus_count = 0
       self._last_entropy_bonus = 0.0
+      # --- paired MMD feature reward (see `_mmd_term`) --------------------- #
+      # Weight on the D-MMD/IDLM `(teacher - fake)` term. At 0 those forwards
+      # are SKIPPED rather than multiplied by zero, so an MMD-only run does not
+      # pay for critics it ignores.
+      self.dmd_weight = float(getattr(
+        self.config.adversarial_distill, 'dmd_weight', 1.0) or 0.0)
+      self.mmd_reward_weight = float(getattr(
+        self.config.adversarial_distill, 'mmd_reward_weight', 0.0) or 0.0)
+      assert self.dmd_weight or self.mmd_reward_weight, (
+        'adversarial_distill.dmd_weight and .mmd_reward_weight are both 0, so '
+        'the generator objective is empty and the student would never move.')
+      # Built lazily on first use: at 0 weight the teacher is never hooked and
+      # nothing is resolved, so turning the reward off costs exactly nothing.
+      self._mmd_critic_cached = None
+      # `(student_probs, student_xt)` recorded by whichever generator-loss
+      # branch ran, consumed by `generator_loss`. Same side-channel shape as
+      # `_entropy_term_sum` above -- the sub-losses already compute both, and
+      # recomputing them would mean a second student forward per step.
+      self._mmd_probs = None
+      self._mmd_xt = None
       # Weight of the auxiliary->teacher regularizer in the fake loss (D-MMD
       # Eq. 12). 0 => original fake loss (hard NLL on student samples only).
       self.fake_teacher_weight = getattr(
@@ -1261,6 +1282,96 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       loss = loss * dalpha_t / (1 - alpha_t)
     return self._reduce_positions(loss, valid_tokens, loss_mask)
 
+  @property
+  def _mmd_critic(self):
+    """The frozen teacher, read as a fixed feature map. Built on first use.
+
+    `critic_type='diffusion'` is required, and not incidentally: that is the
+    only configuration in which `self.teacher` IS the frozen diffusion model the
+    student is distilled from (a deepcopy of the pretrained backbone, taken
+    before the noise wrapper). Under `critic_type='ar'` the same attribute holds
+    a causal DiT over pixels, whose features mean something else entirely.
+    """
+    if self._mmd_critic_cached is not None:
+      return self._mmd_critic_cached
+    cfg = self.config.adversarial_distill
+    assert self.critic_type == 'diffusion', (
+      'adversarial_distill.mmd_reward_weight needs critic_type=diffusion: the '
+      'feature map is the frozen diffusion teacher, and under critic_type=ar '
+      '`self.teacher` is a causal DiT instead.')
+    kernel = str(cfg.get('mmd_kernel', 'linear'))
+    assert kernel in ('linear', 'rbf'), (
+      f'adversarial_distill.mmd_kernel must be linear|rbf, got {kernel!r}')
+    rows_of = int(cfg.get('mmd_kernel_batch_size', 1) or 1)
+    critic = mmd_reward.FrozenBackboneFeatures(
+      self.teacher, self.mask_index,
+      layer_index=cfg.get('mmd_feature_layer', None),
+      layer_weights=cfg.get('mmd_feature_layer_weights', None),
+      noise_level=float(cfg.get('mmd_noise_level', 0.0) or 0.0))
+    critic.kernel = kernel
+    critic.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
+    critic.rbf_block_size = int(cfg.get('mmd_rbf_block_size', 0) or 0)
+    critic.kernel_batch_size = rows_of
+    print(f'[mmd] feature map: frozen diffusion teacher, block '
+          f'{critic.layer_description}, kernel={kernel}, rows_of={rows_of}, '
+          f'noise_level={critic.noise_level:g}, '
+          f'weight={self.mmd_reward_weight:g}', flush=True)
+    self._mmd_critic_cached = critic
+    return critic
+
+  def _mmd_content_mask(self, x0, valid_tokens):
+    """Which positions are eligible to be scored at all.
+
+    On unconditional CIFAR-10 `valid_tokens` is always None (see
+    `_conditional_valid_tokens`), so every position is content and this is
+    all-ones. The prompt/padding bookkeeping the text branches need has no
+    analogue here -- `RawPixelsVisionTokenizer` has no pad, bos or eos.
+    """
+    if valid_tokens is None:
+      return torch.ones_like(x0, dtype=torch.bool)
+    return valid_tokens.bool()
+
+  def _record_mmd_draw(self, student_probs, student_xt):
+    """Hand `generator_loss` the student draw the reward is built from.
+
+    A no-op unless the reward is on, so nothing is retained on a plain D-MMD
+    run. Keeps the FIRST draw when `generator_num_noised_samples > 1`: the
+    critic terms average over those draws, but the reward is a single REINFORCE
+    estimate and averaging its surrogate over redrawn latents would change what
+    the group baseline is a baseline for.
+    """
+    if not self.mmd_reward_weight or self._mmd_probs is not None:
+      return
+    self._mmd_probs = student_probs
+    self._mmd_xt = student_xt
+
+  def _mmd_term(self, x0, valid_tokens, student_probs, xt):
+    """REINFORCE term rewarding the student for matching `x0`'s features.
+
+    `selected` is the positions the student actually wrote -- the ones masked in
+    the latent it was conditioned on. Those are the only positions whose
+    log-probability the surrogate sums, and the only evidence of whether a row
+    did anything at all.
+
+    Always logs, on every rank, even when there is nothing to score. The
+    `log_dict` key set has to be identical across ranks or Lightning deadlocks
+    under DDP, and an early return here would be exactly the kind of thing that
+    fires on one rank and not another.
+    """
+    selected = (xt == self.mask_index) & self._mmd_content_mask(x0, valid_tokens)
+    if not bool(selected.any()):
+      self.log_dict(mmd_reward.zero_stats(device=self.device),
+                    on_step=True, on_epoch=False, sync_dist=True)
+      return student_probs.new_zeros(())
+    cfg = self.config.adversarial_distill
+    loss, stats = mmd_reward.mmd_reinforce_loss(
+      student_probs, x0, selected, self._mmd_critic,
+      group_size=int(cfg.get('mmd_group_size', 4)),
+      reward_weight=self.mmd_reward_weight,
+      baseline=str(cfg.get('mmd_baseline', 'auto')))
+    self.log_dict(stats, on_step=True, on_epoch=False, sync_dist=True)
+    return loss
+
   def generator_loss(self, x0, valid_tokens, current_accumulation_step):
     """Generator objective, plus the optional entropy bonus.
 
@@ -1290,12 +1401,40 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     """
     self._entropy_term_sum = None
     self._entropy_term_count = 0
-    if self.critic_type == 'diffusion':
+    self._mmd_probs = None
+    self._mmd_xt = None
+    if not self.dmd_weight:
+      # MMD-only: the critic terms are skipped outright rather than scaled by
+      # zero, so neither the teacher nor the fake is ever forwarded. The student
+      # draw still has to happen, since the reward is built from it.
+      student_probs, student_xt = self.multistep_generation(
+        x0, valid_tokens, current_accumulation_step, return_xt=True)
+      loss_mask = self._confidence_loss_mask_for(
+        student_probs, student_xt, valid_tokens, is_generator=True)
+      self._record_student_entropy(student_probs, student_xt, valid_tokens,
+                                   loss_mask)
+      loss = self._mmd_term(x0, valid_tokens, student_probs, student_xt)
+    elif self.critic_type == 'diffusion':
       loss = self._generator_loss_diffusion(
         x0, valid_tokens, current_accumulation_step)
     else:
       loss = self._generator_loss_ar(
         x0, valid_tokens, current_accumulation_step)
+    if self.dmd_weight and self.dmd_weight != 1.0:
+      loss = self.dmd_weight * loss
+    if self.dmd_weight and self.mmd_reward_weight:
+      # The critic terms and the reward are scored at different noise levels
+      # within one step: the sub-loss draws its own critic latent, while this
+      # reads the latent the STUDENT was conditioned on. That is deliberate --
+      # the reward is about what the student wrote, which only `student_xt`
+      # identifies.
+      assert self._mmd_probs is not None, (
+        'the generator branch did not record its student draw, so the MMD '
+        'reward has nothing to score')
+      loss = loss + self._mmd_term(
+        x0, valid_tokens, self._mmd_probs, self._mmd_xt)
+    self._mmd_probs = None
+    self._mmd_xt = None
     if self.entropy_weight != 0.0 and self._entropy_term_count:
       # Mean over the `generator_num_noised_samples` draws, matching how the
       # critic terms are averaged over them.
@@ -1321,6 +1460,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       student_probs, student_xt, valid_tokens, is_generator=True)
     self._record_student_entropy(
       student_probs, student_xt, valid_tokens, loss_mask)
+    self._record_mmd_draw(student_probs, student_xt)
 
     # Discrete sequence fed as context to the AR critics (non-differentiable).
     x_gen = trainer_base.sample_categorical(student_probs.detach())
@@ -1350,6 +1490,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       student_probs, student_xt, valid_tokens, is_generator=True)
     self._record_student_entropy(
       student_probs, student_xt, valid_tokens, loss_mask)
+    self._record_mmd_draw(student_probs, student_xt)
 
     num_noised_samples = getattr(self.config.adversarial_distill, 'generator_num_noised_samples', 1)
 
@@ -2190,6 +2331,7 @@ class MDLM_DMMD(MDLM_with_AR):
         student_probs, student_xt, valid_tokens, is_generator=True)
       self._record_student_entropy(
         student_probs, student_xt, valid_tokens, loss_mask)
+      self._record_mmd_draw(student_probs, student_xt)
       sigma = self._sigma_from_alphat(alpha)
       sigma = self._process_sigma(sigma)
 
@@ -2266,6 +2408,7 @@ class MDLM_DMMD(MDLM_with_AR):
       student_probs, student_xt, valid_tokens, is_generator=True)
     self._record_student_entropy(
       student_probs, student_xt, valid_tokens, loss_mask)
+    self._record_mmd_draw(student_probs, student_xt)
 
     x_gen = trainer_base.sample_categorical(student_probs.detach())
     x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)

@@ -109,6 +109,95 @@ adversarial_distill:
   # entirely (not created, no fake steps) and trains the generator with only the
   # teacher term, i.e. generator loss = teacher_loss (no min-max).
   use_fake: True
+
+  # --- paired MMD feature reward (ported from the `owt_mmd` branch) -------- #
+  # The generator objective is
+  #     dmd_weight * (teacher_loss - fake_loss)  +  REINFORCE(mmd reward)
+  # where the reward is a PAIRED feature distance: each generated sample's
+  # pooled features from the frozen diffusion teacher, against the features of
+  # ITS OWN clean row `x0`. Gradient reaches the student only through
+  # `log p(sampled token)` -- a score estimator, so the feature map never needs
+  # to be differentiable.
+  #
+  # Weight on the D-MMD/IDLM critic term. At 0 the teacher and fake forwards are
+  # SKIPPED, not multiplied by zero, so an MMD-only run costs one student draw
+  # plus the feature forwards and nothing else. Pair it with `use_fake: False`
+  # so no fake optimizer is built either.
+  dmd_weight: 1.0
+  # Weight on the REINFORCE term. 0 (the default) is a plain D-MMD run: the
+  # feature map is never resolved and the teacher is never hooked.
+  #
+  # DOES NOT TRANSFER from an OWT recipe. Two things move the scale: this branch
+  # reduces the critic terms with `loss_reduction: sum` over all 3072 positions
+  # while the reward is normalised by the generated-token count (a mean), and
+  # `PSEUDO_HUBER_C` was tuned against transformer hidden states an order of
+  # magnitude smaller than UNet ResBlock outputs. Calibrate against
+  # `grad_norm_student` before trusting a value.
+  mmd_reward_weight: 0.0
+  # Which block of the frozen teacher is read. `null` = the bottleneck
+  # (`middle_modules[-1]` on a UNet, the middle block on a DiT). A list asks for
+  # a summed reward, one term per block; the terms are not on a common scale, so
+  # pass `mmd_feature_layer_weights` alongside.
+  mmd_feature_layer: null
+  mmd_feature_layer_weights: null
+  # Fraction of the scored positions masked in BOTH rows before the teacher
+  # reads them. Keep at 0.0 on CIFAR-10. `[MASK]` is not an out-of-band symbol
+  # here -- `UNet._center_data` maps id 256 to +0.992 on a [-1,1] scale, a
+  # near-white pixel -- so masking paints correlated white speckle into both
+  # rows and that speckle, not the content, drives the features. A nonzero value
+  # additionally requires passing the matching `sigma`, or the teacher is
+  # conditioned on t=0 while reading a noised input.
+  mmd_noise_level: 0.0
+  # Hard samples drawn per state. Each costs one feature forward. At >= 2 the
+  # group's own leave-one-out mean is the baseline, which is what stops the
+  # reward's negative offset (it is a distance) from pushing down every sample.
+  mmd_group_size: 4
+  # auto | group | batch | none. `auto` = group at group_size >= 2, none at 1.
+  mmd_baseline: auto
+  # linear | rbf. `linear` pools each row to a mean and scores the difference
+  # with pseudo-Huber; `rbf` compares the two feature *distributions*.
+  #
+  # PREFER `linear` HERE. The UNet bottleneck gives 16 positions per row, where
+  # the unbiased MMD^2 estimator's null spread is the same order as the whole
+  # signal and its clamp-at-zero fires on about half of all rows -- those rows
+  # then get a negative advantage for being indistinguishable from data. `rbf`
+  # is only meaningful with `mmd_kernel_batch_size` raised and
+  # `mmd_rbf_alpha` pinned.
+  mmd_kernel: linear
+  # Bandwidth as `alpha = 1/(2 sigma^2)`. `null` uses the median heuristic, but
+  # that measures CROSS-image pairs while the estimator runs WITHIN one image;
+  # bottleneck features are largely image-identity features, so the automatic
+  # value lands too wide and the kernel saturates. Pin it when using `rbf`.
+  mmd_rbf_alpha: null
+  # Tile edge for the blocked kernel; 0 sizes it from a 256 MB scratch budget.
+  mmd_rbf_block_size: 0
+  # How many adjacent sequences share one kernel row. Must divide the PER-DEVICE
+  # `loader.batch_size`. Raising it puts N times the positions behind the
+  # statistic (N^2 the pairs), at the cost of coarsening credit assignment: all
+  # N sequences in a row then share one advantage, and content swapped between
+  # them is invisible to either kernel. At `== loader.batch_size` every row
+  # carries the same reward, which silently zeroes `mmd_baseline: batch` -- that
+  # combination is rejected rather than allowed to train on nothing.
+  mmd_kernel_batch_size: 1
+  #
+  # NOTE ON WHAT IS COMPARED. The reward compares WHOLE IMAGES, not just the
+  # regions the student wrote. The teacher is read after both the 16x16 and the
+  # middle 4x4 self-attention blocks, so every bottleneck cell is already a
+  # global function of all 3072 tokens and there is no 4x4 mask that could
+  # isolate the generated positions. The token mask still decides which rows are
+  # scored at all and which positions the surrogate sums. Genuine spatial
+  # locality would need an earlier, pre-attention read point.
+  #
+  # NOTE ON THE TARGET. `x0` is the clean row the sample is scored against, and
+  # on unconditional CIFAR-10 that is one arbitrary draw from p(x). At the
+  # median mask rate the student writes ~70% of the image, so this rewards
+  # reproducing THAT PARTICULAR image -- a per-sample regression rather than a
+  # distribution match, which works against FID. It is defensible where the
+  # unmasked context nearly determines `x0`, i.e. at low mask rates; cap the
+  # draw with `t_warmup_steps` / `t_warmup_start` above. On OpenWebText this
+  # reward collapsed the student (gen_ppl 68 -> 11.9 while val/nll rose 3.15 ->
+  # 4.16 and entropy fell 5.46 -> 4.39), so watch a diversity signal, not just
+  # `mmd/reward`.
   # Autoregressive teacher (and fake-model initialisation) for MDLM_with_AR.
   # Interpreted according to `ar_backbone`.
   ar_model_path: kuleshov-group/owt-ar
