@@ -199,6 +199,219 @@ class IdlmRatioReward:
     return reward, active
 
 
+def _embedding_std(embed_module):
+  """Per-entry std of a token-embedding module's weight matrix.
+
+  Used to calibrate the noise-conditioning init to the loaded checkpoint rather
+  than to a freshly-initialised backbone. Returns the DiT init scale (0.02) if
+  no weight can be located, so the behaviour degrades to a constant.
+  """
+  for attr in ('embedding', 'weight'):
+    w = getattr(embed_module, attr, None)
+    if isinstance(w, torch.Tensor) and w.numel() > 0:
+      return float(w.detach().float().std())
+  return 0.02
+
+
+class _NoiseConditionedBackbone(torch.nn.Module):
+  """Wraps a denoiser backbone and injects a learned projection of Gaussian
+  noise into the token-embedding residual (D-MMD Sec. 6.5). By default the
+  noise is drawn independently per token position; with `shared_noise` a single
+  vector per sample is broadcast across all embeddings (same noise everywhere).
+
+  A masked-diffusion generator is otherwise a deterministic function of its
+  (masked) input, so a moment-matching objective can only be minimised by
+  collapsing its output distribution -- which destroys sample diversity. An
+  input noise source lets the generator stay diverse while sharpening its
+  factorised output. Fresh noise is drawn on every forward pass and added to
+  the embedding via a forward hook, so it is applied uniformly across training
+  (`multistep_generation`) and sampling (`generate_samples`).
+
+  The projection's *output* is rescaled by `embed_std / sqrt(noise_dim)`, a
+  constant measured from the *actual* embedding matrix of `embed_module` at
+  construction time. That makes the parameterization dimensionless: a unit-RMS
+  `W` injects a vector as large as the token identity, so `noise/snr ~= rms(W)`
+  and, under Adam (per-entry `|dW| ~= lr` per step), snr grows at ~`noise_lr`
+  per step whatever `noise_dim` or checkpoint is in use -- i.e. `noise_lr`
+  transfers. The constant adds no expressiveness (`c * (W z)` spans the same
+  functions as `W' z`); it fixes the units, which is what makes the *optimizer*
+  behave comparably across settings.
+
+  Calibrating to the loaded checkpoint matters when distilling: a hardcoded init
+  calibrated to a freshly-initialised DiT (`kaiming_uniform_`, per-entry std
+  ~= 0.021) is ~15x too small for `kuleshov-group/mdlm-owt`, whose trained
+  embedding has std ~= 0.309. At that scale two noise draws move the student's
+  output distribution by a total-variation distance of only ~0.09, i.e. the
+  generator is effectively noise-free and behaves like a run with `noise_dim=0`.
+  The mirror-image failure is a large init (snr ~= 10): the embedding residual
+  is then ~90% noise, the student cannot read its own masked context, and a
+  pretrained checkpoint has to spend thousands of steps just attenuating `W`
+  before distillation means anything. Hence the zero-init default -- see
+  `noise_scale` in `configs/config.yaml`.
+
+  ZERO-INIT DOES NOT GROW ON ITS OWN, and `noise_lr` cannot fix that: `W = 0` is
+  an exact saddle of *any* objective that sees only the backbone's output. The
+  gradient is `dL/dW = c * g z^T` with `g = dL/d(embed output)`; at `W = 0` the
+  output does not depend on `z`, so `g` is independent of `z` and
+  `E[dL/dW] = c E[g] E[z]^T = 0`. Only per-batch gradient *noise* moves `W`, and
+  Adam turns that into an undirected random walk: measured on mdlm-owt at
+  `noise_lr=1e-3`, snr reached 0.04 after 80k steps, versus ~`noise_lr * sqrt(T)`
+  ~= 0.28 for an unbiased walk and ~`noise_lr * T` if the drift were directed --
+  i.e. slower than chance, so the objective is weakly pulling `W` back to zero.
+  The same erosion is visible from a large start: a `noise_scale=0.5` run decays
+  monotonically to snr ~= 0.35 over 80k steps while having the *better* generative
+  perplexity. The injection magnitude is therefore a hyperparameter the objective
+  will never discover and will slowly erode, so it is scheduled rather than
+  learned:
+
+  * `warmup_steps > 0` ramps a gain `0 -> 1` over that many steps, so step 0 is
+    bit-identical to the loaded checkpoint (nothing destroyed, the reason to
+    zero-init) while `W` itself starts at the *target* rms `noise_scale`. The
+    gradient into `W` is proportional to the gain, so the saddle is left behind
+    as soon as the ramp starts instead of being waited out.
+  * `hold_rms` additionally pins `rms(W)` to `noise_scale` by normalising the
+    projection in the forward pass (weight-norm style, gradient included, so the
+    radial component is projected out rather than fought). The *direction* of the
+    projection stays learned; only its size is fixed, which stops the slow decay
+    above. Watch `noise/proj_norm` against `noise/snr` to see how hard the
+    objective is pushing against the constraint.
+  """
+
+  def __init__(self, backbone, embed_module, noise_dim, hidden_size,
+               shared_noise=False, noise_scale=1.0, warmup_steps=0,
+               hold_rms=False):
+    super().__init__()
+    self.backbone = backbone
+    self.noise_dim = noise_dim
+    # True => one Gaussian vector per sample, broadcast across every token
+    # embedding; False => an independent vector per token position.
+    self.shared_noise = shared_noise
+    self.noise_scale = noise_scale
+    self.warmup_steps = int(warmup_steps or 0)
+    self.hold_rms = bool(hold_rms)
+    assert not ((self.warmup_steps > 0 or self.hold_rms) and not noise_scale), (
+      'adversarial_distill.noise_scale is the TARGET the schedule ramps to and '
+      'holds, so it must be > 0 when noise_warmup_steps > 0 or '
+      'noise_hold_rms=True; got noise_scale=0, which schedules nothing. The '
+      'zero *start* comes from the warmup gain, not from noise_scale.')
+    # Step the ramp is evaluated at, set once per training batch by
+    # `MDLM.on_train_batch_start`. None => no training loop has claimed this
+    # module (eval-only runs), and the schedule reads as complete so a
+    # checkpoint is evaluated with the noise level it was trained with.
+    self._noise_step = None
+    self.noise_proj = torch.nn.Linear(noise_dim, hidden_size)
+    # The projection output is rescaled by a constant measured once, here, from
+    # the *actual* embedding matrix, so a unit-RMS `W` injects a vector the size
+    # of the token identity: `snr == rms(W)`. Fixed at construction (the
+    # embedding drifts during training, and recomputing it per forward would
+    # both cost a reduction over the whole matrix and feed back into itself).
+    embed_std = _embedding_std(embed_module)
+    # Non-persistent: recomputed from the embedding at every construction, so it
+    # adds no state_dict key (an old noise-conditioned checkpoint would
+    # otherwise fail Lightning's strict resume with a missing key) and it is not
+    # a parameter, so it stays out of `_student_param_groups` / weight decay.
+    self.register_buffer(
+      'noise_out_scale',
+      torch.tensor(embed_std / (noise_dim ** 0.5), dtype=torch.float32),
+      persistent=False)
+    # `noise_scale` is the initial RMS of `W`, i.e. the initial `noise/snr` --
+    # or, with `warmup_steps`/`hold_rms`, the RMS the schedule aims at, since the
+    # gain then supplies the zero start instead.
+    # 0.0 (default) => zero-init: the wrapped student starts as an exact copy of
+    # the checkpoint's function and grows its noise usage only if the objective
+    # pays for it. The gradient into `W` is `noise_out_scale * g_out z^T`, which
+    # is non-zero because `z` is, so a zero start still trains (the standard
+    # zero-init residual branch, cf. AdaLN-zero / zero-convs / LoRA `B=0`).
+    if noise_scale:
+      torch.nn.init.normal_(self.noise_proj.weight, std=noise_scale)
+    else:
+      torch.nn.init.zeros_(self.noise_proj.weight)
+    torch.nn.init.zeros_(self.noise_proj.bias)
+    self._noise = None
+    embed_module.register_forward_hook(self._add_noise)
+
+  def set_noise_step(self, step):
+    """Point the warmup ramp at `step` (the trainer's global step)."""
+    self._noise_step = int(step)
+
+  @property
+  def noise_gain(self):
+    """Multiplier on the injected vector: 0 at step 0, 1 once warmed up.
+
+    Derived from the step rather than accumulated, so a resumed run picks the
+    schedule back up where it left off and the ramp is identical on every rank
+    without any communication.
+    """
+    if self.warmup_steps <= 0 or self._noise_step is None:
+      return 1.0
+    return min(1.0, max(0.0, self._noise_step / self.warmup_steps))
+
+  def effective_weight(self):
+    """The projection actually applied, i.e. after the magnitude schedule.
+
+    `rms(effective_weight)` is the injection's `noise/snr` (see the class
+    docstring), so this is also what the diagnostics read.
+    """
+    w = self.noise_proj.weight
+    if self.hold_rms:
+      # Differentiable normalisation: the gradient through `rms` cancels the
+      # radial component, so the optimizer spends its updates on the direction
+      # instead of pushing against a constraint that silently undoes them.
+      rms = w.pow(2).mean().sqrt().clamp_min(1e-12)
+      w = w * (self.noise_scale / rms)
+    gain = self.noise_gain
+    return w if gain == 1.0 else gain * w
+
+  def _add_noise(self, module, inputs, output):
+    if self._noise is None:
+      return output
+    # Shared noise has length 1 and broadcasts over the position axis.
+    gain = self.noise_gain
+    bias = self.noise_proj.bias
+    injected = self.noise_out_scale * F.linear(
+      self._noise, self.effective_weight(),
+      bias if gain == 1.0 else gain * bias)
+    # At gain == 0 this adds an exact zero (the forward is bit-identical to the
+    # unwrapped checkpoint) but still touches `noise_proj`, so DDP does not have
+    # to be told the projection is unused for the duration of the ramp's first
+    # step.
+    return output + injected.to(output.dtype)
+
+  def forward(self, xt, sigma=None, *args, **kwargs):
+    length = 1 if self.shared_noise else xt.shape[1]
+    self._noise = torch.randn(
+      xt.shape[0], length, self.noise_dim,
+      device=xt.device, dtype=torch.float32)
+    try:
+      return self.backbone(xt, sigma, *args, **kwargs)
+    finally:
+      self._noise = None
+
+
+def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden,
+                              shared_noise=False, noise_scale=1.0,
+                              warmup_steps=0, hold_rms=False):
+  """Locate the token-embedding module of `backbone` and wrap it so a learned
+  Gaussian-noise projection is added to the embedding residual."""
+  embed_module = None
+  for name, module in backbone.named_modules():
+    if name.endswith('vocab_embed'):
+      embed_module = module
+      break
+  assert embed_module is not None, (
+    'Could not locate a `vocab_embed` module for noise conditioning.')
+  if hasattr(embed_module, 'embedding'):
+    hidden_size = embed_module.embedding.shape[-1]
+  elif hasattr(embed_module, 'embedding_dim'):
+    hidden_size = embed_module.embedding_dim
+  else:
+    hidden_size = default_hidden
+  return _NoiseConditionedBackbone(
+    backbone, embed_module, noise_dim, hidden_size,
+    shared_noise=shared_noise, noise_scale=noise_scale,
+    warmup_steps=warmup_steps, hold_rms=hold_rms)
+
+
 class MDLM(trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
@@ -208,10 +421,39 @@ class MDLM(trainer_base.AbsorbingState):
       self.automatic_optimization = False
       self.teacher = copy.deepcopy(self.backbone)
       utils.freeze_model(self.teacher)
-      
+
       self.fake_model = copy.deepcopy(self.backbone)
       utils.activate_model(self.fake_model)
+
+      # Optional generator input-noise conditioning (D-MMD Sec. 6.5): wrap the
+      # student backbone so a learned Gaussian-noise projection is injected into
+      # the embedding residual. The position in this block is load-bearing --
+      # AFTER the teacher/fake deepcopies above, so both critics stay noise-free
+      # and keep measuring the student against an unperturbed reference, and
+      # BEFORE the EMA rebuild below, so `noise_proj` is tracked and swapped in
+      # at eval like every other student parameter.
+      distill_cfg = self.config.adversarial_distill
+      noise_dim = int(distill_cfg.get('noise_dim', 0) or 0)
+      if noise_dim > 0:
+        self.backbone = _wrap_backbone_with_noise(
+          self.backbone, noise_dim, self.config.model.hidden_size,
+          shared_noise=bool(distill_cfg.get('noise_shared', False)),
+          noise_scale=float(distill_cfg.get('noise_scale', 0.0) or 0.0),
+          warmup_steps=int(distill_cfg.get('noise_warmup_steps', 0) or 0),
+          hold_rms=bool(distill_cfg.get('noise_hold_rms', False)))
+        shared = distill_cfg.get('noise_shared', False)
+        print(f'[noise] {noise_dim}-dim '
+              f"{'shared' if shared else 'per-token'} injection, "
+              f"scale={distill_cfg.get('noise_scale', 0.0)}, "
+              f"warmup={distill_cfg.get('noise_warmup_steps', 0)}, "
+              f"hold_rms={distill_cfg.get('noise_hold_rms', False)}", flush=True)
       utils.activate_model(self.backbone)
+      # Resolved lazily by `_student_embed_std`. A NAME, not the module: this is
+      # an `nn.Module`, so assigning a submodule to an attribute registers it,
+      # and the embedding would then be emitted a second time in `state_dict`
+      # under `_embed_module_cache.embedding` -- which resume rejects as an
+      # unexpected key.
+      self._embed_module_name = None
       if self.ema is not None:
         del self.ema
         self.ema = models.ema.ExponentialMovingAverage(
@@ -235,10 +477,32 @@ class MDLM(trainer_base.AbsorbingState):
       self.total_loss_fake = 0
       self.f_loss_ar = []
 
+  def _student_param_groups(self):
+    """Student optimizer parameter groups.
+
+    If the backbone is noise-conditioned and `adversarial_distill.noise_lr` is
+    set, the learned noise-projection matrix gets its own learning rate; every
+    other parameter uses `optim.lr`. Worth its own knob because the two move on
+    different scales: under the output rescaling in
+    `_NoiseConditionedBackbone`, Adam moves `noise/snr` by roughly `noise_lr`
+    per step, while the student's weights want whatever `optim.lr` the
+    distillation needs -- often several orders of magnitude apart.
+    """
+    base_lr = self.config.optim.lr
+    noise_lr = self.config.adversarial_distill.get('noise_lr', None)
+    if noise_lr is None or not hasattr(self.backbone, 'noise_proj'):
+      return [{'params': list(self.backbone.parameters()), 'lr': base_lr}]
+    noise_params = list(self.backbone.noise_proj.parameters())
+    noise_ids = {id(p) for p in noise_params}
+    other_params = [p for p in self.backbone.parameters()
+                    if id(p) not in noise_ids]
+    return [{'params': other_params, 'lr': base_lr},
+            {'params': noise_params, 'lr': float(noise_lr)}]
+
   def configure_optimizers(self):
     if self.config.adversarial_distill.is_distill:
       optimizer_student = torch.optim.AdamW(
-        self.backbone.parameters(),
+        self._student_param_groups(),
         lr=self.config.optim.lr,
         betas=(self.config.optim.beta1,
               self.config.optim.beta2),
@@ -298,14 +562,121 @@ class MDLM(trainer_base.AbsorbingState):
       else:
         utils.activate_model(self.backbone)
         utils.freeze_model(self.fake_model)
+      self._sync_noise_schedule()
     super().on_train_start()
+
+  def _sync_noise_schedule(self):
+    """Point the injection's warmup ramp at the current global step.
+
+    A no-op unless the backbone is noise-conditioned with
+    `adversarial_distill.noise_warmup_steps > 0`. Called from `on_train_start`
+    (so a sanity-check validation and the first training forward already see the
+    right gain, whether the run is fresh or resumed) and from
+    `on_train_batch_start` (so the ramp advances). Validation reuses whatever the
+    last training batch set, which is the level the student was just trained at.
+
+    `self.global_step` counts optimizer steps -- student *and* fake updates --
+    the same x-axis the `noise/*` diagnostics are logged against, so the logged
+    `noise/gain` visibly reaches 1.0 at `noise_warmup_steps` on the plot.
+    """
+    setter = getattr(self.backbone, 'set_noise_step', None)
+    if setter is not None:
+      setter(self.global_step)
+
+  def on_train_batch_start(self, batch, batch_idx):
+    if self.is_adversarial_distill:
+      self._sync_noise_schedule()
+    return super().on_train_batch_start(batch, batch_idx)
+
+  def _student_embed_std(self):
+    """Per-entry std of the (possibly noise-wrapped) student's embedding.
+
+    Re-read rather than cached as a number, because the embedding drifts during
+    training and `noise/embed_std` is the scale the injection is compared
+    against. Only the module's NAME is remembered -- caching the module itself
+    on `self` would register it as a submodule and duplicate its parameter in
+    `state_dict`.
+    """
+    if getattr(self, '_embed_module_name', None) is None:
+      inner = getattr(self.backbone, 'backbone', self.backbone)
+      for name, module in inner.named_modules():
+        if name.endswith('vocab_embed'):
+          self._embed_module_name = name
+          break
+    name = getattr(self, '_embed_module_name', None)
+    if name is None:
+      return 0.02
+    inner = getattr(self.backbone, 'backbone', self.backbone)
+    return _embedding_std(inner.get_submodule(name))
+
+  def _noise_conditioning_stats(self):
+    """Diagnostics for the generator's input-noise conditioning, or `{}` when
+    it is disabled (`noise_dim=0`).
+
+    Logged every generator step so it is visible whether the student is
+    actually *using* the noise source or ignoring it:
+
+    * `noise/proj_norm` -- Frobenius norm of the *raw* learned projection. Flat
+      means the generator is not learning to use the noise; the run is then
+      equivalent to `noise_dim=0` regardless of `noise_lr`. Under
+      `noise_hold_rms` this is the one number the schedule does not pin, so it is
+      how hard the objective is pushing against the constraint (drifting down =>
+      it wants less noise than `noise_scale`).
+    * `noise/gain` -- the warmup ramp, 0 at step 0 and 1 after
+      `noise_warmup_steps`. Every number below is post-gain, so at gain 0 they
+      are 0 no matter what `W` holds.
+    * `noise/inject_std` -- per-hidden-dim std of the injected vector,
+      `noise_out_scale * ||W||_F / sqrt(hidden)` for unit-Gaussian input. The
+      `noise_out_scale` factor is what `_add_noise` actually applies; dropping it
+      here would under-report the injection by `embed_std / sqrt(noise_dim)`
+      (~37x at `noise_dim=128` on mdlm-owt). Compare against `noise/embed_std`.
+    * `noise/embed_std` -- per-entry std of the student's token embedding
+      (constant up to training drift), the scale the injection competes with.
+    * `noise/snr` -- ratio of the two, and with the output rescaling also just
+      `rms(W)`. At ~0.06 the injection is a few-percent perturbation that
+      LayerNorm largely absorbs; ~1.0 means the noise is as large as the token
+      identity itself; ~10 means the token identity is a tenth of the residual
+      and the student can barely read its own input.
+    """
+    proj = getattr(self.backbone, 'noise_proj', None)
+    if proj is None:
+      return {}
+    with torch.no_grad():
+      raw = proj.weight.detach().float()
+      # The magnitude schedule (warmup gain, `hold_rms` normalisation) is part of
+      # the forward pass, so read the projection the hook actually applies --
+      # otherwise the ramp is invisible and `snr` over-reports it.
+      w = self.backbone.effective_weight().detach().float()
+      proj_norm = raw.norm()
+      # E[||Wz||^2] = ||W||_F^2 for z ~ N(0, I), spread over `hidden` dims,
+      # then the constant output rescaling `_add_noise` applies.
+      out_scale = float(getattr(self.backbone, 'noise_out_scale', 1.0))
+      inject_std = out_scale * w.norm() / (w.shape[0] ** 0.5)
+      embed_std = self._student_embed_std()
+      gain = float(getattr(self.backbone, 'noise_gain', 1.0))
+    return {
+      'noise/proj_norm': proj_norm,
+      'noise/gain': torch.as_tensor(gain, device=raw.device),
+      'noise/inject_std': inject_std,
+      'noise/embed_std': torch.as_tensor(embed_std, device=raw.device),
+      'noise/snr': inject_std / max(embed_std, 1e-12)}
 
   def on_load_checkpoint(self, checkpoint):
     if self.is_adversarial_distill:
       state_dict = collections.OrderedDict(checkpoint['state_dict'])
+      # The critics are seeded from the student when a checkpoint carries no
+      # weights of their own. Noise conditioning inserts a level in the student
+      # -- `backbone.backbone.blocks…` plus `backbone.noise_proj.*` -- while the
+      # teacher and fake stay UNWRAPPED, so mirroring the raw prefix would hand
+      # them `teacher.backbone.…` and a `teacher.noise_proj.weight` they have no
+      # parameter for, and Lightning's strict load would reject both. Strip the
+      # wrapper's level and drop the projection instead.
+      student_prefix = ('backbone.backbone.'
+                        if hasattr(self.backbone, 'noise_proj')
+                        else 'backbone.')
       for key, value in list(state_dict.items()):
-        if key.startswith('backbone.'):
-          suffix = key[len('backbone.'):]
+        if key.startswith(student_prefix):
+          suffix = key[len(student_prefix):]
           state_dict.setdefault(f'teacher.{suffix}', value)
           state_dict.setdefault(f'fake_model.{suffix}', value)
       checkpoint['state_dict'] = state_dict
@@ -631,6 +1002,9 @@ class MDLM(trainer_base.AbsorbingState):
         stats = {"student_loss": self.total_loss_student}
         if self.f_loss_ar:
           stats["fake_loss"] = torch.stack(self.f_loss_ar).mean()
+        # Rank-identical (read off the parameters, not the batch), so the
+        # `sync_dist=True` below averages equal values.
+        stats.update(self._noise_conditioning_stats())
         self.log_dict(
             stats,
             prog_bar=True,

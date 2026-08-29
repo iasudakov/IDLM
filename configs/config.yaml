@@ -148,6 +148,77 @@ adversarial_distill:
   #            what the baseline is worth, not for training.
   mmd_baseline: auto
 
+  # --- Generator input-noise conditioning (D-MMD Sec. 6.5) -------------------
+  # A masked-diffusion generator is a DETERMINISTIC function of its masked
+  # input, and its tokens are drawn independently per position. That
+  # factorization is why a moment-matching objective can minimise itself by
+  # collapsing the output distribution -- which is exactly the failure this repo
+  # already documents, gen_ppl improving while entropy falls. These give the
+  # generator a real input noise source: a learned matrix projects per-token
+  # Gaussian noise into the student's token-embedding residual, so it can stay
+  # diverse across draws while each factorised output sharpens.
+  #
+  # Applied by wrapping the student backbone (`algo._NoiseConditionedBackbone`),
+  # so the noise is injected identically in training and in sampling. The
+  # teacher and fake critics are copied BEFORE the wrap and stay noise-free.
+  # Distillation only; a plain MDLM run is unaffected.
+  #
+  # Dimensionality of the injected Gaussian. 0 => disabled (original IDLM), and
+  # the forward pass is then bit-identical to a run without this feature.
+  noise_dim: 0
+  # Granularity. False (default) draws an independent Gaussian per token
+  # position; True broadcasts one per-sample vector across all token embeddings
+  # (same noise for every position).
+  noise_shared: False
+  # INITIAL size of the injected noise vector, as a multiple of the student
+  # embedding's own per-entry std -- i.e. the initial `noise/snr`. The projection
+  # output is always rescaled by `embed_std / sqrt(noise_dim)` (measured from the
+  # loaded checkpoint), so this is just the init RMS of the projection weight and
+  # the units are the same across noise_dim / backbones.
+  # 0.0 (default) => zero-init. The wrapped student starts as an exact copy of
+  # the checkpoint's function and grows its noise usage only if the objective
+  # pays for it -- nothing is destroyed at step 0, which matters when distilling
+  # a pretrained model. It still trains (zero-init residual branch).
+  # 1.0 => the injection starts as large as the token identity itself. Values
+  # >> 1 (e.g. 10) mean the residual is mostly noise and the student cannot read
+  # its own masked context until it has attenuated the projection.
+  # With `noise_warmup_steps > 0` (or `noise_hold_rms`) this is instead the
+  # snr the schedule ramps to / holds, and the zero start comes from the ramp.
+  # It must then be > 0: the objective cannot find a useful noise level on its
+  # own (see below), so leaving this at 0 schedules nothing.
+  # Otherwise this is ONLY an init and `noise_lr` is the knob that controls the
+  # magnitude thereafter. Watch `noise/snr` and `noise/proj_norm`.
+  noise_scale: 0.0
+  # Steps over which the injected noise is ramped in, from a gain of 0 (the
+  # forward pass is then bit-identical to the loaded checkpoint) up to
+  # `noise_scale` -- linearly, in trainer global steps (student + fake updates,
+  # the x-axis the `noise/*` diagnostics are logged against). 0 => no ramp.
+  #
+  # This exists because a zero-init projection does NOT grow on its own and no
+  # `noise_lr` makes it: `W = 0` is an exact saddle, since the output does not
+  # depend on the noise there and so `E[dL/dW] = c E[g] E[z]^T = 0`. Only
+  # gradient noise moves it -- measured, snr reached 0.04 after 80k steps at
+  # noise_lr=1e-3, below even the ~`noise_lr * sqrt(T)` of an unbiased random
+  # walk. Meanwhile a `noise_scale=0.5` run decays to snr ~0.35 over the same
+  # 80k steps while scoring the *better* generative perplexity: the objective
+  # mildly prefers less noise than is good for sample quality. So the ramp is
+  # the way to have both the safe zero start (nothing destroyed at step 0, the
+  # reason to zero-init when distilling a pretrained checkpoint) and a noise
+  # level the objective would never have reached by itself.
+  noise_warmup_steps: 0
+  # Pin `rms(W)` to `noise_scale` for the whole run by normalising the projection
+  # in the forward pass, leaving only its *direction* learnable. Stops the slow
+  # erosion described above, so the snr you set is the snr you keep. Requires
+  # noise_scale > 0. False => the magnitude stays learnable and `noise/snr`
+  # drifts wherever the objective takes it.
+  noise_hold_rms: False
+  # Separate learning rate for the learned noise-projection matrix. null => it
+  # trains at optim.lr like the rest of the student. Only used when noise_dim>0.
+  # Under the rescaled parameterization above, Adam moves `noise/snr` by roughly
+  # this much per step (sign-consistent upper bound), so ~1e-3 reaches snr ~1 in
+  # a few thousand steps and 1e-4 takes ~1e4+.
+  noise_lr: null
+
   accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   fake_frequency: 1
   gradient_clipping_val: 1.0
