@@ -77,6 +77,42 @@ def ar_decoder_layers(core):
     'core.model.layers, core.model.decoder.layers, or core.transformer.h')
 
 
+def embedding_module(core):
+  """The token-embedding module, whose output is layer -1.
+
+  That is the bag-of-embeddings floor: a pure lookup table, no attention and no
+  mixing, so its pooled features carry the token *multiset* and nothing about
+  order. Useful as the reference a real block has to beat, rather than as a
+  reward on its own.
+
+  The `backbone` probe is what makes `algo.backbone=hf_dit` work: on
+  `kuleshov-group/mdlm-owt` the embedding is at `backbone.vocab_embed`, one
+  level down on the `DITBackbone` the wrapper holds -- the same indirection
+  `ar_decoder_layers` already handles for the blocks.
+  """
+  for attr in ('vocab_embed', 'embed_tokens', 'wte'):
+    for holder in (core,
+                   getattr(core, 'model', None),
+                   getattr(core, 'backbone', None)):
+      module = None if holder is None else getattr(holder, attr, None)
+      if module is not None:
+        return module
+  getter = getattr(core, 'get_input_embeddings', None)
+  if callable(getter):
+    try:
+      module = getter()
+    except NotImplementedError:
+      # `mdlm-owt`'s wrapper defines the method and raises from it, so this
+      # cannot be treated as "no such method".
+      module = None
+    if module is not None:
+      return module
+  raise ValueError(
+    'mmd_feature_layer=-1 needs a token-embedding module; looked for '
+    'vocab_embed, embed_tokens and wte on the model, its `.model` and its '
+    '`.backbone`, then get_input_embeddings()')
+
+
 def resolve_feature_layers(core, layer_index):
   """Resolve `mmd_feature_layer` to an ordered list of blocks and their indices.
 
@@ -115,10 +151,16 @@ def resolve_feature_layers(core, layer_index):
                        'just rescales that block\'s term -- use '
                        'mmd_feature_layer_weights instead')
   for index in indices:
-    if index < 0 or index >= len(layers):
+    # -1 is the embedding output, the bag-of-embeddings floor; it is a real
+    # choice rather than an out-of-range index, so it is admitted explicitly
+    # instead of falling through to Python's from-the-end indexing, which
+    # would silently hand back the last block.
+    if index < -1 or index >= len(layers):
       raise ValueError(
-        f'mmd_feature_layer={index} is outside [0,{len(layers) - 1}]')
-  return [layers[i] for i in indices], indices
+        f'mmd_feature_layer={index} is outside [-1,{len(layers) - 1}] '
+        '(-1 = raw token embeddings)')
+  return ([embedding_module(core) if i == -1 else layers[i] for i in indices],
+          indices)
 
 
 def resolve_layer_weights(indices, weights):
@@ -777,6 +819,14 @@ class _CausalBackboneAdapter(torch.nn.Module):
   @property
   def blocks(self):
     return self.inner.blocks
+
+  @property
+  def vocab_embed(self):
+    # Same reason as `blocks`: a property rather than an assignment, so the
+    # inner embedding is not registered a second time under this module.
+    # Without it `mmd_feature_layer=-1` cannot find owt-ar's embedding, since
+    # it sits on the wrapped `DITLegacy` rather than on the adapter.
+    return self.inner.vocab_embed
 
   def forward(self, indices, sigma=None):
     # A causal LM has no noise conditioning, and owt-ar is `adaln: false`, so

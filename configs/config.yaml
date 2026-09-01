@@ -86,6 +86,14 @@ adversarial_distill:
   # embedding, so neither end says much about whether two sequences *mean* the
   # same thing. Both owt-ar and mdlm-owt have 12 blocks, so null resolves to 6.
   #
+  # `-1` selects the token EMBEDDINGS instead of a block -- a pure lookup with
+  # no attention and no mixing, so its pooled feature carries the token
+  # multiset and nothing about order. Verified: permuting a sequence leaves the
+  # pooled delta at 3e-08 for -1, against 17.9 for block 6. That makes it the
+  # floor any real block has to beat, not a reward to train on. It is admitted
+  # explicitly rather than falling through to Python's from-the-end indexing,
+  # which would have silently handed back the last block.
+  #
   # A list asks for a summed reward, one pseudo-Huber term per block. Mind the
   # scale spread: on the TinyGSM teacher the reward per corrupted token grew
   # ~6x per four blocks, which makes an unweighted sum very nearly the deepest
