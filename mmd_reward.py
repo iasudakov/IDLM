@@ -553,7 +553,7 @@ class FrozenARFeatures(_LayeredFeatures):
 
 def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
                        group_size, eos_id, reward_weight=1.0,
-                       baseline='auto'):
+                       baseline='auto', scored=None):
   """REINFORCE loss driving the student toward the clean answer's AR features.
 
   `group_size` hard answers are drawn from the student's differentiable
@@ -574,7 +574,18 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     student_probs: `(batch, length, vocab)`, differentiable, sums to 1.
     x0: `(batch, length)` clean tokens.
     selected: `(batch, length)` bool; the positions the student generated (the
-      masked ones), which are also the only ones scored.
+      masked ones). These are the WRITTEN positions: they decide which tokens
+      are replaced by the student's draw and whose log-probabilities carry the
+      gradient. Scoring is a separate question -- see `scored`.
+    scored: `(batch, length)` bool, or None for `selected`. Which positions the
+      reward is measured over. Widening it past `selected` is meaningful only
+      because the features are CONTEXTUAL: outside the written span the two
+      token sequences are identical, but their hidden states are not, because
+      the surrounding tokens changed. So `scored` beyond `selected` measures
+      how the student's writing perturbed the rest of the sequence's
+      representation rather than only the span itself. It must never be used
+      for the log-prob sum -- the student did not write those positions and
+      cannot be credited or blamed for them directly.
     critic: a `FrozenARFeatures`.
     group_size: samples per state. At >= 2 the group's own leave-one-out mean
       is the baseline. At 1 there is no second sample at the same state, so
@@ -605,6 +616,12 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
                      'baseline=batch')
   batch, length, _ = student_probs.shape
   selected = selected.bool()
+  # The written span drives sampling and the surrogate; `scored` only ever
+  # reaches the critic.
+  scored = selected if scored is None else scored.bool()
+  if scored.shape != selected.shape:
+    raise ValueError(f'scored mask must be {tuple(selected.shape)}, got '
+                     f'{tuple(scored.shape)}')
 
   # Sampling and the reward are no-grad; only the log-prob gather carries
   # gradient.
@@ -619,7 +636,7 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     rewards, actives, breakdown = [], [], {}
     multi = len(getattr(critic, 'resolved_layers', [None])) > 1
     for k in range(group_size):
-      out = critic.paired_reward(x0, samples[k], selected, eos_id,
+      out = critic.paired_reward(x0, samples[k], scored, eos_id,
                                  return_per_layer=multi)
       reward, active = out[0], out[1]
       if multi:

@@ -867,15 +867,30 @@ class MDLM(trainer_base.AbsorbingState):
     """The paired feature reward as a REINFORCE term, or zero."""
     import mmd_reward
     cfg = self.config.adversarial_distill
-    selected = (xt == self.mask_index) & self._mmd_content_mask(x0, valid_tokens)
+    content = self._mmd_content_mask(x0, valid_tokens)
+    # The WRITTEN span: what the student filled in, hence what the REINFORCE
+    # surrogate sums log-probabilities over. Never widened.
+    selected = (xt == self.mask_index) & content
     if not bool(selected.any()):
       return student_probs.new_zeros(())
+    # The SCORED span, which `mmd_score_positions` may widen to every content
+    # position. Outside the written span the two token sequences are identical,
+    # so this adds signal only through the feature map's context sensitivity.
+    where = str(cfg.get('mmd_score_positions', 'written'))
+    if where == 'written':
+      scored = selected
+    elif where == 'all':
+      scored = content
+    else:
+      raise ValueError('adversarial_distill.mmd_score_positions must be '
+                       f'written|all, got {where!r}')
     loss, stats = mmd_reward.mmd_reinforce_loss(
       student_probs, x0, selected, self._mmd_critic,
       group_size=cfg.mmd_group_size,
       eos_id=self.tokenizer.eos_token_id,
       reward_weight=cfg.mmd_reward_weight,
-      baseline=str(cfg.get('mmd_baseline', 'auto')))
+      baseline=str(cfg.get('mmd_baseline', 'auto')),
+      scored=scored)
     self.log_dict(stats, on_step=True, on_epoch=False, sync_dist=True)
     return loss
 

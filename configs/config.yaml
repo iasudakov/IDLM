@@ -129,6 +129,40 @@ adversarial_distill:
   # simply shared by the sequences in it, which coarsens credit assignment.
   mmd_kernel_batch_size: 1
 
+  # Which positions the reward is measured over. The student only ever WRITES
+  # the masked ones, and the REINFORCE surrogate always sums log-probabilities
+  # over exactly those -- this changes only what the critic looks at.
+  #   written -- the masked span alone (the default, and the historical
+  #              behaviour). Outside it the generated row IS the clean row, so
+  #              this is the span the two sequences actually differ on.
+  #   all     -- every content position. The extra positions hold identical
+  #              TOKENS in both rows, so they contribute only through the
+  #              feature map's context sensitivity: the hidden state at an
+  #              unwritten position still moves when the tokens around it
+  #              change. It therefore asks a different question -- how far the
+  #              student's writing perturbed the whole sequence's
+  #              representation, rather than how wrong the written span is.
+  #
+  # Measured on mdlm-owt features, against a known per-row corruption level.
+  # `all` does NOT discriminate better -- it rescales:
+  #
+  #   written/seq        51     153     307     512     921
+  #   corr  written    0.941   0.961   0.965   0.971   0.965
+  #   corr  all        0.908   0.948   0.963   0.971   0.966
+  #   |reward| written 1.038   1.050   1.149   1.293   1.538
+  #   |reward| all     0.152   0.410   0.720   1.059   1.509
+  #
+  # So the context term carries no extra ranking information, and the delta is
+  # diluted in proportion to the mask fraction -- 7x smaller at 5% masked,
+  # converging by 90%. Since `t ~ U(0,1)` spreads rows across that whole range,
+  # the practical effect is a REWEIGHTING of the schedule: rows that wrote
+  # little count for less. That is not obviously wrong -- few-step sampling
+  # starts from a fully masked sequence, so the heavily-masked rows are the
+  # regime that matters -- but it is a different knob from the one it looks
+  # like, and it costs correlation at the sparse end. Watch `mmd/reward` and
+  # `mmd/reward_spread`: both shrinking is the dilution, not a broader signal.
+  mmd_score_positions: written
+
   # Samples drawn per state, each costing one critic forward. At >= 2 the
   # group's own leave-one-out mean is the baseline. 1 is allowed and is the
   # cheap end -- a quarter the critic cost of 4 -- but it has no second sample
