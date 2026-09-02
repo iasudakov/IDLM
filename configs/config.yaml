@@ -315,7 +315,10 @@ training:
   importance_sampling: False
   sampling_eps: 1e-3
   change_of_variables: False
-  loss_precision: 'bf16'  # bf16, float32, float64
+  # Match the released IDLM training recipe. Keep this aligned with
+  # `trainer.precision`: the MMD reward is a small loss difference and loses
+  # useful resolution when both the forward and loss arithmetic run in bf16.
+  loss_precision: 'float32'  # bf16, float32, float64
   finetune_path: ''
 
 eval:
@@ -503,7 +506,7 @@ trainer:
   devices: ${device_count:}
   accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   gradient_clip_val: 1.0
-  precision: 'bf16'
+  precision: 32
   num_sanity_val_steps: 2
   max_steps: 1_000_000
   log_every_n_steps: 100
