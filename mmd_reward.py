@@ -632,7 +632,9 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     group_size: samples per state. At >= 2 the group's own leave-one-out mean
       is the baseline. At 1 there is no second sample at the same state, so
       `baseline` decides what stands in; the sampling cost falls with the
-      group, since each member costs one critic forward.
+      group, since each member costs one critic forward. Candidate surrogate
+      terms are averaged over this axis, as in GRPO, so changing the group size
+      does not also rescale `reward_weight`.
     baseline: which control variate subtracts off the reward's offset.
       `auto` picks `group` when group_size >= 2 and `none` when it is 1.
       `batch` uses the other sequences in the batch -- unbiased, free, but
@@ -709,9 +711,11 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     seq_logp = (token_logp * selected.to(token_logp.dtype)).sum(dim=1)
     surrogate = surrogate + (advantage[:, k] * seq_logp).sum()
 
-  # Negated: maximizing reward means descending this. Normalized by generated
-  # tokens so the scale does not track batch or sequence length.
-  denom = selected.sum().clamp_min(1).to(surrogate.dtype)
+  # Negated: maximizing reward means descending this. Normalize by generated
+  # tokens and average the Monte Carlo candidates, as in GRPO's `1 / G`
+  # reduction. A larger group should improve the within-state comparison, not
+  # silently multiply the reward weight and its gradient.
+  denom = (selected.sum().clamp_min(1) * group_size).to(surrogate.dtype)
   loss = -reward_weight * surrogate / denom
 
   with torch.no_grad():

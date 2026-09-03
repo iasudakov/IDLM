@@ -175,6 +175,9 @@ adversarial_distill:
   # group's own leave-one-out mean is the baseline. 1 is allowed and is the
   # cheap end -- a quarter the critic cost of 4 -- but it has no second sample
   # at the same state, so the baseline has to come from somewhere else.
+  # The surrogate is averaged over this axis (`1 / group_size`, as in GRPO), so
+  # increasing it changes estimator variance and compute, not the nominal
+  # strength of `mmd_reward_weight`.
   mmd_group_size: 4
 
   # Which control variate removes the reward's offset.
