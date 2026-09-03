@@ -51,7 +51,8 @@ export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 BATCH_SIZE="${BATCH_SIZE:-8}"
 GLOBAL_BATCH="${GLOBAL_BATCH:-512}"
 echo "devices=${NUM_GPUS} batch_size=${BATCH_SIZE} global_batch=${GLOBAL_BATCH}" \
-     "-> accum_batches $(python -c "import math;print(math.ceil(${GLOBAL_BATCH}/(${NUM_GPUS}*${BATCH_SIZE})))") per optimizer step"
+     "-> accum_batches $(python -c "import math;print(math.ceil(${GLOBAL_BATCH}/(${NUM_GPUS}*${BATCH_SIZE})))") per optimizer step" \
+     "| high_mask=${HIGH_MASK_FRACTION:-0.0}@${HIGH_MASK_MIN:-0.7}-${HIGH_MASK_MAX:-1.0}"
 
 # --- tracker ---------------------------------------------------------- #
 
@@ -81,6 +82,9 @@ python -u -m main \
   sampling.predictor='ancestral_cache' \
   optim.lr="${LR:-1e-6}" \
   adversarial_distill.fake_frequency=1 \
+  adversarial_distill.high_mask_fraction="${HIGH_MASK_FRACTION:-0.0}" \
+  adversarial_distill.high_mask_min="${HIGH_MASK_MIN:-0.7}" \
+  adversarial_distill.high_mask_max="${HIGH_MASK_MAX:-1.0}" \
   trainer.val_check_interval=1500 \
   trainer.limit_val_batches=0.01 \
   logger.experiment="${EXPERIMENT}" \

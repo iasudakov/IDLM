@@ -190,6 +190,21 @@ adversarial_distill:
   #            what the baseline is worth, not for training.
   mmd_baseline: auto
 
+  # Optional few-NFE training mixture. The ordinary distillation schedule
+  # draws a uniform diffusion time and thus an approximately uniform expected
+  # mask probability. When this is non-zero, that fraction of generator rows
+  # instead draws its expected mask probability uniformly from
+  # [high_mask_min, high_mask_max]. For example, 0.5 / 0.7 / 1.0 devotes half
+  # of the rows to states with 70--100% of their tokens masked.
+  #
+  # This changes the corruption used to PRODUCE the student's sample. It is
+  # unrelated to mmd_noise_level, which only corrupts inputs to a diffusion
+  # feature critic. It applies consistently to MMD, DMD, and their combination
+  # because they share the same generator rollout. A zero fraction preserves
+  # the historical sampler exactly, including its RNG stream.
+  high_mask_fraction: 0.0
+  high_mask_min: 0.7
+  high_mask_max: 1.0
   # --- Generator input-noise conditioning (D-MMD Sec. 6.5) -------------------
   # A masked-diffusion generator is a DETERMINISTIC function of its masked
   # input, and its tokens are drawn independently per position. That

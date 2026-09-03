@@ -711,9 +711,45 @@ class MDLM(trainer_base.AbsorbingState):
       return tokens
     return torch.where(valid_tokens.bool(), tokens, x0)
 
+  def _sample_distill_generator_t(self, n, current_accumulation_step):
+    """Sample generator corruption, optionally emphasizing high-mask rows.
+
+    The knobs describe expected mask probabilities instead of raw diffusion
+    times. For the log-linear schedule used here,
+    `mask_probability = (1 - noise.eps) * t`; expressing the option in mask
+    space makes its effect explicit and keeps it meaningful to few-NFE runs.
+
+    With a zero mixture fraction, return the original `_sample_t` tensor before
+    drawing any more randomness. This keeps disabled runs bit-compatible with
+    the historical schedule.
+    """
+    t = self._sample_t(n, current_accumulation_step)
+    cfg = self.config.adversarial_distill
+    fraction = float(cfg.get('high_mask_fraction', 0.0))
+    minimum = float(cfg.get('high_mask_min', 0.7))
+    maximum = float(cfg.get('high_mask_max', 1.0))
+    if not 0.0 <= fraction <= 1.0:
+      raise ValueError('adversarial_distill.high_mask_fraction must be in '
+                       f'[0, 1], got {fraction}')
+    if not 0.0 <= minimum <= maximum <= 1.0:
+      raise ValueError('adversarial_distill high-mask interval must satisfy '
+                       '0 <= high_mask_min <= high_mask_max <= 1, got '
+                       f'[{minimum}, {maximum}]')
+    if fraction == 0.0:
+      return t
+
+    high_mask_probability = minimum + (maximum - minimum) * torch.rand_like(t)
+    # LogLinear gives `1 - alpha_t = (1 - noise.eps) * t`, so this is
+    # the exact inverse in the mask-probability parameterization above.
+    high_t = (high_mask_probability / (1.0 - self.noise.eps)).clamp(
+      self.sampling_eps, 1.0)
+    choose_high = torch.rand_like(t) < fraction
+    return torch.where(choose_high, high_t.to(t.dtype), t)
+
   def multistep_generation(self, x0, valid_tokens, current_accumulation_step,
                            return_xt=False):
-    t = self._sample_t(x0.shape[0], current_accumulation_step)
+    t = self._sample_distill_generator_t(
+      x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
     assert alpha_t.ndim == 2
@@ -891,6 +927,9 @@ class MDLM(trainer_base.AbsorbingState):
       reward_weight=cfg.mmd_reward_weight,
       baseline=str(cfg.get('mmd_baseline', 'auto')),
       scored=scored)
+    stats['mmd/generator_mask_fraction'] = (
+      selected.sum().to(student_probs.dtype)
+      / content.sum().clamp_min(1).to(student_probs.dtype)).detach()
     self.log_dict(stats, on_step=True, on_epoch=False, sync_dist=True)
     return loss
 

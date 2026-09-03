@@ -131,6 +131,20 @@ The OpenWebText recipes train IDLM students for unconditional language generatio
 bash scripts/train_idlm_mdlm.sh
 ```
 
+For OWT MMD distillation, the portable launcher can bias the generator toward
+the heavily masked states that matter most at low NFE. This keeps the original
+schedule for half of the rows and draws the other half from 70--100% expected
+masking:
+
+```bash
+OWT_CACHE=/path/to/owt \
+HIGH_MASK_FRACTION=0.5 HIGH_MASK_MIN=0.7 HIGH_MASK_MAX=1.0 \
+  bash scripts/train_owt_distill.sh
+```
+
+The default fraction is zero, so existing runs are unchanged. MMD runs log the
+realized whole-sequence fraction as `mmd/generator_mask_fraction`.
+
 #### DUO teacher → IDLM-Duo student
 
 ```bash
