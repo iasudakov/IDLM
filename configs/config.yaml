@@ -19,8 +19,8 @@ adversarial_distill:
 
   # --- Distillation objective -----------------------------------------------
   # The generator loss is `dmd_weight * (teacher - fake) + mmd_reward_weight *
-  # REINFORCE(feature reward)`. Defaults reproduce the published objective
-  # exactly: DMD alone, the MMD critic never built or downloaded.
+  # REINFORCE(sample reward)`. Defaults reproduce the published objective
+  # exactly: DMD alone, the optional reward critic never built or downloaded.
   dmd_weight: 1.0
 
   # --- Paired AR feature reward (ported from the TinyGSM branch) -------------
@@ -51,6 +51,9 @@ adversarial_distill:
   #              dmd_weight=0, which for the feature reward switches it off.
   #              `dmd_weight=0` with this reward therefore means: train the fake
   #              as usual, but give the generator only the REINFORCE term.
+  #              Candidates in one leave-one-out group share the SAME sampled
+  #              diffusion time and corruption mask. Otherwise the advantage
+  #              mostly ranks corruption luck rather than generated quality.
   mmd_reward_type: feature
 
   # Which frozen model supplies the features.
@@ -113,6 +116,28 @@ adversarial_distill:
   # Computed by `mmd_rbf.py`, which reduces the three pair sums a tile at a
   # time and never materialises the (batch, length, length) Gram matrix.
   mmd_kernel: linear
+  # What ONE SAMPLE is, for whichever kernel is chosen.
+  #   token    -- every scored position of the kernel row (the default and the
+  #               historical behaviour). The distribution being matched is over
+  #               token features.
+  #   sentence -- mean-pool each sequence over its own scored positions first,
+  #               then hand the kernel the row's `mmd_kernel_batch_size`
+  #               sentence vectors. The distribution being matched is over
+  #               SENTENCES.
+  #
+  # For `linear` this changes nothing when the sequences in a row carry equal
+  # numbers of scored positions -- a mean of means is then the pooled mean --
+  # which is exactly the case at `mmd_kernel_batch_size=1`. It differs only in
+  # the weighting when the counts differ: pooling weights a sequence by how
+  # much of it was written, sentence level weights every sequence alike.
+  #
+  # For `rbf` it is a different statistic. Token level asks whether the two
+  # sets of per-position features have the same distribution; sentence level
+  # asks that of the pooled sentence vectors. Needs
+  # `mmd_kernel_batch_size >= 2`, since the unbiased MMD^2 has no estimate from
+  # a single sample per side -- and realistically more, the row size is the
+  # sample count.
+  mmd_kernel_level: token
   # Kernel bandwidth as `alpha = 1 / (2 sigma^2)`. `null` measures it per call
   # by the median heuristic on the REAL branch -- a bandwidth fitted to the
   # student would drift as the student does, making the reward a moving target.
@@ -193,12 +218,19 @@ adversarial_distill:
   #            what the baseline is worth, not for training.
   mmd_baseline: auto
 
-  # Optional few-NFE training mixture. The ordinary distillation schedule
-  # draws a uniform diffusion time and thus an approximately uniform expected
-  # mask probability. When this is non-zero, that fraction of generator rows
-  # instead draws its expected mask probability uniformly from
-  # [high_mask_min, high_mask_max]. For example, 0.5 / 0.7 / 1.0 devotes half
-  # of the rows to states with 70--100% of their tokens masked.
+  # Distillation-only sanity check for a one-forward generator. When true,
+  # the student's first prediction is made from the exact inference prior:
+  # every generated token is MASK, at t=1. The teacher/fake ELBO noise level
+  # remains independently sampled by the original IDLM schedule. This is
+  # intentionally separate from `sampling.steps`, which only controls eval.
+  generator_force_full_mask: False
+
+  # Optional few-NFE training mixture. Unless full-mask mode above is enabled,
+  # the ordinary distillation schedule draws a uniform diffusion time and thus
+  # an approximately uniform expected mask probability. When this is non-zero,
+  # that fraction of generator rows instead draws its expected mask probability
+  # uniformly from [high_mask_min, high_mask_max]. For example, 0.5 / 0.7 / 1.0
+  # devotes half of the rows to states with 70--100% of their tokens masked.
   #
   # This changes the corruption used to PRODUCE the student's sample. It is
   # unrelated to mmd_noise_level, which only corrupts inputs to a diffusion
@@ -208,6 +240,7 @@ adversarial_distill:
   high_mask_fraction: 0.0
   high_mask_min: 0.7
   high_mask_max: 1.0
+
   # --- Generator input-noise conditioning (D-MMD Sec. 6.5) -------------------
   # A masked-diffusion generator is a DETERMINISTIC function of its masked
   # input, and its tokens are drawn independently per position. That

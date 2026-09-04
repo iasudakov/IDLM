@@ -234,6 +234,19 @@ def pseudo_huber_reward(feature_delta):
   return -(torch.sqrt(delta ** 2 + c ** 2) - c).mean(dim=-1)
 
 
+def pool_over_selected(features, selected):
+  """Mean-pool `(rows, length, hidden)` over `selected`, ignoring the rest.
+
+  Returns `(pooled, active)`, shapes `(rows, hidden)` and `(rows,)`. A row
+  selecting nothing pools to zero and is reported inactive rather than scored
+  on positions no token contributed to.
+  """
+  selected = selected.bool()
+  weight = selected.unsqueeze(-1).to(torch.float32)
+  denom = selected.sum(dim=1).clamp_min(1).to(torch.float32).unsqueeze(-1)
+  return (features.float() * weight).sum(dim=1) / denom, selected.any(dim=1)
+
+
 def sequence_pooled_delta(clean, generated, selected):
   """Mean-pool both feature streams over `selected`, and subtract.
 
@@ -255,12 +268,9 @@ def sequence_pooled_delta(clean, generated, selected):
     raise ValueError(f'MMD selected mask must be {(batch, length)}, got '
                      f'{tuple(selected.shape)}')
 
-  selected = selected.bool()
-  weight = selected.unsqueeze(-1).to(torch.float32)
-  denom = selected.sum(dim=1).clamp_min(1).to(torch.float32).unsqueeze(-1)
-  clean_mean = (clean.float() * weight).sum(dim=1) / denom
-  gen_mean = (generated.float() * weight).sum(dim=1) / denom
-  return gen_mean - clean_mean, selected.any(dim=1)
+  clean_mean, active = pool_over_selected(clean, selected)
+  gen_mean, _ = pool_over_selected(generated, selected)
+  return gen_mean - clean_mean, active
 
 
 def median_alpha(feat, selected, max_samples=512, generator=None):
@@ -379,13 +389,18 @@ def merge_kernel_rows(clean, generated, selected, rows_of):
 
 
 def paired_sequence_reward(clean, generated, selected, kernel='linear',
-                           alpha=None, block_size=0, rows_of=1):
+                           alpha=None, block_size=0, rows_of=1,
+                           level='token'):
   """One reward per sequence; rows selecting nothing score zero.
 
   `kernel='linear'` is the original: pool both sides and score the difference
   with pseudo-Huber, which is what a linear kernel's MMD reduces to.
   `kernel='rbf'` compares the two feature distributions instead. See
   `rbf_sequence_reward`.
+
+  `level` chooses what one sample is. `token` (the default) hands the kernel
+  every scored POSITION of the row. `sentence` mean-pools each sequence first
+  and hands it the row's `rows_of` SENTENCE vectors instead.
 
   `rows_of > 1` computes the statistic over that many sequences at once (see
   `merge_kernel_rows`) and hands every sequence in a row its row's reward.
@@ -394,8 +409,36 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
   changes what the number means, not its shape.
   """
   batch = clean.shape[0]
-  clean, generated, selected = merge_kernel_rows(
-    clean, generated, selected, rows_of)
+  if level == 'sentence':
+    # One sample per SEQUENCE: mean-pool it over its own scored positions
+    # first, then let the kernel see the row's `rows_of` sentence vectors as
+    # its sample set. Token level instead hands the kernel every scored
+    # position of the row.
+    #
+    # For the linear kernel this is the same reward whenever the sequences in a
+    # row carry equal numbers of scored positions, since a mean of means then
+    # equals the pooled mean -- exactly so at `rows_of=1`. It differs when the
+    # counts differ, because pooling weights a sequence by its length while
+    # this weights every sequence alike. For rbf it is a different statistic
+    # outright: the distribution being matched is over sentences, not tokens.
+    if rows_of < 2 and kernel == 'rbf':
+      raise ValueError(
+        'mmd_kernel_level=sentence with mmd_kernel=rbf needs '
+        'mmd_kernel_batch_size >= 2: a row of one sentence gives the unbiased '
+        'MMD^2 a single sample per side, which has no estimate at all')
+    if batch % rows_of:
+      raise ValueError(
+        f'mmd_kernel_batch_size={rows_of} does not divide the batch size '
+        f'{batch}; a row would straddle the end of the batch')
+    clean_m, active_seq = pool_over_selected(clean, selected)
+    gen_m, _ = pool_over_selected(generated, selected)
+    rows = batch // rows_of
+    clean = clean_m.reshape(rows, rows_of, -1)
+    generated = gen_m.reshape(rows, rows_of, -1)
+    selected = active_seq.reshape(rows, rows_of)
+  else:
+    clean, generated, selected = merge_kernel_rows(
+      clean, generated, selected, rows_of)
   if kernel == 'rbf':
     reward, active = rbf_sequence_reward(clean, generated, selected,
                                          alpha=alpha, block_size=block_size)
@@ -417,7 +460,7 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
 
 def summed_paired_reward(features, batch, selected, indices, weights,
                          kernel='linear', alpha=None, block_size=0,
-                         rows_of=1):
+                         rows_of=1, level='token'):
   """`R = sum_l w_l * R_l` over the requested blocks.
 
   Args:
@@ -438,7 +481,7 @@ def summed_paired_reward(features, batch, selected, indices, weights,
     stacked = features[index]
     reward, active = paired_sequence_reward(
       stacked[:batch], stacked[batch:], selected, kernel=kernel,
-      alpha=alpha, block_size=block_size, rows_of=rows_of)
+      alpha=alpha, block_size=block_size, rows_of=rows_of, level=level)
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight
   return total, active, per_layer
@@ -496,6 +539,7 @@ class _LayeredFeatures:
   # Set by the critics' constructors; kept on the shared base so both feature
   # maps get the plumbing instead of each threading its own copy.
   kernel = 'linear'
+  kernel_level = 'token'
   rbf_alpha = None
   rbf_block_size = 0
   kernel_batch_size = 1
@@ -587,7 +631,8 @@ class FrozenARFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_paired_reward(
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
-      block_size=self.rbf_block_size, rows_of=self.kernel_batch_size)
+      block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
+      level=self.kernel_level)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
@@ -679,17 +724,24 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
 
     rewards, actives, breakdown = [], [], {}
     multi = len(getattr(critic, 'resolved_layers', [None])) > 1
-    for k in range(group_size):
-      out = critic.paired_reward(x0, samples[k], scored, eos_id,
-                                 return_per_layer=multi)
-      reward, active = out[0], out[1]
-      if multi:
-        for index, value in out[2].items():
-          breakdown.setdefault(index, []).append(value)
-      rewards.append(reward)
-      actives.append(active)
-    reward = torch.stack(rewards, dim=-1)          # (batch, group)
-    active = actives[0]                            # identical across the group
+    grouped = getattr(critic, 'grouped_reward', None)
+    if callable(grouped):
+      reward, active = grouped(x0, samples, scored, eos_id)
+      if reward.shape != (batch, group_size):
+        raise ValueError('grouped critic reward must be '
+                         f'{(batch, group_size)}, got {tuple(reward.shape)}')
+    else:
+      for k in range(group_size):
+        out = critic.paired_reward(x0, samples[k], scored, eos_id,
+                                   return_per_layer=multi)
+        member_reward, member_active = out[0], out[1]
+        if multi:
+          for index, value in out[2].items():
+            breakdown.setdefault(index, []).append(value)
+        rewards.append(member_reward)
+        actives.append(member_active)
+      reward = torch.stack(rewards, dim=-1)        # (batch, group)
+      active = actives[0]                          # identical across the group
 
     if baseline == 'group':
       advantage = group_advantages(reward)
@@ -796,7 +848,8 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_paired_reward(
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
-      block_size=self.rbf_block_size, rows_of=self.kernel_batch_size)
+      block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
+      level=self.kernel_level)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active

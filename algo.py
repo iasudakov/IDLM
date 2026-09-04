@@ -154,31 +154,58 @@ class IdlmRatioReward:
     self.algo = algo
 
   @torch.no_grad()
-  def paired_reward(self, clean_tokens, generated_tokens, selected, eos_id,
-                    return_per_layer=False):
+  def grouped_reward(self, clean_tokens, generated_tokens, selected, eos_id):
+    """Score `(group, batch, length)` samples with common randomness.
+
+    Leave-one-out advantages rank candidates generated for the same state.
+    Giving each candidate its own diffusion time and mask would instead rank
+    how lucky its corruption was. Draw one `t` and one corruption mask per
+    underlying batch row, broadcast both across the group, and evaluate the
+    flattened group in one teacher and one fake forward.
+    """
     del clean_tokens, eos_id  # absolute score; nothing to compare or remap
     algo = self.algo
-    x = generated_tokens
-    valid = selected.to(x.dtype)
+    if generated_tokens.ndim != 3:
+      raise ValueError('IDLM grouped reward expects (group, batch, length), '
+                       f'got {tuple(generated_tokens.shape)}')
+    group, batch, length = generated_tokens.shape
+    if selected.shape != (batch, length):
+      raise ValueError('IDLM selected mask must be '
+                       f'{(batch, length)}, got {tuple(selected.shape)}')
 
-    # One noise level for the whole group draw, so the samples being ranked
-    # against each other are scored under identical conditions -- a per-sample
-    # `t` would let an easy noise level outrank a good answer.
-    t = algo._sample_t(x.shape[0], 0)
+    # One time and mask for each underlying row, repeated in group-major order
+    # to match `generated_tokens.reshape(group * batch, length)`.
+    t = algo._sample_t(batch, 0)
     dalpha_t, alpha_t = algo.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
+    move = torch.rand(batch, length, device=generated_tokens.device) \
+      < 1 - alpha_t
+    move = move & selected.bool()
+    xt_grouped = torch.where(
+      move.unsqueeze(0), algo.mask_index, generated_tokens)
+    if algo.ignore_bos:
+      xt_grouped[:, :, 0] = generated_tokens[:, :, 0]
+
+    x = generated_tokens.reshape(group * batch, length)
+    xt = xt_grouped.reshape(group * batch, length)
+    valid = selected.unsqueeze(0).expand(group, -1, -1) \
+      .reshape(group * batch, length).to(x.dtype)
+    alpha_t = alpha_t.repeat(group, 1)
+    if torch.is_tensor(dalpha_t) and dalpha_t.ndim > 0:
+      dalpha_t = dalpha_t.reshape(batch, -1).repeat(group, 1)
     sigma = algo._process_sigma(algo._sigma_from_alphat(alpha_t))
-    xt = algo.q_xt(x, alpha_t, valid_tokens=valid)
 
     onehot = F.one_hot(x, num_classes=algo.vocab_size).to(torch.float32)
     with torch.cuda.amp.autocast(dtype=torch.float32):
       logits_teacher = algo._process_model_output(
         model_output=algo.teacher(xt, sigma), xt=xt, sigma=sigma)
-      logits_fake = algo._process_model_output(
-        model_output=algo.fake_model(xt, sigma), xt=xt, sigma=sigma)
     nll_teacher = algo.nll_per_token_with_probs(
       logits_teacher, xt, onehot, alpha_t=alpha_t, dalpha_t=dalpha_t,
       valid_tokens=valid)
+    del logits_teacher
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+      logits_fake = algo._process_model_output(
+        model_output=algo.fake_model(xt, sigma), xt=xt, sigma=sigma)
     nll_fake = algo.nll_per_token_with_probs(
       logits_fake, xt, onehot, alpha_t=alpha_t, dalpha_t=dalpha_t,
       valid_tokens=valid)
@@ -191,9 +218,18 @@ class IdlmRatioReward:
     # The generator minimises `nll_teacher - nll_fake`, which makes a sample
     # likelier under the teacher and unlikelier under the fake. The reward to
     # MAXIMISE is therefore that quantity negated.
-    reward = (nll_fake - nll_teacher).float()
+    reward = (nll_fake - nll_teacher).float().view(group, batch).transpose(0, 1)
     active = selected.any(dim=1)
-    reward = torch.where(active, reward, torch.zeros_like(reward))
+    reward = torch.where(active.unsqueeze(-1), reward,
+                         torch.zeros_like(reward))
+    return reward, active
+
+  @torch.no_grad()
+  def paired_reward(self, clean_tokens, generated_tokens, selected, eos_id,
+                    return_per_layer=False):
+    reward, active = self.grouped_reward(
+      clean_tokens, generated_tokens.unsqueeze(0), selected, eos_id)
+    reward = reward[:, 0]
     if return_per_layer:
       return reward, active, {}
     return reward, active
@@ -454,6 +490,11 @@ class MDLM(trainer_base.AbsorbingState):
       # under `_embed_module_cache.embedding` -- which resume rejects as an
       # unexpected key.
       self._embed_module_name = None
+      # Keep the attribute present even for deliberately tiny overfit runs
+      # with `training.ema=0`. EMA is useful for normal training, but it is not
+      # part of the IDLM objective and disabling it should not make manual
+      # adversarial optimization crash.
+      self.ema_fake = None
       if self.ema is not None:
         del self.ema
         self.ema = models.ema.ExponentialMovingAverage(
@@ -560,7 +601,8 @@ class MDLM(trainer_base.AbsorbingState):
 
   def on_train_start(self):
     if self.is_adversarial_distill:
-      self.ema_fake.move_shadow_params_to_device(self.device)
+      if self.ema_fake is not None:
+        self.ema_fake.move_shadow_params_to_device(self.device)
       # Upstream opens on a fake step, so it hands the gradient to the critic
       # and freezes the student. With dmd_weight=0 there is no fake phase and
       # the very first step is the generator's, which would otherwise find its
@@ -673,6 +715,28 @@ class MDLM(trainer_base.AbsorbingState):
   def on_load_checkpoint(self, checkpoint):
     if self.is_adversarial_distill:
       state_dict = collections.OrderedDict(checkpoint['state_dict'])
+      # A plain MDLM checkpoint stores `backbone.<key>`, while a student with
+      # input-noise conditioning wraps that same model and therefore expects
+      # `backbone.backbone.<key>` plus a newly initialized noise projection.
+      # Convert only when starting distillation from such a plain checkpoint;
+      # normal resumes already carry `backbone.noise_proj.*` and bypass this
+      # block. Prefix depth is not a safe discriminator: the HF MDLM itself
+      # owns a `.backbone`, so its *plain* keys already begin with
+      # `backbone.backbone.` before our noise wrapper adds the third level.
+      if hasattr(self.backbone, 'noise_proj'):
+        wrapped_prefix = 'backbone.backbone.'
+        has_noise_state = any(
+          key.startswith('backbone.noise_proj.') for key in state_dict)
+        plain_keys = [
+          key for key in state_dict
+          if key.startswith('backbone.')]
+        if plain_keys and not has_noise_state:
+          for key in plain_keys:
+            suffix = key[len('backbone.'):]
+            state_dict[f'{wrapped_prefix}{suffix}'] = state_dict.pop(key)
+          for name, value in self.backbone.noise_proj.state_dict().items():
+            state_dict.setdefault(
+              f'backbone.noise_proj.{name}', value.detach().clone())
       # The critics are seeded from the student when a checkpoint carries no
       # weights of their own. Noise conditioning inserts a level in the student
       # -- `backbone.backbone.blocks…` plus `backbone.noise_proj.*` -- while the
@@ -690,14 +754,16 @@ class MDLM(trainer_base.AbsorbingState):
           state_dict.setdefault(f'fake_model.{suffix}', value)
       checkpoint['state_dict'] = state_dict
     super().on_load_checkpoint(checkpoint)
-    if self.is_adversarial_distill and self.ema_fake is not None:
+    if (self.is_adversarial_distill
+        and getattr(self, 'ema_fake', None) is not None):
       ema_fake_state = checkpoint.get('ema_fake', checkpoint.get('ema'))
       if ema_fake_state is not None:
         self.ema_fake.load_state_dict(ema_fake_state)
 
   def on_save_checkpoint(self, checkpoint):
     super().on_save_checkpoint(checkpoint)
-    if self.is_adversarial_distill and self.ema_fake is not None:
+    if (self.is_adversarial_distill
+        and getattr(self, 'ema_fake', None) is not None):
       checkpoint['ema_fake'] = self.ema_fake.state_dict()
 
   def _preserve_prompt_probs(self, probs, x0, valid_tokens):
@@ -748,14 +814,26 @@ class MDLM(trainer_base.AbsorbingState):
 
   def multistep_generation(self, x0, valid_tokens, current_accumulation_step,
                            return_xt=False):
-    t = self._sample_distill_generator_t(
-      x0.shape[0], current_accumulation_step)
-    dalpha_t, alpha_t = self.noise(t)
-    alpha_t = alpha_t.unsqueeze(-1)
-    assert alpha_t.ndim == 2
-    sigma = self._sigma_from_alphat(alpha_t)
-
-    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    force_full_mask = bool(self.config.adversarial_distill.get(
+      'generator_force_full_mask', False))
+    if force_full_mask:
+      # `q_xt(x0, alpha(1))` still leaves about eps*length clean tokens on
+      # average. Inference starts from the literal all-MASK prior, so construct
+      # that state explicitly. Prompt positions, when present, stay visible.
+      t = torch.ones(x0.shape[0], device=x0.device)
+      _, alpha_t = self.noise(t)
+      alpha_t = alpha_t.unsqueeze(-1)
+      sigma = self._sigma_from_alphat(alpha_t)
+      xt = torch.full_like(x0, self.mask_index)
+      xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
+    else:
+      t = self._sample_distill_generator_t(
+        x0.shape[0], current_accumulation_step)
+      _, alpha_t = self.noise(t)
+      alpha_t = alpha_t.unsqueeze(-1)
+      assert alpha_t.ndim == 2
+      sigma = self._sigma_from_alphat(alpha_t)
+      xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
 
     log_x_theta = self.forward(xt, sigma=sigma)
     student_probs = log_x_theta.exp()
@@ -856,7 +934,12 @@ class MDLM(trainer_base.AbsorbingState):
       if kernel not in ('linear', 'rbf'):
         raise ValueError('adversarial_distill.mmd_kernel must be linear|rbf, '
                          f'got {kernel!r}')
+      level = str(cfg.get('mmd_kernel_level', 'token'))
+      if level not in ('token', 'sentence'):
+        raise ValueError('adversarial_distill.mmd_kernel_level must be '
+                         f'token|sentence, got {level!r}')
       self._mmd_critic_cached.kernel = kernel
+      self._mmd_critic_cached.kernel_level = level
       self._mmd_critic_cached.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
       self._mmd_critic_cached.rbf_block_size = int(
         cfg.get('mmd_rbf_block_size', 0) or 0)
@@ -864,7 +947,7 @@ class MDLM(trainer_base.AbsorbingState):
         1, int(cfg.get('mmd_kernel_batch_size', 1) or 1))
       print(f'[mmd] {what}, block '
             f'{self._mmd_critic_cached.layer_description}, '
-            f'{kernel} kernel, '
+            f'{kernel} kernel over {level}s, '
             f'rows of {self._mmd_critic_cached.kernel_batch_size}, '
             f'group={cfg.mmd_group_size}, '
             f'weight={cfg.mmd_reward_weight}', flush=True)
@@ -900,7 +983,7 @@ class MDLM(trainer_base.AbsorbingState):
     return content
 
   def _mmd_term(self, x0, valid_tokens, student_probs, xt):
-    """The paired feature reward as a REINFORCE term, or zero."""
+    """The configured hard-sample reward as a REINFORCE term, or zero."""
     import mmd_reward
     cfg = self.config.adversarial_distill
     content = self._mmd_content_mask(x0, valid_tokens)
@@ -947,8 +1030,9 @@ class MDLM(trainer_base.AbsorbingState):
       student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
 
     if not dmd_weight:
-      # MMD-only: the teacher/fake pair is never consulted, so their two
-      # forwards are skipped rather than computed and multiplied by zero.
+      # Reward-only: skip the differentiable DMD teacher/fake pair. The IDLM
+      # ratio reward still consults both critics internally on hard samples;
+      # the paired feature reward does not.
       return self._mmd_term(x0, valid_tokens, student_probs, mmd_xt)
 
     t = self._sample_t(x0.shape[0], current_accumulation_step)
@@ -1027,7 +1111,8 @@ class MDLM(trainer_base.AbsorbingState):
         if self._student_accum_counter == self.accum_batches:
           self._student_accum_counter = 0 
           optimizer_student.step()
-          self.ema.update(self.backbone.parameters())
+          if self.ema is not None:
+            self.ema.update(self.backbone.parameters())
           optimizer_student.zero_grad()
           finish_iter = True
       else:
@@ -1043,7 +1128,8 @@ class MDLM(trainer_base.AbsorbingState):
         if self._fake_accum_counter == self.accum_batches:
           self._fake_accum_counter = 0 
           optimizer_fake.step()
-          self.ema_fake.update(self.fake_model.parameters())
+          if self.ema_fake is not None:
+            self.ema_fake.update(self.fake_model.parameters())
           optimizer_fake.zero_grad()
           finish_iter = True
 
