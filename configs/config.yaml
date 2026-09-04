@@ -25,11 +25,13 @@ adversarial_distill:
 
   # --- Paired AR feature reward (ported from the TinyGSM branch) -------------
   # A frozen model used as a fixed *feature map* rather than a likelihood
-  # critic: run it over the clean row and over the student's sample, mean-pool
-  # one middle block's hidden states, and reward the student for closing the
-  # gap under a pseudo-Huber distance. Optimized by REINFORCE with a
-  # leave-one-out baseline over `mmd_group_size` samples drawn at the same
-  # state. See `mmd_reward.py`.
+  # critic: run it over the clean row and over the student's sample, read one
+  # middle block's hidden states, and reward the student for closing the
+  # feature gap. Historical token/rows modes use pseudo-Huber;
+  # `mmd_kernel_source=draws` plus `mmd_kernel_level=sentence` uses the explicit
+  # linear- or RBF-kernel MMD estimator documented below. Optimized by
+  # REINFORCE with a leave-one-out baseline over `mmd_group_size` candidates
+  # drawn at the same state. See `mmd_reward.py`.
   #
   # 0 disables it entirely -- the feature map is never even loaded.
   mmd_reward_weight: 0.0
@@ -97,7 +99,7 @@ adversarial_distill:
   # explicitly rather than falling through to Python's from-the-end indexing,
   # which would have silently handed back the last block.
   #
-  # A list asks for a summed reward, one pseudo-Huber term per block. Mind the
+  # A list asks for a summed reward, one reward term per block. Mind the
   # scale spread: on the TinyGSM teacher the reward per corrupted token grew
   # ~6x per four blocks, which makes an unweighted sum very nearly the deepest
   # block alone. Use `mmd_feature_layer_weights` to put terms on equal footing.
@@ -105,38 +107,36 @@ adversarial_distill:
   mmd_feature_layer_weights: null
 
   # How the two feature sets are compared.
-  #   linear -- pool both sides and score the difference with pseudo-Huber.
-  #             This is what an MMD with a LINEAR kernel reduces to: it sees
-  #             the means and nothing else, so a sample matching the clean row
-  #             on average is free regardless of its shape.
-  #   rbf    -- Gaussian-kernel MMD^2 between the per-position feature
-  #             distributions, unbiased (self-pairs removed). Sensitive to more
-  #             than the mean, which is the point given the probe's finding
-  #             that the linear reward behaves close to a soft edit distance.
+  #   linear -- rows mode and draws+token pool both sides and score the
+  #             difference with pseudo-Huber. `draws + sentence` instead uses
+  #             the actual normalized linear-kernel MMD: MSE between means,
+  #             with the fake-sample variance correction when K > 1.
+  #   rbf    -- Gaussian-kernel MMD^2 over the token or sentence feature
+  #             distributions selected below. Sensitive to more than the mean,
+  #             which is the point given the probe's finding that the linear
+  #             reward behaves close to a soft edit distance.
   # Computed by `mmd_rbf.py`, which reduces the three pair sums a tile at a
   # time and never materialises the (batch, length, length) Gram matrix.
   mmd_kernel: linear
-  # What ONE SAMPLE is, for whichever kernel is chosen.
+  # What one kernel sample is, for whichever kernel is chosen.
   #   token    -- every scored position of the kernel row (the default and the
-  #               historical behaviour). The distribution being matched is over
-  #               token features.
+  #               historical behaviour). The distribution being matched is
+  #               over token features.
   #   sentence -- mean-pool each sequence over its own scored positions first,
-  #               then hand the kernel the row's `mmd_kernel_batch_size`
-  #               sentence vectors. The distribution being matched is over
-  #               SENTENCES.
+  #               then apply the kernel to the resulting sentence vectors.
   #
-  # For `linear` this changes nothing when the sequences in a row carry equal
-  # numbers of scored positions -- a mean of means is then the pooled mean --
-  # which is exactly the case at `mmd_kernel_batch_size=1`. It differs only in
-  # the weighting when the counts differ: pooling weights a sequence by how
-  # much of it was written, sentence level weights every sequence alike.
+  # In `rows` mode, linear token/sentence levels agree whenever every sequence
+  # in a row has the same scored count; otherwise token pooling weights a
+  # sequence by how much was scored while sentence pooling weights every
+  # sequence alike. Sentence-level RBF in rows mode still needs K >= 2 because
+  # both empirical sides contain K independently observed batch rows.
   #
-  # For `rbf` it is a different statistic. Token level asks whether the two
-  # sets of per-position features have the same distribution; sentence level
-  # asks that of the pooled sentence vectors. Needs
-  # `mmd_kernel_batch_size >= 2`, since the unbiased MMD^2 has no estimate from
-  # a single sample per side -- and realistically more, the row size is the
-  # sample count.
+  # In `draws` mode, sentence level produces one pooled REAL embedding and K
+  # independently pooled FAKE embeddings for each state. For both linear and
+  # RBF, K > 1 removes fake self-pairs: the estimator is unbiased over fake
+  # draws with the observed real embedding treated as fixed. K = 1 uses the
+  # biased empirical estimate because no off-diagonal fake pair exists.
+  # Unlike rows mode, sentence-level RBF is therefore valid at K = 1.
   mmd_kernel_level: token
   # What FILLS the kernel batch, i.e. where the `mmd_kernel_batch_size` samples
   # come from.
@@ -147,13 +147,12 @@ adversarial_distill:
   #            `scripts/probe_kernel_batch_size.py`.
   #   draws -- `mmd_kernel_batch_size` draws from the SAME `student_probs`, at
   #            one state. Each REINFORCE candidate becomes that whole set
-  #            rather than a single sample, so the MMD compares
-  #            `K * n_scored` fake token features against the clean row's
-  #            `n_scored`. What is being matched is the student's output
-  #            DISTRIBUTION at that state, not one realisation of it, so the
-  #            estimate sharpens with K instead of just averaging K noisy
-  #            rewards -- and no reward is shared between different rows, so
-  #            attribution stays intact.
+  #            rather than a single sample. Token level compares n real token
+  #            features with K*n fake token features. Sentence level first
+  #            average-pools each complete sequence over its configured scored
+  #            positions (`written` by default), then compares one fixed real
+  #            vector with K fake vectors. No reward is shared between batch
+  #            rows, so attribution stays intact.
   #
   # `draws` needs a critic with `multi_draw_reward`, which the feature critics
   # have and `mmd_reward_type: idlm` does not. It costs `mmd_group_size *
@@ -166,22 +165,18 @@ adversarial_distill:
   mmd_rbf_alpha: null
   # Tile edge for the blocked kernel; 0 sizes it from a 256MB scratch budget.
   mmd_rbf_block_size: 0
-  # How many sequences share one kernel row. The row is the unit the statistic
-  # is computed over for BOTH kernels -- linear pools it to one mean, rbf takes
-  # its valid tokens as the sample set -- so this decides the granularity:
-  #   1            -- one comparison per sequence (the default, unchanged)
-  #   N            -- N sequences matched as a group; all N share the reward
-  #   batch_size   -- the whole batch as a single pooled distribution
+  # Kernel sample count K. Its meaning depends on `mmd_kernel_source`:
+  #   rows  -- K adjacent device-batch sequences are matched as a group and
+  #            share one reward. K must divide the per-device batch size.
+  #   draws -- K complete generated sequences are sampled at the SAME state
+  #            inside each REINFORCE candidate. It need not divide the batch.
   #
-  # Widening is a trade, not a free win. A row of N can be satisfied by samples
-  # that SWAP content between its sequences: two answers exchanged pool to the
-  # same mean and hold the same token multiset, so neither kernel can tell.
-  # What it buys is N times the tokens behind the statistic, and for rbf N^2
-  # times the pairs. Must divide the per-device batch size.
-  #
-  # The reward stays per sequence whatever this is -- REINFORCE multiplies each
-  # sequence's advantage by its own log-probability -- so a row's reward is
-  # simply shared by the sequences in it, which coarsens credit assignment.
+  # Rows mode can be satisfied by swapping content between its K sequences:
+  # the pooled mean and token multiset can stay unchanged, and sharing its
+  # reward coarsens credit assignment. Draws mode instead spends K times the
+  # critic compute to estimate one state's output distribution. Its candidate
+  # log-probability is the sum over those K draws and the loss divides by K, so
+  # changing K changes compute and estimator variance, not nominal weight.
   mmd_kernel_batch_size: 1
 
   # Which positions the reward is measured over. The student only ever WRITES
@@ -234,10 +229,9 @@ adversarial_distill:
   #   batch -- leave-one-out across the other sequences in the batch. Unbiased
   #            and free, but noisier: those rows carry different x0 and
   #            different masking, so their rewards measure different things.
-  #   none  -- subtract nothing. Still unbiased, but the pseudo-Huber reward is
-  #            a negative distance, so every advantage is negative and every
-  #            update pushes down whatever the student sampled. For measuring
-  #            what the baseline is worth, not for training.
+  #   none  -- subtract nothing; useful mainly as a control. Most rewards are
+  #            non-positive distances, but the unbiased K>1 sentence/draws
+  #            estimator can be negative and therefore produce positive reward.
   mmd_baseline: auto
 
   # Distillation-only sanity check for a one-forward generator. When true,

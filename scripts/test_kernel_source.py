@@ -8,6 +8,7 @@ not widen what the gradient reaches.
 """
 import os
 import sys
+from unittest import mock
 
 import torch
 
@@ -24,6 +25,7 @@ x0 = torch.randint(0, V, (B, L))
 
 class Spy:
     resolved_layers=[0]
+    kernel_level='token'
     def __init__(self): self.calls=0; self.shapes=[]
     def multi_draw_reward(self, clean, draws, scored, eos):
         self.calls += 1; self.shapes.append(tuple(draws.shape))
@@ -45,6 +47,55 @@ chk('gradient exactly zero outside the written span',
     bool((g[:, ~written[0]] == 0).all()))
 chk('written positions carry gradient', bool((g[:, written[0]] > 0).any()))
 chk('reward_spread reported over the group', float(stats['mmd/reward_spread']) > 0)
+
+# Pin two invariants that are easy to lose in this dispatch: draws with K=1
+# must still use multi_draw_reward (the sentence estimator's biased fallback),
+# and the joint K-draw log probability must be normalized by K without changing
+# OWT's historical 1/G normalization.
+class IndexedMultiReward(Spy):
+    kernel_level='sentence'
+    def multi_draw_reward(self, clean, draws, scored, eos):
+        del clean, scored, eos
+        self.calls += 1; self.shapes.append(tuple(draws.shape))
+        # The deterministic sampler below repeats one token within a candidate,
+        # so this reward is independent of K.
+        return draws[:, :, 0].float().mean(0), torch.ones(
+            draws.shape[1], dtype=torch.bool)
+
+def run_k(draw_count):
+    group, batch, length, vocab = 3, 2, 4, 5
+    candidate_ids = torch.arange(group).repeat_interleave(draw_count)
+    def draw_candidates(flat_probs, num_samples, replacement=False, **kwargs):
+        del kwargs
+        assert replacement and num_samples == group * draw_count
+        return candidate_ids.to(flat_probs.device).expand(flat_probs.shape[0], -1)
+    candidate_probs = torch.full(
+        (batch, length, vocab), 1.0 / vocab, requires_grad=True)
+    clean = torch.zeros(batch, length, dtype=torch.long)
+    scored = torch.ones(batch, length, dtype=torch.bool)
+    critic = IndexedMultiReward()
+    with mock.patch.object(torch, 'multinomial', draw_candidates):
+        candidate_loss, _ = mmd_reward.mmd_reinforce_loss(
+            candidate_probs, clean, scored, critic, group_size=group,
+            eos_id=None, baseline='group', kernel_source='draws',
+            kernel_draws=draw_count)
+    candidate_loss.backward()
+    return candidate_loss.detach(), candidate_probs.grad.detach(), critic
+
+k1 = run_k(1)
+k2 = run_k(2)
+k4 = run_k(4)
+for wider in (k2, k4):
+    torch.testing.assert_close(wider[0], k1[0], rtol=0, atol=0)
+    torch.testing.assert_close(wider[1], k1[1], rtol=0, atol=0)
+chk('draws K=1 uses one multi-draw call per candidate',
+    k1[2].calls == 3 and k1[2].shapes == [(1, 2, 4)] * 3)
+chk('sentence-level draws accepts K=2',
+    k2[2].calls == 3 and k2[2].shapes == [(2, 2, 4)] * 3)
+chk('1/K normalization cancels duplicated draw log-probabilities', True)
+chk('sentence draws preserve OWT 1/G normalization',
+    torch.allclose(k2[1][..., 0], torch.full((2, 4), 0.3125))
+    and torch.allclose(k2[1][..., 2], torch.full((2, 4), -0.3125)))
 
 # rows mode must be untouched
 class Spy2:

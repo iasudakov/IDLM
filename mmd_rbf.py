@@ -300,3 +300,62 @@ def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size: int = 0):
     nm = (n_eff * m_eff).clamp_min(1.0)
     mmd2 = (s_xx - n_eff) / nn + (s_yy - m_eff) / mm - 2.0 * s_xy / nm
     return torch.where(active, mmd2, torch.zeros_like(mmd2)), active
+
+
+@torch.no_grad()
+def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0):
+    """MMD^2 from one fixed real vector and K sampled fake vectors per row.
+
+    ``real`` is ``(batch, hidden)`` and ``fake`` is
+    ``(batch, draws, hidden)``. The real vector is the observed conditional
+    target, so ``k(real, real)`` is known exactly. When K > 1 the fake-fake
+    term is the unbiased U-statistic (its diagonal is removed):
+
+        k(x,x) + sum_{i != j} k(y_i,y_j) / (K(K-1))
+               - 2 sum_i k(x,y_i) / K
+
+    With K = 1 there is no off-diagonal fake pair, so this deliberately falls
+    back to the biased empirical estimate ``2 - 2 k(x,y)``. The K > 1 result
+    is not clamped: a U-statistic can legitimately be negative, and clamping it
+    would make the requested estimator biased.
+    """
+    if real.ndim != 2 or fake.ndim != 3:
+        raise ValueError('fixed-real RBF expects (batch, hidden) real and '
+                         '(batch, draws, hidden) fake features, got '
+                         f'{tuple(real.shape)} and {tuple(fake.shape)}')
+    if real.shape[0] != fake.shape[0] or real.shape[1] != fake.shape[2]:
+        raise ValueError('fixed-real RBF features must share batch and hidden '
+                         f'dimensions, got {tuple(real.shape)} and '
+                         f'{tuple(fake.shape)}')
+    draws = fake.shape[1]
+    if draws < 1:
+        raise ValueError('fixed-real RBF needs at least one fake draw')
+
+    real = real.detach().float()
+    fake = fake.detach().float()
+    if torch.is_tensor(alpha):
+        alpha = alpha.detach().to(dtype=real.dtype, device=real.device)
+    real2, fake2 = _sq_norms(real), _sq_norms(fake)
+    rows = real.shape[0]
+    block = (pick_block_size(rows, draws)
+             if block_size <= 0 else block_size)
+
+    fake_sum = real.new_zeros(rows)
+    cross_sum = real.new_zeros(rows)
+    for i0, i1 in _blocks(draws, block):
+        for j0, j1 in _blocks(draws, block):
+            kernel = _kernel_block(
+                fake[:, i0:i1], fake[:, j0:j1],
+                fake2[:, i0:i1], fake2[:, j0:j1], alpha,
+                self_tile=i0 == j0)
+            fake_sum += kernel.sum(dim=(1, 2))
+        cross = _kernel_block(
+            real.unsqueeze(1), fake[:, i0:i1], real2.unsqueeze(1),
+            fake2[:, i0:i1], alpha)
+        cross_sum += cross.sum(dim=(1, 2))
+
+    if draws == 1:
+        fake_term = fake_sum
+    else:
+        fake_term = (fake_sum - draws) / (draws * (draws - 1))
+    return 1.0 + fake_term - 2.0 * cross_sum / draws

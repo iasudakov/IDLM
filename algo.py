@@ -938,6 +938,10 @@ class MDLM(trainer_base.AbsorbingState):
       if level not in ('token', 'sentence'):
         raise ValueError('adversarial_distill.mmd_kernel_level must be '
                          f'token|sentence, got {level!r}')
+      kernel_source = str(cfg.get('mmd_kernel_source', 'rows'))
+      if kernel_source not in ('rows', 'draws'):
+        raise ValueError('adversarial_distill.mmd_kernel_source must be '
+                         f'rows|draws, got {kernel_source!r}')
       self._mmd_critic_cached.kernel = kernel
       self._mmd_critic_cached.kernel_level = level
       self._mmd_critic_cached.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
@@ -945,10 +949,14 @@ class MDLM(trainer_base.AbsorbingState):
         cfg.get('mmd_rbf_block_size', 0) or 0)
       self._mmd_critic_cached.kernel_batch_size = max(
         1, int(cfg.get('mmd_kernel_batch_size', 1) or 1))
+      kernel_batch = (
+        f'{self._mmd_critic_cached.kernel_batch_size} draws/candidate'
+        if kernel_source == 'draws'
+        else f'rows of {self._mmd_critic_cached.kernel_batch_size}')
       print(f'[mmd] {what}, block '
             f'{self._mmd_critic_cached.layer_description}, '
             f'{kernel} kernel over {level}s, '
-            f'rows of {self._mmd_critic_cached.kernel_batch_size}, '
+            f'{kernel_batch}, '
             f'group={cfg.mmd_group_size}, '
             f'weight={cfg.mmd_reward_weight}', flush=True)
     return self._mmd_critic_cached

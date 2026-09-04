@@ -13,6 +13,12 @@ large ones, so a single badly-placed block cannot dominate the gradient the way 
 squared distance would. The reward is per block, and it drives a REINFORCE step whose
 baseline is the leave-one-out mean over a group of samples drawn at the same state.
 
+The ``draws + sentence`` mode uses a different, explicit kernel estimator:
+every sequence is mean-pooled first, then one fixed clean embedding is compared
+with K sampled embeddings. It uses an unclamped U-statistic for K > 1 and a
+biased fallback for K = 1, for both normalized linear and RBF kernels.
+Historical token/rows paths retain the pseudo-Huber behaviour above.
+
 Two things differ here from the OPDLM implementation, both forced by the model:
 
 * **No doubled row.** OPDLM stacks `[prompt|x0|x0]` against `[prompt|x0|x0_gen]` in one
@@ -487,6 +493,129 @@ def summed_paired_reward(features, batch, selected, indices, weights,
   return total, active, per_layer
 
 
+@torch.no_grad()
+def linear_mmd2_fixed_real(real, fake):
+  """Linear-kernel MMD^2 for one fixed real and K fake vectors per row.
+
+  The real vector is the observed conditional target. With K > 1, fake
+  self-pairs are removed for an estimator unbiased over the fake draws. With
+  K = 1, where no off-diagonal fake pair exists, this is the biased empirical
+  MSE between the real and fake means. For K > 1 the same estimator is written
+  as that MSE minus ``Var(fake) / K``; this is algebraically the fake-diagonal
+  removal for the normalized linear kernel ``k(x,y) = mean_d x_d y_d``. No
+  clamp is applied: the K > 1 U-statistic can legitimately be negative.
+  """
+  if real.ndim != 2 or fake.ndim != 3:
+    raise ValueError('fixed-real linear MMD expects (batch, hidden) real and '
+                     '(batch, draws, hidden) fake features, got '
+                     f'{tuple(real.shape)} and {tuple(fake.shape)}')
+  if real.shape[0] != fake.shape[0] or real.shape[1] != fake.shape[2]:
+    raise ValueError('fixed-real linear MMD features must share batch and '
+                     f'hidden dimensions, got {tuple(real.shape)} and '
+                     f'{tuple(fake.shape)}')
+  draws = fake.shape[1]
+  if draws < 1:
+    raise ValueError('fixed-real linear MMD needs at least one fake draw')
+
+  real = real.detach().float()
+  fake = fake.detach().float()
+  mean_mse = (real - fake.mean(dim=1)).square().mean(dim=-1)
+  if draws == 1:
+    return mean_mse
+  variance_correction = fake.var(
+    dim=1, correction=1).mean(dim=-1) / draws
+  return mean_mse - variance_correction
+
+
+def summed_multi_draw_reward(features, batch, draw_count, length, selected,
+                             indices, weights, kernel='linear', alpha=None,
+                             block_size=0, level='token'):
+  """Score K draws from each state as one feature distribution.
+
+  ``features`` contains the clean batch followed by K generated batches.
+  ``level='token'`` retains the historical multi-draw estimator: one side has
+  ``n_scored`` real token features and the other ``K * n_scored`` fake token
+  features. ``level='sentence'`` first mean-pools every sequence over its own
+  scored positions, yielding one fixed real vector and K fake vectors.
+
+  At sentence level both kernels use the same estimator rule. K > 1 removes
+  fake self-pairs and is unbiased over draws conditional on the fixed real
+  vector; K = 1 uses the biased empirical estimate. The sentence-level linear
+  path is a normalized linear-kernel MMD rather than the historical
+  pseudo-Huber transform used by paired/token rewards.
+
+  Returns ``(reward, active, per_layer)`` with one reward per original row.
+  """
+  if selected.shape != (batch, length):
+    raise ValueError(f'multi-draw selected mask must be {(batch, length)}, got '
+                     f'{tuple(selected.shape)}')
+  if draw_count < 1:
+    raise ValueError(f'multi-draw needs at least one draw, got {draw_count}')
+  if level not in ('token', 'sentence'):
+    raise ValueError(f'mmd_kernel_level must be token|sentence, got {level!r}')
+  expected_rows = (draw_count + 1) * batch
+  total, active, per_layer = None, None, {}
+  for index, weight in zip(indices, weights):
+    hidden = features[index]
+    if hidden.shape[0] != expected_rows or hidden.shape[1] != length:
+      raise ValueError(
+        f'multi-draw layer {index} must be {(expected_rows, length, "D")}, '
+        f'got {tuple(hidden.shape)}')
+    real = hidden[:batch]
+    fake_by_draw = hidden[batch:].reshape(draw_count, batch, length, -1)
+
+    if level == 'sentence':
+      real_sentence, real_active = pool_over_selected(real, selected)
+      fake_sentence, fake_active = pool_over_selected(
+        fake_by_draw.reshape(draw_count * batch, length, -1),
+        selected.repeat(draw_count, 1))
+      fake_sentence = fake_sentence.reshape(
+        draw_count, batch, -1).permute(1, 0, 2)
+      layer_active = real_active & fake_active.reshape(
+        draw_count, batch).all(dim=0)
+
+      if kernel == 'rbf':
+        layer_alpha = alpha
+        if layer_alpha is None:
+          # Estimate the sentence-scale bandwidth from real sentences across
+          # the device batch, never from the moving student samples.
+          layer_alpha = median_alpha(
+            real_sentence.unsqueeze(1), real_active.unsqueeze(1))
+        mmd2 = mmd_rbf.rbf_mmd2_fixed_real(
+          real_sentence, fake_sentence, layer_alpha,
+          block_size=block_size)
+      elif kernel == 'linear':
+        mmd2 = linear_mmd2_fixed_real(real_sentence, fake_sentence)
+      else:
+        raise ValueError(f'mmd_kernel must be linear|rbf, got {kernel!r}')
+      reward = torch.where(layer_active, -mmd2, torch.zeros_like(mmd2))
+    else:
+      fake = fake_by_draw.permute(1, 0, 2, 3).reshape(
+        batch, draw_count * length, -1)
+      w_real = selected.to(real.dtype)
+      w_fake = w_real.repeat(1, draw_count)
+      if kernel == 'rbf':
+        layer_alpha = alpha
+        if layer_alpha is None:
+          layer_alpha = median_alpha(real.detach().float(), selected)
+        mmd2, layer_active = mmd_rbf.rbf_mmd2_unequal(
+          real, fake, w_real, w_fake, layer_alpha, block_size=block_size)
+        reward = -mmd2.clamp_min(0.0)
+      elif kernel == 'linear':
+        real_mean, layer_active = pool_over_selected(real, selected)
+        fake_mean, _ = pool_over_selected(fake, w_fake.bool())
+        reward = pseudo_huber_reward(fake_mean - real_mean)
+        reward = torch.where(layer_active, reward, torch.zeros_like(reward))
+      else:
+        raise ValueError(f'mmd_kernel must be linear|rbf, got {kernel!r}')
+
+    per_layer[index] = reward
+    total = reward * weight if total is None else total + reward * weight
+    active = (layer_active if active is None else
+              active & layer_active)
+  return total, active, per_layer
+
+
 def batch_advantages(reward, active):
   """Leave-one-out advantages over the *batch* axis, for a group of one.
 
@@ -609,6 +738,36 @@ class FrozenARFeatures(_LayeredFeatures):
     return captured
 
   @torch.no_grad()
+  def multi_draw_reward(self, clean_tokens, draws, selected, eos_id,
+                        attention_mask=None, return_per_layer=False):
+    """Compare K generated answers from one state with its clean answer."""
+    if draws.ndim != 3:
+      raise ValueError('multi_draw_reward expects (K, batch, length) draws, '
+                       f'got {tuple(draws.shape)}')
+    draw_count, batch, length = draws.shape
+    if clean_tokens.shape != (batch, length):
+      raise ValueError(f'clean tokens must be {(batch, length)}, got '
+                       f'{tuple(clean_tokens.shape)}')
+
+    stacked = torch.cat(
+      [clean_tokens, draws.reshape(draw_count * batch, length)], dim=0)
+    mask = None
+    if attention_mask is not None:
+      if attention_mask.shape != (batch, length):
+        raise ValueError(f'attention mask must be {(batch, length)}, got '
+                         f'{tuple(attention_mask.shape)}')
+      mask = torch.cat([attention_mask,
+                        attention_mask.repeat(draw_count, 1)], dim=0)
+    feats = self.features(stacked, eos_id, attention_mask=mask)
+    reward, active, per_layer = summed_multi_draw_reward(
+      feats, batch, draw_count, length, selected, self.resolved_layers,
+      self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
+      block_size=self.rbf_block_size, level=self.kernel_level)
+    if return_per_layer:
+      return reward, active, per_layer
+    return reward, active
+
+  @torch.no_grad()
   def paired_reward(self, clean_tokens, generated_tokens, selected,
                     eos_id, attention_mask=None, return_per_layer=False):
     """Per-sequence reward comparing a generated answer against the clean one.
@@ -685,10 +844,9 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
       `auto` picks `group` when group_size >= 2 and `none` when it is 1.
       `batch` uses the other sequences in the batch -- unbiased, free, but
       noisier, since those rows carry different `x0`. `none` subtracts
-      nothing, which is still unbiased but leaves every advantage negative
-      (the reward is a negative distance), so every update pushes down
-      whatever was sampled; it is for measuring the baseline's worth, not for
-      training.
+      nothing, which is still unbiased but leaves the reward's potentially
+      large offset in the estimator; it is mainly useful for measuring the
+      baseline's worth.
 
   Returns `(loss, stats)`; `loss` already carries `reward_weight`.
   """
@@ -741,13 +899,24 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     rewards, actives, breakdown = [], [], {}
     multi = len(getattr(critic, 'resolved_layers', [None])) > 1
     grouped = getattr(critic, 'grouped_reward', None)
-    if per_candidate > 1:
-      # (group, per_candidate, batch, length): candidate g is scored on all of
-      # its own draws at once, so one reward comes back per candidate.
+    if kernel_source == 'draws':
+      # Candidate g is a SET of K answers, scored together as one empirical
+      # feature distribution. This branch is source-based rather than K-based:
+      # K=1 still needs the sentence-level biased MMD fallback, not the
+      # historical paired pseudo-Huber path.
       blocks = samples.view(group_size, per_candidate, batch, length)
-      for g in range(group_size):
-        member_reward, member_active = critic.multi_draw_reward(
-          x0, blocks[g], scored, eos_id)
+      for group_index in range(group_size):
+        if multi:
+          out = critic.multi_draw_reward(
+            x0, blocks[group_index], scored, eos_id,
+            return_per_layer=True)
+        else:
+          out = critic.multi_draw_reward(
+            x0, blocks[group_index], scored, eos_id)
+        member_reward, member_active = out[0], out[1]
+        if multi:
+          for index, value in out[2].items():
+            breakdown.setdefault(index, []).append(value)
         rewards.append(member_reward)
         actives.append(member_active)
       reward = torch.stack(rewards, dim=-1)
@@ -775,9 +944,9 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     elif baseline == 'batch':
       advantage = batch_advantages(reward, active)
     else:  # 'none'
-      # Unbiased, but the reward is a negative distance, so every advantage is
-      # negative and each update pushes down whatever was sampled. Kept for
-      # measuring what the baseline is worth, not for training.
+      # Unbiased but high variance because the reward offset remains. Most
+      # modes return a non-positive distance; an unclamped sentence-level
+      # U-statistic can instead make the reward positive.
       advantage = reward
     advantage = torch.where(active.unsqueeze(-1), advantage,
                             torch.zeros_like(advantage))
@@ -817,7 +986,9 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
       per = torch.stack(values, dim=-1)
       stats[f'mmd/reward_l{index}'] = per[active].mean().detach() \
         if active.any() else per.new_zeros(())
-      stats[f'mmd/reward_spread_l{index}'] = per.std(dim=-1).mean().detach()
+      stats[f'mmd/reward_spread_l{index}'] = (
+        per.std(dim=-1).mean().detach() if group_size > 1
+        else per.new_zeros(()))
   return loss, stats
 
 
@@ -853,79 +1024,44 @@ class FrozenBackboneFeatures(_LayeredFeatures):
 
   @torch.no_grad()
   def multi_draw_reward(self, clean_tokens, draws, selected, eos_id,
-                        sigma=None):
-    """One reward per row, comparing K draws at the SAME state to the clean row.
-
-    `paired_reward` compares one generated sequence against its reference, so
-    the kernel's two sets are the same size and the fake side is a single
-    sample path. Here the fake side is `K` independent draws from one
-    `student_probs`, pooled into one sample set: `K * n_scored` fake token
-    features against the clean row's `n_scored`. The student's output
-    distribution at that state is what is being matched, rather than any one
-    realisation of it, which is what makes the estimate sharpen with `K`
-    instead of merely averaging `K` noisy rewards.
-
-    The sizes differ, so this cannot go through `rbf_pair_sums`, which carries
-    one weight tensor for both sides. `mmd_rbf.rbf_mmd2_unequal` takes a mask
-    each.
-
-    Args:
-      clean_tokens: `(batch, length)`.
-      draws: `(K, batch, length)`, all drawn at the same state.
-      selected: `(batch, length)` bool, the scored positions.
-
-    Returns `(reward, active)`, shapes `(batch,)`.
-    """
+                        sigma=None, return_per_layer=False):
+    """Compare K generated answers from one state with its clean answer."""
+    del eos_id  # This backbone uses the student's vocabulary directly.
     if draws.ndim != 3:
       raise ValueError('multi_draw_reward expects (K, batch, length) draws, '
                        f'got {tuple(draws.shape)}')
-    k, batch, length = draws.shape
+    draw_count, batch, length = draws.shape
     if clean_tokens.shape != (batch, length):
       raise ValueError(f'clean tokens must be {(batch, length)}, got '
                        f'{tuple(clean_tokens.shape)}')
 
-    # One corruption mask for the clean row and every draw, so the comparison
-    # isolates what the student wrote rather than which row got masked harder.
+    # Use one critic-corruption mask for the clean answer and all K draws. That
+    # keeps masking luck out of the MMD comparison within a candidate.
     keep = torch.rand(clean_tokens.shape, device=clean_tokens.device)
     drop = (keep < self.noise_level) & selected.bool()
     clean_xt = torch.where(drop, self.mask_index, clean_tokens)
     gen_xt = torch.where(drop.unsqueeze(0), self.mask_index, draws)
+    stacked = torch.cat(
+      [clean_xt, gen_xt.reshape(draw_count * batch, length)], dim=0)
 
-    stacked = torch.cat([clean_xt, gen_xt.reshape(k * batch, length)], dim=0)
     if sigma is None:
       sigma = torch.zeros(stacked.shape[0], device=stacked.device,
                           dtype=torch.float32)
+    else:
+      if sigma.shape[0] != batch:
+        raise ValueError(f'sigma must have {batch} rows, got {tuple(sigma.shape)}')
+      repeats = (draw_count,) + (1,) * (sigma.ndim - 1)
+      sigma = torch.cat([sigma, sigma.repeat(repeats)], dim=0)
     with capture_layer_hidden(self.denoiser, self.layer_index) as (feats, _):
       self.denoiser(stacked, sigma)
 
-    total, active = None, None
-    for index, weight in zip(self.resolved_layers, self.layer_weights):
-      hidden = feats[index]
-      real = hidden[:batch]                                  # (batch, L, D)
-      fake = hidden[batch:].reshape(k, batch, length, -1)
-      fake = fake.permute(1, 0, 2, 3).reshape(batch, k * length, -1)
-      w_real = selected.to(real.dtype)
-      w_fake = w_real.repeat(1, k)
-      if self.kernel == 'rbf':
-        alpha = self.rbf_alpha
-        if alpha is None:
-          alpha = median_alpha(real.detach().float(), selected)
-        mmd2, act = mmd_rbf.rbf_mmd2_unequal(
-          real, fake, w_real, w_fake, alpha, block_size=self.rbf_block_size)
-        reward = -mmd2.clamp_min(0.0)
-      elif self.kernel == 'linear':
-        # A linear kernel sees only the means, so this is the clean row's mean
-        # against the mean over all K draws -- the same statistic the paired
-        # linear reward uses, with a K-times larger fake sample.
-        real_mean, act = pool_over_selected(real, selected)
-        fake_mean, _ = pool_over_selected(fake, w_fake.bool())
-        reward = pseudo_huber_reward(fake_mean - real_mean)
-        reward = torch.where(act, reward, torch.zeros_like(reward))
-      else:
-        raise ValueError(f'mmd_kernel must be linear|rbf, got {self.kernel!r}')
-      total = reward * weight if total is None else total + reward * weight
-      active = act if active is None else (active & act)
-    return total, active
+    reward, active, per_layer = summed_multi_draw_reward(
+      feats, batch, draw_count, length, selected, self.resolved_layers,
+      self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
+      block_size=self.rbf_block_size, level=self.kernel_level)
+    if return_per_layer:
+      return reward, active, per_layer
+    return reward, active
 
   @torch.no_grad()
   def paired_reward(self, clean_tokens, generated_tokens, selected, eos_id,
