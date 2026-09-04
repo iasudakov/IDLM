@@ -1009,7 +1009,9 @@ class MDLM(trainer_base.AbsorbingState):
       eos_id=self.tokenizer.eos_token_id,
       reward_weight=cfg.mmd_reward_weight,
       baseline=str(cfg.get('mmd_baseline', 'auto')),
-      scored=scored)
+      scored=scored,
+      kernel_source=str(cfg.get('mmd_kernel_source', 'rows')),
+      kernel_draws=max(1, int(cfg.get('mmd_kernel_batch_size', 1) or 1)))
     stats['mmd/generator_mask_fraction'] = (
       selected.sum().to(student_probs.dtype)
       / content.sum().clamp_min(1).to(student_probs.dtype)).detach()

@@ -138,6 +138,28 @@ adversarial_distill:
   # a single sample per side -- and realistically more, the row size is the
   # sample count.
   mmd_kernel_level: token
+  # What FILLS the kernel batch, i.e. where the `mmd_kernel_batch_size` samples
+  # come from.
+  #   rows  -- adjacent sequences of the batch (the default and the historical
+  #            behaviour). They are different rows, so different `x0` and
+  #            different `x_t`, and the row's single reward is shared by all of
+  #            them -- which is what costs credit assignment 1/sqrt(N); see
+  #            `scripts/probe_kernel_batch_size.py`.
+  #   draws -- `mmd_kernel_batch_size` draws from the SAME `student_probs`, at
+  #            one state. Each REINFORCE candidate becomes that whole set
+  #            rather than a single sample, so the MMD compares
+  #            `K * n_scored` fake token features against the clean row's
+  #            `n_scored`. What is being matched is the student's output
+  #            DISTRIBUTION at that state, not one realisation of it, so the
+  #            estimate sharpens with K instead of just averaging K noisy
+  #            rewards -- and no reward is shared between different rows, so
+  #            attribution stays intact.
+  #
+  # `draws` needs a critic with `multi_draw_reward`, which the feature critics
+  # have and `mmd_reward_type: idlm` does not. It costs `mmd_group_size *
+  # mmd_kernel_batch_size` critic forwards per micro-batch, so G=8 with K=4 is
+  # 4x the default's critic time.
+  mmd_kernel_source: rows
   # Kernel bandwidth as `alpha = 1 / (2 sigma^2)`. `null` measures it per call
   # by the median heuristic on the REAL branch -- a bandwidth fitted to the
   # student would drift as the student does, making the reward a moving target.

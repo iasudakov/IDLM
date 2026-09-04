@@ -640,7 +640,8 @@ class FrozenARFeatures(_LayeredFeatures):
 
 def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
                        group_size, eos_id, reward_weight=1.0,
-                       baseline='auto', scored=None):
+                       baseline='auto', scored=None, kernel_source='rows',
+                       kernel_draws=1):
   """REINFORCE loss driving the student toward the clean answer's AR features.
 
   `group_size` hard answers are drawn from the student's differentiable
@@ -712,12 +713,27 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     raise ValueError(f'scored mask must be {tuple(selected.shape)}, got '
                      f'{tuple(scored.shape)}')
 
+  if kernel_source not in ('rows', 'draws'):
+    raise ValueError('mmd_kernel_source must be rows|draws, got '
+                     f'{kernel_source!r}')
+  # `draws` mode makes each REINFORCE candidate a SET of `kernel_draws` samples
+  # at the same state, pooled into one MMD estimate, instead of a single
+  # sample. The candidate is then the set, so its log-probability is the sum
+  # over its members and the group still supplies the leave-one-out spread.
+  per_candidate = int(kernel_draws) if kernel_source == 'draws' else 1
+  if per_candidate < 1:
+    raise ValueError(f'mmd_kernel_batch_size must be >= 1, got {kernel_draws}')
+  if kernel_source == 'draws' and not hasattr(critic, 'multi_draw_reward'):
+    raise ValueError('mmd_kernel_source=draws needs a critic exposing '
+                     'multi_draw_reward; the idlm-ratio reward does not')
+
   # Sampling and the reward are no-grad; only the log-prob gather carries
   # gradient.
   with torch.no_grad():
     flat = student_probs.reshape(-1, student_probs.shape[-1])
-    draws = torch.multinomial(flat.float(), group_size, replacement=True)
-    draws = draws.view(batch, length, group_size).permute(2, 0, 1)
+    total_draws = group_size * per_candidate
+    draws = torch.multinomial(flat.float(), total_draws, replacement=True)
+    draws = draws.view(batch, length, total_draws).permute(2, 0, 1)
     # Outside the generated span the answer is the clean one, so the critic
     # sees a row differing from the reference *only* where the student wrote.
     samples = torch.where(selected.unsqueeze(0), draws, x0.unsqueeze(0))
@@ -725,7 +741,18 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     rewards, actives, breakdown = [], [], {}
     multi = len(getattr(critic, 'resolved_layers', [None])) > 1
     grouped = getattr(critic, 'grouped_reward', None)
-    if callable(grouped):
+    if per_candidate > 1:
+      # (group, per_candidate, batch, length): candidate g is scored on all of
+      # its own draws at once, so one reward comes back per candidate.
+      blocks = samples.view(group_size, per_candidate, batch, length)
+      for g in range(group_size):
+        member_reward, member_active = critic.multi_draw_reward(
+          x0, blocks[g], scored, eos_id)
+        rewards.append(member_reward)
+        actives.append(member_active)
+      reward = torch.stack(rewards, dim=-1)
+      active = actives[0]
+    elif callable(grouped):
       reward, active = grouped(x0, samples, scored, eos_id)
       if reward.shape != (batch, group_size):
         raise ValueError('grouped critic reward must be '
@@ -759,15 +786,21 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
   logp = torch.log(student_probs.clamp_min(1e-12))
   surrogate = student_probs.new_zeros(())
   for k in range(group_size):
-    token_logp = logp.gather(-1, samples[k].unsqueeze(-1)).squeeze(-1)
-    seq_logp = (token_logp * selected.to(token_logp.dtype)).sum(dim=1)
+    # A candidate's action is all `per_candidate` of its draws, so its
+    # log-probability is their sum.
+    seq_logp = student_probs.new_zeros(batch)
+    for j in range(per_candidate):
+      drawn = samples[k * per_candidate + j]
+      token_logp = logp.gather(-1, drawn.unsqueeze(-1)).squeeze(-1)
+      seq_logp = seq_logp + (token_logp * selected.to(token_logp.dtype)).sum(1)
     surrogate = surrogate + (advantage[:, k] * seq_logp).sum()
 
   # Negated: maximizing reward means descending this. Normalize by generated
   # tokens and average the Monte Carlo candidates, as in GRPO's `1 / G`
   # reduction. A larger group should improve the within-state comparison, not
   # silently multiply the reward weight and its gradient.
-  denom = (selected.sum().clamp_min(1) * group_size).to(surrogate.dtype)
+  denom = (selected.sum().clamp_min(1) * group_size
+            * per_candidate).to(surrogate.dtype)
   loss = -reward_weight * surrogate / denom
 
   with torch.no_grad():
@@ -817,6 +850,82 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     self.mask_index = mask_index
     self.noise_level = float(noise_level)
     self._resolve_layers(denoiser, layer_index, layer_weights)
+
+  @torch.no_grad()
+  def multi_draw_reward(self, clean_tokens, draws, selected, eos_id,
+                        sigma=None):
+    """One reward per row, comparing K draws at the SAME state to the clean row.
+
+    `paired_reward` compares one generated sequence against its reference, so
+    the kernel's two sets are the same size and the fake side is a single
+    sample path. Here the fake side is `K` independent draws from one
+    `student_probs`, pooled into one sample set: `K * n_scored` fake token
+    features against the clean row's `n_scored`. The student's output
+    distribution at that state is what is being matched, rather than any one
+    realisation of it, which is what makes the estimate sharpen with `K`
+    instead of merely averaging `K` noisy rewards.
+
+    The sizes differ, so this cannot go through `rbf_pair_sums`, which carries
+    one weight tensor for both sides. `mmd_rbf.rbf_mmd2_unequal` takes a mask
+    each.
+
+    Args:
+      clean_tokens: `(batch, length)`.
+      draws: `(K, batch, length)`, all drawn at the same state.
+      selected: `(batch, length)` bool, the scored positions.
+
+    Returns `(reward, active)`, shapes `(batch,)`.
+    """
+    if draws.ndim != 3:
+      raise ValueError('multi_draw_reward expects (K, batch, length) draws, '
+                       f'got {tuple(draws.shape)}')
+    k, batch, length = draws.shape
+    if clean_tokens.shape != (batch, length):
+      raise ValueError(f'clean tokens must be {(batch, length)}, got '
+                       f'{tuple(clean_tokens.shape)}')
+
+    # One corruption mask for the clean row and every draw, so the comparison
+    # isolates what the student wrote rather than which row got masked harder.
+    keep = torch.rand(clean_tokens.shape, device=clean_tokens.device)
+    drop = (keep < self.noise_level) & selected.bool()
+    clean_xt = torch.where(drop, self.mask_index, clean_tokens)
+    gen_xt = torch.where(drop.unsqueeze(0), self.mask_index, draws)
+
+    stacked = torch.cat([clean_xt, gen_xt.reshape(k * batch, length)], dim=0)
+    if sigma is None:
+      sigma = torch.zeros(stacked.shape[0], device=stacked.device,
+                          dtype=torch.float32)
+    with capture_layer_hidden(self.denoiser, self.layer_index) as (feats, _):
+      self.denoiser(stacked, sigma)
+
+    total, active = None, None
+    for index, weight in zip(self.resolved_layers, self.layer_weights):
+      hidden = feats[index]
+      real = hidden[:batch]                                  # (batch, L, D)
+      fake = hidden[batch:].reshape(k, batch, length, -1)
+      fake = fake.permute(1, 0, 2, 3).reshape(batch, k * length, -1)
+      w_real = selected.to(real.dtype)
+      w_fake = w_real.repeat(1, k)
+      if self.kernel == 'rbf':
+        alpha = self.rbf_alpha
+        if alpha is None:
+          alpha = median_alpha(real.detach().float(), selected)
+        mmd2, act = mmd_rbf.rbf_mmd2_unequal(
+          real, fake, w_real, w_fake, alpha, block_size=self.rbf_block_size)
+        reward = -mmd2.clamp_min(0.0)
+      elif self.kernel == 'linear':
+        # A linear kernel sees only the means, so this is the clean row's mean
+        # against the mean over all K draws -- the same statistic the paired
+        # linear reward uses, with a K-times larger fake sample.
+        real_mean, act = pool_over_selected(real, selected)
+        fake_mean, _ = pool_over_selected(fake, w_fake.bool())
+        reward = pseudo_huber_reward(fake_mean - real_mean)
+        reward = torch.where(act, reward, torch.zeros_like(reward))
+      else:
+        raise ValueError(f'mmd_kernel must be linear|rbf, got {self.kernel!r}')
+      total = reward * weight if total is None else total + reward * weight
+      active = act if active is None else (active & act)
+    return total, active
 
   @torch.no_grad()
   def paired_reward(self, clean_tokens, generated_tokens, selected, eos_id,
