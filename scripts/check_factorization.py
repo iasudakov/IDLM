@@ -15,6 +15,7 @@ This reports, per sample, the fraction of positions matching A and matching B:
 Usage:
   python scripts/check_factorization.py --ckpt <path> --data /tmp/overfit_cache
                                         [--steps 1 2 4] [--samples 32]
+                                        [--direct-only]
 """
 import argparse
 import os
@@ -49,6 +50,9 @@ def main():
   ap.add_argument('--data', default='/tmp/overfit_cache')
   ap.add_argument('--steps', type=int, nargs='+', default=[1, 2, 4, 8])
   ap.add_argument('--samples', type=int, default=32)
+  ap.add_argument('--direct-only', action='store_true',
+                  help='score exactly one model forward from an all-MASK '
+                       'input, without the sampler cleanup forward')
   ap.add_argument('--no-ema', action='store_true',
                   help='score the RAW weights. Essential for a short overfit: '
                        'at training.ema=0.9999 the shadow still carries '
@@ -64,6 +68,7 @@ def main():
   import main  # noqa: F401
   import algo
   import dataloader as dl
+  import trainer_base
 
   ref = torch.load(os.path.join(args.data, 'examples.pt'), weights_only=False)
   ckpt = torch.load(args.ckpt, map_location='cpu', weights_only=False)
@@ -94,6 +99,28 @@ def main():
   print(f'\nA/B agree on {(a == b).float().mean():.1%} of positions '
         f'(pure chimera purity ~= 0.5 + half that)')
   with torch.no_grad():
+    torch.manual_seed(0)
+    xt = torch.full(
+      (args.samples, a.numel()), model.mask_index,
+      dtype=torch.long, device='cuda')
+    t = torch.ones(args.samples, device='cuda')
+    _, alpha_t = model.noise(t)
+    sigma = model._sigma_from_alphat(alpha_t.unsqueeze(-1))
+    probs = model.forward(xt, sigma=sigma).exp()
+    direct = trainer_base.sample_categorical(probs)
+    purity_report(direct, a, b, '--- direct: exactly one forward ---')
+    entropy = -(probs.clamp_min(1e-12).log() * probs).sum(-1).mean()
+    confidence = probs.max(-1).values.mean()
+    print(f'     soft token entropy {entropy:.3f}, mean max probability '
+          f'{confidence:.3f}')
+    greedy = probs.argmax(-1)
+    purity_report(greedy, a, b,
+                  '--- greedy per noise draw (no categorical randomness) ---')
+    print(f'     unique greedy sequences: '
+          f'{greedy.unique(dim=0).shape[0]}/{args.samples}')
+
+    if args.direct_only:
+      return
     for k in args.steps:
       torch.manual_seed(0)
       s = model.generate_samples(num_samples=args.samples, num_steps=k)

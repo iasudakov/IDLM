@@ -180,6 +180,22 @@ def mirror(state_dict, student_is_wrapped):
   return state_dict
 
 
+def migrate_plain_to_wrapped(state_dict, noise_state):
+  """Checkpoint namespace migration from `MDLM.on_load_checkpoint`."""
+  import collections
+  state_dict = collections.OrderedDict(state_dict)
+  has_noise_state = any(
+    key.startswith('backbone.noise_proj.') for key in state_dict)
+  plain_keys = [key for key in state_dict if key.startswith('backbone.')]
+  if plain_keys and not has_noise_state:
+    for key in plain_keys:
+      suffix = key[len('backbone.'):]
+      state_dict[f'backbone.backbone.{suffix}'] = state_dict.pop(key)
+    for name, value in noise_state.items():
+      state_dict[f'backbone.noise_proj.{name}'] = value
+  return state_dict
+
+
 # The critics are UNWRAPPED, so mirroring the student's keys has to strip the
 # wrapper's extra level and drop the projection, or strict resume rejects both.
 critic = FakeBackbone()
@@ -209,6 +225,22 @@ buggy = {k[len('teacher.'):] for k in mirror(student_sd, False)
          if k.startswith('teacher.')}
 check('regression guard: the un-stripped prefix produces wrong keys',
       buggy != critic_keys and 'noise_proj.weight' in buggy)
+
+# HF MDLM's plain module already contains its own `.backbone`, so its keys have
+# two backbone components before the noise wrapper is introduced. The
+# projection key, not prefix depth, is what distinguishes a resume from a
+# plain-teacher finetune.
+hf_plain = {'backbone.backbone.vocab_embed.embedding': torch.ones(2)}
+hf_migrated = migrate_plain_to_wrapped(
+  hf_plain, wrapped.noise_proj.state_dict())
+check('nested HF plain key gains exactly one wrapper level',
+      'backbone.backbone.backbone.vocab_embed.embedding' in hf_migrated)
+check('plain migration initializes noise projection',
+      'backbone.noise_proj.weight' in hf_migrated)
+check('noise-conditioned resume is not migrated twice',
+      set(migrate_plain_to_wrapped(hf_migrated,
+                                   wrapped.noise_proj.state_dict()))
+      == set(hf_migrated))
 
 
 class FakeLM(torch.nn.Module):
