@@ -6,6 +6,7 @@ leave-one-out spread while the estimate itself sharpens with K. The invariant
 that matters is the same as everywhere else: widening what the critic sees must
 not widen what the gradient reaches.
 """
+import math
 import os
 import sys
 from unittest import mock
@@ -110,6 +111,26 @@ l2, _ = mmd_reward.mmd_reinforce_loss(p2, x0, written, s2, group_size=G,
                                       eos_id=None, baseline='group')
 l2.backward()
 chk(f'rows mode still calls paired_reward G times ({s2.calls})', s2.calls == G)
+
+# Token-level RBF over K identical copies of {-1, 1} has the exact reward
+# K * (1 - exp(-4)) / (2K - 1). It must remain positive, including at K=1.
+points = torch.tensor([[[-1.0], [1.0]],
+                       [[-1.0], [1.0]],
+                       [[-1.0], [1.0]]])
+mask = torch.tensor([[True, True], [False, False], [True, False]])
+for draw_count in (1, 2, 4):
+    expected = draw_count * (1.0 - math.exp(-4.0)) / (2 * draw_count - 1)
+    for block_size in (0, 1):
+        reward, active, per_layer = mmd_reward.summed_multi_draw_reward(
+            {0: points.repeat(draw_count + 1, 1, 1)}, batch=3,
+            draw_count=draw_count, length=2, selected=mask,
+            indices=[0], weights=[1.0], kernel='rbf', alpha=1.0,
+            block_size=block_size, level='token')
+        torch.testing.assert_close(reward, torch.tensor([expected, 0.0, 0.0]))
+        torch.testing.assert_close(per_layer[0], reward)
+        chk(f'token draws preserve positive reward and inactive rows, '
+            f'K={draw_count}, block={block_size}',
+            active.tolist() == [True, False, False])
 
 for bad, msg in ((0, 'must be >= 1'), (None, None)):
     pass

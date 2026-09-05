@@ -125,6 +125,7 @@ adversarial_distill:
   #             differing only in dependencies between feature coordinates.
   # RBF is computed by `mmd_rbf.py`, which reduces the three pair sums a tile at a
   # time and never materialises the (batch, length, length) Gram matrix.
+  # MMD estimates are never clipped: negative estimates yield positive rewards.
   mmd_kernel: linear
   # What one kernel sample is, for whichever kernel is chosen.
   #   token    -- every scored position of the kernel row (the default and the
@@ -237,9 +238,8 @@ adversarial_distill:
   #   batch -- leave-one-out across the other sequences in the batch. Unbiased
   #            and free, but noisier: those rows carry different x0 and
   #            different masking, so their rewards measure different things.
-  #   none  -- subtract nothing; useful mainly as a control. Most rewards are
-  #            non-positive distances, but the unbiased K>1 sentence/draws
-  #            estimator can be negative and therefore produce positive reward.
+  #   none  -- subtract nothing; useful mainly as a control. Unclipped MMD
+  #            estimates can be negative and therefore produce positive reward.
   mmd_baseline: auto
 
   # Distillation-only sanity check for a one-forward generator. When true,

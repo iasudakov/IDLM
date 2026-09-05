@@ -5,6 +5,7 @@ whenever the sequences in a row carry equal scored counts -- always at
 rows_of=1. The rbf kernel compares distributions, so the two levels are
 different statistics outright.
 """
+import math
 import os
 import sys
 
@@ -64,9 +65,29 @@ r, act = R(clean, gen, eq, kernel='rbf', rows_of=4, level='sentence')
 chk('reward stays per sequence', r.shape == (B,))
 chk(f'a row of 4 shares one value (row0={r[:4].tolist()})',
     len(set(r[:4].tolist())) == 1 and len(set(r.tolist())) == B // 4)
-# identical inputs must score 0
-z, _ = R(clean, clean, eq, kernel='rbf', rows_of=4, level='sentence')
-chk(f'identical sets score ~0 ({z.abs().max():.2e})', float(z.abs().max()) < 1e-5)
+# Identical nonconstant sets have a negative diagonal-excluded estimate.
+# For the two scalar points {-1, 1}, its negative is 1 - exp(-4).
+expected = 1.0 - math.exp(-4.0)
+points = torch.tensor([[[-1.0], [1.0]],
+                       [[-1.0], [1.0]],
+                       [[-1.0], [1.0]]])
+mask = torch.tensor([[True, True], [False, False], [True, False]])
+for block_size in (0, 1):
+    z, active = R(points, points, mask, kernel='rbf', alpha=1.0,
+                  block_size=block_size, level='token')
+    torch.testing.assert_close(z, torch.tensor([expected, 0.0, 0.0]))
+    chk(f'token RBF preserves positive reward and inactive rows, block={block_size}',
+        active.tolist() == [True, False, False])
+
+# In rows/sentence mode the same two points come from two pooled sequences.
+sentences = torch.tensor([[[-1.0], [-1.0]], [[1.0], [1.0]]])
+for block_size in (0, 1):
+    z, active = R(sentences, sentences, torch.ones(2, 2, dtype=torch.bool),
+                  kernel='rbf', rows_of=2, level='sentence', alpha=1.0,
+                  block_size=block_size)
+    torch.testing.assert_close(z, torch.full((2,), expected))
+    chk(f'sentence RBF shares the unclipped positive reward, block={block_size}',
+        bool(active.all()))
 
 print(f"\n{sum(v for _, v in ok)}/{len(ok)} passed")
 sys.exit(0 if all(v for _, v in ok) else 1)

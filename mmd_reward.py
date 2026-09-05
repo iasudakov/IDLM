@@ -359,10 +359,9 @@ def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0):
   mmd2 = ((s_xx - safe_n) / pairs
           + (s_yy - safe_n) / pairs
           - 2.0 * s_xy / square)
-  # A sampling estimator of a squared quantity can come out slightly negative;
-  # clamping keeps the reward a true distance rather than letting noise read as
-  # "better than identical".
-  reward = -mmd2.clamp_min(0.0)
+  # Preserve negative finite-sample estimates; clipping would change the
+  # estimator. Their corresponding rewards are positive.
+  reward = -mmd2
   return torch.where(active, reward, torch.zeros_like(reward)), active
 
 
@@ -663,7 +662,7 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
           layer_alpha = median_alpha(real.detach().float(), selected)
         mmd2, layer_active = mmd_rbf.rbf_mmd2_unequal(
           real, fake, w_real, w_fake, layer_alpha, block_size=block_size)
-        reward = -mmd2.clamp_min(0.0)
+        reward = -mmd2
       elif kernel == 'linear':
         real_mean, layer_active = pool_over_selected(real, selected)
         fake_mean, _ = pool_over_selected(fake, w_fake.bool())
@@ -690,10 +689,7 @@ def batch_advantages(reward, active):
   It is a noisier baseline than the group one, and not for a subtle reason:
   those rows carry different `x0` and different masking fractions, so their
   rewards are not measurements of the same quantity. It removes the reward's
-  overall offset -- which is what matters most here, since the pseudo-Huber
-  reward is a negative distance and therefore always <= 0, so an unbaselined
-  advantage is negative for every sample and pushes down every sequence the
-  student wrote regardless of how good it was.
+  overall offset. MMD estimates are unclipped, so rewards can have either sign.
 
   Inactive rows are excluded from the baseline rather than counted as zero,
   which would drag it toward 0 by however many rows scored nothing.
@@ -1013,8 +1009,8 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
       advantage = batch_advantages(reward, active)
     else:  # 'none'
       # Unbiased but high variance because the reward offset remains. Most
-      # modes return a non-positive distance; an unclamped sentence-level
-      # U-statistic can instead make the reward positive.
+      # distance rewards are non-positive; unclipped MMD estimates can instead
+      # make the reward positive.
       advantage = reward
     advantage = torch.where(active.unsqueeze(-1), advantage,
                             torch.zeros_like(advantage))
