@@ -16,8 +16,11 @@ baseline is the leave-one-out mean over a group of samples drawn at the same sta
 The ``draws + sentence`` mode uses a different, explicit kernel estimator:
 every sequence is mean-pooled first, then one fixed clean embedding is compared
 with K sampled embeddings. It uses an unclamped U-statistic for K > 1 and a
-biased fallback for K = 1, for both normalized linear and RBF kernels.
-Historical token/rows paths retain the pseudo-Huber behaviour above.
+biased fallback for K = 1. Besides normalized linear and RBF kernels, the
+``pseudo_huber`` distance-induced kernel extends the original reward: at K = 1
+it is exactly the pseudo-Huber distance above, and at K > 1 it subtracts the
+fake-pair distance correction. Historical linear token/rows paths retain the
+pseudo-Huber behaviour above.
 
 Two things differ here from the OPDLM implementation, both forced by the model:
 
@@ -399,8 +402,8 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
                            level='token'):
   """One reward per sequence; rows selecting nothing score zero.
 
-  `kernel='linear'` is the original: pool both sides and score the difference
-  with pseudo-Huber, which is what a linear kernel's MMD reduces to.
+  `kernel='linear'` is the historical name for pooling both sides and scoring
+  the difference with pseudo-Huber; it is not the squared linear-kernel MMD.
   `kernel='rbf'` compares the two feature distributions instead. See
   `rbf_sequence_reward`.
 
@@ -414,6 +417,9 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
   the return has to stay per sequence whatever the row size -- the row only
   changes what the number means, not its shape.
   """
+  if kernel == 'pseudo_huber':
+    raise ValueError('mmd_kernel=pseudo_huber requires '
+                     'mmd_kernel_source=draws and mmd_kernel_level=sentence')
   batch = clean.shape[0]
   if level == 'sentence':
     # One sample per SEQUENCE: mean-pool it over its own scored positions
@@ -527,6 +533,56 @@ def linear_mmd2_fixed_real(real, fake):
   return mean_mse - variance_correction
 
 
+@torch.no_grad()
+def pseudo_huber_mmd2_fixed_real(real, fake):
+  """Distance-induced MMD^2 for one fixed real vector and K fake draws.
+
+  Let rho(a,b) = -pseudo_huber_reward(a-b), using the historical c = 0.001
+  and averaging over hidden dimensions. This is a distance of negative type:
+  sqrt(c^2+t)-c is a Bernstein function of the squared coordinate distance.
+  The induced positive-semidefinite kernel is
+
+      k(a,b) = (rho(a,0) + rho(b,0) - rho(a,b)) / 2.
+
+  For one observed real vector x, its MMD^2 is
+  E rho(x,Y) - E rho(Y,Y') / 2. At K > 1, the estimator below uses distinct
+  fake pairs and is unbiased over the fake draws conditional on x. At K = 1,
+  the biased fallback is rho(x,y), exactly the original pooled Huber distance.
+  This is a separate kernel, not Huber applied to a linear/RBF MMD estimate.
+  The coordinatewise sum compares marginals, not arbitrary joint dependence.
+
+  Inputs have shapes (batch, hidden) and (batch, draws, hidden). Pairwise
+  distances use O(batch * hidden) scratch instead of a (batch,K,K,hidden)
+  tensor. No clamping: a U-statistic can legitimately be negative.
+  """
+  if real.ndim != 2 or fake.ndim != 3:
+    raise ValueError('fixed-real pseudo_huber MMD expects (batch, hidden) real '
+                     'and (batch, draws, hidden) fake features, got '
+                     f'{tuple(real.shape)} and {tuple(fake.shape)}')
+  if real.shape[0] != fake.shape[0] or real.shape[1] != fake.shape[2]:
+    raise ValueError('fixed-real pseudo_huber MMD features must share batch '
+                     f'and hidden dimensions, got {tuple(real.shape)} and '
+                     f'{tuple(fake.shape)}')
+  draws = fake.shape[1]
+  if draws < 1:
+    raise ValueError('fixed-real pseudo_huber MMD needs at least one fake draw')
+
+  real = real.detach().float()
+  fake = fake.detach().float()
+  if draws == 1:
+    return -pseudo_huber_reward(fake[:, 0] - real)
+
+  cross_sum = real.new_zeros(real.shape[0])
+  pair_sum = real.new_zeros(real.shape[0])
+  for i in range(draws):
+    cross_sum -= pseudo_huber_reward(fake[:, i] - real)
+    for j in range(i):
+      pair_sum -= pseudo_huber_reward(fake[:, i] - fake[:, j])
+  # Each unordered pair appears twice in the ordered off-diagonal sum,
+  # canceling the 1/2 in the distance-induced MMD formula.
+  return cross_sum / draws - pair_sum / (draws * (draws - 1))
+
+
 def summed_multi_draw_reward(features, batch, draw_count, length, selected,
                              indices, weights, kernel='linear', alpha=None,
                              block_size=0, level='token'):
@@ -538,11 +594,12 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
   features. ``level='sentence'`` first mean-pools every sequence over its own
   scored positions, yielding one fixed real vector and K fake vectors.
 
-  At sentence level both kernels use the same estimator rule. K > 1 removes
+  At sentence level all three kernels use the same estimator rule. K > 1 removes
   fake self-pairs and is unbiased over draws conditional on the fixed real
   vector; K = 1 uses the biased empirical estimate. The sentence-level linear
   path is a normalized linear-kernel MMD rather than the historical
-  pseudo-Huber transform used by paired/token rewards.
+  pseudo-Huber transform used by paired/token rewards. ``pseudo_huber`` uses
+  the distance-induced kernel, preserving that historical reward at K = 1.
 
   Returns ``(reward, active, per_layer)`` with one reward per original row.
   """
@@ -553,6 +610,9 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
     raise ValueError(f'multi-draw needs at least one draw, got {draw_count}')
   if level not in ('token', 'sentence'):
     raise ValueError(f'mmd_kernel_level must be token|sentence, got {level!r}')
+  if kernel == 'pseudo_huber' and level != 'sentence':
+    raise ValueError('mmd_kernel=pseudo_huber requires '
+                     'mmd_kernel_source=draws and mmd_kernel_level=sentence')
   expected_rows = (draw_count + 1) * batch
   total, active, per_layer = None, None, {}
   for index, weight in zip(indices, weights):
@@ -586,8 +646,11 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
           block_size=block_size)
       elif kernel == 'linear':
         mmd2 = linear_mmd2_fixed_real(real_sentence, fake_sentence)
+      elif kernel == 'pseudo_huber':
+        mmd2 = pseudo_huber_mmd2_fixed_real(real_sentence, fake_sentence)
       else:
-        raise ValueError(f'mmd_kernel must be linear|rbf, got {kernel!r}')
+        raise ValueError('mmd_kernel must be linear|rbf|pseudo_huber, got '
+                         f'{kernel!r}')
       reward = torch.where(layer_active, -mmd2, torch.zeros_like(mmd2))
     else:
       fake = fake_by_draw.permute(1, 0, 2, 3).reshape(
@@ -874,6 +937,11 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
   if kernel_source not in ('rows', 'draws'):
     raise ValueError('mmd_kernel_source must be rows|draws, got '
                      f'{kernel_source!r}')
+  if (getattr(critic, 'kernel', None) == 'pseudo_huber'
+      and (kernel_source != 'draws'
+           or getattr(critic, 'kernel_level', 'token') != 'sentence')):
+    raise ValueError('mmd_kernel=pseudo_huber requires '
+                     'mmd_kernel_source=draws and mmd_kernel_level=sentence')
   # `draws` mode makes each REINFORCE candidate a SET of `kernel_draws` samples
   # at the same state, pooled into one MMD estimate, instead of a single
   # sample. The candidate is then the set, so its log-probability is the sum

@@ -29,7 +29,7 @@ adversarial_distill:
   # middle block's hidden states, and reward the student for closing the
   # feature gap. Historical token/rows modes use pseudo-Huber;
   # `mmd_kernel_source=draws` plus `mmd_kernel_level=sentence` uses the explicit
-  # linear- or RBF-kernel MMD estimator documented below. Optimized by
+  # linear-, RBF-, or pseudo-Huber-kernel MMD estimator documented below. Optimized by
   # REINFORCE with a leave-one-out baseline over `mmd_group_size` candidates
   # drawn at the same state. See `mmd_reward.py`.
   #
@@ -115,7 +115,15 @@ adversarial_distill:
   #             distributions selected below. Sensitive to more than the mean,
   #             which is the point given the probe's finding that the linear
   #             reward behaves close to a soft edit distance.
-  # Computed by `mmd_rbf.py`, which reduces the three pair sums a tile at a
+  #   pseudo_huber -- draws+sentence only. Distance-induced kernel built from
+  #             rho(x,y) = mean_d(sqrt((x_d-y_d)^2 + c^2) - c), c=0.001.
+  #             K=1 exactly preserves the historical pseudo-Huber reward.
+  #             K>1 uses mean_i rho(real,fake_i) minus half the mean over
+  #             distinct fake pairs; reward is the negative of that estimate.
+  #             This is a separate additive kernel, not Huber applied to a
+  #             linear/RBF MMD afterward. It need not distinguish distributions
+  #             differing only in dependencies between feature coordinates.
+  # RBF is computed by `mmd_rbf.py`, which reduces the three pair sums a tile at a
   # time and never materialises the (batch, length, length) Gram matrix.
   mmd_kernel: linear
   # What one kernel sample is, for whichever kernel is chosen.
@@ -132,8 +140,8 @@ adversarial_distill:
   # both empirical sides contain K independently observed batch rows.
   #
   # In `draws` mode, sentence level produces one pooled REAL embedding and K
-  # independently pooled FAKE embeddings for each state. For both linear and
-  # RBF, K > 1 removes fake self-pairs: the estimator is unbiased over fake
+  # independently pooled FAKE embeddings for each state. For all three
+  # kernels, K > 1 removes fake self-pairs: the estimator is unbiased over fake
   # draws with the observed real embedding treated as fixed. K = 1 uses the
   # biased empirical estimate because no off-diagonal fake pair exists.
   # Unlike rows mode, sentence-level RBF is therefore valid at K = 1.

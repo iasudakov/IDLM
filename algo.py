@@ -893,6 +893,23 @@ class MDLM(trainer_base.AbsorbingState):
       if kind not in ('feature', 'idlm'):
         raise ValueError('adversarial_distill.mmd_reward_type must be '
                          f'feature|idlm, got {kind!r}')
+      kernel = str(cfg.get('mmd_kernel', 'linear'))
+      if kernel not in ('linear', 'rbf', 'pseudo_huber'):
+        raise ValueError('adversarial_distill.mmd_kernel must be '
+                         f'linear|rbf|pseudo_huber, got {kernel!r}')
+      level = str(cfg.get('mmd_kernel_level', 'token'))
+      if level not in ('token', 'sentence'):
+        raise ValueError('adversarial_distill.mmd_kernel_level must be '
+                         f'token|sentence, got {level!r}')
+      kernel_source = str(cfg.get('mmd_kernel_source', 'rows'))
+      if kernel_source not in ('rows', 'draws'):
+        raise ValueError('adversarial_distill.mmd_kernel_source must be '
+                         f'rows|draws, got {kernel_source!r}')
+      if kernel == 'pseudo_huber' and (
+          kernel_source != 'draws' or level != 'sentence' or kind != 'feature'):
+        raise ValueError('adversarial_distill.mmd_kernel=pseudo_huber requires '
+                         'mmd_kernel_source=draws, mmd_kernel_level=sentence '
+                         'and mmd_reward_type=feature')
       if kind == 'idlm':
         # Scores samples by the teacher/fake ratio instead of by feature
         # distance to x0, so no feature map is built at all.
@@ -930,18 +947,6 @@ class MDLM(trainer_base.AbsorbingState):
       else:
         raise ValueError('adversarial_distill.mmd_feature_source must be '
                          f'ar|diffusion, got {source!r}')
-      kernel = str(cfg.get('mmd_kernel', 'linear'))
-      if kernel not in ('linear', 'rbf'):
-        raise ValueError('adversarial_distill.mmd_kernel must be linear|rbf, '
-                         f'got {kernel!r}')
-      level = str(cfg.get('mmd_kernel_level', 'token'))
-      if level not in ('token', 'sentence'):
-        raise ValueError('adversarial_distill.mmd_kernel_level must be '
-                         f'token|sentence, got {level!r}')
-      kernel_source = str(cfg.get('mmd_kernel_source', 'rows'))
-      if kernel_source not in ('rows', 'draws'):
-        raise ValueError('adversarial_distill.mmd_kernel_source must be '
-                         f'rows|draws, got {kernel_source!r}')
       self._mmd_critic_cached.kernel = kernel
       self._mmd_critic_cached.kernel_level = level
       self._mmd_critic_cached.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
