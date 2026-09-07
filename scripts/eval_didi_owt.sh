@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The official evaluation preset: guided,16 steps,20 samples/batch,2 batches.
+# Released evaluation sample/budget preset with explicit student EMA selection.
 set -eo pipefail
 DIDI_REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIDI_REPO_ROOT"
@@ -22,6 +22,7 @@ exec python -m didi_repro \
   loader.batch_size=20 loader.eval_batch_size=20 \
   sampling.steps=16 sampling.num_sample_batches=2 \
   sampling.predictor=guided sampling.noise_removal=ancestral \
+  +didi_eval.weights=student_ema \
   eval.generate_samples=true \
   "+underdeep.experiment=${EXPERIMENT:-generative-models/owt}" \
   "+underdeep.name=${RUN_NAME:-didi-instruct-eval-guided16}" \

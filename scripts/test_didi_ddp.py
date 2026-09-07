@@ -1,8 +1,8 @@
 """Optional two-rank CPU/Gloo smoke test; no GPU, downloads, or tracker.
 
 Run separately: conda run -n mdlm python scripts/test_didi_ddp.py
-This exercises the released manual two-optimizer schedule and distributed group
-reward normalization with the same tiny network as test_didi_runtime.py.
+This exercises the corrected iteration budget, EMA evaluation and distributed
+group reward normalization with the tiny network from test_didi_runtime.py.
 """
 
 import copy
@@ -25,8 +25,9 @@ class CheckDistributedState(L.Callback):
 
     def on_train_end(self, trainer, pl_module):
         assert trainer.world_size == 2
-        assert trainer.global_step == 4, trainer.global_step
-        assert pl_module.global_steps == 2, pl_module.global_steps
+        assert trainer.global_step == 6, trainer.global_step
+        assert pl_module.global_steps == 3, pl_module.global_steps
+        assert abs(trainer.optimizers[0].param_groups[0]['lr'] - .01 / 3) < 1e-12
         assert any(not torch.equal(value, self.student[key])
                    for key, value in pl_module.backbone.state_dict().items())
         for key, value in pl_module.teacher.state_dict().items():
@@ -41,6 +42,10 @@ class CheckDistributedState(L.Callback):
         gathered = [torch.empty_like(parameters) for _ in range(2)]
         torch.distributed.all_gather(gathered, parameters)
         torch.testing.assert_close(gathered[0], gathered[1], rtol=0, atol=0)
+        ema = torch.cat([p.detach().reshape(-1) for p in pl_module.student_ema.parameters()])
+        gathered_ema = [torch.empty_like(ema) for _ in range(2)]
+        torch.distributed.all_gather(gathered_ema, ema)
+        torch.testing.assert_close(gathered_ema[0], gathered_ema[1], rtol=0, atol=0)
 
         # Exercise monitoring's sample capture and rank-zero gather/barrier
         # around the original guided sampler, without invoking a reference LM.
@@ -59,7 +64,7 @@ class CheckDistributedState(L.Callback):
         assert len(monitor.samples) == 1
         monitor.on_validation_end(trainer, pl_module)
         assert not monitor.samples
-        print(f'Rank {trainer.global_rank}: two updates and guided-monitor gather passed.', flush=True)
+        print(f'Rank {trainer.global_rank}: three iterations, EMA and guided-monitor gather passed.', flush=True)
 
 
 def main():
@@ -67,14 +72,14 @@ def main():
     torch.manual_seed(73)
     DiDiRuntimeTests.setUpClass()
     helpers = DiDiRuntimeTests()
-    model = helpers.model()
+    model = helpers.model(helpers.corrected_config())
     helpers.initialize(model)
     checker = CheckDistributedState(copy.deepcopy(model.teacher.state_dict()),
                                     copy.deepcopy(model.backbone.state_dict()))
     with tempfile.TemporaryDirectory(prefix='didi-ddp-test-') as directory:
         model.config.checkpointing.save_dir = directory
         trainer = L.Trainer(
-            accelerator='cpu', devices=2, precision='32-true', max_steps=4,
+            accelerator='cpu', devices=2, precision='32-true', max_steps=6,
             strategy=DDPStrategy(find_unused_parameters=True, start_method='fork',
                                  process_group_backend='gloo', timeout=timedelta(seconds=60)),
             logger=False, enable_checkpointing=False, enable_progress_bar=False,

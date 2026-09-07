@@ -1,7 +1,7 @@
 # DiDi-Instruct: pinned upstream training with Underdeep
 
-This is an **isolated reproduction of the released code**, not an MMD objective
-or a reimplementation inside `algo.MDLM`. It runs upstream `main.py`, model,
+This is an **isolated integration of the released DiDi code**, not an MMD
+objective or a reimplementation inside `algo.MDLM`. It runs upstream `main.py`, model,
 dataloader, training step and sampler from commit
 `5d39f84973ad19168210bfb0de61450a946a1cbc` of
 [haoyangzheng-ai/didi-instruct](https://github.com/haoyangzheng-ai/didi-instruct).
@@ -9,6 +9,17 @@ The 43 files in `vendor/didi_instruct` are byte-identical to that revision.
 `UPSTREAM.json` records their SHA-256 hashes; startup verifies every file.
 The original MIT license and dependency specification are included. Demo GIFs
 and repository metadata are omitted. All adaptations live in `didi_repro`.
+
+There are now two explicitly different protocols:
+
+- Direct `python -m didi_repro`, without the correction flags below, retains
+  the released-code defaults plus the documented runtime/checkpoint repairs.
+- The supplied launchers select the corrected paper-reported iteration/LR/EMA
+  settings and guided evaluation described below. They do **not** silently
+  change the vendored files or make earlier runs equivalent to this protocol.
+
+These corrections address identified code-versus-paper mismatches; they do not
+establish that every implementation detail reproduces the paper's results.
 
 ## Train from the authors' teacher checkpoint
 
@@ -29,17 +40,28 @@ conda activate didi-upstream
 
 TEACHER_CHECKPOINT=/absolute/path/mdlm.ckpt \
 OWT_CACHE=/absolute/path/cache_dir \
-SAVE_DIR=/absolute/path/owt_didi \
+SAVE_DIR=/absolute/path/owt_didi_corrected \
 GPUS=0,1 \
-RUN_NAME=didi-instruct-owt \
+RUN_NAME=didi-instruct-owt-corrected \
 bash scripts/train_didi_owt.sh
 ```
 
-Use a **new** save directory. `GPUS` chooses visible GPUs; as in the upstream
+Use a **new run and new save directory** for the corrected protocol; do not
+resume an old run under different iteration/schedule/EMA settings. The runtime
+rejects changing the recorded training protocol when resuming.
+
+`GPUS` chooses visible GPUs; as in the upstream
 script, global batch size is the visible GPU count, with one real example per
-GPU and eight generated candidates per example. To reproduce a particular
-published experiment, its GPU count/effective batch must also match. The exact
-original cache names are required:
+GPU and eight generated candidates per example. The paper's table entry
+“batch size 8” is ambiguous relative to the released code's candidate group
+size `G=8`; this launcher does not reinterpret it as eight real examples/GPU.
+An eight-GPU run is **not established equivalent to the paper's single-H100
+experiment**. For its 40-sample generated validation, the corrected training
+launcher requires a GPU count dividing 40. One GPU uses 20 samples × 2 batches;
+with multiple GPUs, each GPU generates one batch of `40 / GPU_count` samples.
+`loader.eval_global_batch_size=40` is explicit. The standalone evaluation script
+always uses 20 samples × 2 batches in one process. The exact original cache names
+are required:
 
 ```text
 openwebtext-train_train_bs1024_wrapped.dat/
@@ -54,23 +76,73 @@ same split, tokenizer and preprocessing.
 
 `DIDI_DRY_RUN=1` prints the launch command without training. The equivalent Python
 entry is `python -m didi_repro`; the shell uses `torch.distributed.run` just like
-upstream's `torchrun`. Location/tracker overrides are passed to upstream Hydra:
+upstream's `torchrun`. See the launcher for its complete, hardware-dependent
+evaluation batch allocation. A two-GPU corrected command is:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 --module didi_repro \
   training.finetune_path=/absolute/path/mdlm.ckpt \
   data.cache_dir=/absolute/path/cache_dir \
-  checkpointing.save_dir=/absolute/path/owt_didi \
-  hydra.run.dir=/absolute/path/owt_didi \
+  checkpointing.save_dir=/absolute/path/owt_didi_corrected \
+  hydra.run.dir=/absolute/path/owt_didi_corrected \
   loader.batch_size=1 loader.global_batch_size=2 trainer.val_check_interval=1000 \
+  +didi_training.iterations=10000 algo.lr_scheduler.warmup_steps=0 \
+  algo.ema_beta=0.9999 +didi_eval.weights=student_ema \
+  sampling.predictor=guided sampling.steps=16 \
+  loader.eval_batch_size=20 loader.eval_global_batch_size=40 sampling.num_sample_batches=1 \
   +underdeep.experiment=generative-models/owt \
-  +underdeep.name=didi-instruct-owt
+  +underdeep.name=didi-instruct-owt-corrected
 ```
 
 Every additional argument to the launcher is an explicit Hydra override and is
-recorded. Overriding original training settings is possible but no longer the
-default reproduction recipe. In particular, do not copy MMD accumulation,
-learning rates, reward kernels, batch sizes or EMA settings into this command.
+recorded. Do not copy MMD accumulation, learning rates, reward kernels, batch
+sizes or gradient-clipping settings into this command.
+
+## Corrected iteration, learning-rate and EMA protocol
+
+The following corrections are opt-in at the Python entry point and enabled by
+the updated training launcher:
+
+| Setting | Direct entry with legacy defaults | Corrected launcher |
+| --- | --- | --- |
+| Stop condition | `trainer.max_steps=10000`, normally 5000 DiDi iterations | `+didi_training.iterations=10000`, normally 20000 optimizer steps |
+| LR horizon | Released scheduler uses the optimizer-step limit as an iteration horizon | 10000 DiDi iterations |
+| LR warmup | 1000 iterations | `algo.lr_scheduler.warmup_steps=0` |
+| Student EMA decay | `algo.ema_beta=0.999` | `algo.ema_beta=0.9999` |
+| Evaluation generator | Raw trainable `backbone` | `+didi_eval.weights=student_ema` |
+| Regular generated samples | 1000-step ancestral, 4/GPU × 2 batches | 16-step guided, 40 samples globally |
+
+One DiDi iteration always updates the discriminator and, with the default
+cadence, also updates the student. Lightning counts both optimizer updates.
+`didi_training.iterations` computes the optimizer-step budget from the requested
+iteration count and actual discriminator-warmup/student-update cadence; do not
+manually double a step limit instead. The learning-rate schedule has a separate
+iteration horizon. With no warmup it starts at the original `1e-6` learning rate
+and decays linearly. The released code's **`1e-8` LR floor is retained**; the
+paper does not specify that floor.
+
+The new EMA selection routes evaluation forwards to `student_ema`; it does not
+copy EMA tensors over trainable student parameters. Training still uses the raw
+student, maintains the separate frozen MDLM teacher, and updates the student EMA
+after student optimizer steps. `training.ema` is the separate legacy MDLM EMA
+setting, not the DiDi EMA controlled by `algo.ema_beta`.
+
+Leaving `didi_training.iterations=null` and `didi_eval.weights=backbone` preserves
+the direct entry point's legacy counting/evaluation behavior. A corrected run
+must start fresh rather than continuing a legacy checkpoint with changed
+training semantics. Resuming an unchanged recorded protocol is supported, with
+the data/RNG replay limitations documented below.
+
+The evaluation-weight choice can be changed independently when evaluating or
+resuming a compatible training protocol; provenance records which generator was
+used. It does not reconstruct a different EMA history for an old checkpoint.
+
+The corrections above do not resolve every paper/code discrepancy. The original
+PG/KL objective and normalization, candidate grouping, discriminator update
+rules, dataset preprocessing and tokenizer remain as implemented upstream.
+Dependency versions, actual teacher/cache contents, GPU count and effective
+batch must also be controlled. Report this as the documented corrected protocol,
+not proof of an exact reproduction of the reported model quality.
 
 ## Optional evaluation before training
 
@@ -85,8 +157,9 @@ the first optimizer update**. The existing validation metrics, generated samples
 and enabled Underdeep PPL/entropy/GM diagnostics are logged in the same run at
 step0 for a fresh run. Periodic validation during training is unchanged.
 The pre-training evaluation uses `trainer.limit_val_batches`, `sampling.*` and
-the same `eval.*` / `didi_monitor.*` settings as normal validation. In particular,
-the default is1000-step ancestral sampling, not the guided16-step preset.
+the same `eval.*` / `didi_monitor.*` settings as normal validation, including
+`didi_eval.weights`. Unmodified direct-entry defaults use 1000-step ancestral
+sampling with the raw backbone; the corrected launcher uses guided16 and EMA.
 `trainer.limit_val_batches=0` is rejected when this option is enabled.
 
 Evaluation performs no optimizer updates, restores RNG states and module modes,
@@ -118,7 +191,8 @@ No HF remote Python code is executed. The resolved revision and SHA-256 of both
 weight files are recorded in checkpoint metadata and the Underdeep configuration
 table. This is a **warm-start/fine-tuning experiment**, not a fresh reproduction
 from the teacher: optimizers, learning-rate schedule, and iteration counters
-start anew. All original training hyperparameters otherwise remain unchanged.
+start anew. This option itself does not change the selected training protocol:
+the updated launcher still applies its corrected iteration/schedule/EMA settings.
 Do not combine HF initialization with `checkpointing.resume_from_ckpt=true`;
 when resuming an existing run, omit the initialization option instead.
 
@@ -188,15 +262,19 @@ Temperature applies only to the denoiser's token probabilities, before guided
 tilting/reranking; discriminator scores, guidance schedule and noise schedule
 are unchanged. **Temperature other than 1 is an optional evaluation extension,
 not an original released DiDi setting.** Temperature 1 takes the original
-sampling path exactly. Training equations and ordinary validation are unchanged;
+sampling equations exactly, using the selected `didi_eval.weights` generator.
+The sweep itself leaves training equations and ordinary validation unchanged;
 the extra sweep restores RNG states, module modes, sampler and forward method.
 
 Sweeps generate additional samples. By default each GPU generates
 `didi_pareto.num_batches=2` batches of `loader.eval_batch_size` sequences per
 temperature/budget/seed; `+didi_pareto.batch_size=...` overrides only the sweep's
-per-GPU batch size. On eight GPUs with the original eval batch size 4, this is
-64 samples per seed/point. The 12-temperature, 3-budget, 5-seed example above
+per-GPU batch size. For example, explicitly setting
+`+didi_pareto.batch_size=4` on eight GPUs gives 64 samples per seed/point.
+With that batch override, the 12-temperature, 3-budget, 5-seed example above
 generates **11,520 extra sequences per validation** and can be expensive.
+Without it, sweep counts follow the resolved evaluation batch size; the sweep's
+two-batch default is independent of the launcher's regular 40-sample allocation.
 Start with fewer temperatures/seeds while checking the setup. The built-in
 temperature list is `[0.75,0.85,0.95,1.0,1.05,1.2]`, with one seed.
 
@@ -214,13 +292,16 @@ OWT-compatible reference curve; `+didi_pareto.keep_samples=2` controls the numbe
 of retained sample texts per point from its first seed. These options apply to training
 validation (including pre-training validation), not `mode=sample_eval`.
 
-## Settings preserved from the released code
+## Released-code defaults retained by the direct entry point
 
 The authoritative files are the vendored YAMLs and `algo.py`, not this summary.
 Constructor defaults that are missing from YAML are also logged as effective
 hyperparameters.
 
-| Setting | Released implementation used here |
+These defaults are retained for comparability with earlier runs; the corrected
+launcher explicitly overrides the schedule, EMA and evaluation rows listed above.
+
+| Setting | Released implementation default |
 | --- | --- |
 | Model | Native DiT small, 12 blocks, width768, length1024, dropout0.1 |
 | Batch and groups | 1 real example/GPU, G=8, no accumulation |
@@ -241,7 +322,8 @@ hyperparameters.
 Several original comments disagree with their executable code: `kl_beta` is
 actually used; the scheduler is linear rather than cosine; the `unbiased` and
 `coupled_traj` YAML flags do not select a different training implementation.
-These are **not silently “corrected” into another method**. The original
+Except for the explicitly selected corrections above, these are **not silently
+“corrected” into another method**. The original
 denoiser-based two-step log-probability formula and independent corruption masks
 are retained. Released-code fidelity is not a guarantee that its defaults
 reproduce the paper's exact reported numbers.
@@ -281,9 +363,11 @@ Underdeep's `didi/config` table and local files:
 - `didi_provenance.json` (including every command-line override)
 - `didi_monitor_config.json`
 
-Original `val/nll`, `val/ppl`, and `val/bpd` still come from upstream validation.
-Training-validation PPL is **not** the paper's guided-sampling result. For that
-sampler use the separate evaluation command below.
+`val/nll`, `val/ppl`, and `val/bpd` still use upstream validation equations, with
+the configured raw/EMA evaluation generator. Legacy ancestral validation PPL is
+**not** the paper's guided-sampling result. The corrected launcher selects guided
+sampling, but matching that choice alone does not establish identical reported
+results. The separate evaluation command below uses the same guided preset.
 
 Optional integration-only flags, without changing the training objective:
 
@@ -296,27 +380,28 @@ Optional integration-only flags, without changing the training objective:
 Underdeep is required by default and initializes only after model/checkpoint
 setup succeeds; it must not silently train without logging.
 
-## Official guided evaluation preset
+## Guided evaluation with corrected EMA selection
 
 ```bash
-CHECKPOINT=/absolute/path/owt_didi/checkpoints/last.ckpt \
+CHECKPOINT=/absolute/path/owt_didi_corrected/checkpoints/last.ckpt \
 SAVE_DIR=/absolute/path/didi_guided_eval \
 GPUS=0 \
 bash scripts/eval_didi_owt.sh
 ```
 
-This preserves the authors' evaluation-script preset:16 steps, guided sampling,
-20 samples/batch and2 batches. Both gradient tilting and four-candidate stochastic
+This uses the authors' evaluation-script sampling preset:16 steps, guided
+sampling, 20 samples/batch and2 batches, with corrected
+`+didi_eval.weights=student_ema`. Both gradient tilting and four-candidate stochastic
 reranking are preserved; guidance is0.2→1.0. The final denoising call and
 discriminator evaluations are additional work: “16 steps” is not16 total model
 evaluations and should not be presented as equal compute to16-step unguided MMD.
 The original evaluator writes `samples.json`; its PPL/entropy and samples are
 also published to Underdeep. Evaluation requires a trained discriminator.
 
-For normal training checkpoints, generation still uses raw `backbone` weights,
-as released. For the authors' HF-converted exports containing **only**
-`student_ema.*`, those tensors are explicitly loaded into the otherwise-missing
-backbone; they are not silently ignored.
+Direct entry with `didi_eval.weights=backbone` retains the released raw-weight
+evaluation. The corrected launcher evaluates `student_ema` instead. The authors'
+HF-converted exports contain `student_ema.*`; those weights are loaded explicitly
+and can also populate the otherwise-missing backbone for legacy evaluation.
 
 ## Complete repair/integration ledger
 
@@ -347,12 +432,21 @@ explicit repairs in memory with exact source-match assertions:
    hooks/provenance. No change to training RNG is introduced by these synchronous
    logging/diagnostic calls.
 9. Fail on cache errors instead of executing upstream's delete/rebuild fallback.
+10. When explicitly selected, interpret `didi_training.iterations` as DiDi
+    iterations, derive the Lightning optimizer-step budget from update cadence,
+    and use the iteration count as the LR horizon. The corrected launcher sets
+    zero warmup and `algo.ema_beta=0.9999`; direct-entry defaults stay unchanged.
+11. When `didi_eval.weights=student_ema` is selected, use EMA evaluation forwards
+    without swapping trainable parameters; record the selected evaluation and
+    training protocols and reject incompatible training resumes.
 
 The optional `didi_eval.before_training`, `didi_init.student_hf`, and
 `didi_pareto` extensions are disabled by default. Their orchestration, HF weight
 loading and sweep implementation live in `pretrain_eval.py`,
 `initialization.py`, `pareto.py` and `temperature.py`; the vendored code and
-original training equations remain unchanged.
+original training objective equations remain unchanged. Separately,
+`didi_training.iterations` and `didi_eval.weights` select the corrected protocol
+above; those flags are now supplied by the shell launchers.
 
 Resume restores models, optimizer state and schedule counters. **Bitwise
 mid-epoch trajectory replay is not claimed**: upstream's shuffled loader does not

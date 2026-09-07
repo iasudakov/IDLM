@@ -8,18 +8,20 @@ import platform
 import sys
 
 from . import UPSTREAM_REVISION
+from .protocol import optimizer_step_budget, training_iterations, training_protocol
 from .runtime import UPSTREAM_ROOT, load_upstream, repaired_function
 
 
 def prepare_config(config):
-  """Add integration settings only; never overwrite an upstream setting."""
+  """Keep upstream defaults unless an explicit integration option opts in."""
   from omegaconf import OmegaConf, open_dict
   additions = {
     'underdeep': {'experiment': 'generative-models/owt', 'name': 'didi-instruct-owt',
                   'force_new_run': False, 'required': True},
     'didi_monitor': {'enabled': True, 'gen_ppl': True, 'gm': True,
                      'gm_batch_size': 4, 'max_reference_samples': 64},
-    'didi_eval': {'before_training': False},
+    'didi_eval': {'before_training': False, 'weights': 'backbone'},
+    'didi_training': {'iterations': None},
     'didi_pareto': {'every_n_validations': 0,
                     'temperatures': [0.75, 0.85, 0.95, 1.0, 1.05, 1.2],
                     'steps': [8, 16, 32], 'seeds': 1, 'num_batches': 2,
@@ -32,7 +34,33 @@ def prepare_config(config):
   with open_dict(config):
     for key, value in additions.items():
       config[key] = OmegaConf.merge(value, config.get(key, {}))
+  configure_training_budget(config)
   return config
+
+
+def configure_training_budget(config, overrides=None):
+  """Resolve an opt-in iteration horizon without hiding conflicting CLI flags."""
+  from hydra.core.hydra_config import HydraConfig
+  from omegaconf import open_dict
+  weights = config.get('didi_eval', {}).get('weights', 'backbone')
+  if weights not in ('backbone', 'student_ema'):
+    raise ValueError('didi_eval.weights must be backbone or student_ema.')
+  iterations = training_iterations(config)
+  if iterations is None or config.get('mode', 'train') != 'train':
+    return
+  budget = optimizer_step_budget(config, iterations)
+  configured = config.trainer.max_steps
+  if overrides is None:
+    overrides = (HydraConfig.get().overrides.task if HydraConfig.initialized() else [])
+  explicit = any(str(item).split('=', 1)[0].lstrip('+') == 'trainer.max_steps'
+                 for item in overrides)
+  if configured != budget and (explicit or configured != 10000):
+    raise ValueError(f'didi_training.iterations={iterations} requires '
+                     f'trainer.max_steps={budget} individual optimizer updates, '
+                     f'but trainer.max_steps={configured} was explicitly configured. '
+                     'Remove that override or set it to the derived budget.')
+  with open_dict(config):
+    config.trainer.max_steps = budget
 
 
 def environment_record():
@@ -108,7 +136,8 @@ def _write_provenance(config, record):
   (directory / 'didi_provenance.json').write_text(json.dumps({
     'upstream_revision': UPSTREAM_REVISION,
     'overrides': overrides,
-    'evaluation_weights': 'backbone (original generate_samples)',
+    'evaluation_weights': config.get('didi_eval', {}).get('weights', 'backbone'),
+    'training_protocol': training_protocol(config),
     'runtime_fix_ledger': 'didi_repro/README.md',
   }, indent=2) + '\n')
 
@@ -176,6 +205,7 @@ def install_entrypoint(upstream):
   ))
 
   def train(diffusion_model, config, logger, tokenizer):
+    configure_training_budget(config)
     validate_options(config)
     if (config.get('didi_init', {}).get('student_hf')
         and config.checkpointing.resume_from_ckpt):

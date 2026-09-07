@@ -1,11 +1,13 @@
 """Explicit runtime/checkpoint repairs around pristine upstream source.
 
-No objective, training hyperparameter, noise schedule, or sampling equation is
-replaced here. See README.md for the complete deviation ledger. Source edits
-are applied in memory with exact-match checks, so the vendored files remain
+The released objective, noise schedule and sampling equations are preserved.
+Explicit iteration-budget and EMA-evaluation options correct the experiment
+protocol without modifying the vendored source. See README.md for the ledger.
+Source edits are applied in memory with exact-match checks, so the vendored files remain
 byte-identical and each repaired method can be compared against its original.
 """
 
+from contextlib import contextmanager
 import hashlib
 import importlib
 import inspect
@@ -68,11 +70,20 @@ def install_runtime(upstream_main):
   guided_step = repaired_function(original._get_gradient_tilting_step, (
     ('reward.backward()\n      grad = log_p_x0_for_grad.grad',
      'grad = torch.autograd.grad(reward, log_p_x0_for_grad)[0]'),))
+  evaluation_forward = repaired_function(original.forward, (
+    ('self.backbone(xt, sigma)', 'self._didi_forward_backbone()(xt, sigma)'),))
 
   class ReproductionDiDi(original):
     _didi_runtime_installed = True
 
     def __init__(self, config, tokenizer):
+      from .protocol import training_iterations, training_protocol
+      iterations = training_iterations(config)
+      evaluation_weights = config.get('didi_eval', {}).get('weights', 'backbone')
+      if evaluation_weights not in ('backbone', 'student_ema'):
+        raise ValueError('didi_eval.weights must be backbone or student_ema.')
+      if evaluation_weights == 'student_ema' and config.eval.disable_ema:
+        raise ValueError('didi_eval.weights=student_ema conflicts with eval.disable_ema=true.')
       if config.algo.backbone != 'dit':
         raise ValueError('Strict DiDi reproduction uses upstream algo.backbone=dit '
                          'and a native teacher .ckpt, not the IDLM HF wrapper.')
@@ -90,6 +101,10 @@ def install_runtime(upstream_main):
       self._didi_teacher_metadata = None
       self._didi_student_metadata = None
       self._didi_loading_checkpoint = False
+      self._didi_iterations = iterations
+      self._didi_training_protocol = training_protocol(config)
+      self._didi_evaluation_weights = evaluation_weights
+      self._didi_evaluation_depth = 0
       effective_names = (
         'discriminator_lr', 'kl_beta', 'entropy_beta', 'sampling_eps',
         'label_smoothing', 'discriminator_warmup_steps', 'student_update_every',
@@ -104,9 +119,80 @@ def install_runtime(upstream_main):
       self._didi_effective_hyperparameters.update({
         'scheduler_implementation': 'linear warmup then linear decay, floor=1e-8',
         'reward_std_correction': 1,
-        'evaluation_weights': 'backbone',
+        'scheduler_horizon_iterations': iterations,
+        'training_protocol': self._didi_training_protocol,
+        'evaluation_weights': evaluation_weights,
         'noise_eps': self.noise.eps,
       })
+
+    def on_fit_start(self):
+      if self._didi_iterations is not None:
+        from .protocol import optimizer_step_budget
+        expected = optimizer_step_budget(self.config)
+        if self.trainer.max_steps != expected:
+          raise ValueError(f'didi_training.iterations={self._didi_iterations} '
+                           f'requires trainer.max_steps={expected} optimizer updates; '
+                           'launch through didi_repro to resolve the budget.')
+        if self.global_steps > self._didi_iterations:
+          raise ValueError('Checkpoint iteration exceeds didi_training.iterations.')
+      return super().on_fit_start()
+
+    def _get_lr(self):
+      if self._didi_iterations is None:
+        return super()._get_lr()
+      # The upstream index is a DiDi iteration, NOT Lightning's count of
+      # individual discriminator/student optimizer updates. Keep its linear
+      # formula and floor but use a horizon measured in the same units.
+      step = self.global_steps
+      warmup = int(self.lr_scheduler_config.warmup_steps)
+      optimizers = self.optimizers()
+      for optimizer, peak in zip(optimizers, (
+          self.optim_config_student.lr, self.discriminator_lr)):
+        if step < warmup:
+          rate = peak * (step + 1) / warmup
+        else:
+          progress = (step - warmup) / (self._didi_iterations - warmup)
+          rate = max(peak * (1.0 - progress), 1e-8)
+        for group in optimizer.param_groups:
+          group['lr'] = rate
+      return optimizers
+
+    def _didi_forward_backbone(self):
+      if (self._didi_evaluation_depth > 0
+          and self._didi_evaluation_weights == 'student_ema'):
+        return self.student_ema
+      return self.backbone
+
+    forward = evaluation_forward
+
+    @contextmanager
+    def _didi_evaluation_context(self):
+      # Do not copy or swap parameters: optimizers, gradients and checkpoint
+      # keys must always retain the real trainable backbone. Every denoiser
+      # forward in this scope selects the separately maintained EMA instead.
+      if self._didi_in_training_step:
+        raise RuntimeError('Evaluation must not run inside a DiDi training step.')
+      modes = [(module, module.training) for module in self.modules()]
+      self._didi_evaluation_depth += 1
+      if self._didi_evaluation_weights == 'student_ema':
+        self.student_ema.eval()
+      try:
+        yield
+      finally:
+        self._didi_evaluation_depth -= 1
+        for module, mode in modes:
+          module.training = mode
+
+    def validation_step(self, batch, batch_idx):
+      with self._didi_evaluation_context():
+        return super().validation_step(batch, batch_idx)
+
+    def _train_mode(self):
+      if self._didi_evaluation_weights == 'backbone':
+        return super()._train_mode()
+      # Do not apply the unused legacy EMA on top of the explicit student EMA.
+      self.backbone.train()
+      self.noise.train()
 
     def initialize_teacher_checkpoint(self, checkpoint, source_path=None):
       """Load native raw MDLM weights into every copy created by __init__."""
@@ -147,6 +233,8 @@ def install_runtime(upstream_main):
     def training_step(self, batch, batch_idx):
       if self._didi_teacher_metadata is None:
         raise RuntimeError('DiDi teacher weights were not initialized from a checkpoint.')
+      if self._didi_iterations is not None and self.global_steps >= self._didi_iterations:
+        raise RuntimeError('DiDi iteration budget exhausted; refusing another optimizer update.')
       self._didi_in_training_step = True
       try:
         result = training_step(self, batch, batch_idx)
@@ -178,7 +266,7 @@ def install_runtime(upstream_main):
       # Lightning validation defaults to inference_mode; the original guided
       # sampler needs input gradients. Its own @no_grad still controls ordinary
       # generation and torch.enable_grad still controls only the tilting step.
-      with torch.inference_mode(False):
+      with torch.inference_mode(False), self._didi_evaluation_context():
         return super().generate_samples(num_samples, num_steps, eps)
 
     def on_save_checkpoint(self, checkpoint):
@@ -193,7 +281,8 @@ def install_runtime(upstream_main):
         'next_iteration': self.global_steps + int(self._didi_in_training_step),
         'teacher': self._didi_teacher_metadata,
         'student_initialization': self._didi_student_metadata,
-        'evaluation_weights': 'backbone',
+        'evaluation_weights': self._didi_evaluation_weights,
+        'training_protocol': self._didi_training_protocol,
       }
 
     def on_load_checkpoint(self, checkpoint):
@@ -208,6 +297,14 @@ def install_runtime(upstream_main):
                            'run, supply the teacher via training.finetune_path.')
         if metadata['upstream_revision'] != UPSTREAM_REVISION:
           raise ValueError('Resume checkpoint uses a different upstream revision.')
+        saved_protocol = metadata.get('training_protocol')
+        if ((saved_protocol is None and self._didi_iterations is not None)
+            or (saved_protocol is not None
+                and saved_protocol != self._didi_training_protocol)):
+          raise ValueError('Resume training protocol differs from the checkpoint '
+                           '(iteration horizon, LR schedule, cadence or EMA). '
+                           'Use a new output directory and a fresh teacher-initialized run '
+                           'for the corrected recipe; old EMA history cannot be repaired.')
         self.global_steps = int(metadata['next_iteration'])
         self._didi_teacher_metadata = metadata['teacher']
       else:
@@ -222,6 +319,10 @@ def install_runtime(upstream_main):
           state.update({f'backbone.{k}': v for k, v in ema_weights.items()})
         if self.sampler == 'guided' and not any(k.startswith('discriminator.') for k in state):
           raise ValueError('Guided evaluation needs trained discriminator weights.')
+        if (self._didi_evaluation_weights == 'student_ema'
+            and not any(k.startswith('student_ema.') for k in state)):
+          raise ValueError('EMA evaluation requires student_ema.* checkpoint weights; '
+                           'use didi_eval.weights=backbone for a raw-only checkpoint.')
       if self.ema is not None and 'ema' in checkpoint:
         self.ema.load_state_dict(checkpoint['ema'])
       self._didi_loading_checkpoint = True
@@ -234,6 +335,8 @@ def install_runtime(upstream_main):
         required = ('backbone.', 'discriminator.') if self.sampler == 'guided' else ('backbone.',)
         if self.config.mode == 'train':
           required = ('backbone.', 'teacher.', 'discriminator.', 'student_ema.')
+        elif self._didi_evaluation_weights == 'student_ema':
+          required = (*required, 'student_ema.')
         missing = [k for k in result.missing_keys if k.startswith(required)]
         if missing or result.unexpected_keys:
           raise ValueError(f'Incomplete DiDi checkpoint: missing={missing}, '

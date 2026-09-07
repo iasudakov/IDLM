@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Original DiDi-Instruct training defaults; locations and tracker only differ.
+# Corrected DiDi iteration/LR/EMA recipe with the released guided16 evaluation.
 # Usage: TEACHER_CHECKPOINT=/path/mdlm.ckpt OWT_CACHE=/path/cache \
 #        SAVE_DIR=/path/owt_didi GPUS=0,1 bash scripts/train_didi_owt.sh
 set -eo pipefail
@@ -32,16 +32,35 @@ if [ "$DIDI_GPU_COUNT" -lt 1 ]; then
   printf '%s\n' 'DiDi reproduction requires CUDA GPUs and the original environment.' >&2
   exit 1
 fi
+if [ $((40 % DIDI_GPU_COUNT)) -ne 0 ]; then
+  printf 'Visible GPU count (%s) must divide 40 for the released evaluation sample count.\n' "$DIDI_GPU_COUNT" >&2
+  exit 1
+fi
+DIDI_EVAL_BATCH_SIZE=$((40 / DIDI_GPU_COUNT))
+DIDI_EVAL_BATCHES=1
+if [ "$DIDI_GPU_COUNT" -eq 1 ]; then
+  # Retain the released single-GPU batch size instead of doubling peak memory.
+  DIDI_EVAL_BATCH_SIZE=20
+  DIDI_EVAL_BATCHES=2
+fi
 
 # Upstream script: one example/GPU, G=8 generated candidates/example,
 # global_batch_size=GPU count, no accumulation, validate every1000 batches.
-# No MMD learning-rate/batch/precision/EMA settings are imported.
+# Explicit corrections: 10000 DiDi iterations (not 10000 individual optimizer
+# updates), no LR warmup, EMA beta .9999, and guided16 EMA evaluation of 40
+# samples globally. Direct python -m didi_repro retains legacy defaults.
 DIDI_COMMAND=(python -m torch.distributed.run --standalone
   --nproc_per_node="$DIDI_GPU_COUNT" --module didi_repro
   "training.finetune_path=$TEACHER_CHECKPOINT"
   "data.cache_dir=$OWT_CACHE"
   "checkpointing.save_dir=$SAVE_DIR" "hydra.run.dir=$SAVE_DIR"
   loader.batch_size=1 "loader.global_batch_size=$DIDI_GPU_COUNT"
+  "loader.eval_batch_size=$DIDI_EVAL_BATCH_SIZE" loader.eval_global_batch_size=40
+  +didi_training.iterations=10000
+  algo.lr_scheduler.warmup_steps=0 algo.ema_beta=0.9999
+  +didi_eval.weights=student_ema
+  sampling.predictor=guided sampling.steps=16 sampling.noise_removal=ancestral
+  "sampling.num_sample_batches=$DIDI_EVAL_BATCHES"
   trainer.val_check_interval=1000
   "+underdeep.experiment=${EXPERIMENT:-generative-models/owt}"
   "+underdeep.name=${RUN_NAME:-didi-instruct-owt}"

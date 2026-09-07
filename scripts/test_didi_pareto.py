@@ -116,12 +116,13 @@ class ParetoTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(prefix='didi-pareto-test-')
         self.addCleanup(self.directory.cleanup)
 
-    def model(self, sampler='ancestral_cache', **overrides):
+    def model(self, sampler='ancestral_cache', weights='backbone', **overrides):
         cfg = self.helpers.config(tiny=True)
         cfg.sampling.predictor = sampler
         cfg.eval.perplexity_batch_size = 3
         cfg.checkpointing.save_dir = self.directory.name
         with open_dict(cfg):
+            cfg.didi_eval = {'weights': weights}
             cfg.didi_pareto = {
                 'every_n_validations': 1, 'temperatures': [.75, 1.0],
                 'steps': [2, 4], 'seeds': 2, 'num_batches': 2,
@@ -344,6 +345,34 @@ class ParetoTests(unittest.TestCase):
     def test_sample_standard_deviation(self):
         self.assertEqual(pareto._mean_std([5]), (5, 0))
         self.assertEqual(pareto._mean_std([1, 3, 5]), (3, 2))
+
+    def test_ema_temperature_sweep_routes_all_denoiser_calls_and_labels_history(self):
+        model = self.model(sampler='guided', weights='student_ema',
+                           steps=[2], seeds=1, num_batches=1)
+        with torch.no_grad():
+            for parameter in model.student_ema.parameters():
+                parameter.add_(.1)
+        state = copy.deepcopy(model.state_dict())
+        modes = [module.training for module in model.modules()]
+        rng = torch.get_rng_state().clone()
+        raw_calls, ema_calls = [], []
+        raw_hook = model.backbone.register_forward_pre_hook(lambda *args: raw_calls.append(1))
+        ema_hook = model.student_ema.register_forward_pre_hook(lambda *args: ema_calls.append(1))
+        callback, trainer = self.callback(model), self.trainer()
+        try:
+            with self.fast_plots():
+                callback.on_validation_end(trainer, model)
+        finally:
+            raw_hook.remove()
+            ema_hook.remove()
+        self.assertEqual(trainer.logger.metrics[-1][0]['didi_pareto/failed'], 0)
+        self.assertEqual(raw_calls, [])
+        self.assertGreater(len(ema_calls), 0)
+        self.assertEqual(self.history()['protocol']['weights'], 'student_ema')
+        self.assertEqual(modes, [module.training for module in model.modules()])
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+        self.helpers.assert_same(state, model.state_dict())
+        self.assertNotIn('forward', model.__dict__)
 
 
 def ddp_smoke():

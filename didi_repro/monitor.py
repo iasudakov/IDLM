@@ -282,7 +282,7 @@ class DiDiMonitor(L.Callback):
                                 trainer.logger.log_table(
                                     key='didi/diagnostics', columns=['Property', 'Value'],
                                     data=[['sampler', str(pl_module.sampler)],
-                                          ['weights', 'backbone (upstream generate_samples)'],
+                                          ['weights', getattr(pl_module, '_didi_evaluation_weights', 'backbone')],
                                           ['sampling_steps', str(self.config.sampling.steps)],
                                           ['sample_source', 'captured upstream validation; no extra draws']],
                                     step=trainer.global_step)

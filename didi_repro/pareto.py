@@ -137,7 +137,7 @@ class DiDiPareto(L.Callback):
         return {
             'upstream_revision': UPSTREAM_REVISION,
             'sampler': sampler,
-            'weights': 'backbone (original generate_samples)',
+            'weights': getattr(model, '_didi_evaluation_weights', 'backbone'),
             'temperatures': self.temperatures,
             'temperature_transform': 'masked-SUBS-logprob-temperature-v1',
             'steps': self.budgets,

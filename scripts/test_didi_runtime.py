@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 
 import hydra
 import lightning as L
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
@@ -155,6 +155,16 @@ class DiDiRuntimeTests(unittest.TestCase):
                    for key, value in model.backbone.state_dict().items()}
         model.initialize_teacher_checkpoint({'state_dict': teacher})
         return teacher
+
+    def corrected_config(self, iterations=3):
+        cfg = self.config(tiny=True)
+        with open_dict(cfg):
+            cfg.didi_training = {'iterations': iterations}
+            cfg.didi_eval = {'weights': 'student_ema'}
+        cfg.algo.lr_scheduler.warmup_steps = 0
+        cfg.algo.ema_beta = .9999
+        cfg.trainer.max_steps = iterations * 2
+        return cfg
 
     def assert_same(self, left, right):
         self.assertEqual(set(left), set(right))
@@ -373,6 +383,165 @@ class DiDiRuntimeTests(unittest.TestCase):
             actual = model._get_gradient_tilting_step(x, t, .1, .4, model.discriminator)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         self.assertTrue(all(p.grad is None for p in model.parameters()))
+
+    def test_iteration_budget_schedule_and_resume_use_same_units(self):
+        cfg = self.corrected_config()
+        model = self.model(cfg)
+        self.initialize(model)
+        initial_ema = [p.detach().clone() for p in model.student_ema.parameters()]
+
+        class StopAtTwo(L.Callback):
+            def on_train_batch_end(self, trainer, pl_module, *args):
+                if pl_module.global_steps == 2:
+                    trainer.should_stop = True
+
+        with tempfile.TemporaryDirectory(prefix='didi-iterations-') as directory:
+            trainer = self.trainer(directory, max_steps=6)
+            trainer.callbacks.append(StopAtTwo())
+            rates = []
+            ema_updates = []
+            original_lr = model._get_lr
+            original_update = model.update_ema
+
+            def capture_lr():
+                optimizers = original_lr()
+                rates.append([o.param_groups[0]['lr'] for o in optimizers])
+                return optimizers
+
+            def capture_ema():
+                before = [p.detach().clone() for p in model.student_ema.parameters()]
+                original_update()
+                for prev, raw, averaged in zip(before, model.backbone.parameters(),
+                                              model.student_ema.parameters()):
+                    torch.testing.assert_close(averaged, prev.lerp(raw.detach(), .0001))
+                ema_updates.append(1)
+
+            with mock.patch.object(model, '_get_lr', side_effect=capture_lr), \
+                    mock.patch.object(model, 'update_ema', side_effect=capture_ema):
+                trainer.fit(model, train_dataloaders=DataLoader(ToyDataset(), batch_size=1))
+            self.assertEqual(model.global_steps, 2)
+            self.assertEqual(trainer.global_step, 4)
+            self.assertEqual(len(ema_updates), 2)
+            self.assertTrue(any(not torch.equal(before, after)
+                                for before, after in zip(initial_ema, model.student_ema.parameters())))
+            torch.testing.assert_close(torch.tensor(rates),
+                                       torch.tensor([[.01, .01], [.01 * 2 / 3] * 2]))
+            path = str(Path(directory) / 'resume.ckpt')
+            trainer.save_checkpoint(path)
+            clone = self.model(self.corrected_config())
+            continuation = self.trainer(directory, max_steps=6)
+            continuation.fit(clone, train_dataloaders=DataLoader(ToyDataset(), batch_size=1),
+                             ckpt_path=path)
+            self.assertEqual(clone.global_steps, 3)
+            self.assertEqual(continuation.global_step, 6)
+            for optimizer in continuation.optimizers:
+                self.assertAlmostEqual(optimizer.param_groups[0]['lr'], .01 / 3)
+            with self.assertRaisesRegex(RuntimeError, 'budget exhausted'):
+                clone.training_step(next(iter(DataLoader(ToyDataset(), batch_size=1))), 0)
+
+    def test_no_warmup_10000_iteration_schedule_reaches_released_floor(self):
+        cfg = self.corrected_config(10000)
+        cfg.optim.lr = cfg.algo.discriminator_lr = 1e-6
+        model = self.model(cfg)
+        optimizers = model.configure_optimizers()
+        with mock.patch.object(model, 'optimizers', return_value=optimizers):
+            for iteration, expected in ((0, 1e-6), (5000, 5e-7), (9999, 1e-8)):
+                model.global_steps = iteration
+                for optimizer in model._get_lr():
+                    self.assertAlmostEqual(optimizer.param_groups[0]['lr'], expected, places=14)
+
+    def test_iteration_mode_rejects_wrong_trainer_budget_and_changed_resume(self):
+        model = self.model(self.corrected_config())
+        self.initialize(model)
+        checkpoint = {'state_dict': copy.deepcopy(model.state_dict())}
+        model.on_save_checkpoint(checkpoint)
+        for changed in ('iterations', 'warmup', 'ema'):
+            cfg = self.corrected_config(4 if changed == 'iterations' else 3)
+            if changed == 'warmup':
+                cfg.algo.lr_scheduler.warmup_steps = 1
+            if changed == 'ema':
+                cfg.algo.ema_beta = .999
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'protocol differs'):
+                self.model(cfg).on_load_checkpoint(copy.deepcopy(checkpoint))
+        legacy = copy.deepcopy(checkpoint)
+        del legacy['didi_repro']['training_protocol']
+        with self.assertRaisesRegex(ValueError, 'protocol differs'):
+            self.model(self.corrected_config()).on_load_checkpoint(legacy)
+        with tempfile.TemporaryDirectory(prefix='didi-wrong-budget-') as directory:
+            trainer = self.trainer(directory, max_steps=3)
+            with self.assertRaisesRegex(ValueError, 'requires trainer.max_steps=6'):
+                trainer.fit(model, train_dataloaders=DataLoader(ToyDataset(), batch_size=1))
+
+    def test_ema_used_for_validation_and_guided_sampling_without_weight_swaps(self):
+        cfg = self.corrected_config()
+        cfg.sampling.predictor = 'guided'
+        model = self.model(cfg)
+        self.initialize(model)
+        with torch.no_grad():
+            for parameter in model.student_ema.parameters():
+                parameter.add_(.2)
+        model.train()
+        model.teacher.eval()
+        model.student_ema.eval()
+        for p in model.backbone.parameters():
+            p.grad = torch.ones_like(p)
+        before = copy.deepcopy(model.state_dict())
+        identities = {name: id(p) for name, p in model.named_parameters()}
+        modes = [module.training for module in model.modules()]
+        grads = {name: None if p.grad is None else p.grad.clone()
+                 for name, p in model.named_parameters()}
+        raw_calls, ema_calls = [], []
+        raw_hook = model.backbone.register_forward_pre_hook(lambda *args: raw_calls.append(1))
+        ema_hook = model.student_ema.register_forward_pre_hook(lambda *args: ema_calls.append(1))
+        try:
+            with torch.inference_mode():
+                sample = model.generate_samples(2, num_steps=4)
+            self.assertEqual(sample.shape, (2, 12))
+            self.assertEqual(raw_calls, [])
+            self.assertGreater(len(ema_calls), 0)
+            ema_calls.clear()
+
+            def validation_forward(instance, batch, batch_idx):
+                return instance.forward(batch, torch.ones(len(batch), 1))
+
+            tokens = model.prior_sample(2, 12)
+            with mock.patch.object(self.original_class, 'validation_step', validation_forward):
+                model.validation_step(tokens, 0)
+            self.assertEqual(raw_calls, [])
+            self.assertEqual(len(ema_calls), 1)
+            model.forward(tokens, torch.ones(2, 1))
+            self.assertEqual(len(raw_calls), 1)  # Training forward still raw.
+        finally:
+            raw_hook.remove()
+            ema_hook.remove()
+        self.assert_same(before, model.state_dict())
+        self.assertEqual(identities, {name: id(p) for name, p in model.named_parameters()})
+        self.assertEqual(modes, [module.training for module in model.modules()])
+        self.assertEqual(model._didi_evaluation_depth, 0)
+        for name, p in model.named_parameters():
+            if grads[name] is None:
+                self.assertIsNone(p.grad)
+            else:
+                torch.testing.assert_close(p.grad, grads[name], rtol=0, atol=0)
+
+    def test_ema_context_restores_modes_after_failure_and_rejects_missing_weights(self):
+        cfg = self.corrected_config()
+        model = self.model(cfg)
+        modes = [module.training for module in model.modules()]
+        with mock.patch.object(self.original_class, 'generate_samples', side_effect=RuntimeError('failed')):
+            with self.assertRaisesRegex(RuntimeError, 'failed'):
+                model.generate_samples(1, num_steps=4)
+        self.assertEqual(model._didi_evaluation_depth, 0)
+        self.assertEqual(modes, [module.training for module in model.modules()])
+        cfg.mode = 'sample_eval'
+        evaluated = self.model(cfg)
+        state = {f'backbone.{k}': v for k, v in model.backbone.state_dict().items()}
+        with self.assertRaisesRegex(ValueError, 'requires student_ema'):
+            evaluated.on_load_checkpoint({'state_dict': state})
+        with open_dict(cfg):
+            cfg.didi_eval.weights = 'invalid'
+        with self.assertRaisesRegex(ValueError, 'must be backbone or student_ema'):
+            self.model(cfg)
 
 
 if __name__ == '__main__':

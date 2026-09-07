@@ -120,6 +120,7 @@ def maybe_evaluate_before_training(trainer, model, valid_loader, ckpt_path=None)
                                   ['checkpoint', str(ckpt_path or 'fresh initialized model')],
                                   ['global_step', str(evaluation_step['value'])],
                                   ['didi_iteration', str(getattr(model, 'global_steps', 0))],
+                                  ['weights', getattr(model, '_didi_evaluation_weights', 'backbone')],
                                   ['sampler', str(model.config.sampling.predictor)],
                                   ['sampling_steps', str(model.config.sampling.steps)]],
                             step=evaluation_step['value'])

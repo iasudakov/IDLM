@@ -3,6 +3,7 @@
 import copy
 import ast
 import inspect
+import json
 import os
 from pathlib import Path
 import random
@@ -22,7 +23,10 @@ from omegaconf import OmegaConf
 import torch
 
 from didi_repro.entrypoint import (
-  _check_cached_data, install_entrypoint, prepare_config, validate_environment)
+  _check_cached_data, _write_provenance, configure_training_budget,
+  install_entrypoint, prepare_config, validate_environment)
+from didi_repro.protocol import (
+  optimizer_step_budget, training_iterations, training_protocol)
 from didi_repro.runtime import UPSTREAM_ROOT, load_upstream
 from didi_repro.tracking import DiDiUnderdeepLogger
 
@@ -35,7 +39,7 @@ class LauncherTests(unittest.TestCase):
       with self.subTest(script=filename):
         subprocess.run(['bash', '-n', str(self.root / 'scripts' / filename)], check=True)
 
-  def test_launchers_preserve_original_presets_without_starting_training(self):
+  def test_launchers_use_corrected_recipe_without_starting_training(self):
     with tempfile.TemporaryDirectory(prefix='didi-launcher-test-') as directory:
       fixture = Path(directory)
       teacher = fixture / 'teacher.ckpt'
@@ -45,8 +49,8 @@ class LauncherTests(unittest.TestCase):
         (cache / f'{split}_bs1024_wrapped.dat').mkdir(parents=True)
       fake_python = fixture / 'python'
       fake_python.write_text(
-        f'#!{sys.executable}\nimport sys\n'
-        "print(2 if sys.argv[1] == '-c' else repr(sys.argv[1:]))\n")
+        f'#!{sys.executable}\nimport os, sys\n'
+        "print(os.environ.get('DIDI_TEST_GPU_COUNT', '2') if sys.argv[1] == '-c' else repr(sys.argv[1:]))\n")
       fake_python.chmod(0o755)
       environment = dict(os.environ, PATH=str(fixture) + os.pathsep + os.environ['PATH'],
                          TEACHER_CHECKPOINT=str(teacher), CHECKPOINT=str(teacher),
@@ -58,9 +62,32 @@ class LauncherTests(unittest.TestCase):
       self.assertEqual(command[:3], ['python', '-m', 'torch.distributed.run'])
       for argument in ('--nproc_per_node=2', 'loader.batch_size=1',
                        'loader.global_batch_size=2', 'trainer.val_check_interval=1000',
+                       'loader.eval_batch_size=20', 'loader.eval_global_batch_size=40',
+                       '+didi_training.iterations=10000',
+                       'algo.lr_scheduler.warmup_steps=0', 'algo.ema_beta=0.9999',
+                       '+didi_eval.weights=student_ema', 'sampling.predictor=guided',
+                       'sampling.steps=16', 'sampling.noise_removal=ancestral',
+                       'sampling.num_sample_batches=1',
                        '+underdeep.name=offline-didi-test'):
         self.assertIn(argument, command)
-      self.assertFalse(any(arg.startswith(('optim.', 'algo.', 'sampling.')) for arg in command))
+      self.assertFalse(any(arg.startswith(('optim.', 'trainer.precision=',
+                                          'algo.num_samples_per_prompt=')) for arg in command))
+      for devices, batch, batches in ((1, 20, 2), (4, 10, 1), (8, 5, 1), (40, 1, 1)):
+        with self.subTest(devices=devices):
+          result = subprocess.run(['bash', str(self.root / 'scripts/train_didi_owt.sh')],
+                                  env=dict(environment, DIDI_TEST_GPU_COUNT=str(devices)),
+                                  text=True, capture_output=True, check=True)
+          command = shlex.split(result.stdout)
+          self.assertIn(f'--nproc_per_node={devices}', command)
+          self.assertIn(f'loader.global_batch_size={devices}', command)
+          self.assertIn(f'loader.eval_batch_size={batch}', command)
+          self.assertIn(f'sampling.num_sample_batches={batches}', command)
+          self.assertEqual(devices * batch * batches, 40)
+      result = subprocess.run(['bash', str(self.root / 'scripts/train_didi_owt.sh')],
+                              env=dict(environment, DIDI_TEST_GPU_COUNT='3'),
+                              text=True, capture_output=True)
+      self.assertNotEqual(result.returncode, 0)
+      self.assertIn('must divide 40', result.stderr)
       # Fake Python reports arguments; the real evaluator is never imported.
       result = subprocess.run(['bash', str(self.root / 'scripts/eval_didi_owt.sh')],
                               env=environment, text=True, capture_output=True, check=True)
@@ -68,7 +95,7 @@ class LauncherTests(unittest.TestCase):
       self.assertEqual(command[:2], ['-m', 'didi_repro'])
       for argument in ('mode=sample_eval', 'sampling.steps=16',
                        'sampling.predictor=guided', 'loader.eval_batch_size=20',
-                       'sampling.num_sample_batches=2'):
+                       'sampling.num_sample_batches=2', '+didi_eval.weights=student_ema'):
         self.assertIn(argument, command)
 
 
@@ -93,6 +120,8 @@ class EntryTests(unittest.TestCase):
     self.assertEqual(prepared.optim.lr, 1e-6)
     self.assertEqual(prepared.loader.batch_size, 1)
     self.assertFalse(prepared.didi_eval.before_training)
+    self.assertEqual(prepared.didi_eval.weights, 'backbone')
+    self.assertIsNone(prepared.didi_training.iterations)
     self.assertEqual(prepared.didi_pareto.every_n_validations, 0)
     self.assertIsNone(prepared.didi_pareto.sampler)
     self.assertIsNone(prepared.didi_init.student_hf)
@@ -116,6 +145,125 @@ class EntryTests(unittest.TestCase):
     self.assertEqual(list(config.didi_pareto.temperatures), [0.85, 1.0, 1.15])
     self.assertEqual(list(config.didi_pareto.steps), [8, 16, 32])
     self.assertEqual(config.didi_pareto.sampler, 'guided')
+
+  def test_corrected_flags_compose_and_map_iterations_to_optimizer_steps(self):
+    with hydra.initialize_config_dir(version_base=None, config_dir=str(UPSTREAM_ROOT / 'configs')):
+      config = hydra.compose(config_name='config', overrides=[
+        'trainer.devices=8', '+didi_training.iterations=10000',
+        'algo.lr_scheduler.warmup_steps=0', 'algo.ema_beta=0.9999',
+        '+didi_eval.weights=student_ema', 'loader.eval_batch_size=5',
+        'loader.eval_global_batch_size=40', 'sampling.num_sample_batches=1',
+        'sampling.predictor=guided', 'sampling.steps=16'])
+    prepare_config(config)
+    self.assertEqual(config.trainer.max_steps, 20000)
+    self.assertEqual(config.didi_training.iterations, 10000)
+    self.assertEqual(config.algo.lr_scheduler.warmup_steps, 0)
+    self.assertEqual(config.algo.ema_beta, 0.9999)
+    self.assertEqual(config.didi_eval.weights, 'student_ema')
+    self.assertEqual(config.optim.lr, 1e-6)
+    self.assertEqual(config.algo.num_samples_per_prompt, 8)
+    self.assertEqual(config.loader.eval_batch_size * config.trainer.devices *
+                     config.sampling.num_sample_batches, 40)
+    # Preparing an already-resolved config is safe and does not map twice.
+    prepare_config(config)
+    self.assertEqual(config.trainer.max_steps, 20000)
+
+  def test_optimizer_budget_matches_exact_upstream_cadence(self):
+    for iterations in range(1, 15):
+      for warmup in range(iterations):
+        for every in range(1, 7):
+          config = {'didi_training': {'iterations': iterations},
+                    'algo': {'discriminator_warmup_steps': warmup,
+                             'student_update_every': every,
+                             'lr_scheduler': {'warmup_steps': 0}}}
+          expected = iterations + sum(s >= warmup and s % every == 0
+                                      for s in range(iterations))
+          self.assertEqual(optimizer_step_budget(config), expected)
+
+  def test_iteration_option_rejects_invalid_counts_and_warmups(self):
+    original = {'didi_training': {'iterations': 10},
+                'algo': {'discriminator_warmup_steps': 0, 'student_update_every': 1,
+                         'lr_scheduler': {'warmup_steps': 0}}}
+    cases = [('didi_training.iterations', x) for x in (0, -1, True, 2.5, '10')]
+    cases += [('algo.student_update_every', x) for x in (0, -1, True, 1.5)]
+    for name in ('algo.discriminator_warmup_steps', 'algo.lr_scheduler.warmup_steps'):
+      cases += [(name, x) for x in (-1, 10, 11, True, 1.5)]
+    for path, value in cases:
+      with self.subTest(path=path, value=value):
+        config = OmegaConf.create(copy.deepcopy(original))
+        OmegaConf.update(config, path, value)
+        with self.assertRaisesRegex(ValueError, path):
+          training_iterations(config)
+
+  def test_legacy_budget_and_eval_configuration_are_not_remapped(self):
+    config = prepare_config(self.config())
+    config.trainer.max_steps = 77
+    # Even previously accepted unusual cadence remains untouched without opt-in.
+    config.algo.student_update_every = 0
+    self.assertIsNone(training_iterations(config))
+    self.assertEqual(optimizer_step_budget(config), 77)
+    configure_training_budget(config)
+    self.assertEqual(config.trainer.max_steps, 77)
+    config.mode = 'sample_eval'
+    config.didi_training.iterations = 10000
+    config.algo.student_update_every = 1
+    configure_training_budget(config)
+    self.assertEqual(config.trainer.max_steps, 77)
+
+  def test_conflicting_explicit_max_steps_is_never_silently_overwritten(self):
+    from hydra.core.hydra_config import HydraConfig
+    for prefix in ('', '+', '++'):
+      config = prepare_config(self.config())
+      config.didi_training.iterations = 10000
+      overrides = [prefix + 'trainer.max_steps=10000']
+      with self.subTest(prefix=prefix), \
+           mock.patch.object(HydraConfig, 'initialized', return_value=True), \
+           mock.patch.object(HydraConfig, 'get', return_value=SimpleNamespace(
+             overrides=SimpleNamespace(task=overrides))):
+        with self.assertRaisesRegex(ValueError, 'requires trainer.max_steps=20000'):
+          configure_training_budget(config)
+        self.assertEqual(config.trainer.max_steps, 10000)
+    config = prepare_config(self.config())
+    config.didi_training.iterations = 10000
+    config.trainer.max_steps = 20000
+    configure_training_budget(config, overrides=['trainer.max_steps=20000'])
+    self.assertEqual(config.trainer.max_steps, 20000)
+    config.trainer.max_steps = 1234
+    with self.assertRaisesRegex(ValueError, 'explicitly configured'):
+      configure_training_budget(config, overrides=[])
+
+  def test_provenance_records_resolved_training_and_evaluation_semantics(self):
+    config = prepare_config(self.config())
+    config.didi_training.iterations = 10000
+    config.algo.lr_scheduler.warmup_steps = 0
+    config.algo.ema_beta = 0.9999
+    config.didi_eval.weights = 'student_ema'
+    configure_training_budget(config)
+    with tempfile.TemporaryDirectory(prefix='didi-provenance-test-') as directory, \
+         mock.patch.dict(os.environ, {'RANK': '0'}):
+      config.checkpointing.save_dir = directory
+      _write_provenance(config, {'python': 'test-runtime'})
+      record = json.loads((Path(directory) / 'didi_provenance.json').read_text())
+    self.assertEqual(record['evaluation_weights'], 'student_ema')
+    protocol = record['training_protocol']
+    self.assertEqual(protocol['iterations'], 10000)
+    self.assertEqual(protocol['optimizer_step_budget'], 20000)
+    self.assertEqual(protocol['lr_horizon'], 10000)
+    self.assertEqual(protocol['lr_horizon_units'], 'didi_iterations')
+    self.assertEqual(protocol['lr_warmup_steps'], 0)
+    self.assertEqual(protocol['lr_floor'], 1e-8)
+    self.assertEqual(protocol['ema_beta'], 0.9999)
+    self.assertEqual(protocol['student_peak_lr'], 1e-6)
+    self.assertEqual(protocol['discriminator_peak_lr'], 1e-6)
+    # Evaluation-only changes cannot invalidate a resumed training protocol.
+    config.didi_eval.weights = 'backbone'
+    self.assertEqual(training_protocol(config), protocol)
+
+  def test_invalid_evaluation_weights_fail_before_io(self):
+    config = prepare_config(self.config())
+    config.didi_eval.weights = 'teacher'
+    with self.assertRaisesRegex(ValueError, 'weights must be backbone or student_ema'):
+      prepare_config(config)
 
   def test_strict_environment_fails_on_unrecorded_runtime(self):
     config = prepare_config(self.config())
