@@ -8,6 +8,7 @@ contacted and no GPU is used.
 """
 
 import copy
+import json
 from pathlib import Path
 import random
 import sys
@@ -27,10 +28,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from didi_repro.monitor import attach_monitor
+from didi_repro.pareto import attach_pareto
 from didi_repro.pretrain_eval import maybe_evaluate_before_training
 from didi_repro.runtime import UPSTREAM_ROOT, load_upstream
 from underdeep_logger import UnderdeepLogger
 from test_didi_runtime import ToyBackbone, ToyDataset, ToyTokenizer
+from test_didi_monitor import Evaluator
 
 
 class MemoryRun:
@@ -66,10 +69,13 @@ class OrderCallback(L.Callback):
     def __init__(self):
         self.events = []
         self.validation_weights = []
+        self.evaluation_contexts = []
 
     def on_validation_start(self, trainer, pl_module):
         self.events.append(('validation', trainer.global_step))
         self.validation_weights.append(copy.deepcopy(pl_module.backbone.state_dict()))
+        self.evaluation_contexts.append(copy.deepcopy(
+            getattr(pl_module, '_didi_evaluation_step', None)))
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         self.events.append(('training', trainer.global_step))
@@ -128,13 +134,20 @@ class TestPretrainEvaluation(unittest.TestCase):
         logger = MemoryLogger(self.directory.name)
         order = OrderCallback()
         callback = attach_monitor(model, model.config, upstream_revision='test')
+        callbacks = [order, callback]
+        pareto = attach_pareto(model, model.config)
+        if pareto is not None:
+            pareto.metrics_factory = Evaluator
+            callbacks.append(pareto)
+            # Capture image calls locally, never instantiate tracker SDK media.
+            logger.log_image = mock.Mock()
         trainer = L.Trainer(
             accelerator='cpu', devices=1, precision='32-true', max_steps=max_steps,
             logger=logger, enable_checkpointing=False, enable_progress_bar=False,
             enable_model_summary=False, limit_val_batches=limit_val_batches,
             num_sanity_val_steps=0, val_check_interval=8, log_every_n_steps=1,
             default_root_dir=self.directory.name, gradient_clip_val=0.0,
-            callbacks=[order, callback],
+            callbacks=callbacks,
         )
         return trainer, logger, order
 
@@ -171,6 +184,9 @@ class TestPretrainEvaluation(unittest.TestCase):
         result = maybe_evaluate_before_training(trainer, model, self.loader())
         self.assertIsInstance(result, list)
         self.assertEqual(order.events, [('validation', 0)])
+        self.assertEqual(order.evaluation_contexts, [
+            {'value': 0, 'checkpoint_loaded': True}])
+        self.assertFalse(hasattr(model, '_didi_evaluation_step'))
         self.assert_same_state(model.state_dict(), state)
         self.assertEqual([module.training for module in model.modules()], flags)
         self.assertTrue(torch.equal(torch.get_rng_state(), rng))
@@ -207,10 +223,22 @@ class TestPretrainEvaluation(unittest.TestCase):
         checkpoint = str(Path(self.directory.name) / 'resume.ckpt')
         trainer.save_checkpoint(checkpoint)
         saved = copy.deepcopy(model.backbone.state_dict())
-        resumed = self.model()
+        config = self.config()
+        with open_dict(config):
+            config.didi_pareto = {
+                'every_n_validations': 3, 'temperatures': [1.0],
+                'steps': [2], 'seeds': 1, 'num_batches': 1, 'batch_size': 2,
+            }
+        resumed = self.model(config)
         continuation, logger, order = self.trainer(resumed, max_steps=4)
         maybe_evaluate_before_training(continuation, resumed, self.loader(), ckpt_path=checkpoint)
         self.assert_same_state(saved, order.validation_weights[0])
+        self.assertEqual(order.evaluation_contexts, [
+            {'value': 2, 'checkpoint_loaded': True}])
+        self.assertFalse(hasattr(resumed, '_didi_evaluation_step'))
+        history = json.loads((Path(self.directory.name)
+                              / 'didi_pareto_temp_history.json').read_text())
+        self.assertEqual(set(history['curves']), {'2'})
         values = [(data, step) for data, step in logger._run.metrics if 'val/nll' in data]
         self.assertTrue(values)
         self.assertEqual(values[-1][1], 2)
@@ -220,6 +248,40 @@ class TestPretrainEvaluation(unittest.TestCase):
         self.assertEqual(continuation.global_step, 4)
         self.assertEqual(resumed.global_steps, 2)
         self.assertEqual(logger._run.finish_calls, 1)
+
+    def test_pareto_baseline_keeps_training_trajectory_and_separate_history(self):
+        states = []
+        for enabled in (False, True):
+            random.seed(51)
+            np.random.seed(51)
+            torch.manual_seed(51)
+            config = self.config()
+            with open_dict(config):
+                config.didi_pareto = {
+                    'every_n_validations': 3 if enabled else 0,
+                    'temperatures': [0.75, 1.0], 'steps': [2], 'seeds': 1,
+                    'num_batches': 1, 'batch_size': 2,
+                }
+            model = self.model(config)
+            trainer, logger, _ = self.trainer(model)
+            initial = copy.deepcopy(model.state_dict())
+            maybe_evaluate_before_training(trainer, model, self.loader())
+            self.assert_same_state(model.state_dict(), initial)
+            if enabled:
+                history = json.loads((Path(self.directory.name)
+                                      / 'didi_pareto_temp_history.json').read_text())
+                self.assertEqual(set(history['curves']), {'0'})
+                self.assertEqual(set(history['curves']['0']), {'0.75', '1'})
+                pareto = next(callback for callback in trainer.callbacks
+                              if hasattr(callback, 'validations_seen'))
+                self.assertEqual(pareto.validations_seen, 0)
+                failures = [values['didi_pareto/failed'] for values, _ in logger._run.metrics
+                            if 'didi_pareto/failed' in values]
+                self.assertEqual(failures, [0])
+                logger.log_image.assert_called()
+            trainer.fit(model, train_dataloaders=self.loader())
+            states.append(copy.deepcopy(model.state_dict()))
+        self.assert_same_state(*states)
 
     def test_exception_restores_rng_modes_and_temporary_methods(self):
         model = self.model()
@@ -232,6 +294,7 @@ class TestPretrainEvaluation(unittest.TestCase):
             torch.get_rng_state(), random.getstate(), np.random.get_state())
 
         def failed_validation(*args, **kwargs):
+            self.assertEqual(model._didi_evaluation_step['value'], 0)
             model.eval()
             torch.rand(3)
             random.random()
@@ -244,6 +307,7 @@ class TestPretrainEvaluation(unittest.TestCase):
         self.assertFalse(logger.defer_finalize)
         self.assertEqual(trainer.save_checkpoint, original_save)
         self.assertEqual(model.on_load_checkpoint, original_load)
+        self.assertFalse(hasattr(model, '_didi_evaluation_step'))
         self.assertEqual(logger.log_metrics, original_log)
         self.assertEqual([module.training for module in model.modules()], flags)
         self.assertTrue(torch.equal(torch.get_rng_state(), torch_state))
@@ -291,7 +355,7 @@ class TestPretrainEvaluation(unittest.TestCase):
         restore_all.assert_called_once_with([fake_state])
 
 
-def ddp_smoke():
+def ddp_smoke(pareto_enabled=False):
     """Opt-in: torchrun --standalone --nproc_per_node=2 this_file --ddp-smoke."""
     from lightning.pytorch.strategies import DDPStrategy
 
@@ -302,17 +366,33 @@ def ddp_smoke():
         torch.manual_seed(30)
         cfg = case.config()
         cfg.trainer.devices = 2
+        if pareto_enabled:
+            from test_didi_pareto import uniform_root_factory
+            cfg.didi_monitor.gen_ppl = True
+            with open_dict(cfg):
+                cfg.didi_pareto = {
+                    'every_n_validations': 1, 'temperatures': [0.75, 1.0],
+                    'steps': [2], 'seeds': 2, 'num_batches': 1, 'batch_size': 2,
+                    'sampler': 'guided',
+                }
         model = case.model(cfg)
         logger = MemoryLogger(case.directory.name)
         order = OrderCallback()
         capture = attach_monitor(model, cfg)
+        callbacks = [order, capture]
+        if pareto_enabled:
+            capture.metrics_factory = uniform_root_factory
+            pareto = attach_pareto(model, cfg)
+            pareto.metrics_factory = uniform_root_factory
+            callbacks.append(pareto)
+            logger.log_image = mock.Mock()
         trainer = L.Trainer(
             accelerator='cpu', devices=2, precision='32-true', max_steps=2,
             strategy=DDPStrategy(process_group_backend='gloo', find_unused_parameters=True),
             logger=logger, enable_checkpointing=False, enable_progress_bar=False,
             enable_model_summary=False, limit_val_batches=1, num_sanity_val_steps=0,
             val_check_interval=4, log_every_n_steps=1, default_root_dir=case.directory.name,
-            gradient_clip_val=0.0, callbacks=[order, capture],
+            gradient_clip_val=0.0, callbacks=callbacks,
         )
         before = copy.deepcopy(model.state_dict())
         maybe_evaluate_before_training(trainer, model, case.loader())
@@ -325,6 +405,15 @@ def ddp_smoke():
         if trainer.is_global_zero:
             assert logger._run.finish_calls == 1
             assert any(data.get('didi_monitor/sample_count') == 4 for data, _ in logger._run.metrics)
+            if pareto_enabled:
+                history = json.loads((Path(case.directory.name)
+                                      / 'didi_pareto_temp_history.json').read_text())
+                assert history['protocol']['samples_per_seed'] == 4
+                assert set(history['curves']) == {'0'}
+                assert any(data.get('didi_pareto/failed') == 0 for data, _ in logger._run.metrics)
+                assert any(abs(data.get('val/gen_ppl', 0) - 9.0) < 1e-5
+                           for data, _ in logger._run.metrics)
+                print('PASS: baseline guided temperature sweep; global counts; CPU DDP -> fit')
             print('PASS: two-rank CPU validate -> fit; gathered samples; one logger finalization')
     finally:
         if torch.distributed.is_initialized():
@@ -334,6 +423,6 @@ def ddp_smoke():
 
 if __name__ == '__main__':
     if '--ddp-smoke' in sys.argv:
-        ddp_smoke()
+        ddp_smoke(pareto_enabled='--pareto-smoke' in sys.argv)
     else:
         unittest.main()

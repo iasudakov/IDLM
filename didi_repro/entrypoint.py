@@ -20,6 +20,11 @@ def prepare_config(config):
     'didi_monitor': {'enabled': True, 'gen_ppl': True, 'gm': True,
                      'gm_batch_size': 4, 'max_reference_samples': 64},
     'didi_eval': {'before_training': False},
+    'didi_pareto': {'every_n_validations': 0,
+                    'temperatures': [0.75, 0.85, 0.95, 1.0, 1.05, 1.2],
+                    'steps': [8, 16, 32], 'seeds': 1, 'num_batches': 2,
+                    'batch_size': None, 'keep_samples': 2,
+                    'reference': None, 'sampler': None},
     'didi_init': {'student_hf': None, 'revision': None, 'cache_dir': None,
                   'local_files_only': False},
     'didi_runtime': {'strict_environment': True},
@@ -137,12 +142,14 @@ def install_entrypoint(upstream):
   from .monitor import attach_monitor
   from .initialization import initialize_student_from_hf
   from .pretrain_eval import maybe_evaluate_before_training
+  from .pareto import attach_pareto, validate_options
   upstream.make_underdeep_logger = make_underdeep_logger
   upstream.initialize_underdeep_logger = initialize_underdeep_logger
   upstream.initialize_didi_student = initialize_student_from_hf
   upstream.maybe_evaluate_didi_before_training = maybe_evaluate_before_training
   upstream.attach_didi_monitor = lambda model, config: attach_monitor(
     model, config, upstream_revision=UPSTREAM_REVISION)
+  upstream.attach_didi_pareto = attach_pareto
   patched_train = repaired_function(upstream._train, (
     ("wandb_logger = None\n  if config.get('wandb', None) is not None:\n"
      "    wandb_logger = L.pytorch.loggers.WandbLogger(\n"
@@ -158,7 +165,10 @@ def install_entrypoint(upstream):
      '  initialize_underdeep_logger(wandb_logger, config)\n'
      '  monitor = attach_didi_monitor(model, config)\n'
      '  if monitor is not None:\n'
-     '    callbacks.append(monitor)\n\n'
+     '    callbacks.append(monitor)\n'
+     '  pareto = attach_didi_pareto(model, config)\n'
+     '  if pareto is not None:\n'
+     '    callbacks.append(pareto)\n\n'
      '  # Print the number of trainable parameters'),
     ('  trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)',
      '  maybe_evaluate_didi_before_training(trainer, model, valid_ds, ckpt_path=ckpt_path)\n'
@@ -166,6 +176,7 @@ def install_entrypoint(upstream):
   ))
 
   def train(diffusion_model, config, logger, tokenizer):
+    validate_options(config)
     if (config.get('didi_init', {}).get('student_hf')
         and config.checkpointing.resume_from_ckpt):
       raise ValueError('HF student initialization is a fresh warm start, not a resume. '

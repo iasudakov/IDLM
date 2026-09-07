@@ -261,6 +261,23 @@ class TestDiDiMonitor(unittest.TestCase):
         gather.assert_called_once()
         barrier.assert_called_once()
 
+    def test_rank_zero_metrics_disable_cached_torchmetrics_synchronization(self):
+        from torchmetrics import MeanMetric
+        callback = monitor.attach_monitor(self.model, self.config)
+        evaluator = Evaluator()
+        evaluator.gen_ppl = MeanMetric()
+        self.assertTrue(evaluator.gen_ppl._to_sync)
+        callback.metrics_factory = lambda **kwargs: evaluator
+        callback._get_evaluator(self.model)
+        self.assertFalse(evaluator.gen_ppl.sync_on_compute)
+        self.assertFalse(evaluator.gen_ppl._to_sync)
+        evaluator.gen_ppl.update(torch.tensor([1.0, 3.0]))
+        with mock.patch.object(torch.distributed, 'is_initialized', return_value=True), \
+             mock.patch.object(torch.distributed, 'get_world_size', return_value=2), \
+             mock.patch.object(torch.distributed, 'all_gather',
+                               side_effect=AssertionError('rank-zero metric tried to synchronize')):
+            self.assertEqual(float(evaluator.gen_ppl.compute()), 2.0)
+
     def test_root_metrics_import_does_not_replace_upstream_module(self):
         upstream_metrics = types.ModuleType('metrics')
         with mock.patch.dict(sys.modules, {'metrics': upstream_metrics}):

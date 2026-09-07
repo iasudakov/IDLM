@@ -207,6 +207,10 @@ class DiDiMonitor(L.Callback):
                     for module in value.modules():
                         if hasattr(module, 'sync_on_compute'):
                             module.sync_on_compute = False
+                            # TorchMetrics caches this flag at construction;
+                            # update()/compute() need the cached flag disabled
+                            # too when only rank zero owns the evaluator.
+                            module._to_sync = False
         self.evaluator.to(model.device)
         cached_model = getattr(self.evaluator, '_eval_model', None)
         if cached_model is not None:

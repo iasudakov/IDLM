@@ -94,6 +94,10 @@ def maybe_evaluate_before_training(trainer, model, valid_loader, ckpt_path=None)
                     torch.cuda.get_rng_state(root_device)
                 stack.enter_context(preserve_rng_state())
             stack.enter_context(_temporary_attribute(model, 'on_load_checkpoint', load_checkpoint))
+            # Callbacks that write their own history must use the same saved
+            # checkpoint step as the logger adapters, not validate()'s zero.
+            stack.enter_context(_temporary_attribute(
+                model, '_didi_evaluation_step', evaluation_step))
             stack.enter_context(_temporary_attribute(trainer, 'save_checkpoint', no_checkpoint_writes))
             for logger in loggers:
                 stack.enter_context(_temporary_attribute(logger, 'defer_finalize', True))

@@ -93,6 +93,8 @@ class EntryTests(unittest.TestCase):
     self.assertEqual(prepared.optim.lr, 1e-6)
     self.assertEqual(prepared.loader.batch_size, 1)
     self.assertFalse(prepared.didi_eval.before_training)
+    self.assertEqual(prepared.didi_pareto.every_n_validations, 0)
+    self.assertIsNone(prepared.didi_pareto.sampler)
     self.assertIsNone(prepared.didi_init.student_hf)
     self.assertFalse(prepared.didi_init.local_files_only)
 
@@ -100,6 +102,9 @@ class EntryTests(unittest.TestCase):
     with hydra.initialize_config_dir(version_base=None, config_dir=str(UPSTREAM_ROOT / 'configs')):
       config = hydra.compose(config_name='config', overrides=[
         'trainer.devices=1', '+didi_eval.before_training=true',
+        '+didi_pareto.every_n_validations=1',
+        '+didi_pareto.temperatures=[0.85,1.0,1.15]',
+        '+didi_pareto.steps=[8,16,32]', '+didi_pareto.sampler=guided',
         '+didi_init.student_hf=haoyangzheng/didi-instruct-small'])
     prepare_config(config)
     self.assertTrue(config.didi_eval.before_training)
@@ -107,6 +112,10 @@ class EntryTests(unittest.TestCase):
     self.assertEqual(config.optim.lr, 1e-6)
     self.assertEqual(config.trainer.max_steps, 10000)
     self.assertEqual(config.sampling.steps, 1000)
+    self.assertEqual(config.didi_pareto.every_n_validations, 1)
+    self.assertEqual(list(config.didi_pareto.temperatures), [0.85, 1.0, 1.15])
+    self.assertEqual(list(config.didi_pareto.steps), [8, 16, 32])
+    self.assertEqual(config.didi_pareto.sampler, 'guided')
 
   def test_strict_environment_fails_on_unrecorded_runtime(self):
     config = prepare_config(self.config())
@@ -218,6 +227,18 @@ class EntryTests(unittest.TestCase):
         self.upstream._train(None, config, None, None)
       data.assert_not_called()
 
+  def test_reject_invalid_pareto_options_before_teacher_data_or_tracker(self):
+    install_entrypoint(self.upstream)
+    config = prepare_config(self.config())
+    config.didi_pareto.every_n_validations = 1
+    config.didi_pareto.temperatures = [0.0]
+    with mock.patch('didi_repro.entrypoint._check_cached_data') as data, \
+         mock.patch('didi_repro.entrypoint.make_underdeep_logger') as logger:
+      with self.assertRaisesRegex(ValueError, 'temperatures'):
+        self.upstream._train(None, config, None, None)
+      data.assert_not_called()
+      logger.assert_not_called()
+
   def test_training_wires_teacher_student_then_evaluation_then_fit(self):
     install_entrypoint(self.upstream)
     config = prepare_config(self.config())
@@ -230,11 +251,13 @@ class EntryTests(unittest.TestCase):
     trainer = mock.Mock()
     trainer.fit.side_effect = lambda *args, **kwargs: events.append('fit')
     tracker = object()
+    pareto_callback = object()
 
     def instantiate(spec, **kwargs):
       if spec._target_ == 'lightning.Trainer':
         events.append('trainer')
         self.assertIs(kwargs['logger'], tracker)
+        self.assertIn(pareto_callback, kwargs['callbacks'])
         return trainer
       return object()
 
@@ -252,6 +275,7 @@ class EntryTests(unittest.TestCase):
       'initialize_didi_student': lambda *args: events.append('student'),
       'maybe_evaluate_didi_before_training': evaluate,
       'attach_didi_monitor': lambda *args: None,
+      'attach_didi_pareto': lambda *args: pareto_callback,
       'dataloader': SimpleNamespace(get_dataloaders=lambda *args: (train_loader, valid_loader)),
       '_print_batch': lambda *args: None,
       'hydra': SimpleNamespace(utils=SimpleNamespace(instantiate=instantiate)),
