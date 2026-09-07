@@ -111,6 +111,9 @@ class TestDiDiMonitor(unittest.TestCase):
     def test_implicit_hyperparameters_teacher_and_environment_provenance(self):
         self.model._didi_teacher_metadata = {
             'path': '/original/mdlm.ckpt', 'sha256': 'abc123', 'weights': 'raw backbone.*'}
+        self.model._didi_student_metadata = {
+            'source': 'authors/student', 'revision': 'immutable-hf-revision',
+            'files': {'model.safetensors': {'sha256': 'student-sha'}}}
         self.model._didi_effective_hyperparameters = {
             'two_step': {'kl_hi_coef': 0.01, 'logprob_mode': 'prev_is_mask'},
             'sampling_eps': 0.02,
@@ -125,12 +128,15 @@ class TestDiDiMonitor(unittest.TestCase):
         rows = dict(self.trainer.logger.tables['didi/config']['data'])
         self.assertEqual(json.loads(rows['didi_provenance.teacher_checkpoint.sha256']), 'abc123')
         self.assertEqual(json.loads(rows['didi_provenance.teacher_checkpoint.weights']), 'raw backbone.*')
+        self.assertEqual(json.loads(rows['didi_provenance.student_initialization.revision']),
+                         'immutable-hf-revision')
         self.assertEqual(json.loads(rows['didi_provenance.effective_hyperparameters.two_step.kl_hi_coef']), 0.01)
         self.assertEqual(json.loads(rows['didi_provenance.environment.devices']), ['A100'])
         self.assertEqual(json.loads(rows['didi_provenance.entrypoint_provenance.overrides']),
                          ['training.finetune_path=/original/mdlm.ckpt'])
         payload = json.loads((directory / 'didi_monitor_config.json').read_text())
         self.assertEqual(payload['teacher_checkpoint'], self.model._didi_teacher_metadata)
+        self.assertEqual(payload['student_initialization'], self.model._didi_student_metadata)
         self.assertEqual(payload['effective_hyperparameters'], self.model._didi_effective_hyperparameters)
         self.assertEqual(payload['environment']['torch'], '2.5.1')
 

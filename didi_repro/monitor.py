@@ -155,6 +155,8 @@ class DiDiMonitor(L.Callback):
         extra = {
             'teacher_checkpoint': _resolved_config(
                 getattr(model, '_didi_teacher_metadata', None)),
+            'student_initialization': _resolved_config(
+                getattr(model, '_didi_student_metadata', None)),
             'effective_hyperparameters': _resolved_config(
                 getattr(model, '_didi_effective_hyperparameters', None)),
         }

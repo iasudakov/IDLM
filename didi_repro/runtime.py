@@ -88,6 +88,7 @@ def install_runtime(upstream_main):
       self.loss_type = getattr(config.algo, 'loss_type', 'elbo')
       self._didi_in_training_step = False
       self._didi_teacher_metadata = None
+      self._didi_student_metadata = None
       self._didi_loading_checkpoint = False
       effective_names = (
         'discriminator_lr', 'kl_beta', 'entropy_beta', 'sampling_eps',
@@ -141,6 +142,7 @@ def install_runtime(upstream_main):
             digest.update(chunk)
         metadata['sha256'] = digest.hexdigest()
       self._didi_teacher_metadata = metadata
+      self._didi_student_metadata = None
 
     def training_step(self, batch, batch_idx):
       if self._didi_teacher_metadata is None:
@@ -190,12 +192,15 @@ def install_runtime(upstream_main):
         'upstream_revision': UPSTREAM_REVISION,
         'next_iteration': self.global_steps + int(self._didi_in_training_step),
         'teacher': self._didi_teacher_metadata,
+        'student_initialization': self._didi_student_metadata,
         'evaluation_weights': 'backbone',
       }
 
     def on_load_checkpoint(self, checkpoint):
       state = checkpoint.get('state_dict', {})
       metadata = checkpoint.get('didi_repro')
+      self._didi_student_metadata = (metadata.get('student_initialization')
+                                     if metadata is not None else None)
       if self.config.mode == 'train':
         if metadata is None or not any(k.startswith('teacher.') for k in state):
           raise ValueError('Training resume needs a didi_repro checkpoint '

@@ -72,6 +72,80 @@ recorded. Overriding original training settings is possible but no longer the
 default reproduction recipe. In particular, do not copy MMD accumulation,
 learning rates, reward kernels, batch sizes or EMA settings into this command.
 
+## Optional evaluation before training
+
+Append this flag to the training command or launcher:
+
+```bash
++didi_eval.before_training=true
+```
+
+This runs the normal validation loop **after checkpoint initialization and before
+the first optimizer update**. The existing validation metrics, generated samples,
+and enabled Underdeep PPL/entropy/GM diagnostics are logged in the same run at
+step0 for a fresh run. Periodic validation during training is unchanged.
+The pre-training evaluation uses `trainer.limit_val_batches`, `sampling.*` and
+the same `eval.*` / `didi_monitor.*` settings as normal validation. In particular,
+the default is1000-step ancestral sampling, not the guided16-step preset.
+`trainer.limit_val_batches=0` is rejected when this option is enabled.
+
+Evaluation performs no optimizer updates, restores RNG states and module modes,
+and keeps the Underdeep run open for training. When resuming, it evaluates the
+resume checkpoint and logs at its saved optimizer step, rather than evaluating
+the fresh teacher at step0. The option defaults to **false**.
+
+## Optional warm start from the authors' distilled HF model
+
+Append:
+
+```bash
++didi_init.student_hf=haoyangzheng/didi-instruct-small
+```
+
+The default source is **null**, preserving the teacher-initialized reproduction.
+With this option enabled, the two safetensors files are fetched from Hugging Face
+and cached automatically. The authors' release is pinned by default to revision
+`2e9a21a63cc727a1e703370d55de13b842c69076`:
+
+- `model.safetensors` initializes both the trainable student and its EMA copy.
+- `discriminator.safetensors` initializes the trained discriminator, including
+  its head and spectral-normalization buffers.
+- `training.finetune_path` still supplies the **separate frozen MDLM teacher**
+  used for KL regularization. The distilled student never replaces this teacher.
+
+Keys and tensor shapes must match the native model before weights are applied.
+No HF remote Python code is executed. The resolved revision and SHA-256 of both
+weight files are recorded in checkpoint metadata and the Underdeep configuration
+table. This is a **warm-start/fine-tuning experiment**, not a fresh reproduction
+from the teacher: optimizers, learning-rate schedule, and iteration counters
+start anew. All original training hyperparameters otherwise remain unchanged.
+Do not combine HF initialization with `checkpointing.resume_from_ckpt=true`;
+when resuming an existing run, omit the initialization option instead.
+
+For a downloaded snapshot, supply its directory containing both weight files:
+
+```bash
++didi_init.student_hf=/absolute/path/to/didi-hf-snapshot
+```
+
+Optional controls are `+didi_init.revision=<revision>`,
+`+didi_init.cache_dir=/absolute/path/hf-cache`, and
+`+didi_init.local_files_only=true`. For an ordinary local directory, file hashes
+are recorded without claiming a verified HF revision.
+
+Example combining both options on eight GPUs:
+
+```bash
+TEACHER_CHECKPOINT=/absolute/path/mdlm.ckpt \
+OWT_CACHE=/absolute/path/cache_dir \
+SAVE_DIR=/absolute/path/owt_didi_hf_finetune \
+GPUS=0,1,2,3,4,5,6,7 \
+RUN_NAME=didi-hf-finetune-with-baseline \
+bash scripts/train_didi_owt.sh \
+  +didi_eval.before_training=true \
+  +didi_init.student_hf=haoyangzheng/didi-instruct-small
+```
+
 ## Settings preserved from the released code
 
 The authoritative files are the vendored YAMLs and `algo.py`, not this summary.
@@ -126,7 +200,8 @@ change training gradients or sampling modes. The reference evaluator is moved
 off GPU afterward. Underdeep calls are also wrapped in RNG preservation.
 These diagnostics add evaluation time and may need to download GPT-2 Large.
 
-All resolved settings (including strings/lists), teacher hash, effective
+All resolved settings (including strings/lists), teacher hash, optional HF
+student/discriminator initialization hashes and revision, effective
 constructor defaults, upstream revision and installed versions are recorded in
 Underdeep's `didi/config` table and local files:
 
@@ -202,6 +277,11 @@ explicit repairs in memory with exact source-match assertions:
    logging/diagnostic calls.
 9. Fail on cache errors instead of executing upstream's delete/rebuild fallback.
 
+The optional `didi_eval.before_training` and `didi_init.student_hf` extensions
+are disabled by default. Their orchestration and HF weight loading live in
+`pretrain_eval.py` and `initialization.py`; the vendored code and original
+training equations remain unchanged.
+
 Resume restores models, optimizer state and schedule counters. **Bitwise
 mid-epoch trajectory replay is not claimed**: upstream's shuffled loader does not
 checkpoint its exact data cursor or all RNG state. For strict experimental
@@ -220,7 +300,10 @@ recorded. Do not report an overridden environment as an exact reproduction.
 python scripts/test_didi_runtime.py
 python scripts/test_didi_monitor.py
 python scripts/test_didi_entrypoint.py
+python scripts/test_didi_initialization.py
+python scripts/test_didi_pretrain_eval.py
 python scripts/test_didi_ddp.py  # optional two-rank CPU/Gloo smoke test
+torchrun --standalone --nproc_per_node=2 scripts/test_didi_pretrain_eval.py --ddp-smoke
 ```
 
 These offline tests use tiny CPU networks and mocked tracking, exercise the

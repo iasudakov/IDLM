@@ -2,6 +2,7 @@
 
 import copy
 import ast
+import inspect
 import os
 from pathlib import Path
 import random
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -90,6 +92,21 @@ class EntryTests(unittest.TestCase):
     self.assertEqual(prepared.algo.num_samples_per_prompt, 8)
     self.assertEqual(prepared.optim.lr, 1e-6)
     self.assertEqual(prepared.loader.batch_size, 1)
+    self.assertFalse(prepared.didi_eval.before_training)
+    self.assertIsNone(prepared.didi_init.student_hf)
+    self.assertFalse(prepared.didi_init.local_files_only)
+
+  def test_new_flags_compose_without_changing_upstream_defaults(self):
+    with hydra.initialize_config_dir(version_base=None, config_dir=str(UPSTREAM_ROOT / 'configs')):
+      config = hydra.compose(config_name='config', overrides=[
+        'trainer.devices=1', '+didi_eval.before_training=true',
+        '+didi_init.student_hf=haoyangzheng/didi-instruct-small'])
+    prepare_config(config)
+    self.assertTrue(config.didi_eval.before_training)
+    self.assertEqual(config.didi_init.student_hf, 'haoyangzheng/didi-instruct-small')
+    self.assertEqual(config.optim.lr, 1e-6)
+    self.assertEqual(config.trainer.max_steps, 10000)
+    self.assertEqual(config.sampling.steps, 1000)
 
   def test_strict_environment_fails_on_unrecorded_runtime(self):
     config = prepare_config(self.config())
@@ -180,6 +197,74 @@ class EntryTests(unittest.TestCase):
         with self.assertRaisesRegex(FileNotFoundError, 'Requested resume checkpoint'):
           self.upstream._train(None, config, None, None)
         logger.assert_not_called()
+
+  def test_reject_hf_initialization_with_resume_before_io(self):
+    install_entrypoint(self.upstream)
+    config = prepare_config(self.config())
+    config.didi_init.student_hf = 'haoyangzheng/didi-instruct-small'
+    config.checkpointing.resume_from_ckpt = True
+    with mock.patch('didi_repro.entrypoint._check_cached_data') as data:
+      with self.assertRaisesRegex(ValueError, 'fresh warm start, not a resume'):
+        self.upstream._train(None, config, None, None)
+      data.assert_not_called()
+
+  def test_reject_pre_eval_with_validation_disabled(self):
+    install_entrypoint(self.upstream)
+    config = prepare_config(self.config())
+    config.didi_eval.before_training = True
+    config.trainer.limit_val_batches = 0
+    with mock.patch('didi_repro.entrypoint._check_cached_data') as data:
+      with self.assertRaisesRegex(ValueError, 'limit_val_batches > 0'):
+        self.upstream._train(None, config, None, None)
+      data.assert_not_called()
+
+  def test_training_wires_teacher_student_then_evaluation_then_fit(self):
+    install_entrypoint(self.upstream)
+    config = prepare_config(self.config())
+    config.didi_eval.before_training = True
+    config.didi_init.student_hf = 'haoyangzheng/didi-instruct-small'
+    events = []
+    model = SimpleNamespace(initialize_teacher_checkpoint=lambda *args: events.append('teacher'))
+    train_loader = object()
+    valid_loader = SimpleNamespace(tokenizer=object())
+    trainer = mock.Mock()
+    trainer.fit.side_effect = lambda *args, **kwargs: events.append('fit')
+    tracker = object()
+
+    def instantiate(spec, **kwargs):
+      if spec._target_ == 'lightning.Trainer':
+        events.append('trainer')
+        self.assertIs(kwargs['logger'], tracker)
+        return trainer
+      return object()
+
+    def evaluate(actual_trainer, actual_model, loader, ckpt_path=None):
+      self.assertIs(actual_trainer, trainer)
+      self.assertIs(actual_model, model)
+      self.assertIs(loader, valid_loader)
+      self.assertIsNone(ckpt_path)
+      events.append('pre_eval')
+
+    repaired = inspect.getclosurevars(self.upstream._train).nonlocals['patched_train']
+    replacements = {
+      'make_underdeep_logger': lambda *args, **kwargs: tracker,
+      'initialize_underdeep_logger': lambda *args: events.append('logger_ready'),
+      'initialize_didi_student': lambda *args: events.append('student'),
+      'maybe_evaluate_didi_before_training': evaluate,
+      'attach_didi_monitor': lambda *args: None,
+      'dataloader': SimpleNamespace(get_dataloaders=lambda *args: (train_loader, valid_loader)),
+      '_print_batch': lambda *args: None,
+      'hydra': SimpleNamespace(utils=SimpleNamespace(instantiate=instantiate)),
+      'utils': SimpleNamespace(fsspec_exists=lambda *args: True, count_parameters=lambda *args: 1),
+      'torch': SimpleNamespace(load=lambda *args, **kwargs: {'state_dict': {}}),
+    }
+    with tempfile.NamedTemporaryFile(prefix='didi-entry-teacher-') as teacher:
+      config.training.finetune_path = teacher.name
+      with mock.patch.dict(repaired.__globals__, replacements), \
+           mock.patch('didi_repro.entrypoint._check_cached_data'):
+        self.upstream._train(lambda *args, **kwargs: model, config, mock.Mock(), None)
+    self.assertEqual(events, ['teacher', 'student', 'logger_ready', 'trainer', 'pre_eval', 'fit'])
+    trainer.fit.assert_called_once_with(model, train_loader, valid_loader, ckpt_path=None)
 
 
 if __name__ == '__main__':

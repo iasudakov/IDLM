@@ -19,6 +19,9 @@ def prepare_config(config):
                   'force_new_run': False, 'required': True},
     'didi_monitor': {'enabled': True, 'gen_ppl': True, 'gm': True,
                      'gm_batch_size': 4, 'max_reference_samples': 64},
+    'didi_eval': {'before_training': False},
+    'didi_init': {'student_hf': None, 'revision': None, 'cache_dir': None,
+                  'local_files_only': False},
     'didi_runtime': {'strict_environment': True},
   }
   with open_dict(config):
@@ -132,8 +135,12 @@ def install_entrypoint(upstream):
   if getattr(upstream, '_didi_entrypoint_installed', False):
     return
   from .monitor import attach_monitor
+  from .initialization import initialize_student_from_hf
+  from .pretrain_eval import maybe_evaluate_before_training
   upstream.make_underdeep_logger = make_underdeep_logger
   upstream.initialize_underdeep_logger = initialize_underdeep_logger
+  upstream.initialize_didi_student = initialize_student_from_hf
+  upstream.maybe_evaluate_didi_before_training = maybe_evaluate_before_training
   upstream.attach_didi_monitor = lambda model, config: attach_monitor(
     model, config, upstream_revision=UPSTREAM_REVISION)
   patched_train = repaired_function(upstream._train, (
@@ -147,18 +154,30 @@ def install_entrypoint(upstream):
     ("model.load_state_dict(checkpoint['state_dict'], strict=False)",
      'model.initialize_teacher_checkpoint(checkpoint, config.training.finetune_path)'),
     ('  # Print the number of trainable parameters',
+     '  initialize_didi_student(model, config)\n'
      '  initialize_underdeep_logger(wandb_logger, config)\n'
      '  monitor = attach_didi_monitor(model, config)\n'
      '  if monitor is not None:\n'
      '    callbacks.append(monitor)\n\n'
      '  # Print the number of trainable parameters'),
+    ('  trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)',
+     '  maybe_evaluate_didi_before_training(trainer, model, valid_ds, ckpt_path=ckpt_path)\n'
+     '  trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)'),
   ))
 
   def train(diffusion_model, config, logger, tokenizer):
+    if (config.get('didi_init', {}).get('student_hf')
+        and config.checkpointing.resume_from_ckpt):
+      raise ValueError('HF student initialization is a fresh warm start, not a resume. '
+                       'Clear didi_init.student_hf when resuming a training checkpoint.')
+    if (config.get('didi_eval', {}).get('before_training', False)
+        and config.trainer.limit_val_batches == 0):
+      raise ValueError('didi_eval.before_training requires trainer.limit_val_batches > 0.')
     if not Path(config.training.finetune_path).is_file():
       raise FileNotFoundError('Set training.finetune_path to the original native '
                               'teacher .ckpt; the strict reproduction never starts '
-                              'with random weights or an unverified HF substitute.')
+                              'with a random teacher. didi_init.student_hf initializes '
+                              'the student/discriminator only, not this frozen teacher.')
     if (config.checkpointing.resume_from_ckpt
         and not Path(config.checkpointing.resume_ckpt_path).is_file()):
       raise FileNotFoundError('Requested resume checkpoint does not exist; '
