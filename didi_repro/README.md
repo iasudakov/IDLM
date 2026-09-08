@@ -21,6 +21,58 @@ There are now two explicitly different protocols:
 These corrections address identified code-versus-paper mismatches; they do not
 establish that every implementation detail reproduces the paper's results.
 
+## Standalone control using the authors' actual evaluator
+
+To isolate evaluation from this integration, `scripts/eval_didi_authors.sh`
+runs **unmodified `vendor/didi_instruct/main.py`**, with the sampling/model/batch
+settings from the authors' `scripts/eval-didi-instruct.sh`. It does not install
+the `didi_repro` runtime repairs, train a model, read the OWT dataset, or create
+an Underdeep run. It replaces only the cluster setup and output/checkpoint paths.
+Use one GPU, not `torchrun`. Activate the authors' environment first.
+
+Prepare the released HF weights once, then evaluate into a new directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/prepare_didi_authors_checkpoint.py \
+  --output /absolute/path/didi-authors.ckpt --device cuda:0
+
+GPUS=0 CHECKPOINT=/absolute/path/didi-authors.ckpt \
+SAVE_DIR=/absolute/path/didi-authors-eval \
+bash scripts/eval_didi_authors.sh
+
+CUDA_VISIBLE_DEVICES=0 python scripts/score_didi_authors_samples.py \
+  --samples /absolute/path/didi-authors-eval/samples.json \
+  --output /absolute/path/didi-authors-eval/all40.json \
+  --batch-size 4 --device cuda:0
+```
+
+The checkpoint preparer pins the authors' HF revision and verifies all generator
+and discriminator keys/shapes against the pristine native architecture. It puts
+the same generator tensors under both `backbone.*` and `student_ema.*`. This is
+necessary because the original HF converter writes only `student_ema.*`, whereas
+the released sampling forward reads `backbone.*`. No weight values are changed.
+It also serializes tensors on logical `cuda:0`: the original standalone loader
+relies on the checkpoint device and does not explicitly move a CPU export to CUDA.
+The native MDLM teacher is **not needed** for this evaluation-only control.
+
+The original evaluator generates 2 × 20 sequences at 16 guided steps, but its
+default perplexity batch size 8 drops each batch's final 4 sequences. Consequently
+its printed PPL scores **32 of the 40 generated sequences**. The final command
+above separately scores all saved sequences with the original metric function,
+without regenerating samples or overwriting the original result. The scorer uses
+an already cached GPT-2 Large snapshot; the original evaluation downloads it if
+needed. This remainder issue does not affect the integration's training monitor,
+which already scores every captured sample.
+
+The launcher records the checkpoint hash, dependency versions, console output,
+Hydra configuration and original samples/results. It checks core upstream package
+versions by default; that is **not** a claim that every Conda build/system library
+matches `environment.yml`. An explicitly labelled mismatched-environment diagnostic
+can use `DIDI_STRICT_ENVIRONMENT=0`; it is not a strict reproduction. Neither this
+control nor using the original script guarantees the paper's numerical results:
+the released guidance schedule and precision implementation still differ from
+the paper's stated protocol. Preserve them for the first control.
+
 ## Train from the authors' teacher checkpoint
 
 Use the **native MDLM teacher `.ckpt` linked in the upstream README** (the Google
