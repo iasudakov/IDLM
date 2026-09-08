@@ -10,9 +10,10 @@ import sys
 from . import UPSTREAM_REVISION
 from .protocol import optimizer_step_budget, training_iterations, training_protocol
 from .runtime import UPSTREAM_ROOT, load_upstream, repaired_function
+from .sampling_protocol import configure_sampler_source, sampling_protocol
 
 
-def prepare_config(config):
+def prepare_config(config, overrides=None):
   """Keep upstream defaults unless an explicit integration option opts in."""
   from omegaconf import OmegaConf, open_dict
   additions = {
@@ -20,7 +21,7 @@ def prepare_config(config):
                   'force_new_run': False, 'required': True},
     'didi_monitor': {'enabled': True, 'gen_ppl': True, 'gm': True,
                      'gm_batch_size': 4, 'max_reference_samples': 64},
-    'didi_eval': {'before_training': False, 'weights': 'backbone'},
+    'didi_eval': {'before_training': False, 'weights': 'backbone', 'sampler_source': 'main'},
     'didi_training': {'iterations': None},
     'didi_pareto': {'every_n_validations': 0,
                     'temperatures': [0.75, 0.85, 0.95, 1.0, 1.05, 1.2],
@@ -34,7 +35,8 @@ def prepare_config(config):
   with open_dict(config):
     for key, value in additions.items():
       config[key] = OmegaConf.merge(value, config.get(key, {}))
-  configure_training_budget(config)
+  configure_training_budget(config, overrides=overrides)
+  configure_sampler_source(config, overrides=overrides)
   return config
 
 
@@ -137,6 +139,7 @@ def _write_provenance(config, record):
     'upstream_revision': UPSTREAM_REVISION,
     'overrides': overrides,
     'evaluation_weights': config.get('didi_eval', {}).get('weights', 'backbone'),
+    'sampling_protocol': sampling_protocol(config),
     'training_protocol': training_protocol(config),
     'runtime_fix_ledger': 'didi_repro/README.md',
   }, indent=2) + '\n')

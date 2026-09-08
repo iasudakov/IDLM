@@ -2,7 +2,7 @@
 
 This is an **isolated integration of the released DiDi code**, not an MMD
 objective or a reimplementation inside `algo.MDLM`. It runs upstream `main.py`, model,
-dataloader, training step and sampler from commit
+dataloader, training step and (by default) sampler from commit
 `5d39f84973ad19168210bfb0de61450a946a1cbc` of
 [haoyangzheng-ai/didi-instruct](https://github.com/haoyangzheng-ai/didi-instruct).
 The 43 files in `vendor/didi_instruct` are byte-identical to that revision.
@@ -21,7 +21,177 @@ There are now two explicitly different protocols:
 These corrections address identified code-versus-paper mismatches; they do not
 establish that every implementation detail reproduces the paper's results.
 
-## Standalone control using the authors' actual evaluator
+## Standalone control using the dedicated authors' inference release
+
+The authors also publish a **different `inference` branch**, pinned here to
+[`eb9f96c78ddcf3c9d601fbde1744eba45238b3c7`](https://github.com/haoyangzheng-ai/didi-instruct/tree/eb9f96c78ddcf3c9d601fbde1744eba45238b3c7).
+Its 42 pristine files live separately in `vendor/didi_inference`, verified by
+`INFERENCE_UPSTREAM.json`. Training and the default `didi_repro` sampler still
+use the main-branch release. The opt-in integrated evaluator below selects the
+inference sampler without switching the training implementation.
+
+This inference sampler reads `student_ema` directly, ramps gradient guidance
+from **30 to 40 over the first half**, then sets gradient tilting to zero while
+retaining four-candidate categorical reranking with `softmax(reward)`. The
+direct EMA call also preserves this release's timestep-conditioning path.
+Changing main's two guidance overrides alone does not reproduce this sampler.
+The original final ancestral denoising call still reads `backbone`; both weight
+sets must be present. No sampling/model/metric equations are patched here.
+
+Run from this repository's updated `didi` checkout, in the original environment:
+
+```bash
+# Once, if the upstream environment is not already installed:
+conda env create -n didi-inference -f vendor/didi_inference/environment.yml
+conda activate didi-inference
+
+# Once per new checkpoint path. Downloads the pinned HF generator/discriminator;
+# this is an explicit HF format adapter, NOT a downloaded native Drive checkpoint.
+CUDA_VISIBLE_DEVICES=0 python scripts/prepare_didi_authors_checkpoint.py \
+  --upstream inference \
+  --output /absolute/path/didi-authors-inference.ckpt --device cuda:0
+
+GPUS=0 CHECKPOINT=/absolute/path/didi-authors-inference.ckpt \
+SAVE_DIR=/absolute/path/didi-inference16-seed1 \
+bash scripts/eval_didi_inference.sh seed=1
+
+CUDA_VISIBLE_DEVICES=0 python scripts/score_didi_authors_samples.py \
+  --upstream inference \
+  --samples /absolute/path/didi-inference16-seed1/samples.json \
+  --output /absolute/path/didi-inference16-seed1/all40.json \
+  --batch-size 4 --device cuda:0
+```
+
+This uses **one GPU, 16 guided steps, 2 batches of 20, no temperature override**.
+It neither trains nor logs to Underdeep, and needs no MDLM teacher or OWT dataset.
+It refuses existing output directories and overwriting a prepared checkpoint;
+reuse an already prepared valid checkpoint or choose a new path.
+An original native authors checkpoint can be passed as `CHECKPOINT` instead,
+provided its complete backbone/EMA/discriminator states and saved `cuda:0`
+device tags pass validation. They are checked separately and never overwritten.
+Only load trusted native checkpoints because the upstream loader uses pickle.
+
+The source, checkpoint hash/validation, environment and original console result
+are recorded in `authors_eval_environment.json`, `console.log` and Hydra's config
+files. The original PPL still scores **32/40** samples; the separate `all40.json`
+rescoring covers every saved sample without changing the original output. The
+40-sample entropy is identical between these reports. The scorer is offline and
+uses GPT-2 Large already cached by the original evaluation.
+
+The shell permits only `seed=...`, `sampling.steps=...` and
+`eval.perplexity_batch_size=...` overrides. Use a fresh SAVE_DIR for 8/32-step or
+additional-seed controls. If overriding metric batching, provide matching count
+assumptions to the rescorer's `--original-perplexity-batch-size` option.
+Keep `DIDI_STRICT_ENVIRONMENT` at its default `1` for the controlled comparison;
+setting it to `0` labels a mismatched-environment diagnostic, not reproduction.
+The core guard is not a complete Conda/system-build check. Likewise, preserving
+upstream `use_float64=true` is not a claim all internal model computation is
+float64; the original DiT contains bf16 autocast.
+
+First compare the 16-step result with the paper's approximately PPL 38.188 /
+entropy 5.21. Matching is **not guaranteed** before running the experiment.
+Existing commands continue to use the main sampler unless they explicitly set
+`+didi_eval.sampler_source=inference`. That option and its source-aware
+temperature extension are described next; the standalone control remains
+available to isolate the unchanged authors' entry point.
+
+Offline checks: `python scripts/test_didi_inference.py` and
+`python scripts/test_didi_authors_checkpoint.py`. These validate source hashes,
+release selection, checkpoint safety, and tiny-CPU sampler control flow, not
+the paper's numerical results on the full model.
+
+## Eight-GPU inference-release Pareto sweep with Underdeep
+
+Use the updated `didi` checkout on the other machine. The new option is
+`+didi_eval.sampler_source=inference`, with `sampling.predictor=guided` and
+`+didi_eval.weights=student_ema`. It selects the two sampling methods from the
+verified inference release and its defaults (guidance 30→40, four candidates,
+reranking over the final half). Explicit `algo.guidance_scale_start/end`,
+`algo.num_candidates`, and `algo.rerank_steps_ratio` overrides are respected
+and recorded; non-default values are a changed experiment.
+
+```bash
+python -u -m torch.distributed.run \
+  --standalone --nproc_per_node=8 --module didi_repro \
+  mode=train data=openwebtext \
+  data.cache_dir="$SOURCE_CODE_PATH/code/cache_dir" \
+  training.finetune_path="$SOURCE_CODE_PATH/code/cache_dir/mdlm.ckpt" \
+  checkpointing.save_dir="$SOURCE_CODE_PATH/code/owt_didi_inference_pareto" \
+  hydra.run.dir="$SOURCE_CODE_PATH/code/owt_didi_inference_pareto" \
+  checkpointing.resume_from_ckpt=false \
+  model=small model.length=1024 \
+  algo=didi_instruct algo.backbone=dit \
+  +didi_init.student_hf=haoyangzheng/didi-instruct-small \
+  +didi_init.revision=2e9a21a63cc727a1e703370d55de13b842c69076 \
+  +didi_eval.before_training=true \
+  +didi_eval.weights=student_ema \
+  +didi_eval.sampler_source=inference \
+  +didi_training.iterations=null \
+  trainer.max_steps=0 trainer.devices=8 \
+  trainer.limit_val_batches=1 trainer.num_sanity_val_steps=0 \
+  trainer.accumulate_grad_batches=1 \
+  training.loss_precision=bf16 trainer.precision=bf16 \
+  loader.batch_size=1 loader.global_batch_size=8 \
+  loader.eval_batch_size=5 loader.eval_global_batch_size=40 \
+  loader.num_workers=4 \
+  sampling.predictor=guided sampling.steps=16 \
+  sampling.noise_removal=ancestral sampling.num_sample_batches=1 \
+  eval.generate_samples=false eval.perplexity_batch_size=4 \
+  +didi_monitor.gm=false +didi_monitor.gen_ppl=false \
+  +didi_pareto.every_n_validations=1 \
+  '+didi_pareto.steps=[8,16,32]' \
+  '+didi_pareto.temperatures=[0.75,0.80,0.85,0.875,0.90,0.925,0.95,0.975,1.00,1.05,1.10,1.20]' \
+  +didi_pareto.seeds=5 +didi_pareto.num_batches=1 \
+  +underdeep.experiment=generative-models/owt \
+  +underdeep.name=didi-inference-authors-pareto-8-16-32 \
+  +underdeep.force_new_run=true \
+  'callbacks=[]' +trainer.enable_checkpointing=false \
+  +didi_runtime.strict_environment=true
+```
+
+Activate the original environment first (see above). To use a different
+environment for a diagnostic only, change the last flag to
+`+didi_runtime.strict_environment=false`; that is **not** a strict paper
+reproduction. The source/config/HF checkpoint hashes are logged, but a matching
+environment and sampler do not guarantee matching the reported numbers.
+Underdeep and Matplotlib must also be installed for the added tracking/plots;
+the standalone authors' environment alone may not include those integrations.
+
+This keeps the existing train-entry-point initialization and OWT cache checks,
+so the native teacher file and tokenized cache must still be present. The HF
+generator initializes both raw and EMA student copies, and the HF discriminator
+is loaded; the frozen teacher is not used to generate the Pareto samples.
+`trainer.max_steps=0` performs no optimizer updates. The baseline sweep is at
+step 0, uses 8 GPUs × 5 sequences × 1 batch = **40 sequences per seed/point**, and
+scores all 40 with perplexity batches of 4. Across 5 seeds and 36 points this is
+7,200 sequences. This is the same plot template and aggregation as the existing
+MMD-style Pareto logging, not the literal one-GPU authors' RNG/batching protocol.
+
+At **T=1** the temperature context is an exact no-op. For other temperatures,
+the integration divides the direct EMA raw logits by T before guidance and
+applies the existing SUBS-aware temperature transform to terminal ancestral
+cleanup. It does not temperature-scale discriminator reranking rewards or
+change the source's raw-logit support/timestep path. Non-unit temperature sweeps
+are an explicit extension to the released sampler, not a paper preset.
+
+The inference release uses EMA for its guided steps and the **raw backbone** for
+ancestral cleanup. This routing is preserved even if a native checkpoint's two
+copies differ; validation NLL still uses `didi_eval.weights`. The sole sampling
+repair replaces `reward.backward(); grad = input.grad` with the same input
+gradient from `autograd.grad`, so evaluation does not fill discriminator `.grad`
+buffers. The outer context enables input autograd under Lightning inference
+mode and restores module modes afterward. No vendor file is changed.
+
+`pareto/protocol`, `didi/config`, local provenance and new checkpoints record
+the sampler source/revision separately from the main training revision, weight
+routing, and temperature transform. Histories from different sampler sources
+are not merged. Tests in `test_didi_inference_sampler.py`,
+`test_didi_integrated_inference.py`, and `test_didi_inference_temperature.py` exercise
+literal-source equivalence, configuration, temperature routing, and the
+evaluation-only lifecycle on tiny CPU models; they do not validate full-model
+paper scores.
+
+## Standalone control using the authors' main-branch evaluator
 
 To isolate evaluation from this integration, `scripts/eval_didi_authors.sh`
 runs **unmodified `vendor/didi_instruct/main.py`**, with the sampling/model/batch
@@ -490,7 +660,13 @@ explicit repairs in memory with exact source-match assertions:
     zero warmup and `algo.ema_beta=0.9999`; direct-entry defaults stay unchanged.
 11. When `didi_eval.weights=student_ema` is selected, use EMA evaluation forwards
     without swapping trainable parameters; record the selected evaluation and
-    training protocols and reject incompatible training resumes.
+    training protocols and reject incompatible training resumes. The inference
+    release's terminal ancestral cleanup is the documented raw-backbone exception.
+12. When `didi_eval.sampler_source=inference` is selected, load the two guided
+    sampling methods from the separately pinned inference release, using the
+    same input-autograd repair from item 5. Its guidance defaults, direct EMA
+    timestep path, categorical reranking and raw ancestral cleanup are preserved.
+    Temperature interception covers both direct EMA and processed cleanup calls.
 
 The optional `didi_eval.before_training`, `didi_init.student_hf`, and
 `didi_pareto` extensions are disabled by default. Their orchestration, HF weight
@@ -522,10 +698,14 @@ python scripts/test_didi_initialization.py
 python scripts/test_didi_pretrain_eval.py
 python scripts/test_didi_temperature.py
 python scripts/test_didi_pareto.py
+python scripts/test_didi_inference_sampler.py
+python scripts/test_didi_inference_temperature.py
+python scripts/test_didi_integrated_inference.py
 python scripts/test_didi_ddp.py  # optional two-rank CPU/Gloo smoke test
 torchrun --standalone --nproc_per_node=2 scripts/test_didi_pretrain_eval.py --ddp-smoke
 torchrun --standalone --nproc_per_node=2 scripts/test_didi_pretrain_eval.py --ddp-smoke --pareto-smoke
 torchrun --standalone --nproc_per_node=2 scripts/test_didi_pareto.py --ddp-smoke
+torchrun --standalone --nproc_per_node=2 scripts/test_didi_integrated_inference.py --ddp-smoke
 ```
 
 These offline tests use tiny CPU networks and mocked tracking, exercise the

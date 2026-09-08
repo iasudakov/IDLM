@@ -72,13 +72,24 @@ def install_runtime(upstream_main):
      'grad = torch.autograd.grad(reward, log_p_x0_for_grad)[0]'),))
   evaluation_forward = repaired_function(original.forward, (
     ('self.backbone(xt, sigma)', 'self._didi_forward_backbone()(xt, sigma)'),))
+  inference_release = None
+
+  def get_inference_release():
+    nonlocal inference_release
+    if inference_release is None:
+      from .inference_sampler import load_inference_sampler
+      inference_release = load_inference_sampler(upstream_main.algo)
+    return inference_release
 
   class ReproductionDiDi(original):
     _didi_runtime_installed = True
 
     def __init__(self, config, tokenizer):
       from .protocol import training_iterations, training_protocol
+      from .sampling_protocol import validate_sampler_source, sampling_protocol
       iterations = training_iterations(config)
+      source = validate_sampler_source(config)
+      sampler_metadata = get_inference_release()[1] if source == 'inference' else None
       evaluation_weights = config.get('didi_eval', {}).get('weights', 'backbone')
       if evaluation_weights not in ('backbone', 'student_ema'):
         raise ValueError('didi_eval.weights must be backbone or student_ema.')
@@ -105,6 +116,10 @@ def install_runtime(upstream_main):
       self._didi_training_protocol = training_protocol(config)
       self._didi_evaluation_weights = evaluation_weights
       self._didi_evaluation_depth = 0
+      self._didi_sampler_source = source
+      self._didi_inference_sampling_depth = 0
+      self._didi_sampling_protocol = sampling_protocol(config)
+      self._didi_sampler_metadata = sampler_metadata
       effective_names = (
         'discriminator_lr', 'kl_beta', 'entropy_beta', 'sampling_eps',
         'label_smoothing', 'discriminator_warmup_steps', 'student_update_every',
@@ -122,6 +137,8 @@ def install_runtime(upstream_main):
         'scheduler_horizon_iterations': iterations,
         'training_protocol': self._didi_training_protocol,
         'evaluation_weights': evaluation_weights,
+        'sampling_protocol': self._didi_sampling_protocol,
+        'sampler_source_metadata': sampler_metadata,
         'noise_eps': self.noise.eps,
       })
 
@@ -158,6 +175,12 @@ def install_runtime(upstream_main):
       return optimizers
 
     def _didi_forward_backbone(self):
+      # The inference release directly calls student_ema for guided steps,
+      # but its terminal ancestral _denoiser_update calls the RAW backbone.
+      # Preserve both checkpoint copies instead of silently replacing cleanup
+      # with EMA. Validation NLL outside sampling still uses the chosen weights.
+      if self._didi_inference_sampling_depth > 0:
+        return self.backbone
       if (self._didi_evaluation_depth > 0
           and self._didi_evaluation_weights == 'student_ema'):
         return self.student_ema
@@ -168,8 +191,8 @@ def install_runtime(upstream_main):
     @contextmanager
     def _didi_evaluation_context(self):
       # Do not copy or swap parameters: optimizers, gradients and checkpoint
-      # keys must always retain the real trainable backbone. Every denoiser
-      # forward in this scope selects the separately maintained EMA instead.
+      # keys must always retain the real trainable backbone. The main sampler
+      # selects EMA in this scope; inference has its own explicit cleanup path.
       if self._didi_in_training_step:
         raise RuntimeError('Evaluation must not run inside a DiDi training step.')
       modes = [(module, module.training) for module in self.modules()]
@@ -259,6 +282,11 @@ def install_runtime(upstream_main):
 
     _get_gradient_tilting_step = guided_step
 
+    def reward_guided_ancestral_step(self, x, t, dt, h, M):
+      if self._didi_sampler_source != 'inference':
+        raise RuntimeError('The inference RGAS step requires didi_eval.sampler_source=inference.')
+      return get_inference_release()[0]['reward_guided_ancestral_step'](self, x, t, dt, h, M)
+
     def generate_samples(self, num_samples, num_steps=None, eps=1e-5):
       steps = self.config.sampling.steps if num_steps is None else num_steps
       if self.sampler == 'guided' and int(steps) < 2:
@@ -267,6 +295,16 @@ def install_runtime(upstream_main):
       # sampler needs input gradients. Its own @no_grad still controls ordinary
       # generation and torch.enable_grad still controls only the tilting step.
       with torch.inference_mode(False), self._didi_evaluation_context():
+        if self._didi_sampler_source == 'inference':
+          if self.sampler != 'guided':
+            raise ValueError('didi_eval.sampler_source=inference requires the guided sampler.')
+          self._didi_inference_sampling_depth += 1
+          try:
+            # Source is verified and compiled from the separate pinned release;
+            # no main-branch training method or default sampler is replaced.
+            return get_inference_release()[0]['generate_samples'](self, num_samples, num_steps, eps)
+          finally:
+            self._didi_inference_sampling_depth -= 1
         return super().generate_samples(num_samples, num_steps, eps)
 
     def on_save_checkpoint(self, checkpoint):
@@ -282,6 +320,8 @@ def install_runtime(upstream_main):
         'teacher': self._didi_teacher_metadata,
         'student_initialization': self._didi_student_metadata,
         'evaluation_weights': self._didi_evaluation_weights,
+        'sampling_protocol': self._didi_sampling_protocol,
+        'sampler_source_metadata': self._didi_sampler_metadata,
         'training_protocol': self._didi_training_protocol,
       }
 

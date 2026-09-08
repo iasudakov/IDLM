@@ -20,7 +20,8 @@ import sys
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-METRICS_PATH = REPO_ROOT / 'vendor' / 'didi_instruct' / 'metrics.py'
+sys.path.insert(0, str(REPO_ROOT))
+from didi_repro.standalone import verify_source
 
 
 def positive_int(value):
@@ -32,6 +33,8 @@ def positive_int(value):
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument('--upstream', choices=('main', 'inference'), default='main',
+                        help='Pristine release supplying metrics.py')
     result.add_argument('--samples', required=True, type=Path)
     result.add_argument('--output', required=True, type=Path)
     result.add_argument('--batch-size', type=positive_int, default=4)
@@ -67,13 +70,12 @@ def read_samples(path):
     return original, texts
 
 
-def load_pristine_metrics():
-    manifest = json.loads((REPO_ROOT / 'didi_repro' / 'UPSTREAM.json').read_text())
-    actual_hash = sha256(METRICS_PATH)
-    if actual_hash != manifest['files']['metrics.py']:
-        raise RuntimeError('Vendored metrics.py does not match the pristine upstream manifest.')
+def load_pristine_metrics(source='main'):
+    directory, manifest = verify_source(source)
+    metrics_path = directory / 'metrics.py'
+    actual_hash = sha256(metrics_path)
     name = '_didi_authors_pristine_rescore_metrics'
-    spec = importlib.util.spec_from_file_location(name, METRICS_PATH)
+    spec = importlib.util.spec_from_file_location(name, metrics_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     try:
@@ -82,7 +84,7 @@ def load_pristine_metrics():
         sys.modules.pop(name, None)
         raise
     return module.Metrics, {'commit': manifest['commit'],
-                            'metrics_path': str(METRICS_PATH),
+                            'metrics_path': str(metrics_path),
                             'metrics_sha256': actual_hash}
 
 
@@ -176,7 +178,7 @@ def main(argv=None):
     os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     import torch
-    Metrics, upstream = load_pristine_metrics()
+    Metrics, upstream = load_pristine_metrics(args.upstream)
     snapshot, model_metadata = resolve_cached_model(args.model, args.revision, args.cache_dir)
     device = torch.device(args.device)
     evaluator = Metrics(gen_ppl_eval_model_name_or_path=str(snapshot),

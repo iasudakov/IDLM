@@ -18,6 +18,7 @@ import torch
 from . import UPSTREAM_REVISION
 from .monitor import _entropy, _root_metrics_class, config_rows, preserve_rng_state
 from .temperature import sampling_temperature
+from .sampling_protocol import sampling_protocol
 
 
 def _distributed():
@@ -134,12 +135,15 @@ class DiDiPareto(L.Callback):
             raise ValueError('DiDi Pareto supports ancestral, ancestral_cache, or guided sampling')
         if sampler == 'guided' and min(self.budgets) < 2:
             raise ValueError('The original guided schedule needs at least two denoising steps')
+        source_protocol = getattr(model, '_didi_sampling_protocol', sampling_protocol(self.config))
+        if source_protocol['sampler_source'] == 'inference' and sampler != 'guided':
+            raise ValueError('didi_eval.sampler_source=inference requires the guided Pareto sampler')
         return {
             'upstream_revision': UPSTREAM_REVISION,
+            **source_protocol,
             'sampler': sampler,
             'weights': getattr(model, '_didi_evaluation_weights', 'backbone'),
             'temperatures': self.temperatures,
-            'temperature_transform': 'masked-SUBS-logprob-temperature-v1',
             'steps': self.budgets,
             'seeds': self.seeds,
             'seed_formula': '9973*(repeat+1)+steps+104729*rank',
@@ -426,6 +430,8 @@ def validate_options(config):
     if config.get('trainer', {}).get('limit_val_batches', 1) == 0:
         raise ValueError('didi_pareto requires trainer.limit_val_batches > 0')
     sampler = callback.options.get('sampler', None) or config.sampling.predictor
+    if sampling_protocol(config)['sampler_source'] == 'inference' and sampler != 'guided':
+        raise ValueError('didi_eval.sampler_source=inference requires the guided Pareto sampler')
     if sampler not in ('ancestral', 'ancestral_cache', 'guided'):
         raise ValueError('DiDi Pareto supports ancestral, ancestral_cache, or guided sampling')
     if sampler == 'guided' and min(callback.budgets) < 2:

@@ -24,14 +24,15 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from didi_repro import UPSTREAM_REVISION
 from didi_repro.initialization import (
     AUTHORS_STUDENT_REPO, WEIGHT_FILES, _resolve_files, _sha256, _validate_state)
-from didi_repro.runtime import UPSTREAM_ROOT, verify_upstream
+from didi_repro.standalone import verify_source
 
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument('--upstream', choices=('main', 'inference'), default='main',
+                        help='Pristine release whose architecture validates the checkpoint')
     result.add_argument('--student-hf', default=AUTHORS_STUDENT_REPO,
                         help='HF repository or local directory containing both safetensors files')
     result.add_argument('--revision', default=None,
@@ -68,16 +69,16 @@ def saved_device(requested, torch_module):
     return torch_module.device('cuda:0')
 
 
-def pristine_model():
+def pristine_model(source='main'):
     """Build the original native architecture on CPU without installing repairs."""
-    verify_upstream()
+    upstream_root, manifest = verify_source(source)
     for name in ('main', 'algo', 'models', 'trainer_base', 'dataloader', 'metrics', 'utils'):
         module = sys.modules.get(name)
         if module is not None:
             location = Path(getattr(module, '__file__', '') or '').resolve()
-            if not location.is_relative_to(UPSTREAM_ROOT):
+            if not location.is_relative_to(upstream_root):
                 raise RuntimeError(f'Conflicting {name} import; run this script in its own process.')
-    sys.path.insert(0, str(UPSTREAM_ROOT))
+    sys.path.insert(0, str(upstream_root))
     upstream = importlib.import_module('main')
     if getattr(upstream.algo.DiDiInstruct, '_didi_runtime_installed', False):
         raise RuntimeError('Refusing a patched DiDi runtime; preparation requires pristine upstream.')
@@ -85,7 +86,7 @@ def pristine_model():
     from omegaconf import OmegaConf
     import torch
     with hydra.initialize_config_dir(
-            version_base=None, config_dir=str(UPSTREAM_ROOT / 'configs')):
+            version_base=None, config_dir=str(upstream_root / 'configs')):
         config = hydra.compose(config_name='config', overrides=[
             'mode=sample_eval', 'model=small', 'algo=didi_instruct',
             'algo.backbone=dit', 'sampling.predictor=guided', 'trainer.devices=1'])
@@ -101,6 +102,9 @@ def pristine_model():
         'tokenizer': str(config.data.tokenizer_name_or_path),
         'model_class': f'{type(model).__module__}.{type(model).__name__}',
         'runtime_patches_installed': False,
+        'upstream_source': source,
+        'upstream_revision': manifest['commit'],
+        'upstream_entrypoint': str(upstream_root / 'main.py'),
     }
     return model, architecture
 
@@ -120,6 +124,45 @@ def mapped_state(model, generator, discriminator, device):
     for name, value in discriminator.items():
         state[f'discriminator.{name}'] = value.detach().to(device=device)
     return state
+
+
+def validate_native_checkpoint(path, model):
+    """Check all used weights before the permissive original loader sees them.
+
+    Only pass trusted checkpoints: native Lightning files use pickle. Storage
+    is mapped to CPU for inspection; serialized CUDA tags are checked without
+    allocating GPU memory or changing the file. Both releases use the raw
+    backbone for terminal ancestral denoising; inference also needs student_ema.
+    """
+    import torch
+    locations = []
+
+    def on_storage(storage, location):
+        locations.append(location)
+        return storage
+
+    checkpoint = torch.load(path, map_location=on_storage, weights_only=False)
+    state = checkpoint.get('state_dict') if isinstance(checkpoint, dict) else None
+    if not isinstance(state, dict):
+        raise ValueError('Expected a native Lightning checkpoint with state_dict')
+    counts = {}
+    for prefix, module in (('backbone', model.backbone), ('student_ema', model.student_ema),
+                           ('discriminator', model.discriminator)):
+        weights = {key[len(prefix) + 1:]: value for key, value in state.items()
+                   if key.startswith(prefix + '.')}
+        _validate_state(module, weights, prefix)
+        counts[prefix] = len(weights)
+    # The unmodified loader restores saved devices, without map_location. A
+    # CPU-only export stays on CPU and FlashAttention cannot evaluate it.
+    if not locations or set(locations) != {'cuda:0'}:
+        raise ValueError('Original standalone evaluation requires a checkpoint saved '
+                         'on logical cuda:0 with one visible GPU. Use '
+                         'prepare_didi_authors_checkpoint.py --device cuda:0 for HF '
+                         'weights; do not use the teacher mdlm.ckpt or an EMA-only export. '
+                         f'Found saved devices: {sorted(set(locations))}')
+    return {'complete_tensor_counts': counts, 'saved_devices': sorted(set(locations)),
+            'raw_and_ema_weights': 'validated separately; neither overwritten',
+            'source_metadata': checkpoint.get('didi_authors_checkpoint')}
 
 
 def write_checkpoint(output, state, metadata, lightning_version):
@@ -163,13 +206,13 @@ def main(argv=None):
     source['files'] = {
         name: {'path': str(path), 'sha256': _sha256(path)} for name, path in files.items()}
     print('[didi-checkpoint] Validating against the pristine native CPU model.', flush=True)
-    model, architecture = pristine_model()
+    model, architecture = pristine_model(options.upstream)
     state = mapped_state(model, generator, discriminator, device)
     del model
     lightning_version = importlib.metadata.version('lightning')
     metadata = {
         'kind': 'authors_safetensors_for_unmodified_upstream_evaluation',
-        'upstream_revision': UPSTREAM_REVISION,
+        'upstream_revision': architecture['upstream_revision'],
         'source': source, 'architecture': architecture,
         'remapping': {
             'model.safetensors': ['backbone.*', 'student_ema.*'],
@@ -180,7 +223,7 @@ def main(argv=None):
             'omitted_unused_state': ['teacher', 'legacy EMA', 'optimizers', 'training progress'],
         },
         'saved_tensor_device': str(device),
-        'intended_use': ('unmodified vendor/didi_instruct/main.py mode=sample_eval'
+        'intended_use': (f'unmodified {architecture["upstream_entrypoint"]} mode=sample_eval'
                          if device.type == 'cuda' else 'CPU inspection only; reprepare on CUDA for original GPU evaluation'),
         'environment': {
             'python': platform.python_version(), 'torch': str(torch.__version__),
