@@ -72,7 +72,18 @@ def maybe_evaluate_before_training(trainer, model, valid_loader, ckpt_path=None)
     def remap_metric_step(original):
         @functools.wraps(original)
         def logged(metrics, step=None, **kwargs):
-            return original(metrics, step=evaluation_step['value'], **kwargs)
+            # These per-checkpoint curves deliberately use an NFE cost axis,
+            # not a training-step axis. Their checkpoint is already in the key.
+            # Remapping them to step zero would collapse the entire frontier.
+            costs = {key: value for key, value in metrics.items()
+                     if str(key).startswith('pareto/gsm8k_step_')}
+            regular = {key: value for key, value in metrics.items() if key not in costs}
+            result = None
+            if regular or not costs:
+                result = original(regular, step=evaluation_step['value'], **kwargs)
+            if costs:
+                result = original(costs, step=step, **kwargs)
+            return result
         return logged
 
     def remap_media_step(original):

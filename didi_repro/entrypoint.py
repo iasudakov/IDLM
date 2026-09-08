@@ -16,10 +16,13 @@ from .sampling_protocol import configure_sampler_source, sampling_protocol
 def prepare_config(config, overrides=None):
   """Keep upstream defaults unless an explicit integration option opts in."""
   from omegaconf import OmegaConf, open_dict
+  from .tinygsm import is_tinygsm, prepare_tinygsm_config
+  conditional = is_tinygsm(config)
   additions = {
-    'underdeep': {'experiment': 'generative-models/owt', 'name': 'didi-instruct-owt',
+    'underdeep': {'experiment': ('generative-models/tinygsm' if conditional else 'generative-models/owt'),
+                  'name': ('didi-instruct-tinygsm' if conditional else 'didi-instruct-owt'),
                   'force_new_run': False, 'required': True},
-    'didi_monitor': {'enabled': True, 'gen_ppl': True, 'gm': True,
+    'didi_monitor': {'enabled': True, 'gen_ppl': not conditional, 'gm': not conditional,
                      'gm_batch_size': 4, 'max_reference_samples': 64},
     'didi_eval': {'before_training': False, 'weights': 'backbone', 'sampler_source': 'main'},
     'didi_training': {'iterations': None},
@@ -37,6 +40,7 @@ def prepare_config(config, overrides=None):
       config[key] = OmegaConf.merge(value, config.get(key, {}))
   configure_training_budget(config, overrides=overrides)
   configure_sampler_source(config, overrides=overrides)
+  prepare_tinygsm_config(config)
   return config
 
 
@@ -107,6 +111,10 @@ def validate_environment(config, record):
 
 def _check_cached_data(config):
   """Avoid upstream's destructive cache-rebuild fallback on shared OWT data."""
+  from .tinygsm import is_tinygsm
+  if is_tinygsm(config):
+    from .tinygsm_data import check_cached_data
+    return check_cached_data(config)
   import datasets
   for split, mode, eos in ((config.data.train, 'train', config.data.insert_train_eos),
                            (config.data.valid, 'validation', config.data.insert_valid_eos)):
@@ -126,6 +134,7 @@ def _check_cached_data(config):
 
 def _write_provenance(config, record):
   from omegaconf import OmegaConf
+  from .tinygsm import adaptation_record
   if int(os.environ.get('RANK', 0)) != 0:
     return
   directory = Path(config.checkpointing.save_dir)
@@ -142,6 +151,7 @@ def _write_provenance(config, record):
     'sampling_protocol': sampling_protocol(config),
     'training_protocol': training_protocol(config),
     'runtime_fix_ledger': 'didi_repro/README.md',
+    'dataset_adaptation': adaptation_record(config),
   }, indent=2) + '\n')
 
 
@@ -175,6 +185,7 @@ def install_entrypoint(upstream):
   from .initialization import initialize_student_from_hf
   from .pretrain_eval import maybe_evaluate_before_training
   from .pareto import attach_pareto, validate_options
+  from .tinygsm import is_tinygsm
   upstream.make_underdeep_logger = make_underdeep_logger
   upstream.initialize_underdeep_logger = initialize_underdeep_logger
   upstream.initialize_didi_student = initialize_student_from_hf
@@ -182,6 +193,12 @@ def install_entrypoint(upstream):
   upstream.attach_didi_monitor = lambda model, config: attach_monitor(
     model, config, upstream_revision=UPSTREAM_REVISION)
   upstream.attach_didi_pareto = attach_pareto
+  def attach_conditional(model, config):
+    if not is_tinygsm(config):
+      return None
+    from .tinygsm_eval import attach_tinygsm_evaluation
+    return attach_tinygsm_evaluation(model, config)
+  upstream.attach_didi_conditional = attach_conditional
   patched_train = repaired_function(upstream._train, (
     ("wandb_logger = None\n  if config.get('wandb', None) is not None:\n"
      "    wandb_logger = L.pytorch.loggers.WandbLogger(\n"
@@ -201,6 +218,9 @@ def install_entrypoint(upstream):
      '  pareto = attach_didi_pareto(model, config)\n'
      '  if pareto is not None:\n'
      '    callbacks.append(pareto)\n\n'
+     '  conditional = attach_didi_conditional(model, config)\n'
+     '  if conditional is not None:\n'
+     '    callbacks.append(conditional)\n\n'
      '  # Print the number of trainable parameters'),
     ('  trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)',
      '  maybe_evaluate_didi_before_training(trainer, model, valid_ds, ckpt_path=ckpt_path)\n'
@@ -269,6 +289,8 @@ def install_entrypoint(upstream):
 
 def run():
   import hydra
+  from .tinygsm import register_configs, is_tinygsm, install_tinygsm
+  register_configs()
   upstream = load_upstream()
   install_entrypoint(upstream)
 
@@ -277,6 +299,8 @@ def run():
     prepare_config(config)
     record = environment_record()
     validate_environment(config, record)
+    if is_tinygsm(config):
+      install_tinygsm(upstream)
     _write_provenance(config, record)
     # Calls the actual original entry body, not IDLM's algorithm dispatch.
     upstream.main.__wrapped__(config)

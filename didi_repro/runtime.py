@@ -64,7 +64,7 @@ def install_runtime(upstream_main):
   original = upstream_main.algo.DiDiInstruct
   if getattr(original, '_didi_runtime_installed', False):
     return original
-  training_step = repaired_function(original.training_step, TRAINING_REPAIRS)
+  repaired_training_step = repaired_function(original.training_step, TRAINING_REPAIRS)
   # Same input gradient; unlike backward(), autograd.grad does not leave
   # discriminator parameter gradients behind during guided evaluation.
   guided_step = repaired_function(original._get_gradient_tilting_step, (
@@ -83,6 +83,9 @@ def install_runtime(upstream_main):
 
   class ReproductionDiDi(original):
     _didi_runtime_installed = True
+    # Dataset adapters can replace diagnostics around this same objective.
+    # Kept as a bound method so the OWT execution path is unchanged.
+    _didi_training_step_impl = repaired_training_step
 
     def __init__(self, config, tokenizer):
       from .protocol import training_iterations, training_protocol
@@ -260,7 +263,7 @@ def install_runtime(upstream_main):
         raise RuntimeError('DiDi iteration budget exhausted; refusing another optimizer update.')
       self._didi_in_training_step = True
       try:
-        result = training_step(self, batch, batch_idx)
+        result = self._didi_training_step_impl(batch, batch_idx)
         self.log('didi/iteration', float(self.global_steps), on_step=True,
                  on_epoch=False, sync_dist=True)
         return result

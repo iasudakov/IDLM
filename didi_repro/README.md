@@ -10,11 +10,17 @@ The 43 files in `vendor/didi_instruct` are byte-identical to that revision.
 The original MIT license and dependency specification are included. Demo GIFs
 and repository metadata are omitted. All adaptations live in `didi_repro`.
 
+For the conditional TinyGSM adaptation, see [TINYGSM.md](TINYGSM.md).
+Its `scripts/train_didi_tinygsm.sh` keeps the **released** training settings,
+not the paper-informed OWT launcher settings described next. Selecting
+`data=tiny-gsm` opts into separate data, prompt masking and answer evaluation;
+it is not an authors-published TinyGSM reproduction.
+
 There are now two explicitly different protocols:
 
 - Direct `python -m didi_repro`, without the correction flags below, retains
   the released-code defaults plus the documented runtime/checkpoint repairs.
-- The supplied launchers select the corrected paper-reported iteration/LR/EMA
+- The OWT launchers select the corrected paper-reported iteration/LR/EMA
   settings and guided evaluation described below. They do **not** silently
   change the vendored files or make earlier runs equivalent to this protocol.
 

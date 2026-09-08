@@ -216,6 +216,83 @@ class TestPretrainEvaluation(unittest.TestCase):
             states.append(copy.deepcopy(model.state_dict()))
         self.assert_same_state(states[0], states[1])
 
+    def _assert_pretrain_metric_axes(self, evaluation_step):
+        """Cost-axis curves coexist with train-step scalars in one logger call."""
+        model = self.model()
+        trainer, logger, _ = self.trainer(model)
+        logger.log_image = mock.Mock()
+        original_log_metrics = logger.log_metrics
+        original_log_table = logger.log_table
+        original_log_image = logger.log_image
+        checkpoint = None
+        checkpoint_path = None
+        if evaluation_step:
+            model.global_steps = evaluation_step // 2
+            checkpoint = {'global_step': evaluation_step,
+                          'state_dict': copy.deepcopy(model.state_dict())}
+            model.on_save_checkpoint(checkpoint)
+            checkpoint_path = 'memory-only-resume.ckpt'
+        curve = f'pareto/gsm8k_step_{evaluation_step}'
+        mixed = {curve: .33, 'val/gsm8k_acc_thr05': .33,
+                 'val/gen_ppl_s8_t1': 41., 'didi_pareto/samples_per_seed': 40}
+
+        def validate(*args, **kwargs):
+            self.assertEqual(kwargs['ckpt_path'], checkpoint_path)
+            if checkpoint is not None:
+                model.on_load_checkpoint(checkpoint)
+                model.load_state_dict(checkpoint['state_dict'])
+            self.assertEqual(model._didi_evaluation_step['value'], evaluation_step)
+            logger.log_metrics({'val/nll': 4.2}, step=999)
+            # Two pure-cost calls must remain distinct points on the NFE axis,
+            # even when the outer validation phase has trainer.global_step=0.
+            logger.log_metrics({curve: .11}, step=137)
+            logger.log_metrics({curve: .22}, step=245)
+            logger.log_metrics(mixed, step=389)
+            # Existing OWT Pareto telemetry uses the checkpoint/train axis,
+            # not TinyGSM's cost-series prefix, and must remain unchanged.
+            logger.log_metrics({'val/gen_ppl_s16_t075': 39.,
+                                'val/entropy_s16_t075': 5.2,
+                                'didi_pareto/failed': 0}, step=1001)
+            logger.log_metrics({'pareto/gsm8k_steps': 2,
+                                'pareto/gsm8k_stepx_17': 3}, step=1002)
+            logger.log_table(key='pareto/protocol', columns=['key'], data=[['value']], step=777)
+            logger.log_image(key='pareto/frontier', image='memory-only', step=778)
+            return [{'val/nll': 4.2}]
+
+        with mock.patch.object(trainer, 'validate', side_effect=validate):
+            result = maybe_evaluate_before_training(
+                trainer, model, self.loader(), ckpt_path=checkpoint_path)
+        self.assertEqual(result, [{'val/nll': 4.2}])
+        cost_calls = [(metrics, step) for metrics, step in logger._run.metrics if curve in metrics]
+        self.assertEqual(cost_calls, [({curve: .11}, 137), ({curve: .22}, 245), ({curve: .33}, 389)])
+        regular_calls = [(metrics, step) for metrics, step in logger._run.metrics if curve not in metrics]
+        self.assertTrue(regular_calls)
+        self.assertTrue(all(step == evaluation_step for _, step in regular_calls))
+        self.assertIn(({'val/gsm8k_acc_thr05': .33, 'val/gen_ppl_s8_t1': 41.,
+                        'didi_pareto/samples_per_seed': 40}, evaluation_step), regular_calls)
+        self.assertIn(({'val/gen_ppl_s16_t075': 39., 'val/entropy_s16_t075': 5.2,
+                        'didi_pareto/failed': 0}, evaluation_step), regular_calls)
+        self.assertIn(({'pareto/gsm8k_steps': 2, 'pareto/gsm8k_stepx_17': 3}, evaluation_step), regular_calls)
+        self.assertEqual(mixed, {curve: .33, 'val/gsm8k_acc_thr05': .33,
+                                 'val/gen_ppl_s8_t1': 41., 'didi_pareto/samples_per_seed': 40})
+        self.assertTrue(all(step == evaluation_step for _, _, step in logger.tables))
+        original_log_image.assert_called_once_with(
+            key='pareto/frontier', image='memory-only', step=evaluation_step)
+        self.assertEqual(logger.log_metrics, original_log_metrics)
+        self.assertEqual(logger.log_table, original_log_table)
+        self.assertIs(logger.log_image, original_log_image)
+        self.assertFalse(hasattr(model, '_didi_evaluation_step'))
+        self.assertEqual(logger._run.finish_calls, 0)
+        # The temporary adapter must not leak into subsequent fit logging.
+        logger.log_metrics({'val/post_training': 7}, step=1007)
+        self.assertEqual(logger._run.metrics[-1], ({'val/post_training': 7}, 1007))
+
+    def test_fresh_pretrain_validation_preserves_tinygsm_nfe_axis_and_owt_steps(self):
+        self._assert_pretrain_metric_axes(evaluation_step=0)
+
+    def test_resume_pretrain_validation_preserves_tinygsm_nfe_axis_and_owt_steps(self):
+        self._assert_pretrain_metric_axes(evaluation_step=26)
+
     def test_resume_evaluates_restored_weights_at_checkpoint_step(self):
         model = self.model()
         trainer, _, _ = self.trainer(model)

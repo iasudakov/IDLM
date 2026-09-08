@@ -1,0 +1,17 @@
+train: tiny_gsm
+valid: tiny_gsm
+tokenizer_name_or_path: HuggingFaceTB/SmolLM-135M
+tokenizer_local_files_only: false
+cache_dir: ${cwd:}/cache_dir
+wrap: false
+streaming: false
+insert_train_eos: true
+insert_valid_eos: true
+# Literal backslash + n, matching tinygsm-upstream-repro and its checkpoints.
+separator: '\n'
+train_on_prompt: false
+train_on_pad: true
+val_ratio: 0.01
+val_seed: 42
+filter_too_long: true
+data_path: null

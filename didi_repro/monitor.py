@@ -308,10 +308,29 @@ class DiDiMonitor(L.Callback):
         self.references = []
 
 
+class DiDiProvenanceMonitor(DiDiMonitor):
+    """Record run provenance without capturing conditional evaluation draws."""
+
+    def on_validation_start(self, trainer, pl_module):
+        self.capturing = False
+
+    def on_validation_batch_end(self, *args, **kwargs):
+        pass
+
+    def on_validation_end(self, trainer, pl_module):
+        if not trainer.sanity_checking:
+            with preserve_rng_state():
+                self._provenance(trainer, pl_module)
+
+
 def attach_monitor(model, config, upstream_revision=None):
     """Return a callback after attaching capture; call after runtime adapters."""
     if not config.get('didi_monitor', {}).get('enabled', True):
         return None
+    if config.get('data', {}).get('train') == 'tiny_gsm':
+        # Conditional evaluation owns entropy, samples and accuracy. Capturing
+        # its draws here would overwrite them with prompt-inclusive OWT metrics.
+        return DiDiProvenanceMonitor(config, upstream_revision=upstream_revision)
     monitor = DiDiMonitor(config, upstream_revision=upstream_revision)
     original = model.generate_samples
 
