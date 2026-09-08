@@ -211,6 +211,39 @@ gradient. Omit the new option or set `mmd_sentence_pooling=mean` to retain the
 previous behavior. Diffusion features and token-level kernels do not support
 `last_token`.
 
+To use cosine similarity as the MMD kernel, change only the kernel in your
+feature-reward command (keep its existing source, level, K, G and pooling):
+
+```bash
+adversarial_distill.mmd_reward_type=feature \
+adversarial_distill.mmd_kernel=cosine
+```
+
+This computes MMD with `k(x,y) = dot(normalize(x), normalize(y))`, using L2
+normalization in float32. At token level each token vector is normalized
+individually; at sentence level the existing mean/last-token readout happens
+first, and that sentence vector is normalized. It is **not** cosine similarity
+between two final pooled means and does not apply pseudo-Huber. It supports
+both AR and diffusion features (the `last_token` readout remains AR-only).
+
+Self-pair removal and activity rules follow RBF: token comparisons need at
+least two scored vectors on each side; sentence `rows` needs K >= 2. Sentence
+`draws` treats the observed real vector as fixed, removes fake self-pairs at
+K > 1, and uses a biased squared distance between normalized vectors at K = 1
+(`2 * (1 - cosine)` for nonzero unit vectors). Zero vectors are handled with
+epsilon-safe normalization and their actual diagonal kernel values. Negative
+finite-sample MMD estimates are retained. No bandwidth is needed;
+`mmd_rbf_alpha` and `mmd_rbf_block_size` do not affect this kernel.
+
+Cosine is a linear kernel on unit features, so its population MMD only matches
+their **mean**, unlike RBF's nonlinear comparison. Removing feature magnitude
+therefore also changes the objective's sensitivity; an RBF kernel applied to
+unit-normalized features would be a different experiment (not enabled by this
+option). Existing `linear`, `rbf`, and `pseudo_huber` behavior and the REINFORCE
+`G*K`/token loss normalization are unchanged. Cosine uses a dot-product sum,
+not an extra `1/hidden_dim` average; reward scales need not match the prior run.
+Test it as a fresh run rather than resuming and mixing kernel histories.
+
 #### DUO teacher → IDLM-Duo student
 
 ```bash

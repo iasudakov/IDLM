@@ -898,9 +898,12 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         raise ValueError('adversarial_distill.mmd_reward_type must be '
                          f'feature|idlm, got {kind!r}')
       kernel = str(cfg.get('mmd_kernel', 'linear'))
-      if kernel not in ('linear', 'rbf', 'pseudo_huber'):
+      if kernel not in ('linear', 'rbf', 'cosine', 'pseudo_huber'):
         raise ValueError('adversarial_distill.mmd_kernel must be '
-                         f'linear|rbf|pseudo_huber, got {kernel!r}')
+                         f'linear|rbf|cosine|pseudo_huber, got {kernel!r}')
+      if kernel == 'cosine' and kind != 'feature':
+        raise ValueError('adversarial_distill.mmd_kernel=cosine requires '
+                         'mmd_reward_type=feature')
       level = str(cfg.get('mmd_kernel_level', 'token'))
       if level not in ('token', 'sentence'):
         raise ValueError('adversarial_distill.mmd_kernel_level must be '

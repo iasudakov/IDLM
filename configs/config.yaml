@@ -27,9 +27,9 @@ adversarial_distill:
   # A frozen model used as a fixed *feature map* rather than a likelihood
   # critic: run it over the clean row and over the student's sample, read one
   # middle block's hidden states, and reward the student for closing the
-  # feature gap. Historical token/rows modes use pseudo-Huber;
+  # feature gap. Historical linear token/rows modes use pseudo-Huber;
   # `mmd_kernel_source=draws` plus `mmd_kernel_level=sentence` uses the explicit
-  # linear-, RBF-, or pseudo-Huber-kernel MMD estimator documented below. Optimized by
+  # linear-, RBF-, cosine-, or pseudo-Huber-kernel MMD documented below. Optimized by
   # REINFORCE with a leave-one-out baseline over `mmd_group_size` candidates
   # drawn at the same state. See `mmd_reward.py`.
   #
@@ -115,6 +115,14 @@ adversarial_distill:
   #             distributions selected below. Sensitive to more than the mean,
   #             which is the point given the probe's finding that the linear
   #             reward behaves close to a soft edit distance.
+  #   cosine -- true dot-product MMD on individually L2-normalized features.
+  #             Token level normalizes each token; sentence level computes the
+  #             mean/last-token readout first, then normalizes that vector.
+  #             No pseudo-Huber, no extra 1/hidden_dim, and no RBF bandwidth.
+  #             Same off-diagonal estimator/activity rules as RBF, including
+  #             the fixed-real K=1 biased fallback for draws+sentence.
+  #             Matches mean unit features, not the full directional distribution.
+  #             Requires mmd_reward_type: feature; supports AR and diffusion.
   #   pseudo_huber -- draws+sentence only. Distance-induced kernel built from
   #             rho(x,y) = mean_d(sqrt((x_d-y_d)^2 + c^2) - c), c=0.001.
   #             K=1 exactly preserves the historical pseudo-Huber reward.
@@ -137,15 +145,15 @@ adversarial_distill:
   # With mean pooling in `rows` mode, linear token/sentence levels agree when
   # every sequence in a row has the same scored count; otherwise token pooling
   # weights a sequence by how much was scored while sentence pooling weights every
-  # sequence alike. Sentence-level RBF in rows mode still needs K >= 2 because
+  # sequence alike. Sentence-level RBF/cosine in rows mode need K >= 2 because
   # both empirical sides contain K independently observed batch rows.
   #
   # In `draws` mode, sentence level produces one pooled REAL embedding and K
-  # independently pooled FAKE embeddings for each state. For all three
+  # independently pooled FAKE embeddings for each state. For all four
   # kernels, K > 1 removes fake self-pairs: the estimator is unbiased over fake
   # draws with the observed real embedding treated as fixed. K = 1 uses the
   # biased empirical estimate because no off-diagonal fake pair exists.
-  # Unlike rows mode, sentence-level RBF is therefore valid at K = 1.
+  # Unlike rows mode, sentence-level RBF/cosine are therefore valid at K = 1.
   mmd_kernel_level: token
   # Sentence representation (`mmd_kernel_level: sentence`):
   #   mean       -- average over `mmd_score_positions` (historical default).
