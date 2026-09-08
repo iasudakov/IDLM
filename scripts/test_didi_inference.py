@@ -174,14 +174,25 @@ class CheckpointPreflightTests(unittest.TestCase):
         self.state['student_ema.weight'] = self.state['backbone.weight'] + 0.25
         self.checkpoint = {'state_dict': self.state, 'didi_authors_checkpoint': {'source': 'fixture'}}
 
-    def _validate(self, checkpoint=None, devices=('cuda:0',)):
+    def _validate(self, checkpoint=None, devices=('cuda:0',), state_devices=None,
+                  unrelated_devices=()):
         payload = self.checkpoint if checkpoint is None else checkpoint
+        state_devices = {} if state_devices is None else state_devices
 
         def load(path, map_location, weights_only):
             self.assertEqual(path, '/unused/native.ckpt')
             self.assertFalse(weights_only)
-            for device in devices:
-                storage = object()
+            state = payload.get('state_dict') if isinstance(payload, dict) else None
+            if isinstance(state, dict) and devices:
+                for index, (name, value) in enumerate(state.items()):
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    storage = value.untyped_storage()
+                    device = state_devices.get(name, devices[index % len(devices)])
+                    self.assertIs(map_location(storage, device), storage)
+            # Keep these storages alive so distinct identity tags remain valid.
+            unrelated = [torch.zeros(1).untyped_storage() for _ in unrelated_devices]
+            for storage, device in zip(unrelated, unrelated_devices):
                 self.assertIs(map_location(storage, device), storage)
             return payload
 
@@ -194,6 +205,9 @@ class CheckpointPreflightTests(unittest.TestCase):
                         for prefix in ('backbone', 'student_ema', 'discriminator')}
         result = self._validate()
         self.assertEqual(result['saved_devices'], ['cuda:0'])
+        self.assertEqual(result['sampling_saved_devices'], ['cuda:0'])
+        self.assertEqual(result['first_state_tensor'],
+                         {'name': 'backbone.weight', 'saved_device': 'cuda:0'})
         self.assertEqual(result['complete_tensor_counts'],
                          {prefix: len(state) for prefix, state in before_model.items()})
         self.assertEqual(result['source_metadata'], {'source': 'fixture'})
@@ -227,6 +241,32 @@ class CheckpointPreflightTests(unittest.TestCase):
         for devices in ((), ('cpu',), ('cuda:1',), ('cuda:0', 'cpu')):
             with self.subTest(devices=devices), self.assertRaisesRegex(ValueError, 'logical cuda:0'):
                 self._validate(devices=devices)
+
+    def test_unrelated_cpu_optimizer_storages_are_allowed(self):
+        result = self._validate(unrelated_devices=('cpu', 'cpu'))
+        self.assertEqual(result['saved_devices'], ['cpu', 'cuda:0'])
+        self.assertEqual(result['sampling_saved_devices'], ['cuda:0'])
+        self.assertEqual(result['first_state_tensor']['saved_device'], 'cuda:0')
+
+    def test_cpu_first_buffer_fails_even_when_all_sampling_weights_are_cuda(self):
+        state = {'reward_baseline': torch.tensor(0.), **self.state}
+        with self.assertRaisesRegex(ValueError, 'reward_baseline on cpu'):
+            self._validate({'state_dict': state}, state_devices={'reward_baseline': 'cpu'})
+
+    def test_teacher_is_filtered_before_first_state_device_is_checked(self):
+        state = {'teacher.weight': torch.zeros(2), **self.state}
+        result = self._validate({'state_dict': state}, state_devices={'teacher.weight': 'cpu'})
+        self.assertEqual(result['first_state_tensor'],
+                         {'name': 'backbone.weight', 'saved_device': 'cuda:0'})
+
+    def test_cpu_sampling_tensor_fails_even_when_first_state_tensor_is_cuda(self):
+        with self.assertRaisesRegex(ValueError, 'sampling devices'):
+            self._validate(state_devices={'discriminator.weight_v': 'cpu'})
+
+    def test_unrelated_unsupported_cuda_device_still_fails(self):
+        # Original torch.load must restore every saved storage with one visible GPU.
+        with self.assertRaisesRegex(ValueError, 'logical cuda:0'):
+            self._validate(unrelated_devices=('cuda:1',))
 
     def test_non_lightning_or_non_mapping_state_fails(self):
         for checkpoint in ({}, [], {'state_dict': None}, {'state_dict': []}):

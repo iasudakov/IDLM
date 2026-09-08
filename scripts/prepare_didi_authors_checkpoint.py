@@ -135,10 +135,10 @@ def validate_native_checkpoint(path, model):
     backbone for terminal ancestral denoising; inference also needs student_ema.
     """
     import torch
-    locations = []
+    locations = {}
 
     def on_storage(storage, location):
-        locations.append(location)
+        locations[storage._cdata] = location
         return storage
 
     checkpoint = torch.load(path, map_location=on_storage, weights_only=False)
@@ -146,21 +146,37 @@ def validate_native_checkpoint(path, model):
     if not isinstance(state, dict):
         raise ValueError('Expected a native Lightning checkpoint with state_dict')
     counts = {}
+    sampling_locations = set()
     for prefix, module in (('backbone', model.backbone), ('student_ema', model.student_ema),
                            ('discriminator', model.discriminator)):
         weights = {key[len(prefix) + 1:]: value for key, value in state.items()
                    if key.startswith(prefix + '.')}
         _validate_state(module, weights, prefix)
         counts[prefix] = len(weights)
-    # The unmodified loader restores saved devices, without map_location. A
-    # CPU-only export stays on CPU and FlashAttention cannot evaluate it.
-    if not locations or set(locations) != {'cuda:0'}:
+        sampling_locations.update(locations.get(value.untyped_storage()._cdata, 'unknown')
+                                  for value in weights.values())
+    # Lightning chooses the model device from the first state tensor AFTER
+    # DiDi.on_load_checkpoint removes teacher keys. CPU optimizer counters and
+    # other unused storages are valid and must not reject a native checkpoint.
+    first_tensor = next(((key, value) for key, value in state.items()
+                         if not key.startswith('teacher') and isinstance(value, torch.Tensor)), None)
+    first_name, first_location = None, 'unknown'
+    if first_tensor is not None:
+        first_name, value = first_tensor
+        first_location = locations.get(value.untyped_storage()._cdata, 'unknown')
+    saved_locations = set(locations.values())
+    if (sampling_locations != {'cuda:0'} or first_location != 'cuda:0'
+            or saved_locations - {'cpu', 'cuda:0'}):
         raise ValueError('Original standalone evaluation requires a checkpoint saved '
                          'on logical cuda:0 with one visible GPU. Use '
                          'prepare_didi_authors_checkpoint.py --device cuda:0 for HF '
                          'weights; do not use the teacher mdlm.ckpt or an EMA-only export. '
-                         f'Found saved devices: {sorted(set(locations))}')
-    return {'complete_tensor_counts': counts, 'saved_devices': sorted(set(locations)),
+                         f'Found sampling devices: {sorted(sampling_locations)}; '
+                         f'first state tensor: {first_name} on {first_location}; '
+                         f'all saved devices: {sorted(saved_locations)}')
+    return {'complete_tensor_counts': counts, 'saved_devices': sorted(saved_locations),
+            'sampling_saved_devices': sorted(sampling_locations),
+            'first_state_tensor': {'name': first_name, 'saved_device': first_location},
             'raw_and_ema_weights': 'validated separately; neither overwritten',
             'source_metadata': checkpoint.get('didi_authors_checkpoint')}
 

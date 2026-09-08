@@ -3,6 +3,15 @@
 set -euo pipefail
 DIDI_REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIDI_AUTHORS_SOURCE="${DIDI_AUTHORS_SOURCE:-main}"
+DIDI_INFERENCE_PRECISION="${DIDI_INFERENCE_PRECISION:-upstream}"
+case "$DIDI_INFERENCE_PRECISION" in
+  upstream) ;;
+  float64)
+    if [[ "$DIDI_AUTHORS_SOURCE" != inference ]]; then
+      printf 'The precision diagnostic requires the inference source.\n' >&2; exit 1
+    fi ;;
+  *) printf 'DIDI_INFERENCE_PRECISION must be upstream or float64.\n' >&2; exit 1 ;;
+esac
 case "$DIDI_AUTHORS_SOURCE" in
   main) DIDI_SOURCE_DIR="$DIDI_REPO_ROOT/vendor/didi_instruct" ;;
   inference) DIDI_SOURCE_DIR="$DIDI_REPO_ROOT/vendor/didi_inference" ;;
@@ -28,8 +37,8 @@ for didi_override in "$@"; do
   esac
 done
 
-# Validate before generation, but never install the repaired algorithm or logger.
-python - "$CHECKPOINT" "$SAVE_DIR" "$DIDI_AUTHORS_SOURCE" <<'PY'
+# Validate before generation; do not install the integrated training/runtime or logger.
+python - "$CHECKPOINT" "$SAVE_DIR" "$DIDI_AUTHORS_SOURCE" "$DIDI_INFERENCE_PRECISION" <<'PY'
 import hashlib
 import importlib.metadata
 import json
@@ -44,6 +53,7 @@ from didi_repro.standalone import verify_source
 
 checkpoint, directory = map(Path, sys.argv[1:3])
 source = sys.argv[3]
+precision = sys.argv[4]
 if not checkpoint.is_file():
     raise FileNotFoundError(checkpoint)
 if directory.exists() or directory.is_symlink():
@@ -76,27 +86,41 @@ digest = hashlib.sha256()
 with checkpoint.open('rb') as stream:
     for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
         digest.update(block)
+diagnostic = None
+entrypoint = str(source_root / 'main.py') + '; no runtime patches'
+if precision == 'float64':
+    from didi_repro.inference_precision import precision_metadata
+    diagnostic = precision_metadata()
+    entrypoint = str(Path.cwd() / 'scripts' / 'run_didi_precision.py')
 directory.mkdir(parents=True, exist_ok=False)
 (directory / 'authors_eval_environment.json').write_text(json.dumps({
     'environment': record,
     'installed_packages': {d.metadata['Name']: d.version
                            for d in importlib.metadata.distributions()},
     'core_environment_guard_strict': strict,
+    'cuda_allocator_config': os.environ.get('PYTORCH_CUDA_ALLOC_CONF'),
     'upstream_source': source,
     'upstream_revision': manifest['commit'],
     'checkpoint': str(checkpoint),
     'checkpoint_sha256': digest.hexdigest(),
-    'entrypoint': str(source_root / 'main.py') + '; no runtime patches',
+    'entrypoint': entrypoint,
+    'precision_diagnostic': diagnostic,
     'checkpoint_validation': validation,
     'note': 'Core version check is not a complete environment.yml build match.',
 }, indent=2) + '\n')
 PY
 
 cd "$DIDI_SOURCE_DIR"
+if [[ "$DIDI_INFERENCE_PRECISION" == float64 ]]; then
+  didi_entrypoint=(env "DIDI_PRECISION_REPORT=$SAVE_DIR/precision_diagnostic.json"
+    python -u "$DIDI_REPO_ROOT/scripts/run_didi_precision.py")
+else
+  didi_entrypoint=(python -u main.py)
+fi
 # These sampling/model/batching flags match scripts/eval-didi-instruct.sh.
 # Path changes only. Keep default perplexity_batch_size=8 for the literal result;
 # score_didi_authors_samples.py can score all saved samples separately afterward.
-python -u main.py \
+"${didi_entrypoint[@]}" \
   mode=sample_eval \
   loader.batch_size=20 loader.eval_batch_size=20 \
   model=small algo=didi_instruct \
