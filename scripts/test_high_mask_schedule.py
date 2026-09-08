@@ -1,4 +1,4 @@
-"""CPU-only checks for the optional high-mask distillation mixture.
+"""CPU-only checks for generator high-mask mixtures and clipped schedules.
 
 Run with:
 
@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import algo  # noqa: E402
 import trainer_base  # noqa: E402
+from mask_schedule import ClippedMaskSchedule  # noqa: E402
 
 
 class ScheduleStub:
@@ -21,6 +22,7 @@ class ScheduleStub:
 
   def __init__(self, values, **overrides):
     config = {
+      'is_distill': True,
       'high_mask_fraction': 0.0,
       'high_mask_min': 0.7,
       'high_mask_max': 1.0,
@@ -96,9 +98,41 @@ def test_invalid_settings_fail_loudly():
       raise AssertionError(f'invalid settings were accepted: {overrides}')
 
 
+def test_clipped_generator_schedule_preserves_stratification_and_rng():
+  base = torch.linspace(0.001, 1.0, 64)
+  stub = ScheduleStub(base, mask_schedule={
+    'mode': 'clipped', 'min': 0.45, 'max': 0.95})
+  stub._mask_schedule = ClippedMaskSchedule.from_config(
+    stub.config.adversarial_distill, sampling_eps=0.001,
+    noise_eps=stub.noise.eps)
+  torch.manual_seed(13)
+  before = torch.random.get_rng_state()
+  actual = sample(stub)
+  after = torch.random.get_rng_state()
+  mask_probability = (1.0 - stub.noise.eps) * actual
+  assert torch.allclose(mask_probability, torch.linspace(0.45, 0.95, 64))
+  assert torch.equal(before, after)
+
+
+def test_original_schedule_keeps_existing_mixture():
+  stub = ScheduleStub(
+    torch.full((1024,), 0.1), high_mask_fraction=0.5,
+    mask_schedule={'mode': 'original'})
+  torch.manual_seed(17)
+  expected = sample(stub)
+  stub._mask_schedule = ClippedMaskSchedule.from_config(
+    stub.config.adversarial_distill, sampling_eps=0.001,
+    noise_eps=stub.noise.eps)
+  torch.manual_seed(17)
+  actual = sample(stub)
+  assert torch.equal(actual, expected)
+
+
 if __name__ == '__main__':
   test_disabled_is_exact_and_consumes_no_rng()
   test_full_mixture_respects_mask_probability_interval()
   test_partial_mixture_preserves_requested_share()
   test_invalid_settings_fail_loudly()
-  print('4/4 passed')
+  test_clipped_generator_schedule_preserves_stratification_and_rng()
+  test_original_schedule_keeps_existing_mixture()
+  print('6/6 passed')

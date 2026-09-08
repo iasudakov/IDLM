@@ -79,6 +79,11 @@ class TrainerBase(L.LightningModule):
     super().__init__()
     self.save_hyperparameters()
     self.config = config
+    mask_schedule_cfg = config.adversarial_distill.get('mask_schedule', {}) or {}
+    if (hasattr(mask_schedule_cfg, 'get')
+        and mask_schedule_cfg.get('mode', 'original') != 'original'
+        and config.algo.name != 'mdlm'):
+      raise ValueError('adversarial_distill.mask_schedule requires algo=mdlm')
     if hasattr(self.config.algo, 'ignore_bos'):
       self.ignore_bos = config.algo.ignore_bos
     else:

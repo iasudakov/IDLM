@@ -145,6 +145,44 @@ HIGH_MASK_FRACTION=0.5 HIGH_MASK_MIN=0.7 HIGH_MASK_MAX=1.0 \
 The default fraction is zero, so existing runs are unchanged. MMD runs log the
 realized whole-sequence fraction as `mmd/generator_mask_fraction`.
 
+An alternative is the [BD3-LMs clipped masking schedule](https://arxiv.org/abs/2503.09573).
+`MASK_SCHEDULE=clipped` samples every generator row's masking probability
+uniformly inside a fixed interval, preserving stratification across devices
+and accumulation steps:
+
+```bash
+OWT_CACHE=/path/to/owt MASK_SCHEDULE=clipped MASK_MIN=0.45 MASK_MAX=0.95 \
+  bash scripts/train_owt_distill.sh
+```
+
+Use `MASK_SCHEDULE=adaptive` to select the interval during validation:
+
+```bash
+OWT_CACHE=/path/to/owt MASK_SCHEDULE=adaptive MASK_SEARCH_BATCHES=4 \
+  bash scripts/train_owt_distill.sh
+```
+
+These options also apply to existing MMD/DMD combination commands. Direct
+Hydra equivalents are `adversarial_distill.mask_schedule.mode`, `.min`, `.max`,
+and `.search_batches`. Override `.search_intervals` with a list of `[min,max]`
+pairs to change the candidates. Adaptive mode starts from `.min`/`.max`, then
+chooses the lowest pooled **per-sequence student denoising-loss variance**
+over the first few validation batches, with one extra forward per candidate
+per batch. This is a BD3-LMs-inspired proxy, not measured MMD gradient variance;
+it does not assume that larger masking rates are always better. Sanity checks,
+step-zero validation, and standalone evaluation do not update the schedule.
+The selected bounds and proxy are logged under `mask_schedule/*` and restored
+from checkpoints when the schedule settings match.
+
+The default `original` mode preserves the existing sampler and high-mask
+mixture. For `clipped`/`adaptive`, use `HIGH_MASK_FRACTION=0` and disable
+`adversarial_distill.generator_force_full_mask`. Only the corruption used to
+produce student samples changes, including samples used to train the fake
+critic; teacher/fake loss corruption, evaluation NLL, and generation remain
+unchanged. Bounds refer to **expected** masking probabilities: mask patterns
+are still Bernoulli draws, without blockwise rejection resampling. The
+log-linear schedule caps a requested maximum of 1 at 0.999 before drawing.
+
 #### DUO teacher → IDLM-Duo student
 
 ```bash

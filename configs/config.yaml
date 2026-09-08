@@ -265,6 +265,29 @@ adversarial_distill:
   high_mask_min: 0.7
   high_mask_max: 1.0
 
+  # BD3-LMs-style clipping of the generator's expected masking probability.
+  # original keeps the sampler/high-mask mixture above; clipped uses a fixed
+  # interval; adaptive selects an interval by held-out per-sequence denoising
+  # loss variance (a proxy, not MMD gradient variance). Only generator input
+  # corruption changes. Use high_mask_fraction=0 and generator_force_full_mask=False.
+  # Bounds are intersected with the log-linear noise support, so max=1 means
+  # 0.999 here. Actual mask counts remain Bernoulli draws, without rejection.
+  mask_schedule:
+    mode: original
+    min: 0.45
+    max: 0.95
+    # Extra student forwards per candidate on this many validation batches;
+    # ordinary validation NLL continues using the original full range.
+    search_batches: 4
+    search_intervals:
+      - [0.001, 1.0]
+      - [0.1, 0.6]
+      - [0.2, 0.7]
+      - [0.3, 0.8]
+      - [0.4, 0.9]
+      - [0.45, 0.95]
+      - [0.5, 1.0]
+
   # --- Generator input-noise conditioning (D-MMD Sec. 6.5) -------------------
   # A masked-diffusion generator is a DETERMINISTIC function of its masked
   # input, and its tokens are drawn independently per position. That

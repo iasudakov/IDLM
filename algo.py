@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 import trainer_base
+from mask_schedule import DistillMaskScheduleMixin
 import utils
 import hydra.utils
 import models
@@ -448,7 +449,7 @@ def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden,
     warmup_steps=warmup_steps, hold_rms=hold_rms)
 
 
-class MDLM(trainer_base.AbsorbingState):
+class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
     self._validate_configuration()
@@ -790,6 +791,9 @@ class MDLM(trainer_base.AbsorbingState):
     the historical schedule.
     """
     t = self._sample_t(n, current_accumulation_step)
+    schedule = getattr(self, '_mask_schedule', None)
+    if schedule is not None and schedule.mode != 'original':
+      return schedule.sample(t)
     cfg = self.config.adversarial_distill
     fraction = float(cfg.get('high_mask_fraction', 0.0))
     minimum = float(cfg.get('high_mask_min', 0.7))

@@ -53,6 +53,7 @@ GLOBAL_BATCH="${GLOBAL_BATCH:-512}"
 echo "devices=${NUM_GPUS} batch_size=${BATCH_SIZE} global_batch=${GLOBAL_BATCH}" \
      "-> accum_batches $(python -c "import math;print(math.ceil(${GLOBAL_BATCH}/(${NUM_GPUS}*${BATCH_SIZE})))") per optimizer step" \
      "| high_mask=${HIGH_MASK_FRACTION:-0.0}@${HIGH_MASK_MIN:-0.7}-${HIGH_MASK_MAX:-1.0}"
+echo "mask_schedule=${MASK_SCHEDULE:-original} interval=${MASK_MIN:-0.45}-${MASK_MAX:-0.95} search_batches=${MASK_SEARCH_BATCHES:-4}"
 
 # --- tracker ---------------------------------------------------------- #
 
@@ -85,6 +86,10 @@ python -u -m main \
   adversarial_distill.high_mask_fraction="${HIGH_MASK_FRACTION:-0.0}" \
   adversarial_distill.high_mask_min="${HIGH_MASK_MIN:-0.7}" \
   adversarial_distill.high_mask_max="${HIGH_MASK_MAX:-1.0}" \
+  adversarial_distill.mask_schedule.mode="${MASK_SCHEDULE:-original}" \
+  adversarial_distill.mask_schedule.min="${MASK_MIN:-0.45}" \
+  adversarial_distill.mask_schedule.max="${MASK_MAX:-0.95}" \
+  adversarial_distill.mask_schedule.search_batches="${MASK_SEARCH_BATCHES:-4}" \
   trainer.val_check_interval=1500 \
   trainer.limit_val_batches=0.01 \
   logger.experiment="${EXPERIMENT}" \
