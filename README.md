@@ -183,6 +183,34 @@ unchanged. Bounds refer to **expected** masking probabilities: mask patterns
 are still Bernoulli draws, without blockwise rejection resampling. The
 log-linear schedule caps a requested maximum of 1 at 0.999 before drawing.
 
+For sentence-level MMD with the AR critic, add these overrides to an existing
+OWT MMD training command to use the **last token's hidden state** instead of
+the mean over scored (usually masked) positions:
+
+```bash
+adversarial_distill.mmd_reward_type=feature \
+adversarial_distill.mmd_feature_source=ar \
+adversarial_distill.mmd_kernel_level=sentence \
+adversarial_distill.mmd_sentence_pooling=last_token
+```
+
+On packed OWT this reads position `model.length - 1`, even if it was not
+masked; it does not read the last masked token or stop at an internal EOS.
+The critic still processes the full sequence, so a contextual AR layer's final
+hidden state can represent changes earlier in the sequence. Layer `-1` is only
+the input embedding and cannot summarize the prefix; the default middle block
+is contextual.
+
+Keep your existing kernel/source/draw-count settings. This option works with
+both `rows` and `draws` under their existing kernel restrictions (for example,
+`pseudo_huber` still requires `draws`). Estimators and loss normalization are
+unchanged: sentence `draws` still uses the unbiased fake-pair correction for
+K > 1 and the biased fallback for K = 1. `mmd_score_positions` does not move
+the last-token readout, and only masked/written positions carry the REINFORCE
+gradient. Omit the new option or set `mmd_sentence_pooling=mean` to retain the
+previous behavior. Diffusion features and token-level kernels do not support
+`last_token`.
+
 #### DUO teacher → IDLM-Duo student
 
 ```bash

@@ -131,12 +131,12 @@ adversarial_distill:
   #   token    -- every scored position of the kernel row (the default and the
   #               historical behaviour). The distribution being matched is
   #               over token features.
-  #   sentence -- mean-pool each sequence over its own scored positions first,
-  #               then apply the kernel to the resulting sentence vectors.
+  #   sentence -- read one feature vector per sequence using
+  #               `mmd_sentence_pooling`, then apply the kernel to those vectors.
   #
-  # In `rows` mode, linear token/sentence levels agree whenever every sequence
-  # in a row has the same scored count; otherwise token pooling weights a
-  # sequence by how much was scored while sentence pooling weights every
+  # With mean pooling in `rows` mode, linear token/sentence levels agree when
+  # every sequence in a row has the same scored count; otherwise token pooling
+  # weights a sequence by how much was scored while sentence pooling weights every
   # sequence alike. Sentence-level RBF in rows mode still needs K >= 2 because
   # both empirical sides contain K independently observed batch rows.
   #
@@ -147,6 +147,18 @@ adversarial_distill:
   # biased empirical estimate because no off-diagonal fake pair exists.
   # Unlike rows mode, sentence-level RBF is therefore valid at K = 1.
   mmd_kernel_level: token
+  # Sentence representation (`mmd_kernel_level: sentence`):
+  #   mean       -- average over `mmd_score_positions` (historical default).
+  #   last_token -- AR hidden state at the last content token, even if that
+  #                 token was NOT masked/written. For packed OWT this is always
+  #                 position length-1, not the last masked token or first EOS.
+  #                 Requires mmd_feature_source: ar and mmd_reward_type: feature.
+  # This changes only the sequence readout, for both rows and draws and their
+  # existing kernels; estimators, layer weights and loss normalization stay
+  # unchanged. All tokens still go through the AR critic. A contextual block
+  # (`mmd_feature_layer >= 0`, or null for middle) sees the preceding tokens;
+  # layer -1 is only an input embedding and has no prefix context.
+  mmd_sentence_pooling: mean
   # What FILLS the kernel batch, i.e. where the `mmd_kernel_batch_size` samples
   # come from.
   #   rows  -- adjacent sequences of the batch (the default and the historical
@@ -158,10 +170,9 @@ adversarial_distill:
   #            one state. Each REINFORCE candidate becomes that whole set
   #            rather than a single sample. Token level compares n real token
   #            features with K*n fake token features. Sentence level first
-  #            average-pools each complete sequence over its configured scored
-  #            positions (`written` by default), then compares one fixed real
-  #            vector with K fake vectors. No reward is shared between batch
-  #            rows, so attribution stays intact.
+  #            reads each sequence via `mmd_sentence_pooling`, then compares
+  #            one fixed real vector with K fake vectors. No reward is shared
+  #            between batch rows, so attribution stays intact.
   #
   # `draws` needs a critic with `multi_draw_reward`, which the feature critics
   # have and `mmd_reward_type: idlm` does not. It costs `mmd_group_size *
@@ -191,6 +202,8 @@ adversarial_distill:
   # Which positions the reward is measured over. The student only ever WRITES
   # the masked ones, and the REINFORCE surrogate always sums log-probabilities
   # over exactly those -- this changes only what the critic looks at.
+  # For sentence pooling `last_token`, this does not choose the readout
+  # position: the endpoint comes from the full content span instead.
   #   written -- the masked span alone (the default, and the historical
   #              behaviour). Outside it the generated row IS the clean row, so
   #              this is the span the two sequences actually differ on.

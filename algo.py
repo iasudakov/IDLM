@@ -914,6 +914,16 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         raise ValueError('adversarial_distill.mmd_kernel=pseudo_huber requires '
                          'mmd_kernel_source=draws, mmd_kernel_level=sentence '
                          'and mmd_reward_type=feature')
+      source = getattr(cfg, 'mmd_feature_source', 'ar')
+      sentence_pooling = str(cfg.get('mmd_sentence_pooling', 'mean'))
+      if sentence_pooling not in ('mean', 'last_token'):
+        raise ValueError('adversarial_distill.mmd_sentence_pooling must be '
+                         f'mean|last_token, got {sentence_pooling!r}')
+      if sentence_pooling == 'last_token' and (
+          kind != 'feature' or source != 'ar' or level != 'sentence'):
+        raise ValueError('adversarial_distill.mmd_sentence_pooling=last_token '
+                         'requires mmd_reward_type=feature, '
+                         'mmd_feature_source=ar and mmd_kernel_level=sentence')
       if kind == 'idlm':
         # Scores samples by the teacher/fake ratio instead of by feature
         # distance to x0, so no feature map is built at all.
@@ -922,7 +932,6 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
               f'reward, group={cfg.mmd_group_size}, '
               f'weight={cfg.mmd_reward_weight}', flush=True)
         return self._mmd_critic_cached
-      source = getattr(cfg, 'mmd_feature_source', 'ar')
       if source == 'ar':
         # `kuleshov-group/owt-ar`: a causal DiT trained on the student's exact
         # corpus and vocabulary. Independent of the model being distilled,
@@ -953,6 +962,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
                          f'ar|diffusion, got {source!r}')
       self._mmd_critic_cached.kernel = kernel
       self._mmd_critic_cached.kernel_level = level
+      self._mmd_critic_cached.sentence_pooling = sentence_pooling
       self._mmd_critic_cached.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
       self._mmd_critic_cached.rbf_block_size = int(
         cfg.get('mmd_rbf_block_size', 0) or 0)
@@ -965,6 +975,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       print(f'[mmd] {what}, block '
             f'{self._mmd_critic_cached.layer_description}, '
             f'{kernel} kernel over {level}s, '
+            f'sentence_pooling={sentence_pooling}, '
             f'{kernel_batch}, '
             f'group={cfg.mmd_group_size}, '
             f'weight={cfg.mmd_reward_weight}', flush=True)
@@ -1028,7 +1039,11 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       baseline=str(cfg.get('mmd_baseline', 'auto')),
       scored=scored,
       kernel_source=str(cfg.get('mmd_kernel_source', 'rows')),
-      kernel_draws=max(1, int(cfg.get('mmd_kernel_batch_size', 1) or 1)))
+      kernel_draws=max(1, int(cfg.get('mmd_kernel_batch_size', 1) or 1)),
+      # Keep the endpoint independent of the written/scored span. Packed OWT
+      # includes every position, even document-separator EOS tokens.
+      sequence_mask=(content if cfg.get('mmd_sentence_pooling', 'mean')
+                     == 'last_token' else None))
     stats['mmd/generator_mask_fraction'] = (
       selected.sum().to(student_probs.dtype)
       / content.sum().clamp_min(1).to(student_probs.dtype)).detach()

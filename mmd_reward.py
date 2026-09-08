@@ -256,6 +256,42 @@ def pool_over_selected(features, selected):
   return (features.float() * weight).sum(dim=1) / denom, selected.any(dim=1)
 
 
+def pool_sentence_features(features, selected, pooling='mean',
+                           sequence_mask=None):
+  """Represent a sequence by its scored mean or its final valid AR feature.
+
+  `selected` controls activity, not the endpoint in `last_token` mode. The
+  endpoint is the last True position in `sequence_mask`, or the final physical
+  position when no mask is supplied (packed OWT). It need not have been written
+  by the student: its causal hidden state sees the preceding changed tokens.
+  The same endpoint is used for the clean sequence and every generated draw.
+  Empty scored/valid rows return zero and are inactive. `sequence_mask` only
+  chooses the readout position; it must not hide the prompt from AR attention.
+  """
+  if pooling not in ('mean', 'last_token'):
+    raise ValueError('mmd_sentence_pooling must be mean|last_token, got '
+                     f'{pooling!r}')
+  if features.ndim != 3 or selected.shape != features.shape[:2]:
+    raise ValueError('sentence pooling expects (batch, length, hidden) '
+                     'features and a matching (batch, length) selected mask')
+  if sequence_mask is not None and sequence_mask.shape != selected.shape:
+    raise ValueError(f'sequence mask must be {tuple(selected.shape)}, got '
+                     f'{tuple(sequence_mask.shape)}')
+  if pooling == 'mean':
+    return pool_over_selected(features, selected)
+
+  batch, length, hidden = features.shape
+  valid = (torch.ones_like(selected, dtype=torch.bool)
+           if sequence_mask is None else sequence_mask.bool())
+  active = selected.bool().any(dim=1) & valid.any(dim=1)
+  if length == 0:
+    return features.new_zeros((batch, hidden), dtype=torch.float32), active
+  positions = torch.arange(length, device=features.device).expand(batch, -1)
+  last = positions.masked_fill(~valid, -1).max(dim=1).values.clamp_min(0)
+  pooled = features[torch.arange(batch, device=features.device), last].float()
+  return torch.where(active.unsqueeze(-1), pooled, torch.zeros_like(pooled)), active
+
+
 def sequence_pooled_delta(clean, generated, selected):
   """Mean-pool both feature streams over `selected`, and subtract.
 
@@ -398,7 +434,8 @@ def merge_kernel_rows(clean, generated, selected, rows_of):
 
 def paired_sequence_reward(clean, generated, selected, kernel='linear',
                            alpha=None, block_size=0, rows_of=1,
-                           level='token'):
+                           level='token', sentence_pooling='mean',
+                           sequence_mask=None):
   """One reward per sequence; rows selecting nothing score zero.
 
   `kernel='linear'` is the historical name for pooling both sides and scoring
@@ -407,8 +444,8 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
   `rbf_sequence_reward`.
 
   `level` chooses what one sample is. `token` (the default) hands the kernel
-  every scored POSITION of the row. `sentence` mean-pools each sequence first
-  and hands it the row's `rows_of` SENTENCE vectors instead.
+  every scored POSITION of the row. `sentence` represents each sequence by
+  `sentence_pooling` and hands it the row's `rows_of` SENTENCE vectors instead.
 
   `rows_of > 1` computes the statistic over that many sequences at once (see
   `merge_kernel_rows`) and hands every sequence in a row its row's reward.
@@ -421,12 +458,11 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
                      'mmd_kernel_source=draws and mmd_kernel_level=sentence')
   batch = clean.shape[0]
   if level == 'sentence':
-    # One sample per SEQUENCE: mean-pool it over its own scored positions
-    # first, then let the kernel see the row's `rows_of` sentence vectors as
-    # its sample set. Token level instead hands the kernel every scored
-    # position of the row.
+    # One sample per SEQUENCE: read out its sentence representation first,
+    # then let the kernel see the row's `rows_of` sentence vectors as its
+    # sample set. Token level instead hands it every scored position.
     #
-    # For the linear kernel this is the same reward whenever the sequences in a
+    # With mean pooling, linear gives the same reward whenever the sequences in a
     # row carry equal numbers of scored positions, since a mean of means then
     # equals the pooled mean -- exactly so at `rows_of=1`. It differs when the
     # counts differ, because pooling weights a sequence by its length while
@@ -441,8 +477,10 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
       raise ValueError(
         f'mmd_kernel_batch_size={rows_of} does not divide the batch size '
         f'{batch}; a row would straddle the end of the batch')
-    clean_m, active_seq = pool_over_selected(clean, selected)
-    gen_m, _ = pool_over_selected(generated, selected)
+    clean_m, active_seq = pool_sentence_features(
+      clean, selected, pooling=sentence_pooling, sequence_mask=sequence_mask)
+    gen_m, _ = pool_sentence_features(
+      generated, selected, pooling=sentence_pooling, sequence_mask=sequence_mask)
     rows = batch // rows_of
     clean = clean_m.reshape(rows, rows_of, -1)
     generated = gen_m.reshape(rows, rows_of, -1)
@@ -471,7 +509,8 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
 
 def summed_paired_reward(features, batch, selected, indices, weights,
                          kernel='linear', alpha=None, block_size=0,
-                         rows_of=1, level='token'):
+                         rows_of=1, level='token', sentence_pooling='mean',
+                         sequence_mask=None):
   """`R = sum_l w_l * R_l` over the requested blocks.
 
   Args:
@@ -483,7 +522,7 @@ def summed_paired_reward(features, batch, selected, indices, weights,
 
   Summing rather than, say, averaging keeps a single-block config numerically
   identical to what it was before multi-block support existed. `active` depends
-  only on `selected`, so it is the same for every block.
+  only on the masks, so it is the same for every block.
 
   Returns `(reward, active, per_layer)`; `per_layer` is unweighted, for logging.
   """
@@ -492,7 +531,8 @@ def summed_paired_reward(features, batch, selected, indices, weights,
     stacked = features[index]
     reward, active = paired_sequence_reward(
       stacked[:batch], stacked[batch:], selected, kernel=kernel,
-      alpha=alpha, block_size=block_size, rows_of=rows_of, level=level)
+      alpha=alpha, block_size=block_size, rows_of=rows_of, level=level,
+      sentence_pooling=sentence_pooling, sequence_mask=sequence_mask)
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight
   return total, active, per_layer
@@ -584,14 +624,15 @@ def pseudo_huber_mmd2_fixed_real(real, fake):
 
 def summed_multi_draw_reward(features, batch, draw_count, length, selected,
                              indices, weights, kernel='linear', alpha=None,
-                             block_size=0, level='token'):
+                             block_size=0, level='token',
+                             sentence_pooling='mean', sequence_mask=None):
   """Score K draws from each state as one feature distribution.
 
   ``features`` contains the clean batch followed by K generated batches.
   ``level='token'`` retains the historical multi-draw estimator: one side has
   ``n_scored`` real token features and the other ``K * n_scored`` fake token
-  features. ``level='sentence'`` first mean-pools every sequence over its own
-  scored positions, yielding one fixed real vector and K fake vectors.
+  features. ``level='sentence'`` reads every sequence using ``sentence_pooling``
+  (a scored-position mean by default), yielding one fixed real and K fake vectors.
 
   At sentence level all three kernels use the same estimator rule. K > 1 removes
   fake self-pairs and is unbiased over draws conditional on the fixed real
@@ -624,10 +665,13 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
     fake_by_draw = hidden[batch:].reshape(draw_count, batch, length, -1)
 
     if level == 'sentence':
-      real_sentence, real_active = pool_over_selected(real, selected)
-      fake_sentence, fake_active = pool_over_selected(
+      real_sentence, real_active = pool_sentence_features(
+        real, selected, pooling=sentence_pooling, sequence_mask=sequence_mask)
+      fake_sentence, fake_active = pool_sentence_features(
         fake_by_draw.reshape(draw_count * batch, length, -1),
-        selected.repeat(draw_count, 1))
+        selected.repeat(draw_count, 1), pooling=sentence_pooling,
+        sequence_mask=(None if sequence_mask is None else
+                       sequence_mask.repeat(draw_count, 1)))
       fake_sentence = fake_sentence.reshape(
         draw_count, batch, -1).permute(1, 0, 2)
       layer_active = real_active & fake_active.reshape(
@@ -728,6 +772,7 @@ class _LayeredFeatures:
   # maps get the plumbing instead of each threading its own copy.
   kernel = 'linear'
   kernel_level = 'token'
+  sentence_pooling = 'mean'
   rbf_alpha = None
   rbf_block_size = 0
   kernel_batch_size = 1
@@ -768,6 +813,12 @@ class FrozenARFeatures(_LayeredFeatures):
   than clamped to an arbitrary row. Those positions are excluded from `selected`
   anyway; the remap only keeps the forward legal, and because attention is
   causal it cannot disturb any earlier position's features.
+
+  For sentence `last_token` readout, `sequence_mask` chooses the endpoint
+  independently of the scored positions. If omitted, an existing 2-D
+  `attention_mask` also serves as the padding mask for endpoint selection;
+  without either mask the final physical position is read. A supplied
+  `sequence_mask` never changes the attention mask sent to the model.
   """
 
   def __init__(self, model_name, layer_index=None, device='cuda',
@@ -798,7 +849,8 @@ class FrozenARFeatures(_LayeredFeatures):
 
   @torch.no_grad()
   def multi_draw_reward(self, clean_tokens, draws, selected, eos_id,
-                        attention_mask=None, return_per_layer=False):
+                        attention_mask=None, return_per_layer=False,
+                        sequence_mask=None):
     """Compare K generated answers from one state with its clean answer."""
     if draws.ndim != 3:
       raise ValueError('multi_draw_reward expects (K, batch, length) draws, '
@@ -821,14 +873,17 @@ class FrozenARFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_multi_draw_reward(
       feats, batch, draw_count, length, selected, self.resolved_layers,
       self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
-      block_size=self.rbf_block_size, level=self.kernel_level)
+      block_size=self.rbf_block_size, level=self.kernel_level,
+      sentence_pooling=self.sentence_pooling,
+      sequence_mask=(attention_mask if sequence_mask is None else sequence_mask))
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
 
   @torch.no_grad()
   def paired_reward(self, clean_tokens, generated_tokens, selected,
-                    eos_id, attention_mask=None, return_per_layer=False):
+                    eos_id, attention_mask=None, return_per_layer=False,
+                    sequence_mask=None):
     """Per-sequence reward comparing a generated answer against the clean one.
 
     Both rows go through the *same* forward so they share a kernel launch and
@@ -850,7 +905,8 @@ class FrozenARFeatures(_LayeredFeatures):
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
-      level=self.kernel_level)
+      level=self.kernel_level, sentence_pooling=self.sentence_pooling,
+      sequence_mask=(attention_mask if sequence_mask is None else sequence_mask))
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
@@ -859,12 +915,12 @@ class FrozenARFeatures(_LayeredFeatures):
 def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
                        group_size, eos_id, reward_weight=1.0,
                        baseline='auto', scored=None, kernel_source='rows',
-                       kernel_draws=1):
+                       kernel_draws=1, sequence_mask=None):
   """REINFORCE loss driving the student toward the clean answer's AR features.
 
   `group_size` hard answers are drawn from the student's differentiable
   one-step prediction at the *same* state; each is scored against the clean
-  `x0` by pooling the frozen AR's features over the generated positions, and
+  `x0` using the configured frozen AR feature representation, and
   the group's leave-one-out mean is the baseline. Gradient reaches the student
   only through `log p(sampled token)` -- the sampling is not differentiable,
   which is the whole reason for a score estimator rather than a
@@ -892,6 +948,9 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
       representation rather than only the span itself. It must never be used
       for the log-prob sum -- the student did not write those positions and
       cannot be credited or blamed for them directly.
+    sequence_mask: `(batch, length)` bool, or None for all positions. In
+      sentence `last_token` mode, selects the sequence endpoint independently
+      of `scored`. This never changes sampling, attention, or log-probabilities.
     critic: a `FrozenARFeatures`.
     group_size: samples per state. At >= 2 the group's own leave-one-out mean
       is the baseline. At 1 there is no second sample at the same state, so
@@ -929,6 +988,15 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
   if scored.shape != selected.shape:
     raise ValueError(f'scored mask must be {tuple(selected.shape)}, got '
                      f'{tuple(scored.shape)}')
+  if sequence_mask is not None and sequence_mask.shape != selected.shape:
+    raise ValueError(f'sequence mask must be {tuple(selected.shape)}, got '
+                     f'{tuple(sequence_mask.shape)}')
+  # Older/custom critics keep their original call signature. Only sentence
+  # endpoint readout needs a mask separate from the scored/written positions.
+  readout_kwargs = {}
+  if (getattr(critic, 'sentence_pooling', 'mean') == 'last_token'
+      and sequence_mask is not None):
+    readout_kwargs['sequence_mask'] = sequence_mask
 
   if kernel_source not in ('rows', 'draws'):
     raise ValueError('mmd_kernel_source must be rows|draws, got '
@@ -973,10 +1041,10 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
         if multi:
           out = critic.multi_draw_reward(
             x0, blocks[group_index], scored, eos_id,
-            return_per_layer=True)
+            return_per_layer=True, **readout_kwargs)
         else:
           out = critic.multi_draw_reward(
-            x0, blocks[group_index], scored, eos_id)
+            x0, blocks[group_index], scored, eos_id, **readout_kwargs)
         member_reward, member_active = out[0], out[1]
         if multi:
           for index, value in out[2].items():
@@ -993,7 +1061,7 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
     else:
       for k in range(group_size):
         out = critic.paired_reward(x0, samples[k], scored, eos_id,
-                                   return_per_layer=multi)
+                                   return_per_layer=multi, **readout_kwargs)
         member_reward, member_active = out[0], out[1]
         if multi:
           for index, value in out[2].items():
@@ -1088,7 +1156,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
 
   @torch.no_grad()
   def multi_draw_reward(self, clean_tokens, draws, selected, eos_id,
-                        sigma=None, return_per_layer=False):
+                        sigma=None, return_per_layer=False, sequence_mask=None):
     """Compare K generated answers from one state with its clean answer."""
     del eos_id  # This backbone uses the student's vocabulary directly.
     if draws.ndim != 3:
@@ -1122,14 +1190,15 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_multi_draw_reward(
       feats, batch, draw_count, length, selected, self.resolved_layers,
       self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
-      block_size=self.rbf_block_size, level=self.kernel_level)
+      block_size=self.rbf_block_size, level=self.kernel_level,
+      sentence_pooling=self.sentence_pooling, sequence_mask=sequence_mask)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
 
   @torch.no_grad()
   def paired_reward(self, clean_tokens, generated_tokens, selected, eos_id,
-                    sigma=None, return_per_layer=False):
+                    sigma=None, return_per_layer=False, sequence_mask=None):
     """Per-sequence reward comparing a generated answer against the clean one."""
     del eos_id  # same vocabulary; nothing to remap
     if clean_tokens.shape != generated_tokens.shape:
@@ -1158,7 +1227,8 @@ class FrozenBackboneFeatures(_LayeredFeatures):
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
-      level=self.kernel_level)
+      level=self.kernel_level, sentence_pooling=self.sentence_pooling,
+      sequence_mask=sequence_mask)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
