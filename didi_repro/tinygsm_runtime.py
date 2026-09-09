@@ -85,6 +85,17 @@ def install_tinygsm_runtime(upstream_main):
                 },
             }
 
+        def initialize_teacher_checkpoint(self, checkpoint, source_path=None):
+            # Validate the entire native EMA before the common initializer can
+            # alter any model copy. Keep raw training/teacher/discriminator
+            # weights; only the evaluation EMA gets the saved MDLM average.
+            from .tinygsm_initialization import prepare_student_ema
+            ema_state, metadata = prepare_student_ema(self, checkpoint)
+            super().initialize_teacher_checkpoint(checkpoint, source_path)
+            self.student_ema.load_state_dict(ema_state, strict=True)
+            metadata['checkpoint'] = dict(self._didi_teacher_metadata)
+            self._didi_student_metadata = metadata
+
         def on_save_checkpoint(self, checkpoint):
             super().on_save_checkpoint(checkpoint)
             checkpoint['didi_tinygsm'] = self._conditional_checkpoint_metadata()

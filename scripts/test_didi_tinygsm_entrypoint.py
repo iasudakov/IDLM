@@ -88,6 +88,7 @@ class EntryTests(unittest.TestCase):
         self.assertEqual(training_protocol(cfg)['lr_warmup_steps'], 1000)
         self.assertEqual(training_protocol(cfg)['ema_beta'], .999)
         self.assertIsNone(cfg.didi_training.iterations)
+        self.assertEqual(cfg.didi_init.tinygsm_student_ema, 'checkpoint')
         self.assertEqual(cfg.data.separator, r'\n')
         self.assertFalse(cfg.didi_monitor.gm)
         self.assertFalse(cfg.didi_monitor.gen_ppl)
@@ -106,6 +107,17 @@ class EntryTests(unittest.TestCase):
                          'eval.compute_generative_perplexity=true'):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 prepare_config(self.config([override]))
+
+    def test_native_ema_initialization_option_is_tinygsm_specific(self):
+        default = prepare_config(self.config())
+        raw = prepare_config(self.config(['+didi_init.tinygsm_student_ema=raw']))
+        self.assertEqual(default.didi_init.tinygsm_student_ema, 'checkpoint')
+        self.assertEqual(raw.didi_init.tinygsm_student_ema, 'raw')
+        self.assertEqual(default.algo, raw.algo)
+        self.assertEqual(default.optim, raw.optim)
+        for value in ('student', 'none', 'true', 'null'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                prepare_config(self.config([f'+didi_init.tinygsm_student_ema={value}']))
 
     def test_unused_gpt2_tokenizer_is_not_loaded(self):
         with mock.patch('transformers.AutoTokenizer.from_pretrained',
@@ -220,8 +232,12 @@ class EntryTests(unittest.TestCase):
                                side_effect=AssertionError('unexpected download')):
                 initial = self.model_class(cfg, tokenizer)
                 teacher = copy.deepcopy(initial.backbone.state_dict())
-                torch.save({'state_dict': {f'backbone.{key}': value for key, value in teacher.items()}},
-                           cfg.training.finetune_path)
+                native_ema = [teacher[name].clone() + .007
+                              for name, _ in initial.backbone.named_parameters()]
+                torch.save({
+                    'state_dict': {f'backbone.{key}': value for key, value in teacher.items()},
+                    'ema': {'decay': .9999, 'num_updates': 12000, 'shadow_params': native_ema},
+                }, cfg.training.finetune_path)
                 patched_train = next(
                     cell.cell_contents for cell in self.upstream._train.__closure__
                     if getattr(cell.cell_contents, '__name__', None) == '_train')

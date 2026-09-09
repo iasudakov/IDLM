@@ -25,6 +25,11 @@ def prepare_tinygsm_config(config):
   if not is_tinygsm(config):
     return
   from omegaconf import open_dict
+  from .tinygsm_initialization import student_ema_source
+  with open_dict(config.didi_init):
+    if 'tinygsm_student_ema' not in config.didi_init:
+      config.didi_init.tinygsm_student_ema = 'checkpoint'
+  student_ema_source(config)
   defaults = {
     'tinygsm_exec': False, 'tinygsm_exec_timeout': 5.0,
     'gsm8k_at_validation': False, 'gsm8k_every_n_validations': 1,
@@ -130,6 +135,8 @@ def adaptation_record(config):
     'train_on_pad': bool(config.data.train_on_pad),
     'separator': config.data.separator,
     'training_settings': 'released DiDi defaults unless explicitly overridden',
-    'checkpoint': 'native TinyGSM MDLM backbone initializes student, teacher, EMA and discriminator trunk',
+    'checkpoint': 'native TinyGSM MDLM raw backbone initializes student, teacher and discriminator trunk',
+    'student_ema_initialization': config.get('didi_init', {}).get('tinygsm_student_ema', 'checkpoint'),
+    'student_ema_resume': 'saved DiDi student_ema tensors and initialization provenance take precedence',
     'evaluation': 'prefix-only generation and reference TinyGSM/S-FLM program grader',
   }

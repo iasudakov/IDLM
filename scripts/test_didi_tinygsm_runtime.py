@@ -26,7 +26,22 @@ class TinyGSMRuntimeTests(unittest.TestCase):
         cls.upstream = load_upstream()
         cls.owt_class = cls.upstream.algo.DiDiInstruct
         cls.model_class = install_tinygsm_runtime(cls.upstream)
-        cls.fixture = runtime_fixtures.DiDiRuntimeTests()
+        class TinyGSMTeacherFixture(runtime_fixtures.DiDiRuntimeTests):
+            def initialize(self, model):
+                teacher = {f'backbone.{key}': value.detach().clone() + .03
+                           for key, value in model.backbone.state_dict().items()}
+                # Native TinyGSM checkpoints carry separately trained EMA
+                # shadows. They must not silently be replaced by raw weights.
+                shadows = [teacher[f'backbone.{name}'].clone() + .007
+                           for name, _ in model.backbone.named_parameters()]
+                model.initialize_teacher_checkpoint({
+                    'state_dict': teacher,
+                    'ema': {'decay': .9999, 'num_updates': 12000,
+                            'shadow_params': shadows},
+                })
+                return teacher
+
+        cls.fixture = TinyGSMTeacherFixture()
         cls.fixture.upstream = cls.upstream
         cls.fixture.model_class = cls.model_class
 

@@ -70,6 +70,7 @@ DIDI_TINY_COMMAND=(python -u -m torch.distributed.run --standalone
   trainer.num_sanity_val_steps=0
   "+didi_eval.before_training=${EVAL_BEFORE_TRAINING:-true}"
   +didi_eval.weights=student_ema
+  +didi_init.tinygsm_student_ema=checkpoint
   "+didi_eval.sampler_source=${SAMPLER_SOURCE:-main}"
   "sampling.predictor=${SAMPLER:-guided}" "sampling.steps=${EVAL_STEPS:-16}"
   sampling.noise_removal=ancestral sampling.num_sample_batches=2
