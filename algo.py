@@ -537,7 +537,8 @@ class MDLM(trainer_base.AbsorbingState):
         self._mmd_critic_cached = mmd_reward.FrozenARFeatures(
           cfg.mmd_ar_model, layer_index=cfg.mmd_feature_layer,
           layer_weights=cfg.get('mmd_feature_layer_weights', None),
-          device=self.device)
+          device=self.device,
+          weights_dir=getattr(self.config, 'model_weights_dir', None))
         what = f'HF AR {cfg.mmd_ar_model}'
       else:
         raise ValueError('adversarial_distill.mmd_feature_source must be '

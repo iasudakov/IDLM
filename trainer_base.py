@@ -15,6 +15,7 @@ import confidence_sampling
 import dataloader
 import metrics
 import models
+from model_assets import pretrained_kwargs
 import utils
 from ipdb import set_trace as debug
 
@@ -125,7 +126,10 @@ class TrainerBase(L.LightningModule):
         pad_token_id=self.tokenizer.pad_token_id)
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
-        config.eval.checkpoint_path, trust_remote_code=True)
+        **pretrained_kwargs(
+          config.eval.checkpoint_path,
+          getattr(config, 'model_weights_dir', None)),
+        trust_remote_code=True)
 
     self.T = self.config.algo.T
     self.num_tokens = self.config.model.length
@@ -138,7 +142,8 @@ class TrainerBase(L.LightningModule):
       gen_ppl_eval_model_name_or_path=\
         self.config.eval.gen_ppl_eval_model_name_or_path,
       eval_ppl_batch_size=\
-        self.config.eval.perplexity_batch_size)
+        self.config.eval.perplexity_batch_size,
+      model_weights_dir=getattr(config, 'model_weights_dir', None))
 
     if self.config.training.ema > 0:
       self.ema = models.ema.ExponentialMovingAverage(
@@ -412,6 +417,11 @@ class TrainerBase(L.LightningModule):
         omegaconf.OmegaConf.to_container(self.config, resolve=True))
       cfg.data.valid = 'gsm8k_test'
       cfg.data.data_path = self.config.eval.gsm8k_data_path
+      weights_dir = getattr(self.config, 'model_weights_dir', None)
+      if weights_dir and not os.path.isfile(cfg.data.data_path):
+        bundled_path = os.path.join(weights_dir, 'data', 'gsm8k_test.json')
+        if os.path.isfile(bundled_path):
+          cfg.data.data_path = bundled_path
       cfg.data.separator = self.config.data.separator
       self._gsm8k_cached = dataloader.get_gsm8k_test_dataset(
         cfg, self.tokenizer)

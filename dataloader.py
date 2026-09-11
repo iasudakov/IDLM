@@ -18,6 +18,7 @@ import tokenizers
 import torch
 import transformers
 
+from model_assets import pretrained_kwargs
 import utils
 
 LOGGER = utils.get_logger(__name__)
@@ -858,16 +859,24 @@ class VocabSizeTokenizerWrapper:
 
 
 def get_tokenizer(config):
+  tokenizer_name = config.data.tokenizer_name_or_path
+  weights_dir = getattr(config, 'model_weights_dir', None)
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
   elif config.data.tokenizer_name_or_path == 'bert-base-uncased':
     tokenizer = transformers.BertTokenizer.\
-      from_pretrained('bert-base-uncased')
+      from_pretrained(**pretrained_kwargs(
+        tokenizer_name, weights_dir, kind='tokenizer'))
   elif config.data.tokenizer_name_or_path == 'synthetic':
     tokenizer = SyntheticTokenizer(vocab_size=256)
   else:
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-      config.data.tokenizer_name_or_path)
+      **pretrained_kwargs(tokenizer_name, weights_dir, kind='tokenizer'))
+
+  # Keep the logical tokenizer identity for cached datasets and integral files;
+  # the bundle directory changes where assets are read, not their identity.
+  if weights_dir and tokenizer_name not in ('text8', 'synthetic'):
+    tokenizer.name_or_path = tokenizer_name
 
   if (isinstance(tokenizer, transformers.GPT2TokenizerFast)
       or isinstance(tokenizer, transformers.GPT2Tokenizer)):

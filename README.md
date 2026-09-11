@@ -81,6 +81,29 @@ IDLM/
 ## Getting Started
 <a name="getting_started"></a>
 
+### Use a local TinyGSM model bundle
+
+Add these overrides to your TinyGSM training command:
+
+```bash
+model_weights_dir="$SOURCE_CODE_PATH/code/cache_dir/tinygsm_mmd_offline_bundle" \
+adversarial_distill.mmd_ar_model=checkpoints/tinygsm/ar_notok.ckpt
+```
+
+You can also use `/home/iasudakov/tinygsm_mmd_offline_bundle` directly.
+Keep `data.tokenizer_name_or_path=HuggingFaceTB/SmolLM-135M` and point
+`training.finetune_path` to your local MDLM checkpoint. With `model_weights_dir`
+set, model and tokenizer loaders use local files and report missing assets
+without downloading them. Leaving it unset preserves the existing loading
+behavior. Explicit local paths still work; native checkpoint paths can also be
+relative to the bundle. Tokenizer IDs and dataset cache names stay unchanged.
+
+The example bundle includes the AR checkpoint and the training and evaluation
+tokenizers. It does not include the MDLM checkpoint or GPT-2 Large model weights,
+so use `eval.compute_generative_perplexity=False` with this bundle. GSM8K
+validation uses the bundle's `data/gsm8k_test.json` if the configured local file
+is missing. Configure the TinyGSM training dataset cache separately.
+
 ### 1. Clone the repository
 
 ```bash

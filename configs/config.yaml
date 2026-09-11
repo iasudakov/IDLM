@@ -20,6 +20,10 @@ gsm8k:
 
 seed: 1
 
+# Optional local model/tokenizer bundle. With this set, model assets are loaded
+# from local files only; native checkpoint paths may be relative to the bundle.
+model_weights_dir: null
+
 adversarial_distill:
   is_distill: False
   # --- Paired AR feature reward (ported from yrOPDLM's rl-mmd branch) ---

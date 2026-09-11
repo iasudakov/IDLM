@@ -756,10 +756,12 @@ class FrozenARFeatures(_LayeredFeatures):
   """
 
   def __init__(self, model_name, layer_index=None, device='cuda',
-               dtype=torch.bfloat16, layer_weights=None):
+               dtype=torch.bfloat16, layer_weights=None, weights_dir=None):
     import transformers
+    from model_assets import pretrained_kwargs
     self.model = transformers.AutoModelForCausalLM.from_pretrained(
-      model_name, torch_dtype=dtype).to(device).eval()
+      **pretrained_kwargs(model_name, weights_dir),
+      torch_dtype=dtype).to(device).eval()
     for param in self.model.parameters():
       param.requires_grad_(False)
     self.vocab_size = int(self.model.config.vocab_size)
@@ -1169,7 +1171,10 @@ def load_ar_backbone(ckpt_path, config, tokenizer, device):
   import algo
   import omegaconf
   import utils
+  from model_assets import resolve_checkpoint
 
+  ckpt_path = resolve_checkpoint(
+    ckpt_path, getattr(config, 'model_weights_dir', None))
   if not os.path.exists(ckpt_path):
     raise FileNotFoundError(
       f'MMD AR checkpoint not found: {ckpt_path}\n'

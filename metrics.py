@@ -7,6 +7,8 @@ import torch.nn.functional as F
 import torchmetrics
 import transformers
 
+from model_assets import pretrained_kwargs
+
 LOG2 = math.log(2)
 
 
@@ -66,7 +68,7 @@ class Perplexity(NLL):
 
 class Metrics:
   def __init__(self, gen_ppl_eval_model_name_or_path=None,
-               eval_ppl_batch_size=None) -> None:
+               eval_ppl_batch_size=None, model_weights_dir=None) -> None:
     metrics = torchmetrics.MetricCollection({
         'nll': NLL(), 'bpd': BPD(), 'ppl': Perplexity()})
     metrics.set_dtype(torch.float64)
@@ -78,8 +80,10 @@ class Metrics:
     self.sample_entropy = torchmetrics.aggregation.MeanMetric()
     self.eval_ppl_batch_size = eval_ppl_batch_size
     self.gen_ppl_eval_model_name_or_path = gen_ppl_eval_model_name_or_path
+    self.model_weights_dir = model_weights_dir
     self.tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(gen_ppl_eval_model_name_or_path)
+      from_pretrained(**pretrained_kwargs(
+        gen_ppl_eval_model_name_or_path, model_weights_dir, kind='tokenizer'))
     if self.tokenizer.pad_token is None:
       self.tokenizer.pad_token = self.tokenizer.eos_token
       self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -170,7 +174,8 @@ class Metrics:
     
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     eval_model = transformers.AutoModelForCausalLM.from_pretrained(
-      self.gen_ppl_eval_model_name_or_path).eval()
+      **pretrained_kwargs(self.gen_ppl_eval_model_name_or_path,
+                          self.model_weights_dir)).eval()
     if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
       eval_model = eval_model.to(device)
     # Re-tokenize using eval model's tokenizer
