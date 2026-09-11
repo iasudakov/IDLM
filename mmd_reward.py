@@ -844,12 +844,10 @@ class FrozenARFeatures(_LayeredFeatures):
   """
 
   def __init__(self, model_name, layer_index=None, device='cuda',
-               dtype=torch.bfloat16, layer_weights=None, weights_dir=None):
+               dtype=torch.bfloat16, layer_weights=None):
     import transformers
-    from model_assets import pretrained_kwargs
     self.model = transformers.AutoModelForCausalLM.from_pretrained(
-      **pretrained_kwargs(model_name, weights_dir),
-      torch_dtype=dtype).to(device).eval()
+      model_name, torch_dtype=dtype).to(device).eval()
     for param in self.model.parameters():
       param.requires_grad_(False)
     self.vocab_size = int(self.model.config.vocab_size)
@@ -1296,45 +1294,7 @@ class _CausalBackboneAdapter(torch.nn.Module):
     return self.inner(input_ids=indices)
 
 
-def load_ar_backbone(ckpt_path, config, tokenizer, device):
-  """Load a frozen native AR checkpoint, including S-FLM's TinyGSM AR.
-
-  The native checkpoint uses this repo's causal DiT and the student's model
-  dimensions and tokenizer. Construct its private configuration without
-  inheriting the student's distillation or diffusion mask schedule.
-  """
-  # Import locally because algo accesses this module from its lazy MMD loader.
-  import algo
-  import omegaconf
-  import utils
-  from model_assets import resolve_checkpoint
-
-  ckpt_path = resolve_checkpoint(
-    ckpt_path, getattr(config, 'model_weights_dir', None))
-  if not os.path.isfile(ckpt_path):
-    raise FileNotFoundError(f'MMD AR checkpoint not found: {ckpt_path}')
-
-  cfg = omegaconf.OmegaConf.create(
-    omegaconf.OmegaConf.to_container(config, resolve=True))
-  cfg.algo.name = 'ar'
-  cfg.algo.backbone = 'dit'
-  cfg.algo.parameterization = 'ar'
-  cfg.algo.causal_attention = True
-  cfg.algo.time_conditioning = False
-  cfg.algo.T = 0
-  cfg.algo.subs_masking = False
-  cfg.adversarial_distill.is_distill = False
-  if cfg.adversarial_distill.get('mask_schedule'):
-    cfg.adversarial_distill.mask_schedule.mode = 'original'
-
-  model = algo.AR.load_from_checkpoint(
-    ckpt_path, tokenizer=tokenizer, config=cfg, weights_only=False)
-  model = model.to(device).eval()
-  utils.freeze_model(model)
-  return model.backbone
-
-
-def load_owt_ar_backbone(model_id_or_path, device, weights_dir=None):
+def load_owt_ar_backbone(model_id_or_path, device):
   """Load `kuleshov-group/owt-ar` as a frozen feature map.
 
   The OpenWebText analogue of the TinyGSM branch's S-FLM AR: a causal DiT
@@ -1354,9 +1314,7 @@ def load_owt_ar_backbone(model_id_or_path, device, weights_dir=None):
   import huggingface_hub
 
   from models import backbone_dit_legacy
-  from model_assets import resolve_pretrained_path
 
-  model_id_or_path = resolve_pretrained_path(model_id_or_path, weights_dir)
   if os.path.isdir(model_id_or_path):
     config_path = os.path.join(model_id_or_path, 'config.json')
     weights_path = os.path.join(model_id_or_path, 'pytorch_model.bin')

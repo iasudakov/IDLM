@@ -81,53 +81,6 @@ IDLM/
 ## Getting Started
 <a name="getting_started"></a>
 
-### Use existing model weights without downloading
-
-Add `model_weights_dir=/absolute/path/to/bundle` to your existing
-`python -m main` command. This works on both the OWT and TinyGSM branches.
-When supplied, model and tokenizer loaders use local files only and report a
-missing asset instead of downloading it. Leaving it unset preserves the normal
-loading behavior.
-
-For the OWT bundle, add:
-
-```bash
-model_weights_dir=/home/iasudakov/owt_mmd_offline_bundle
-```
-
-Keep the usual model IDs in your command:
-`eval.checkpoint_path=kuleshov-group/mdlm-owt`,
-`adversarial_distill.mmd_ar_model=kuleshov-group/owt-ar`,
-`data.tokenizer_name_or_path=gpt2`, and
-`eval.gen_ppl_eval_model_name_or_path=gpt2-large`. They resolve to the bundled
-MDLM, AR, GPT-2 tokenizer, and GPT-2 Large evaluation assets. Perplexity,
-temperature sweeps, and Gradient Moment share the local evaluation model.
-
-For a TinyGSM run with native AR features, add these overrides:
-
-```bash
-model_weights_dir=/home/iasudakov/tinygsm_mmd_offline_bundle \
-adversarial_distill.mmd_ar_model=checkpoints/tinygsm/ar_notok.ckpt
-```
-
-Keep `data.tokenizer_name_or_path=HuggingFaceTB/SmolLM-135M` and set
-`training.finetune_path` to your existing local MDLM checkpoint. This TinyGSM
-bundle includes the AR checkpoint and both required tokenizers; it does **not**
-include the MDLM checkpoint or GPT-2 Large model weights. Evaluation tokenizer
-initialization works without those GPT-2 weights; enabling generative
-perplexity or Gradient Moment requires a local copy of the evaluation model.
-
-The resolver reads `manifest.json` entries and `hf-cache` snapshots, or model
-directories named by repository ID or basename. Explicit absolute model and
-checkpoint paths remain supported, including paths outside the bundle. Native
-checkpoint paths can be relative to the bundle; existing paths relative to the
-launch directory take precedence. Relative bundle paths are resolved before
-Hydra changes directories. Quote an override when its path contains spaces.
-
-Tokenizer IDs stay unchanged, preserving vocabulary handling and dataset cache
-keys. This option controls model/tokenizer loading; keep configuring your
-existing local dataset cache separately.
-
 ### 1. Clone the repository
 
 ```bash

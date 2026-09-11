@@ -14,10 +14,6 @@ mode: train  # train / ppl_eval / sample_eval
 debug: False
 seed: 1
 
-# Optional local model/tokenizer bundle. When set, model loads use only local
-# files and fail on missing assets. Native checkpoint paths can be bundle-relative.
-model_weights_dir: null
-
 adversarial_distill:
   is_distill: False
 
@@ -70,9 +66,7 @@ adversarial_distill:
   #                measures the reward in the student's own feature space.
   mmd_feature_source: ar
 
-  # HF hub id (or a local dir with the same config.json / pytorch_model.bin),
-  # or a native TinyGSM .ckpt file. With model_weights_dir, checkpoint paths
-  # can be relative to the bundle, e.g. checkpoints/tinygsm/ar_notok.ckpt.
+  # HF hub id (or a local dir with the same config.json / pytorch_model.bin).
   # Loaded via the vendored `models/backbone_dit_legacy.py`, because the
   # published remote code imports transformers.models.qwen3, which this
   # environment's transformers 4.38.2 does not have.

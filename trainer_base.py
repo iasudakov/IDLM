@@ -14,7 +14,6 @@ import transformers
 import dataloader
 import metrics
 import models
-from model_assets import pretrained_kwargs
 import utils
 from ipdb import set_trace as debug
 
@@ -109,10 +108,7 @@ class TrainerBase(L.LightningModule):
         pad_token_id=self.tokenizer.pad_token_id)
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
-        **pretrained_kwargs(
-          config.eval.checkpoint_path,
-          getattr(config, 'model_weights_dir', None)),
-        trust_remote_code=True)
+        config.eval.checkpoint_path, trust_remote_code=True)
 
     self.T = self.config.algo.T
     self.num_tokens = self.config.model.length
@@ -127,8 +123,7 @@ class TrainerBase(L.LightningModule):
       gen_ppl_eval_model_name_or_path=\
         self.config.eval.gen_ppl_eval_model_name_or_path,
       eval_ppl_batch_size=\
-        self.config.eval.perplexity_batch_size,
-      model_weights_dir=getattr(config, 'model_weights_dir', None))
+        self.config.eval.perplexity_batch_size)
 
     if self.config.training.ema > 0:
       self.ema = models.ema.ExponentialMovingAverage(
