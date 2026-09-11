@@ -12,6 +12,7 @@ import torch
 
 import algo
 import dataloader
+import model_assets
 import nirvana_snapshot
 import owt_pareto_plot
 import pareto_temperature
@@ -170,7 +171,8 @@ def _load_from_checkpoint(diffusion_model, config, tokenizer):
     return model
   
   return diffusion_model.load_from_checkpoint(
-    config.eval.checkpoint_path,
+    model_assets.resolve_checkpoint(
+      config.eval.checkpoint_path, config.get('model_weights_dir')),
     tokenizer=tokenizer,
     config=config,
     weights_only=False)
@@ -570,9 +572,11 @@ def _train(diffusion_model, config, logger, tokenizer):
   _print_batch(train_ds, valid_ds, tokenizer)
 
   if config.training.finetune_path != '':
-    assert utils.fsspec_exists(config.training.finetune_path)
+    finetune_path = model_assets.resolve_checkpoint(
+      config.training.finetune_path, config.get('model_weights_dir'))
+    assert utils.fsspec_exists(finetune_path)
     model = diffusion_model.load_from_checkpoint(
-      config.training.finetune_path,
+      finetune_path,
       tokenizer=tokenizer,
       config=config,
       weights_only=False)
@@ -593,6 +597,8 @@ def _train(diffusion_model, config, logger, tokenizer):
             config_name='config')
 def main(config):
   """Main entry point for training."""
+  model_assets.configure_model_weights(
+    config, base_dir=hydra.utils.get_original_cwd())
   L.seed_everything(config.seed)
   # `save_cfg` writes a file into the run dir; under torchrun every rank shares
   # that dir, so let one of them write it rather than eight racing on it.

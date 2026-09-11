@@ -936,19 +936,23 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
               f'weight={cfg.mmd_reward_weight}', flush=True)
         return self._mmd_critic_cached
       if source == 'ar':
-        # `kuleshov-group/owt-ar`: a causal DiT trained on the student's exact
-        # corpus and vocabulary. Independent of the model being distilled,
-        # unlike the diffusion teacher, and it *did* see clean sequences --
-        # hence noise_level=0, since masking would inject a difference into a
-        # comparison meant to isolate what the student wrote.
-        backbone = mmd_reward.load_owt_ar_backbone(
-          str(cfg.mmd_ar_model), self.device)
+        # Both the native TinyGSM checkpoint and the published OWT AR read
+        # clean sequences on the student's vocabulary, hence noise_level=0.
+        ar_model = str(cfg.mmd_ar_model)
+        if ar_model.endswith('.ckpt'):
+          backbone = mmd_reward.load_ar_backbone(
+            ar_model, self.config, self.tokenizer, self.device)
+          what = f'AR checkpoint {ar_model} (clean, no masking)'
+        else:
+          backbone = mmd_reward.load_owt_ar_backbone(
+            ar_model, self.device,
+            weights_dir=getattr(self.config, 'model_weights_dir', None))
+          what = f'owt-ar {ar_model} (clean, no masking)'
         self._mmd_critic_cached = mmd_reward.FrozenBackboneFeatures(
           backbone, self.mask_index,
           layer_index=cfg.mmd_feature_layer,
           layer_weights=cfg.get('mmd_feature_layer_weights', None),
           noise_level=0.0)
-        what = f'owt-ar {cfg.mmd_ar_model} (clean, no masking)'
       elif source == 'diffusion':
         # The teacher is a frozen copy of the student taken before training:
         # already in memory, same vocabulary, and its features are about this
