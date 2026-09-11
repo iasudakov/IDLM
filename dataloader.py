@@ -18,7 +18,6 @@ import tokenizers
 import torch
 import transformers
 
-from model_assets import pretrained_kwargs
 import utils
 
 LOGGER = utils.get_logger(__name__)
@@ -269,6 +268,19 @@ class Text8Tokenizer(transformers.PreTrainedTokenizer):
     return self._vocab_str_to_int
 
 
+def _separator_tag(separator):
+  """Cache-key fragment for the question/answer separator.
+
+  The separator is baked into every tokenized example, so two runs that
+  disagree about it are two different datasets -- and they disagree easily:
+  `"\\n"` in YAML is one newline (SmolLM token 198) while `'\\n'` is the two
+  characters backslash-n (tokens 76, 94). Without this in the key, changing
+  the separator silently reuses the previous tokenization and the change has
+  no effect at all.
+  """
+  return 'sep' + ''.join(f'{byte:02x}' for byte in separator.encode('utf-8'))
+
+
 def get_tiny_gsm_dataset(config, tokenizer):
   """Download, tokenize, and split TinyGSM.
 
@@ -285,8 +297,10 @@ def get_tiny_gsm_dataset(config, tokenizer):
   pad_tag = '_train_on_pad' if config.data.train_on_pad else ''
   tokenizer_tag = config.data.tokenizer_name_or_path.replace('/', '__')
   dataset_tag = config.data.train
+  sep_tag = _separator_tag(config.data.separator)
   save_dir = (f'{config.data.cache_dir}/{dataset_tag}_bs{config.model.length}'
-              f'_{mask_tag}{filter_tag}{wrap_tag}{pad_tag}_{tokenizer_tag}')
+              f'_{mask_tag}{filter_tag}{wrap_tag}{pad_tag}_{tokenizer_tag}'
+              f'_{sep_tag}')
   split_names = ['train', 'validation']
 
   if all(utils.fsspec_exists(os.path.join(save_dir, split))
@@ -405,7 +419,9 @@ def get_tiny_gsm_dataset(config, tokenizer):
 def get_gsm8k_test_dataset(config, tokenizer):
   """Load and tokenize the local GSM8K/TinyGSM test set for conditional eval."""
   tokenizer_tag = config.data.tokenizer_name_or_path.replace('/', '__')
-  save_dir = f'{config.data.cache_dir}/gsm8k_test_{tokenizer_tag}_with_text'
+  sep_tag = _separator_tag(config.data.separator)
+  save_dir = (f'{config.data.cache_dir}/gsm8k_test_{tokenizer_tag}'
+              f'_{sep_tag}_with_text')
 
   if utils.fsspec_exists(save_dir):
     LOGGER.info(f'Loading GSM8K test from cache: {save_dir}')
@@ -842,24 +858,16 @@ class VocabSizeTokenizerWrapper:
 
 
 def get_tokenizer(config):
-  tokenizer_name = config.data.tokenizer_name_or_path
-  weights_dir = getattr(config, 'model_weights_dir', None)
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
   elif config.data.tokenizer_name_or_path == 'bert-base-uncased':
     tokenizer = transformers.BertTokenizer.\
-      from_pretrained(**pretrained_kwargs(
-        tokenizer_name, weights_dir, kind='tokenizer'))
+      from_pretrained('bert-base-uncased')
   elif config.data.tokenizer_name_or_path == 'synthetic':
     tokenizer = SyntheticTokenizer(vocab_size=256)
   else:
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-      **pretrained_kwargs(tokenizer_name, weights_dir, kind='tokenizer'))
-
-  # Keep the logical tokenizer identity for cached datasets and integral files;
-  # the bundle directory changes where assets are read, not their identity.
-  if weights_dir and tokenizer_name not in ('text8', 'synthetic'):
-    tokenizer.name_or_path = tokenizer_name
+      config.data.tokenizer_name_or_path)
 
   if (isinstance(tokenizer, transformers.GPT2TokenizerFast)
       or isinstance(tokenizer, transformers.GPT2Tokenizer)):

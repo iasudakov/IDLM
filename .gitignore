@@ -169,3 +169,25 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
+
+# Reproduction artifacts. All regenerable; see scripts/. NOTE: .gitignore has
+# no trailing-comment syntax -- `checkpoints/  # note` is a literal pattern and
+# silently ignores nothing, which is how ~300 GB of these sat untracked-but-
+# stageable until someone ran `git add -A`.
+checkpoints/
+eval_runs/
+outputs/
+cache_dir/
+cache_dir_cifar/
+sweep_mmd/
+# python scripts/make_gsm8k_test_json.py
+data/gsm8k_test.json
+
+# Nested working repos, each with its own history.
+yrOPDLM/
+yrELF/
+
+*.pdf
+
+# 4 GB of packed training data, rebuilt by the tinygsm prep scripts.
+*.tar

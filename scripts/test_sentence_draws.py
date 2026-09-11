@@ -167,38 +167,6 @@ def test_auto_bandwidth_uses_only_pooled_real_sentences():
   assert seen['selected'].tolist() == [[True], [False]]
 
 
-def test_owt_backbone_wrapper_forwards_sentence_level():
-  class IdentityBlock(torch.nn.Module):
-    def forward(self, hidden):
-      return hidden
-
-  class TinyBackbone(torch.nn.Module):
-    def __init__(self):
-      super().__init__()
-      self.embedding = torch.nn.Embedding(8, 3)
-      self.blocks = torch.nn.ModuleList([IdentityBlock()])
-
-    def forward(self, tokens, sigma):
-      del sigma
-      return self.blocks[0](self.embedding(tokens))
-
-  critic = mmd_reward.FrozenBackboneFeatures(
-    TinyBackbone(), mask_index=7, layer_index=0, noise_level=0.0)
-  critic.kernel_level = 'sentence'
-  critic.kernel = 'rbf'
-  critic.rbf_alpha = 0.2
-  clean = torch.tensor([[0, 1, 2], [2, 3, 4]])
-  draws = torch.tensor([[[0, 2, 2], [2, 4, 4]],
-                         [[1, 1, 2], [3, 3, 4]]])
-  selected = torch.tensor([[True, True, False],
-                           [True, False, True]])
-  reward, active = critic.multi_draw_reward(
-    clean, draws, selected, eos_id=None)
-  assert reward.shape == (2,)
-  assert active.tolist() == [True, True]
-  assert torch.isfinite(reward).all()
-
-
 def main():
   for name, fn in sorted(globals().items()):
     if name.startswith('test_'):

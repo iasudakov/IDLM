@@ -1,103 +1,37 @@
-import collections
+import gc
 import json
 import os
 
 import fsspec
 import hydra
 import lightning as L
+from lightning.fabric import Fabric
+import numpy as np
 import omegaconf
 import rich.syntax
 import rich.tree
 import torch
+from tqdm import trange
 
 import algo
 import dataloader
-import model_assets
-import nirvana_snapshot
-import owt_pareto_plot
-import pareto_temperature
+import sandbox_gsm8k
 import utils
 from ipdb import set_trace as debug
 
 torch.autograd.set_detect_anomaly(True)
 
-omegaconf.OmegaConf.register_new_resolver(
-  'cwd', os.getcwd)
-omegaconf.OmegaConf.register_new_resolver(
-  'device_count', torch.cuda.device_count)
-omegaconf.OmegaConf.register_new_resolver(
-  'eval', eval)
-omegaconf.OmegaConf.register_new_resolver(
-  'div_up', lambda x, y: (x + y - 1) // y)
-
-
-def _warn_if_resume_unreachable(config, logger):
-  """Say so when resume is configured but nothing will write the file it wants.
-
-  `resume_ckpt_path` defaults to `checkpoints/last.ckpt`, which only the
-  `checkpoint_every_n_steps` callback writes, and only when `save_last` is on.
-  Turn `save_last` off -- the shipped TinyGSM scripts do, and it is an easy
-  thing to copy -- and resume degrades in the worst possible way: the job
-  restores its snapshot, finds no checkpoint, starts from step 0, and reports
-  nothing wrong. Numbered `step=*.ckpt` files may be sitting right beside the
-  path it looked for.
-
-  A warning rather than an error: wanting checkpoints without wanting resume is
-  a legitimate configuration, and this runs on every start including the ones
-  that never get preempted.
-  """
-  if not config.checkpointing.get('resume_from_ckpt', False):
-    return
-  wanted = config.checkpointing.get('resume_ckpt_path', None)
-  if not wanted or not str(wanted).endswith('last.ckpt'):
-    return
-  callbacks = config.get('callbacks', None) or {}
-  every_n = callbacks.get('checkpoint_every_n_steps', None) or {}
-  monitor = callbacks.get('checkpoint_monitor', None) or {}
-  if every_n.get('save_last', False) or monitor.get('save_last', False):
-    return
-  logger.warning(
-    f'resume_from_ckpt is on and resume_ckpt_path is {wanted}, but no '
-    'checkpoint callback has save_last=True, so that file will never be '
-    'written and every restart will silently begin from step 0. Set '
-    'callbacks.checkpoint_every_n_steps.save_last=True, or point '
-    'checkpointing.resume_ckpt_path at a file something does write.')
-
-
-class SnapshotSync(L.Callback):
-  """Push the run directory to the snapshot store after validation.
-
-  `PeriodicStepCheckpoint` pushes its own writes, but Lightning's
-  `ModelCheckpoint` callbacks save on validation and know nothing about
-  snapshots. `on_validation_end` runs after they have written, which is the
-  first hook where the new file is actually on disk -- `on_save_checkpoint`
-  fires *before* the write and would push the previous state.
-  """
-
-  def __init__(self, snapshot_dir, enabled=True):
-    self.snapshot_dir = os.fspath(snapshot_dir)
-    self.enabled = bool(enabled)
-
-  def on_validation_end(self, trainer, pl_module):
-    if trainer.sanity_checking or not trainer.is_global_zero:
-      return
-    nirvana_snapshot.save(self.snapshot_dir, enabled=self.enabled,
-                          reason=f'validation step={trainer.global_step}')
+utils.register_omegaconf_resolvers()
 
 
 class PeriodicStepCheckpoint(L.Callback):
   """Save deterministic checkpoints every N completed train batches."""
 
-  def __init__(self, dirpath, every_n_train_steps, snapshot_dir=None,
-               snapshot=False):
+  def __init__(self, dirpath, every_n_train_steps):
     self.dirpath = os.fspath(dirpath)
     self.every_n_train_steps = int(every_n_train_steps)
     self._completed_train_batches = 0
     self._last_saved_step = 0
-    # The snapshot covers the whole run directory, not just `dirpath`, so that
-    # a restored job also gets its logs and tracker metadata back.
-    self.snapshot_dir = os.fspath(snapshot_dir or dirpath)
-    self.snapshot = bool(snapshot)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     if self.every_n_train_steps <= 0:
@@ -120,49 +54,6 @@ class PeriodicStepCheckpoint(L.Callback):
       print(
         f'Saved periodic checkpoint at train_batch={save_step}: {ckpt_path}',
         flush=True)
-      nirvana_snapshot.save(self.snapshot_dir, enabled=self.snapshot,
-                            reason=f'periodic step={save_step}')
-
-
-# Logged at every validation, whatever `eval.eval_step_range` says: they come
-# from the held-out NLL, which the window deliberately leaves running.
-_ALWAYS_LOGGED_VAL_METRICS = ('val/nll', 'val/bpd', 'val/ppl')
-
-
-def _check_eval_window_monitors(config, callbacks):
-  """Refuse a checkpoint monitor the eval window will starve.
-
-  `eval.eval_step_range` / `eval.eval_at_steps` skip the generative half of
-  validation outside the window, so `val/gen_ppl`, `val/sample_entropy` and
-  everything the Pareto sweeps log simply do not exist at those validations.
-  A `ModelCheckpoint` monitoring one of them then raises
-  `MisconfigurationException` at the FIRST validation outside the window --
-  a crash from a diagnostic knob, hours into a run, with a message that points
-  at the checkpoint callback rather than at the window that caused it.
-
-  Caught here instead, before a single training step is taken.
-  """
-  window = config.eval.get('eval_step_range', None)
-  at_steps = config.eval.get('eval_at_steps', None)
-  if window is None and at_steps is None:
-    return
-  offenders = []
-  for callback in callbacks:
-    if not isinstance(callback, L.pytorch.callbacks.ModelCheckpoint):
-      continue
-    monitor = getattr(callback, 'monitor', None)
-    if monitor and monitor not in _ALWAYS_LOGGED_VAL_METRICS:
-      offenders.append(monitor)
-  if not offenders:
-    return
-  which = ', '.join(f'{m!r}' for m in sorted(set(offenders)))
-  raise ValueError(
-    f'ModelCheckpoint monitors {which}, but eval.eval_step_range / '
-    'eval.eval_at_steps skip the generative evaluation outside the window, so '
-    'that metric is not logged at every validation and Lightning raises the '
-    'moment one is missed. Either drop the monitoring callback '
-    "('~callbacks.checkpoint_monitor'), point it at a metric the window never "
-    f'gates ({", ".join(_ALWAYS_LOGGED_VAL_METRICS)}), or clear the window.')
 
 
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
@@ -171,11 +62,33 @@ def _load_from_checkpoint(diffusion_model, config, tokenizer):
     return model
   
   return diffusion_model.load_from_checkpoint(
-    model_assets.resolve_checkpoint(
-      config.eval.checkpoint_path, config.get('model_weights_dir')),
+    config.eval.checkpoint_path,
     tokenizer=tokenizer,
     config=config,
     weights_only=False)
+
+
+def _configure_training_mode(config):
+  """Make teacher continuation a first-class alternative to distillation.
+
+  `training.finetune_path` has always been a weights-only warm start. The new
+  flag deliberately keeps that behavior, but forces the ordinary model loss
+  even when a shared command line already set `is_distill=True`.
+  """
+  if (config.mode != 'train'
+      or not bool(config.training.get('continue_teacher', False))):
+    return
+  if not config.training.finetune_path:
+    raise ValueError(
+      'training.continue_teacher=True requires training.finetune_path; '
+      'there is no teacher checkpoint to continue.')
+  config.adversarial_distill.is_distill = False
+  # Distillation performs its own accumulation and its launch commands
+  # therefore set Lightning's accumulation to one. Once the ordinary automatic
+  # optimization path is selected, restore the accumulation implied by the
+  # requested global batch size instead of silently training at a smaller one.
+  config.trainer.accumulate_grad_batches = int(
+    config.adversarial_distill.accum_batches)
 
 
 @L.pytorch.utilities.rank_zero_only
@@ -277,224 +190,6 @@ def _generate_samples(diffusion_model, config, logger,
                'generated_seqs': all_samples}, f, indent=4)
   print('Samples saved at:', samples_path)
 
-
-def _load_student_weights(model, config, logger, path=None):
-  """Put a trained student's weights into a model built from the HF teacher.
-
-  `algo.backbone=hf_dit` builds the architecture from `eval.checkpoint_path` --
-  an HF hub id -- so that path cannot also carry the trained student. This
-  loads the Lightning `.ckpt` written by training on top of it.
-
-  Which weights: the EMA ones by default, because those are what every number
-  the run reported was measured on. A checkpoint stores BOTH -- `state_dict`
-  holds the raw live parameters, `ema` holds the shadow copy -- and reading
-  `state_dict` alone silently evaluates a different model from the one the
-  training curves describe. `eval.disable_ema=True` asks for the raw weights.
-
-  Returns a short label naming what was loaded, for the figure and the JSON.
-
-  `path` overrides `eval.student_ckpt_path`, which is how a multi-checkpoint
-  sweep walks a list: the architecture is built once and only the weights are
-  swapped, since every checkpoint in a sweep shares the `hf_dit` backbone that
-  `eval.checkpoint_path` names.
-  """
-  if path is None:
-    path = config.eval.get('student_ckpt_path', '') or ''
-  if not path:
-    logger.info('No eval.student_ckpt_path: evaluating '
-                f'{config.eval.checkpoint_path} as built.')
-    return f'{config.eval.checkpoint_path} (no student ckpt)'
-  assert utils.fsspec_exists(path), f'no such checkpoint: {path}'
-  # Training wrote these on a newer `tokenizers` than this env pins, and every
-  # checkpoint embeds a pickled tokenizer under `hyper_parameters`.
-  with utils.tolerant_checkpoint_load():
-    checkpoint = torch.load(path, map_location='cpu')
-  state_dict = collections.OrderedDict(
-    (k, v) for k, v in checkpoint['state_dict'].items()
-    # A distillation checkpoint carries the frozen teacher and the fake critic
-    # alongside the student; only the student is being evaluated.
-    if not k.startswith(('teacher.', 'fake_model.')))
-  use_ema = not config.eval.disable_ema and 'ema' in checkpoint
-  if use_ema:
-    model._apply_checkpoint_ema_to_backbone_state(state_dict, checkpoint)
-  missing, unexpected = model.load_state_dict(state_dict, strict=False)
-  if missing:
-    logger.warning(f'{len(missing)} missing keys, first: {missing[:3]}')
-  if unexpected:
-    logger.warning(f'{len(unexpected)} unexpected keys, '
-                   f'first: {unexpected[:3]}')
-  # `_eval_mode` would otherwise copy this freshly-built model's own shadow
-  # params over the weights just loaded. The EMA choice is already baked in
-  # above, so take that path out of the picture entirely.
-  model.ema = None
-  step = checkpoint.get('global_step', '?')
-  which = 'ema' if use_ema else 'raw'
-  logger.info(f'Loaded {which} weights from {path} (global_step={step}).')
-  return f'{os.path.basename(path)} @ step {step} ({which})'
-
-
-def _init_distributed():
-  """Join the torchrun process group, if this process was launched by one.
-
-  `mode=pareto_eval` runs no Lightning trainer -- the sweep is a plain loop --
-  so nothing else would set this up. All distribution has to buy here is that
-  the ranks split the samples and the metrics all-reduce; there is no gradient
-  and so no need for DDP to wrap the model.
-
-  Returns `(rank, world_size, local_rank)`, and `(0, 1, 0)` for an ordinary
-  single-process run.
-  """
-  world_size = int(os.environ.get('WORLD_SIZE', 1))
-  if world_size <= 1:
-    return 0, 1, 0
-  local_rank = int(os.environ.get('LOCAL_RANK', 0))
-  torch.cuda.set_device(local_rank)
-  if not torch.distributed.is_initialized():
-    torch.distributed.init_process_group(backend='nccl')
-  return torch.distributed.get_rank(), world_size, local_rank
-
-
-def _pareto_checkpoints(config):
-  """The checkpoints this sweep covers, in the order they will be drawn.
-
-  `eval.student_ckpt_paths` wins whenever it is set; `eval.student_ckpt_path`
-  is the single-checkpoint spelling and stays the fallback, so every command
-  written before the list existed still means what it meant. An empty string
-  is a legal ENTRY, not a terminator: it names the model as
-  `eval.checkpoint_path` builds it, i.e. the teacher, which is the baseline the
-  students in the same list are read against.
-  """
-  paths = list(config.eval.get('student_ckpt_paths', None) or [])
-  if paths:
-    return [str(p) for p in paths]
-  return [str(config.eval.get('student_ckpt_path', '') or '')]
-
-
-def _short_labels(paths):
-  """Compact, unique legend names for a list of checkpoint paths.
-
-  The basename's stem is what a reader recognises -- `step=00014000` -- and for
-  the usual case, one run's checkpoint directory, that is the whole answer. Two
-  runs collide on it, so the name widens leftwards a path component at a time
-  until the names separate, skipping any component every path shares:
-  `checkpoints` is in all of them and discriminates nothing, so the pair reads
-  `run_a/step=00014000` rather than `run_a/checkpoints/step=00014000`. An index
-  is the last resort. Uniqueness matters beyond the legend, because these also
-  name the tracker series.
-  """
-  parts = [[c for c in os.path.abspath(path).split(os.sep) if c] if path
-           else ['teacher'] for path in paths]
-  for piece in parts:
-    # Only the file loses its extension; the directories keep their names.
-    piece[-1] = os.path.splitext(piece[-1])[0]
-
-  def render(depths):
-    return ['/'.join(piece[-d] for d in sorted(depths, reverse=True)
-                     if len(piece) >= d) for piece in parts]
-
-  deepest = max(len(piece) for piece in parts)
-  depths, depth = [1], 1
-  labels = render(depths)
-  while len(set(labels)) < len(labels) and depth < deepest:
-    depth += 1
-    # Only over the paths that reach this far: a short entry (`teacher`) would
-    # otherwise make a shared component look like a distinguishing one.
-    column = {piece[-depth] for piece in parts if len(piece) >= depth}
-    if len(column) < 2:
-      continue
-    depths.append(depth)
-    labels = render(depths)
-
-  seen = collections.Counter()
-  for i, label in enumerate(labels):
-    seen[label] += 1
-    if seen[label] > 1:
-      labels[i] = f'{label}#{seen[label]}'
-  return labels
-
-
-def _pareto_eval(diffusion_model, config, logger, tokenizer):
-  """Sweep checkpoints over sampling temperatures and step budgets."""
-  rank, world_size, local_rank = _init_distributed()
-  temperatures = config.eval.get('pareto_temperatures', None)
-  budgets = config.eval.get('owt_pareto_steps', None)
-  assert temperatures, 'set eval.pareto_temperatures, e.g. [0.7,1.0,2.0]'
-  assert budgets, 'set eval.owt_pareto_steps, e.g. [8,16,32]'
-  paths = _pareto_checkpoints(config)
-  shorts = _short_labels(paths)
-  if rank == 0:
-    logger.info(f'Starting temperature Pareto eval over {len(paths)} '
-                'checkpoint(s).'
-                + (f' Sharded over {world_size} ranks.'
-                   if world_size > 1 else ''))
-
-  # Built once for the whole list: every checkpoint in a sweep is the same
-  # architecture -- `eval.checkpoint_path` names it -- so only the weights need
-  # swapping, and rebuilding per checkpoint would re-download the hub config
-  # and re-allocate the model for nothing.
-  model = _load_from_checkpoint(
-    diffusion_model=diffusion_model, config=config, tokenizer=tokenizer)
-  model = model.to(f'cuda:{local_rank}')
-  model.eval()
-  # An empty entry means "the model as built". That is only true before a
-  # student has been loaded over it, so when the baseline is not first in the
-  # list, keep a pristine CPU copy to restore from. Built only when the list
-  # actually asks for it, since it is a second copy of the weights.
-  pristine = None
-  if len(paths) > 1 and any(not p for p in paths):
-    pristine = {k: v.detach().cpu().clone()
-                for k, v in model.state_dict().items()}
-
-  # One tracker run, not one per rank: `logger.force_new_run=true` would
-  # otherwise open `world_size` runs and scatter the sweep across all of them.
-  tracker = None
-  if rank == 0:
-    tracker = hydra.utils.instantiate(config.logger)
-    try:
-      tracker.log_hyperparams({
-        'eval/temperatures': str(list(temperatures)),
-        'eval/steps': str(list(budgets)),
-        'eval/checkpoints': ', '.join(shorts),
-        'eval/world_size': world_size})
-    except Exception as e:  # pragma: no cover - tracker best-effort
-      print(f'[pareto-temp] hyperparam log failed: {e}', flush=True)
-
-  sweeps = []
-  for index, (path, short) in enumerate(zip(paths, shorts)):
-    if not path and pristine is not None:
-      model.load_state_dict(pristine, strict=True)
-    label = _load_student_weights(model, config, logger, path=path)
-    if rank == 0 and len(paths) > 1:
-      print(f'[pareto-temp] === checkpoint {index + 1}/{len(paths)}: '
-            f'{short} -- {label} ===', flush=True)
-    curves, samples = pareto_temperature.sweep(
-      model,
-      temperatures=temperatures,
-      budgets=budgets,
-      seeds=config.eval.get('owt_pareto_seeds', 1),
-      num_batches=(config.eval.get('owt_pareto_num_batches', 0)
-                   or config.sampling.num_sample_batches),
-      batch_size=config.loader.eval_batch_size,
-      max_length=config.model.length)
-    sweeps.append({'label': label, 'short': short, 'path': path,
-                   'curves': curves, 'samples': samples})
-
-  if world_size > 1:
-    # Hold the other ranks until rank 0 is done: tearing the group down while a
-    # collective is outstanding is what turns a finished sweep into a hang.
-    torch.distributed.barrier()
-  if rank == 0:
-    pareto_temperature.publish_many(
-      sweeps, tracker,
-      save_dir=os.fspath(config.checkpointing.save_dir),
-      reference=owt_pareto_plot.load_reference(
-        config.eval.get('owt_pareto_reference', None)))
-    tracker.finalize('success')
-  if world_size > 1:
-    torch.distributed.barrier()
-    torch.distributed.destroy_process_group()
-
-
 def _eval_ppl(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Perplexity Eval.')
 
@@ -528,28 +223,23 @@ def _eval_ppl(diffusion_model, config, logger, tokenizer):
 
 def _train(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Training.')
+  if config.training.get('continue_teacher', False):
+    logger.info(
+      'Continuing the teacher with the standard model objective (no frozen '
+      'teacher, fake model, DMD, or MMD reward); Lightning gradient '
+      f'accumulation={config.trainer.accumulate_grad_batches}.')
   # wandb_logger = None
   # if config.get('wandb', None) is not None:
   #   wandb_logger = L.pytorch.loggers.WandbLogger(
   #     config=omegaconf.OmegaConf.to_object(config),
   #     **config.wandb)
-  train_logger = hydra.utils.instantiate(config.logger)
-
-  # Before the existence check below, not after: on a restarted preemptible
-  # job the local disk is empty and this is what puts `last.ckpt` back on it.
-  # Check first and the run starts from scratch with a full snapshot sitting
-  # unused, silently losing every step of prior training.
-  snapshot = bool(config.checkpointing.get('snapshot', True))
-  snapshot_dir = os.fspath(config.checkpointing.save_dir)
-  nirvana_snapshot.restore(snapshot_dir, enabled=snapshot)
-  _warn_if_resume_unreachable(config, logger)
+  tensorboard_logger = hydra.utils.instantiate(config.logger)
 
   if (config.checkpointing.resume_from_ckpt
       and config.checkpointing.resume_ckpt_path is not None
       and utils.fsspec_exists(
         config.checkpointing.resume_ckpt_path)):
     ckpt_path = config.checkpointing.resume_ckpt_path
-    logger.info(f'Resuming from {ckpt_path}')
   else:
     ckpt_path = None
 
@@ -561,22 +251,16 @@ def _train(diffusion_model, config, logger, tokenizer):
     if config.checkpointing.get('use_periodic_train_batch_checkpoint', False):
       callbacks.append(PeriodicStepCheckpoint(
         os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
-        config.callbacks.checkpoint_every_n_steps.every_n_train_steps,
-        snapshot_dir=snapshot_dir, snapshot=snapshot))
-    if snapshot:
-      callbacks.append(SnapshotSync(snapshot_dir, enabled=True))
-    _check_eval_window_monitors(config, callbacks)
+        config.callbacks.checkpoint_every_n_steps.every_n_train_steps))
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)
   _print_batch(train_ds, valid_ds, tokenizer)
 
   if config.training.finetune_path != '':
-    finetune_path = model_assets.resolve_checkpoint(
-      config.training.finetune_path, config.get('model_weights_dir'))
-    assert utils.fsspec_exists(finetune_path)
+    assert utils.fsspec_exists(config.training.finetune_path)
     model = diffusion_model.load_from_checkpoint(
-      finetune_path,
+      config.training.finetune_path,
       tokenizer=tokenizer,
       config=config,
       weights_only=False)
@@ -588,22 +272,237 @@ def _train(diffusion_model, config, logger, tokenizer):
     default_root_dir=os.getcwd(),
     callbacks=callbacks,
     strategy=hydra.utils.instantiate(config.strategy),
-    logger=train_logger,
+    logger=tensorboard_logger,
     enable_progress_bar=False if config.debug else True)
+  if config.eval.get('validate_before_train', False):
+    # Baseline at step 0. For a distillation run the student *is* the teacher
+    # here, so this is the teacher's own score under the exact metrics the run
+    # is judged by -- the zero point the curve is measured against.
+    # Lightning finalizes the logger when `validate` returns, which for a
+    # tracker closes the run and makes every later write fail; defer that
+    # across the call, `fit` finalizes for real.
+    logger.info('Baseline validation before training (step 0).')
+    defers = hasattr(tensorboard_logger, 'defer_finalize')
+    if defers:
+      tensorboard_logger.defer_finalize = True
+    try:
+      trainer.validate(model, valid_ds)
+    finally:
+      if defers:
+        tensorboard_logger.defer_finalize = False
   trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
 
+
+
+def _load_generated_gsm8k(config, logger):
+  logger.info(f'Loading GSM8K predictions from {config.gsm8k.input_file}')
+  with open(config.gsm8k.input_file) as f:
+    loaded = json.load(f)
+  # Accept either a bare list of records or a previously-saved results.json
+  # (which wraps the list under 'records').
+  if isinstance(loaded, dict) and 'records' in loaded:
+    return loaded['records']
+  return loaded
+
+
+def _pad_prefix_batch(id_lists, device):
+  """Pad a list of 1D tensors into a batch.
+
+  Returns:
+    padded: (B, max_len) int64 tensor, zero-padded.
+    lengths: (B,) int64 tensor of actual lengths.
+  """
+  lengths = torch.tensor(
+    [len(ids) for ids in id_lists], device=device)
+  max_len = int(lengths.max())
+  padded = torch.zeros(
+    len(id_lists), max_len, dtype=torch.long, device=device)
+  for i, ids in enumerate(id_lists):
+    padded[i, :len(ids)] = ids.to(device)
+  return padded, lengths
+
+
+def _sample_gsm8k(diffusion_model, config, logger, tokenizer, fabric):
+  model = _load_from_checkpoint(diffusion_model, config, tokenizer)
+  model.to(fabric.device)
+  if config.eval.disable_ema:
+    logger.info('Disabling EMA.')
+    model.ema = None
+  model._eval_mode()
+
+  # Load dataset on rank 0 first, then broadcast to others
+  with fabric.rank_zero_first():
+    dataset = dataloader.get_gsm8k_test_dataset(config, tokenizer)
+
+  # Interleaved split: rank r gets indices r, r+W, r+2W, ...
+  rank = fabric.global_rank
+  world_size = fabric.world_size
+  local_indices = list(range(rank, len(dataset), world_size))
+  batch_size = config.loader.eval_batch_size
+
+  os.makedirs(config.gsm8k.output_dir, exist_ok=True)
+  rank_json_path = os.path.join(config.gsm8k.output_dir,
+                                f'rank_{rank:04d}.json')
+  records = []
+  total_nfe = 0
+  num_batches = 0
+  for batch_start in trange(
+      0, len(local_indices), batch_size,
+      desc=f'Rank {rank} sampling',
+      disable=rank != 0):
+    batch_indices = local_indices[
+      batch_start:batch_start + batch_size]
+    B = len(batch_indices)
+
+    all_ids = [torch.tensor(dataset[idx]['input_ids'])
+               for idx in batch_indices]
+    padded, lengths = _pad_prefix_batch(
+      all_ids, fabric.device)
+
+    samples, metadata = model.generate_samples(
+      num_samples=B,
+      num_steps=config.sampling.steps,
+      prefix_tokens=padded,
+      prefix_lengths=lengths,
+      return_metadata=True)
+    total_nfe += metadata['nfe']
+    num_batches += 1
+
+    for i, idx in enumerate(batch_indices):
+      prompt_len = int(lengths[i])
+      generated_ids = samples[i, prompt_len:].cpu().tolist()
+
+      response = tokenizer.decode(
+        generated_ids, skip_special_tokens=True)
+      records.append({
+        'prompt': dataset[idx]['prompt'],
+        'response_ground_truth':
+          dataset[idx]['response_ground_truth'],
+        'response': response,
+        # Forwards this record actually cost. Carried per record rather than
+        # per rank so it survives the merge below, and because an adaptive
+        # remasking strategy spends a different amount on every batch.
+        'nfe': int(metadata['nfe']),
+      })
+    # Cleanup memory for the next sampling batch
+    del samples, metadata
+    gc.collect()
+
+  avg_nfe = total_nfe / max(num_batches, 1)
+  logger.info(f'Rank {rank}: average NFE per batch: {avg_nfe:.1f}')
+
+  with open(rank_json_path, 'w') as f:
+    json.dump(records, f, indent=2)
+  logger.info(f'Rank {rank}: saved {len(records)} records to {rank_json_path}')
+
+  fabric.barrier()
+
+  if fabric.global_rank != 0:
+    return None
+
+  all_records = []
+  for r in range(world_size):
+    path = os.path.join(config.gsm8k.output_dir, f'rank_{r:04d}.json')
+    with open(path) as f:
+      all_records.extend(json.load(f))
+  return all_records
+
+
+@torch.no_grad()
+def _gsm8k_eval(diffusion_model, config, logger, tokenizer):
+  logger.info('Starting GSM8K eval.')
+  fabric = Fabric(
+    accelerator=config.trainer.accelerator,
+    devices=config.trainer.devices,
+    num_nodes=config.trainer.num_nodes)
+  fabric.launch()
+
+  seed = config.seed + fabric.global_rank
+  L.seed_everything(seed)
+
+  if config.gsm8k.input_file is not None:
+    if fabric.global_rank == 0:
+      samples = _load_generated_gsm8k(config, logger)
+    else:
+      samples = None
+  else:
+    samples = _sample_gsm8k(
+      diffusion_model, config, logger, tokenizer, fabric)
+  if fabric.global_rank == 0:
+    logger.info(f'Total records evaluated: {len(samples)}')
+    per_sample_correct = np.array([
+      int(sandbox_gsm8k.evaluate_samples(
+        rec['response'],
+        rec['response_ground_truth'],
+        timeout_s=config.gsm8k.timeout))
+      for rec in samples], dtype=np.int32)
+    correct = int(per_sample_correct.sum())
+    # Optionally: bootstrapped 95% CI (test-set bootstrap, percentile method).
+    # When bootstrap_size > 1 the reported `accuracy` is the bootstrap mean
+    # (per Raschka's recommendation) with 95% CI from the 2.5/97.5 percentiles
+    # of the bootstrap distribution. `accuracy_se` is the std of the bootstrap
+    # means (= bootstrap-estimated standard error of the accuracy).
+    if config.gsm8k.bootstrap_size > 1:
+      rng = np.random.default_rng(config.seed)
+      idx = rng.integers(0, len(samples),
+                         size=(config.gsm8k.bootstrap_size, len(samples)))
+      boot_acc = per_sample_correct[idx].mean(axis=1)
+      acc = float(boot_acc.mean())
+      acc_se = float(boot_acc.std(ddof=1))
+      acc_ci_lo = float(np.percentile(boot_acc, 2.5))
+      acc_ci_hi = float(np.percentile(boot_acc, 97.5))
+      logger.info(
+        f'GSM8K accuracy: {acc * 100:.2f}% '
+        f'[{acc_ci_lo * 100:.2f}%, {acc_ci_hi * 100:.2f}%] (95% CI) '
+        f'({correct}/{len(samples)}, bootstrap N={config.gsm8k.bootstrap_size})')
+    else:
+      acc = correct / len(samples)
+      acc_se = 0.0
+      acc_ci_lo = acc
+      acc_ci_hi = acc
+      logger.info(f'GSM8K accuracy: {acc * 100:.2f}% ({correct}/{len(samples)})')
+
+    os.makedirs(config.gsm8k.output_dir, exist_ok=True)
+    merged_path = os.path.join(config.gsm8k.output_dir, 'results.json')
+    # `sampling_steps` is only the budget for the fixed-schedule strategies; under
+    # an adaptive one it is ignored entirely. Record the realized forward count
+    # beside it -- that is the number two runs can be compared on.
+    nfes = [rec['nfe'] for rec in samples if 'nfe' in rec]
+    strategy = config.sampling.get('remasking_strategy', 'random')
+    results = {'accuracy': acc,
+               'accuracy_se': acc_se,
+               'accuracy_ci_lo': acc_ci_lo,
+               'accuracy_ci_hi': acc_ci_hi,
+               'num_correct': correct,
+               'num_total': len(samples),
+               'sampling_steps': config.sampling.steps,
+               'remasking_strategy': strategy,
+               # Only the adaptive strategy is budgeted by it; recording it
+               # elsewhere would put a knob in the row that did nothing.
+               'dynamic_threshold': config.sampling.get(
+                 'dynamic_threshold', None) if strategy ==
+               'low_confidence_dynamic' else None,
+               'avg_nfe': sum(nfes) / len(nfes) if nfes else None,
+               'records': samples}
+    if results['avg_nfe'] is not None:
+      logger.info(
+        f"GSM8K decode: {results['remasking_strategy']} at "
+        f"{results['avg_nfe']:.1f} NFE per sample")
+    if config.gsm8k.input_file is not None:
+      results['input_file'] = config.gsm8k.input_file
+    with open(merged_path, 'w') as f:
+      json.dump(results, f, indent=2)
+    logger.info(f'Results saved to {merged_path}')
+
+  fabric.barrier()
 
 @hydra.main(version_base=None, config_path='configs',
             config_name='config')
 def main(config):
   """Main entry point for training."""
-  model_assets.configure_model_weights(
-    config, base_dir=hydra.utils.get_original_cwd())
+  _configure_training_mode(config)
   L.seed_everything(config.seed)
-  # `save_cfg` writes a file into the run dir; under torchrun every rank shares
-  # that dir, so let one of them write it rather than eight racing on it.
-  if int(os.environ.get('RANK', 0)) == 0:
-    _print_config(config, resolve=True, save_cfg=True)
+  _print_config(config, resolve=True, save_cfg=True)
   
   logger = utils.get_logger(__name__)
   tokenizer = dataloader.get_tokenizer(config)
@@ -634,8 +533,8 @@ def main(config):
     _generate_samples(**kwargs)
   elif config.mode == 'ppl_eval':
     _eval_ppl(**kwargs)
-  elif config.mode == 'pareto_eval':
-    _pareto_eval(**kwargs)
+  elif config.mode == 'gsm8k_eval':
+    _gsm8k_eval(**kwargs)
   else:
     _train(**kwargs)
 

@@ -1,12 +1,12 @@
 train: tiny_gsm
 valid: tiny_gsm
 tokenizer_name_or_path: HuggingFaceTB/SmolLM-135M
-cache_dir: "path-to-dataset"
+cache_dir: ${repo_root:}/cache_dir
 wrap: False
 streaming: False
 insert_train_eos: True
 insert_valid_eos: True
-separator: "\n"
+separator: '\n'
 train_on_prompt: False
 train_on_pad: True
 val_ratio: 0.01

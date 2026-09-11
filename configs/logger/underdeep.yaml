@@ -1,15 +1,11 @@
 # Stream training metrics to the underdeep experiment tracker instead of
-# TensorBoard. A run is created -- or resumed from `underdeep_metadata.pt`
-# under `save_dir` when resuming training -- and scalar metrics are streamed
-# live, alongside the generated-sample tables the validation loop builds.
-# No-ops if the `underdeep` package is unavailable, so a run without the
-# tracker installed trains exactly as it did before.
-# Switch back to the authors' logger with `logger=tensorboard`.
+# TensorBoard (mirrors Halton-MaskGIT/main.py). A run is created -- or resumed
+# from `underdeep_metadata.pt` under `save_dir` when resuming training -- and
+# scalar metrics are streamed live. No-ops if the `underdeep` package is
+# unavailable. Switch back to TensorBoard with `logger=tensorboard`.
 _target_: underdeep_logger.UnderdeepLogger
-experiment: generative-models/owt
+experiment: generative-models/tinygsm
 name: ${algo.name}
 save_dir: ${checkpointing.save_dir}
-# Resume the same tracker run whenever training itself resumes, so an
-# interrupted OWT run stays one continuous curve rather than several.
 resume: ${checkpointing.resume_from_ckpt}
 force_new_run: false

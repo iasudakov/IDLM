@@ -7,8 +7,6 @@ import torch.nn.functional as F
 import torchmetrics
 import transformers
 
-from model_assets import pretrained_kwargs
-
 LOG2 = math.log(2)
 
 
@@ -68,7 +66,7 @@ class Perplexity(NLL):
 
 class Metrics:
   def __init__(self, gen_ppl_eval_model_name_or_path=None,
-               eval_ppl_batch_size=None, model_weights_dir=None) -> None:
+               eval_ppl_batch_size=None) -> None:
     metrics = torchmetrics.MetricCollection({
         'nll': NLL(), 'bpd': BPD(), 'ppl': Perplexity()})
     metrics.set_dtype(torch.float64)
@@ -80,10 +78,8 @@ class Metrics:
     self.sample_entropy = torchmetrics.aggregation.MeanMetric()
     self.eval_ppl_batch_size = eval_ppl_batch_size
     self.gen_ppl_eval_model_name_or_path = gen_ppl_eval_model_name_or_path
-    self.model_weights_dir = model_weights_dir
     self.tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(**pretrained_kwargs(
-        gen_ppl_eval_model_name_or_path, model_weights_dir, kind='tokenizer'))
+      from_pretrained(gen_ppl_eval_model_name_or_path)
     if self.tokenizer.pad_token is None:
       self.tokenizer.pad_token = self.tokenizer.eos_token
       self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -165,84 +161,6 @@ class Metrics:
       self.sample_entropy.update(entropy)
 
   @torch.no_grad()
-  def _ensure_eval_model(self, device='cuda'):
-    """The reference LM, loaded once and kept.
-
-    `record_generative_perplexity` reloads it per call, which is merely slow
-    there. Gradient Moment backprops through it, so reloading 774M parameters
-    per evaluation would dominate the metric's cost outright.
-    """
-    if getattr(self, '_eval_model', None) is None:
-      model = transformers.AutoModelForCausalLM.from_pretrained(
-        **pretrained_kwargs(self.gen_ppl_eval_model_name_or_path,
-                            self.model_weights_dir)).eval()
-      # llama2 is left where `from_pretrained` put it, matching what
-      # `record_generative_perplexity` has always done for that path.
-      if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
-        model = model.to(device)
-      self._eval_model = model
-    return self._eval_model
-
-  def record_gradient_moment(self, samples_texts, data_texts, max_length,
-                             batch_size=4, device='cuda'):
-    """Gradient Moment (arXiv:2603.20155): `||E_samples[grad L] - E_data[grad L]||^2`.
-
-    Ported from yrELF's `metrics_utils.Metrics.record_gradient_moment`, so the
-    numbers are comparable with that project's.
-
-    The reason to pay for it: it backprops through the reference LM, so unlike
-    generative perplexity it is not gamed by low-entropy or mode-collapsed
-    sampling. That failure is not hypothetical here -- an OWT run of this repo
-    drove gen_ppl from 68 to 11.9 while sample entropy fell and held-out NLL
-    rose, i.e. gen_ppl improved precisely because the model was collapsing.
-
-    One GM pair is `2 * batch_size` rows per side, each split in half
-    internally; the halves' inner product is what makes the squared norm
-    unbiased. Returns None when there are too few rows to form one pair, or
-    when the `gradient_moment` package is not installed -- it is an optional
-    sibling repo, and a missing one must not take the run down.
-    """
-    try:
-      from gradient_moment import evaluate, make_generative_llm_metrics
-      from gradient_moment.huggingface import text_causal_lm_forward
-    except ImportError as e:
-      # `gradient_moment/` is vendored at the repo root, so this should not
-      # fire; it stays as a guard for a truncated checkout rather than as a
-      # prompt to install anything.
-      print(f'[gm] skipped: gradient_moment not importable ({e}). '
-            'It is vendored at the repo root -- check the checkout.', flush=True)
-      return None
-
-    model = self._ensure_eval_model(device)
-    pair_rows = 2 * batch_size
-    n = (min(len(samples_texts), len(data_texts)) // pair_rows) * pair_rows
-    if n == 0:
-      print(f'[gm] need >= {pair_rows} sample/data rows, skipping', flush=True)
-      return None
-    samples_texts, data_texts = samples_texts[:n], data_texts[:n]
-
-    def _tok(texts):
-      enc = self.tokenizer(
-        texts, return_tensors='pt', return_token_type_ids=False,
-        truncation=True, padding=True, max_length=max_length)
-      return {'input_ids': enc['input_ids'].to(device).long(),
-              'attention_mask': enc['attention_mask'].to(device).float()}
-
-    batches = [(_tok(samples_texts[i:i + pair_rows]),
-                _tok(data_texts[i:i + pair_rows]))
-               for i in range(0, n, pair_rows)]
-    forward_fn = text_causal_lm_forward(model, self.tokenizer.eos_token_id)
-    metric = make_generative_llm_metrics(forward_fn, model)
-    # `torch.enable_grad` because this runs inside validation, where Lightning
-    # has already switched gradients off -- and the whole metric is a gradient.
-    with torch.enable_grad():
-      results = evaluate([metric], batches)
-    gm = results[metric.name]
-    return {'centered_gm': gm['centered_gm']['mean'],
-            'uncentered_gm_samples': gm['uncentered_gm_samples']['mean'],
-            'uncentered_gm_data': gm['uncentered_gm_data']['mean'],
-            'n_pairs': gm['centered_gm']['n']}
-
   def record_generative_perplexity(
     self,
     text_samples: typing.List[str],
@@ -251,13 +169,10 @@ class Metrics:
     device='cuda') -> None:
     
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    # Cached rather than reloaded per call. This used to run `from_pretrained`
-    # on every invocation -- 18.6s of disk for gpt2-large, once per sample
-    # batch, every validation. The Pareto sweep multiplies that by budgets and
-    # seeds: [2,4,8,16,32,64] x 2 batches x 5 seeds is 60 reloads, ~19 minutes
-    # of pure model loading per validation. The model is frozen and in eval
-    # mode, so reusing it is numerically identical.
-    eval_model = self._ensure_eval_model(device)
+    eval_model = transformers.AutoModelForCausalLM.from_pretrained(
+      self.gen_ppl_eval_model_name_or_path).eval()
+    if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
+      eval_model = eval_model.to(device)
     # Re-tokenize using eval model's tokenizer
     if retokenize:
       (samples, attn_mask,

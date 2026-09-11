@@ -1,10 +1,13 @@
 train: gsm8k_test
 valid: gsm8k_test
 tokenizer_name_or_path: HuggingFaceTB/SmolLM-135M
-cache_dir: ""
+cache_dir: ${repo_root:}/cache_dir
 wrap: False
 streaming: False
 insert_train_eos: True
 insert_valid_eos: True
-separator: "\n"
-data_path: ""
+# Literal backslash-n, matching the separator TinyGSM training uses
+# (configs/data/tiny-gsm.yaml). The tokenized cache is keyed by separator, so
+# this must agree with training or the prompt formatting shifts at eval time.
+separator: '\n'
+data_path: ${repo_root:}/data/gsm8k_test.json

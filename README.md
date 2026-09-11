@@ -81,53 +81,6 @@ IDLM/
 ## Getting Started
 <a name="getting_started"></a>
 
-### Use existing model weights without downloading
-
-Add `model_weights_dir=/absolute/path/to/bundle` to your existing
-`python -m main` command. This works on both the OWT and TinyGSM branches.
-When supplied, model and tokenizer loaders use local files only and report a
-missing asset instead of downloading it. Leaving it unset preserves the normal
-loading behavior.
-
-For the OWT bundle, add:
-
-```bash
-model_weights_dir=/home/iasudakov/owt_mmd_offline_bundle
-```
-
-Keep the usual model IDs in your command:
-`eval.checkpoint_path=kuleshov-group/mdlm-owt`,
-`adversarial_distill.mmd_ar_model=kuleshov-group/owt-ar`,
-`data.tokenizer_name_or_path=gpt2`, and
-`eval.gen_ppl_eval_model_name_or_path=gpt2-large`. They resolve to the bundled
-MDLM, AR, GPT-2 tokenizer, and GPT-2 Large evaluation assets. Perplexity,
-temperature sweeps, and Gradient Moment share the local evaluation model.
-
-For a TinyGSM run with native AR features, add these overrides:
-
-```bash
-model_weights_dir=/home/iasudakov/tinygsm_mmd_offline_bundle \
-adversarial_distill.mmd_ar_model=checkpoints/tinygsm/ar_notok.ckpt
-```
-
-Keep `data.tokenizer_name_or_path=HuggingFaceTB/SmolLM-135M` and set
-`training.finetune_path` to your existing local MDLM checkpoint. This TinyGSM
-bundle includes the AR checkpoint and both required tokenizers; it does **not**
-include the MDLM checkpoint or GPT-2 Large model weights. Evaluation tokenizer
-initialization works without those GPT-2 weights; enabling generative
-perplexity or Gradient Moment requires a local copy of the evaluation model.
-
-The resolver reads `manifest.json` entries and `hf-cache` snapshots, or model
-directories named by repository ID or basename. Explicit absolute model and
-checkpoint paths remain supported, including paths outside the bundle. Native
-checkpoint paths can be relative to the bundle; existing paths relative to the
-launch directory take precedence. Relative bundle paths are resolved before
-Hydra changes directories. Quote an override when its path contains spaces.
-
-Tokenizer IDs stay unchanged, preserving vocabulary handling and dataset cache
-keys. This option controls model/tokenizer loading; keep configuring your
-existing local dataset cache separately.
-
 ### 1. Clone the repository
 
 ```bash
@@ -178,119 +131,6 @@ The OpenWebText recipes train IDLM students for unconditional language generatio
 bash scripts/train_idlm_mdlm.sh
 ```
 
-For OWT MMD distillation, the portable launcher can bias the generator toward
-the heavily masked states that matter most at low NFE. This keeps the original
-schedule for half of the rows and draws the other half from 70--100% expected
-masking:
-
-```bash
-OWT_CACHE=/path/to/owt \
-HIGH_MASK_FRACTION=0.5 HIGH_MASK_MIN=0.7 HIGH_MASK_MAX=1.0 \
-  bash scripts/train_owt_distill.sh
-```
-
-The default fraction is zero, so existing runs are unchanged. MMD runs log the
-realized whole-sequence fraction as `mmd/generator_mask_fraction`.
-
-An alternative is the [BD3-LMs clipped masking schedule](https://arxiv.org/abs/2503.09573).
-`MASK_SCHEDULE=clipped` samples every generator row's masking probability
-uniformly inside a fixed interval, preserving stratification across devices
-and accumulation steps:
-
-```bash
-OWT_CACHE=/path/to/owt MASK_SCHEDULE=clipped MASK_MIN=0.45 MASK_MAX=0.95 \
-  bash scripts/train_owt_distill.sh
-```
-
-Use `MASK_SCHEDULE=adaptive` to select the interval during validation:
-
-```bash
-OWT_CACHE=/path/to/owt MASK_SCHEDULE=adaptive MASK_SEARCH_BATCHES=4 \
-  bash scripts/train_owt_distill.sh
-```
-
-These options also apply to existing MMD/DMD combination commands. Direct
-Hydra equivalents are `adversarial_distill.mask_schedule.mode`, `.min`, `.max`,
-and `.search_batches`. Override `.search_intervals` with a list of `[min,max]`
-pairs to change the candidates. Adaptive mode starts from `.min`/`.max`, then
-chooses the lowest pooled **per-sequence student denoising-loss variance**
-over the first few validation batches, with one extra forward per candidate
-per batch. This is a BD3-LMs-inspired proxy, not measured MMD gradient variance;
-it does not assume that larger masking rates are always better. Sanity checks,
-step-zero validation, and standalone evaluation do not update the schedule.
-The selected bounds and proxy are logged under `mask_schedule/*` and restored
-from checkpoints when the schedule settings match.
-
-The default `original` mode preserves the existing sampler and high-mask
-mixture. For `clipped`/`adaptive`, use `HIGH_MASK_FRACTION=0` and disable
-`adversarial_distill.generator_force_full_mask`. Only the corruption used to
-produce student samples changes, including samples used to train the fake
-critic; teacher/fake loss corruption, evaluation NLL, and generation remain
-unchanged. Bounds refer to **expected** masking probabilities: mask patterns
-are still Bernoulli draws, without blockwise rejection resampling. The
-log-linear schedule caps a requested maximum of 1 at 0.999 before drawing.
-
-For sentence-level MMD with the AR critic, add these overrides to an existing
-OWT MMD training command to use the **last token's hidden state** instead of
-the mean over scored (usually masked) positions:
-
-```bash
-adversarial_distill.mmd_reward_type=feature \
-adversarial_distill.mmd_feature_source=ar \
-adversarial_distill.mmd_kernel_level=sentence \
-adversarial_distill.mmd_sentence_pooling=last_token
-```
-
-On packed OWT this reads position `model.length - 1`, even if it was not
-masked; it does not read the last masked token or stop at an internal EOS.
-The critic still processes the full sequence, so a contextual AR layer's final
-hidden state can represent changes earlier in the sequence. Layer `-1` is only
-the input embedding and cannot summarize the prefix; the default middle block
-is contextual.
-
-Keep your existing kernel/source/draw-count settings. This option works with
-both `rows` and `draws` under their existing kernel restrictions (for example,
-`pseudo_huber` still requires `draws`). Estimators and loss normalization are
-unchanged: sentence `draws` still uses the unbiased fake-pair correction for
-K > 1 and the biased fallback for K = 1. `mmd_score_positions` does not move
-the last-token readout, and only masked/written positions carry the REINFORCE
-gradient. Omit the new option or set `mmd_sentence_pooling=mean` to retain the
-previous behavior. Diffusion features and token-level kernels do not support
-`last_token`.
-
-To use cosine similarity as the MMD kernel, change only the kernel in your
-feature-reward command (keep its existing source, level, K, G and pooling):
-
-```bash
-adversarial_distill.mmd_reward_type=feature \
-adversarial_distill.mmd_kernel=cosine
-```
-
-This computes MMD with `k(x,y) = dot(normalize(x), normalize(y))`, using L2
-normalization in float32. At token level each token vector is normalized
-individually; at sentence level the existing mean/last-token readout happens
-first, and that sentence vector is normalized. It is **not** cosine similarity
-between two final pooled means and does not apply pseudo-Huber. It supports
-both AR and diffusion features (the `last_token` readout remains AR-only).
-
-Self-pair removal and activity rules follow RBF: token comparisons need at
-least two scored vectors on each side; sentence `rows` needs K >= 2. Sentence
-`draws` treats the observed real vector as fixed, removes fake self-pairs at
-K > 1, and uses a biased squared distance between normalized vectors at K = 1
-(`2 * (1 - cosine)` for nonzero unit vectors). Zero vectors are handled with
-epsilon-safe normalization and their actual diagonal kernel values. Negative
-finite-sample MMD estimates are retained. No bandwidth is needed;
-`mmd_rbf_alpha` and `mmd_rbf_block_size` do not affect this kernel.
-
-Cosine is a linear kernel on unit features, so its population MMD only matches
-their **mean**, unlike RBF's nonlinear comparison. Removing feature magnitude
-therefore also changes the objective's sensitivity; an RBF kernel applied to
-unit-normalized features would be a different experiment (not enabled by this
-option). Existing `linear`, `rbf`, and `pseudo_huber` behavior and the REINFORCE
-`G*K`/token loss normalization are unchanged. Cosine uses a dot-product sum,
-not an extra `1/hidden_dim` average; reward scales need not match the prior run.
-Test it as a fresh run rather than resuming and mixing kernel histories.
-
 #### DUO teacher → IDLM-Duo student
 
 ```bash
@@ -312,6 +152,58 @@ The TinyGSM recipes train IDLM students for conditional mathematical reasoning o
 ```bash
 bash scripts/train_idlm_mdlm_tynigsm.sh
 ```
+
+To bias distillation toward the heavily masked states that matter most at low
+NFE, enable the optional high-mask mixture. This example keeps the original
+uniform schedule for half of the rows and draws the other half from 70--100%
+expected masking:
+
+```bash
+HIGH_MASK_FRACTION=0.5 HIGH_MASK_MIN=0.7 HIGH_MASK_MAX=1.0 \
+  MODE=mmd bash scripts/train_tinygsm_mmd.sh
+```
+
+The default fraction is zero, so existing commands are unchanged. During MMD
+training, `mmd/generator_mask_fraction` reports the realized fraction over real
+answer tokens (padding and the prompt are excluded).
+
+To use one reward sample per state and cut the reward critic cost, select the
+fallback baseline explicitly:
+
+```bash
+MMD_GROUP=1 MMD_BASELINE=batch MODE=mmd bash scripts/train_tinygsm_mmd.sh
+```
+
+`MMD_BASELINE=auto` resolves to `none` for a group of one. `batch` instead uses
+the other active sequences on the same device as a leave-one-out baseline; it
+removes the reward offset but is noisier because TinyGSM rows have different
+questions and masking fractions.
+
+#### Continue training the TinyGSM teacher
+
+Use the same data, checkpoint, validation, and logging setup while optimizing
+the ordinary MDLM denoising objective instead of DMD/MMD distillation:
+
+```bash
+MODE=teacher bash scripts/train_tinygsm_mmd.sh
+```
+
+For a custom Hydra command, add `training.continue_teacher=True`. It takes
+precedence over `adversarial_distill.is_distill=True`, which makes it safe to
+append to an existing shared `COMMON` string. The checkpoint at
+`training.finetune_path` initializes the trainable backbone and EMA; no frozen
+teacher or fake model is constructed. If the input is itself an MDLM
+distillation checkpoint, its frozen `teacher.*` weights are selected rather
+than its student `backbone.*` weights.
+
+The mode also sets `trainer.accumulate_grad_batches` to the value implied by
+`loader.global_batch_size`. This matters when reusing a distillation command:
+that path accumulates internally and commonly pins Lightning's value to `1`,
+whereas ordinary teacher training uses Lightning's automatic accumulation.
+
+This is a new training run: optimizer, scheduler, and global step start from
+zero. To resume an interrupted teacher-continuation run exactly, use
+`checkpointing.resume_ckpt_path` as usual.
 
 #### DUO teacher → IDLM-Duo TinyGSM student
 
@@ -412,7 +304,55 @@ Generated sample files contain:
 
 ### Conditional TinyGSM Evaluation
 
-We release the TinyGSM IDLM checkpoints on Hugging Face: [IDLM-MDLM TinyGSM](https://huggingface.co/kekchpek/idlm-mdlm-tynigsm) and [IDLM-Duo TinyGSM](https://huggingface.co/kekchpek/idlm-duo-tynigsm). To evaluate these conditional models on the TinyGSM benchmark, use the `.ckpt` files from the Hugging Face repositories together with the TinyGSM evaluation code from the [S-FLM repository](https://github.com/jdeschena/s-flm).
+We release the TinyGSM IDLM checkpoints on Hugging Face: [IDLM-MDLM TinyGSM](https://huggingface.co/kekchpek/idlm-mdlm-tynigsm) and [IDLM-Duo TinyGSM](https://huggingface.co/kekchpek/idlm-duo-tynigsm).
+
+The benchmark evaluation is available in-tree as `mode=gsm8k_eval`. It follows the
+TinyGSM evaluation protocol of the [S-FLM repository](https://github.com/jdeschena/s-flm):
+the question is pinned as a clean prefix, the model generates a `simple_math_problem()`
+program over the remaining positions, and that program is executed in a restricted
+sandbox (`sandbox_gsm8k.py`) and compared against the `#### N` gold answer of the
+1319-example GSM8K test set in `data/gsm8k_test.json`.
+
+```bash
+CKPT_PATH=outputs/tiny_gsm/<date>/<time>/checkpoints/step=00050000.ckpt \
+DEVICES=4 \
+bash scripts/eval_tinygsm_idlm_mdlm.sh
+```
+
+The script sweeps 4, 8, 16, and 32 sampling steps and prints an accuracy table with
+bootstrapped 95% confidence intervals. Per-step results (including every generated
+program) are written to `eval_runs/tinygsm/idlm-mdlm/steps_<N>/results.json`.
+`adversarial_distill.is_distill` is probed from the checkpoint itself
+(`scripts/probe_is_distill.py`), because a checkpoint produced by a distillation run
+also stores the frozen `teacher` and the `fake_model` critic while a released student
+checkpoint ships `backbone` alone; override it with `IS_DISTILL` if needed.
+
+Useful environment overrides: `STEPS_LIST`, `EVAL_BATCH_SIZE`, `OUTPUT_ROOT`,
+`BOOTSTRAP`, `NUM_NODES`, `IS_DISTILL`, `STEP_CONVENTION`. To re-grade an existing
+generation file without resampling, pass `gsm8k.input_file=<results.json>`.
+
+`STEP_CONVENTION` selects where the noise-removal step lives, which is the one place
+this repository's `generate_samples` and the S-FLM sampler differ:
+
+| Value | Behaviour | NFE |
+| --- | --- | --- |
+| `sflm` (default here) | Denoising folded into the final loop iteration (`alpha_s = 1` at `timesteps[-2]`), matching `scripts/sample/tinygsm/mdlm.sh` in S-FLM | `steps` |
+| `idlm` | A separate denoising call appended after the loop at `t = eps` | `steps + 1` |
+
+Appendix E.2 of the paper states the conditional protocol follows Deschenaux &
+Gulcehre, so `sflm` is the setting that reproduces Table 1. Everything else already
+matches S-FLM: `use_float64`, `noise_removal=ancestral`, `p_nucleus=1.0`, the
+`linspace(1, eps, steps + 1)` grid with `eps=1e-5`, prefix pinning at init and after
+every step, batch size 32 and seed 1. The global default in `configs/config.yaml`
+stays `idlm` so unconditional `mode=sample_eval` is unaffected.
+
+#### The same benchmark during training
+
+`eval.gsm8k_at_validation` runs these exact 1319 questions at every validation and
+logs the result as `val/gsm8k_acc`, so a training curve and a standalone benchmark
+number are directly comparable. It uses `eval.gsm8k_step_convention` (default `sflm`,
+matching the script) rather than the global `sampling.step_convention`; set
+`eval.gsm8k_steps` and `eval.gsm8k_num_examples` to trade fidelity for wall-clock.
 
 ---
 

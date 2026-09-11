@@ -9,7 +9,6 @@ import torch
 import torch.nn.functional as F
 
 import trainer_base
-from mask_schedule import DistillMaskScheduleMixin
 import utils
 import hydra.utils
 import models
@@ -155,58 +154,31 @@ class IdlmRatioReward:
     self.algo = algo
 
   @torch.no_grad()
-  def grouped_reward(self, clean_tokens, generated_tokens, selected, eos_id):
-    """Score `(group, batch, length)` samples with common randomness.
-
-    Leave-one-out advantages rank candidates generated for the same state.
-    Giving each candidate its own diffusion time and mask would instead rank
-    how lucky its corruption was. Draw one `t` and one corruption mask per
-    underlying batch row, broadcast both across the group, and evaluate the
-    flattened group in one teacher and one fake forward.
-    """
+  def paired_reward(self, clean_tokens, generated_tokens, selected, eos_id,
+                    return_per_layer=False):
     del clean_tokens, eos_id  # absolute score; nothing to compare or remap
     algo = self.algo
-    if generated_tokens.ndim != 3:
-      raise ValueError('IDLM grouped reward expects (group, batch, length), '
-                       f'got {tuple(generated_tokens.shape)}')
-    group, batch, length = generated_tokens.shape
-    if selected.shape != (batch, length):
-      raise ValueError('IDLM selected mask must be '
-                       f'{(batch, length)}, got {tuple(selected.shape)}')
+    x = generated_tokens
+    valid = selected.to(x.dtype)
 
-    # One time and mask for each underlying row, repeated in group-major order
-    # to match `generated_tokens.reshape(group * batch, length)`.
-    t = algo._sample_t(batch, 0)
+    # One noise level for the whole group draw, so the samples being ranked
+    # against each other are scored under identical conditions -- a per-sample
+    # `t` would let an easy noise level outrank a good answer.
+    t = algo._sample_t(x.shape[0], 0)
     dalpha_t, alpha_t = algo.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
-    move = torch.rand(batch, length, device=generated_tokens.device) \
-      < 1 - alpha_t
-    move = move & selected.bool()
-    xt_grouped = torch.where(
-      move.unsqueeze(0), algo.mask_index, generated_tokens)
-    if algo.ignore_bos:
-      xt_grouped[:, :, 0] = generated_tokens[:, :, 0]
-
-    x = generated_tokens.reshape(group * batch, length)
-    xt = xt_grouped.reshape(group * batch, length)
-    valid = selected.unsqueeze(0).expand(group, -1, -1) \
-      .reshape(group * batch, length).to(x.dtype)
-    alpha_t = alpha_t.repeat(group, 1)
-    if torch.is_tensor(dalpha_t) and dalpha_t.ndim > 0:
-      dalpha_t = dalpha_t.reshape(batch, -1).repeat(group, 1)
     sigma = algo._process_sigma(algo._sigma_from_alphat(alpha_t))
+    xt = algo.q_xt(x, alpha_t, valid_tokens=valid)
 
     onehot = F.one_hot(x, num_classes=algo.vocab_size).to(torch.float32)
     with torch.cuda.amp.autocast(dtype=torch.float32):
       logits_teacher = algo._process_model_output(
         model_output=algo.teacher(xt, sigma), xt=xt, sigma=sigma)
+      logits_fake = algo._process_model_output(
+        model_output=algo.fake_model(xt, sigma), xt=xt, sigma=sigma)
     nll_teacher = algo.nll_per_token_with_probs(
       logits_teacher, xt, onehot, alpha_t=alpha_t, dalpha_t=dalpha_t,
       valid_tokens=valid)
-    del logits_teacher
-    with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits_fake = algo._process_model_output(
-        model_output=algo.fake_model(xt, sigma), xt=xt, sigma=sigma)
     nll_fake = algo.nll_per_token_with_probs(
       logits_fake, xt, onehot, alpha_t=alpha_t, dalpha_t=dalpha_t,
       valid_tokens=valid)
@@ -219,238 +191,21 @@ class IdlmRatioReward:
     # The generator minimises `nll_teacher - nll_fake`, which makes a sample
     # likelier under the teacher and unlikelier under the fake. The reward to
     # MAXIMISE is therefore that quantity negated.
-    reward = (nll_fake - nll_teacher).float().view(group, batch).transpose(0, 1)
+    reward = (nll_fake - nll_teacher).float()
     active = selected.any(dim=1)
-    reward = torch.where(active.unsqueeze(-1), reward,
-                         torch.zeros_like(reward))
-    return reward, active
-
-  @torch.no_grad()
-  def paired_reward(self, clean_tokens, generated_tokens, selected, eos_id,
-                    return_per_layer=False):
-    reward, active = self.grouped_reward(
-      clean_tokens, generated_tokens.unsqueeze(0), selected, eos_id)
-    reward = reward[:, 0]
+    reward = torch.where(active, reward, torch.zeros_like(reward))
     if return_per_layer:
       return reward, active, {}
     return reward, active
 
 
-def _embedding_std(embed_module):
-  """Per-entry std of a token-embedding module's weight matrix.
-
-  Used to calibrate the noise-conditioning init to the loaded checkpoint rather
-  than to a freshly-initialised backbone. Returns the DiT init scale (0.02) if
-  no weight can be located, so the behaviour degrades to a constant.
-  """
-  for attr in ('embedding', 'weight'):
-    w = getattr(embed_module, attr, None)
-    if isinstance(w, torch.Tensor) and w.numel() > 0:
-      return float(w.detach().float().std())
-  return 0.02
-
-
-class _NoiseConditionedBackbone(torch.nn.Module):
-  """Wraps a denoiser backbone and injects a learned projection of Gaussian
-  noise into the token-embedding residual (D-MMD Sec. 6.5). By default the
-  noise is drawn independently per token position; with `shared_noise` a single
-  vector per sample is broadcast across all embeddings (same noise everywhere).
-
-  A masked-diffusion generator is otherwise a deterministic function of its
-  (masked) input, so a moment-matching objective can only be minimised by
-  collapsing its output distribution -- which destroys sample diversity. An
-  input noise source lets the generator stay diverse while sharpening its
-  factorised output. Fresh noise is drawn on every forward pass and added to
-  the embedding via a forward hook, so it is applied uniformly across training
-  (`multistep_generation`) and sampling (`generate_samples`).
-
-  The projection's *output* is rescaled by `embed_std / sqrt(noise_dim)`, a
-  constant measured from the *actual* embedding matrix of `embed_module` at
-  construction time. That makes the parameterization dimensionless: a unit-RMS
-  `W` injects a vector as large as the token identity, so `noise/snr ~= rms(W)`
-  and, under Adam (per-entry `|dW| ~= lr` per step), snr grows at ~`noise_lr`
-  per step whatever `noise_dim` or checkpoint is in use -- i.e. `noise_lr`
-  transfers. The constant adds no expressiveness (`c * (W z)` spans the same
-  functions as `W' z`); it fixes the units, which is what makes the *optimizer*
-  behave comparably across settings.
-
-  Calibrating to the loaded checkpoint matters when distilling: a hardcoded init
-  calibrated to a freshly-initialised DiT (`kaiming_uniform_`, per-entry std
-  ~= 0.021) is ~15x too small for `kuleshov-group/mdlm-owt`, whose trained
-  embedding has std ~= 0.309. At that scale two noise draws move the student's
-  output distribution by a total-variation distance of only ~0.09, i.e. the
-  generator is effectively noise-free and behaves like a run with `noise_dim=0`.
-  The mirror-image failure is a large init (snr ~= 10): the embedding residual
-  is then ~90% noise, the student cannot read its own masked context, and a
-  pretrained checkpoint has to spend thousands of steps just attenuating `W`
-  before distillation means anything. Hence the zero-init default -- see
-  `noise_scale` in `configs/config.yaml`.
-
-  ZERO-INIT DOES NOT GROW ON ITS OWN, and `noise_lr` cannot fix that: `W = 0` is
-  an exact saddle of *any* objective that sees only the backbone's output. The
-  gradient is `dL/dW = c * g z^T` with `g = dL/d(embed output)`; at `W = 0` the
-  output does not depend on `z`, so `g` is independent of `z` and
-  `E[dL/dW] = c E[g] E[z]^T = 0`. Only per-batch gradient *noise* moves `W`, and
-  Adam turns that into an undirected random walk: measured on mdlm-owt at
-  `noise_lr=1e-3`, snr reached 0.04 after 80k steps, versus ~`noise_lr * sqrt(T)`
-  ~= 0.28 for an unbiased walk and ~`noise_lr * T` if the drift were directed --
-  i.e. slower than chance, so the objective is weakly pulling `W` back to zero.
-  The same erosion is visible from a large start: a `noise_scale=0.5` run decays
-  monotonically to snr ~= 0.35 over 80k steps while having the *better* generative
-  perplexity. The injection magnitude is therefore a hyperparameter the objective
-  will never discover and will slowly erode, so it is scheduled rather than
-  learned:
-
-  * `warmup_steps > 0` ramps a gain `0 -> 1` over that many steps, so step 0 is
-    bit-identical to the loaded checkpoint (nothing destroyed, the reason to
-    zero-init) while `W` itself starts at the *target* rms `noise_scale`. The
-    gradient into `W` is proportional to the gain, so the saddle is left behind
-    as soon as the ramp starts instead of being waited out.
-  * `hold_rms` additionally pins `rms(W)` to `noise_scale` by normalising the
-    projection in the forward pass (weight-norm style, gradient included, so the
-    radial component is projected out rather than fought). The *direction* of the
-    projection stays learned; only its size is fixed, which stops the slow decay
-    above. Watch `noise/proj_norm` against `noise/snr` to see how hard the
-    objective is pushing against the constraint.
-  """
-
-  def __init__(self, backbone, embed_module, noise_dim, hidden_size,
-               shared_noise=False, noise_scale=1.0, warmup_steps=0,
-               hold_rms=False):
-    super().__init__()
-    self.backbone = backbone
-    self.noise_dim = noise_dim
-    # True => one Gaussian vector per sample, broadcast across every token
-    # embedding; False => an independent vector per token position.
-    self.shared_noise = shared_noise
-    self.noise_scale = noise_scale
-    self.warmup_steps = int(warmup_steps or 0)
-    self.hold_rms = bool(hold_rms)
-    assert not ((self.warmup_steps > 0 or self.hold_rms) and not noise_scale), (
-      'adversarial_distill.noise_scale is the TARGET the schedule ramps to and '
-      'holds, so it must be > 0 when noise_warmup_steps > 0 or '
-      'noise_hold_rms=True; got noise_scale=0, which schedules nothing. The '
-      'zero *start* comes from the warmup gain, not from noise_scale.')
-    # Step the ramp is evaluated at, set once per training batch by
-    # `MDLM.on_train_batch_start`. None => no training loop has claimed this
-    # module (eval-only runs), and the schedule reads as complete so a
-    # checkpoint is evaluated with the noise level it was trained with.
-    self._noise_step = None
-    self.noise_proj = torch.nn.Linear(noise_dim, hidden_size)
-    # The projection output is rescaled by a constant measured once, here, from
-    # the *actual* embedding matrix, so a unit-RMS `W` injects a vector the size
-    # of the token identity: `snr == rms(W)`. Fixed at construction (the
-    # embedding drifts during training, and recomputing it per forward would
-    # both cost a reduction over the whole matrix and feed back into itself).
-    embed_std = _embedding_std(embed_module)
-    # Non-persistent: recomputed from the embedding at every construction, so it
-    # adds no state_dict key (an old noise-conditioned checkpoint would
-    # otherwise fail Lightning's strict resume with a missing key) and it is not
-    # a parameter, so it stays out of `_student_param_groups` / weight decay.
-    self.register_buffer(
-      'noise_out_scale',
-      torch.tensor(embed_std / (noise_dim ** 0.5), dtype=torch.float32),
-      persistent=False)
-    # `noise_scale` is the initial RMS of `W`, i.e. the initial `noise/snr` --
-    # or, with `warmup_steps`/`hold_rms`, the RMS the schedule aims at, since the
-    # gain then supplies the zero start instead.
-    # 0.0 (default) => zero-init: the wrapped student starts as an exact copy of
-    # the checkpoint's function and grows its noise usage only if the objective
-    # pays for it. The gradient into `W` is `noise_out_scale * g_out z^T`, which
-    # is non-zero because `z` is, so a zero start still trains (the standard
-    # zero-init residual branch, cf. AdaLN-zero / zero-convs / LoRA `B=0`).
-    if noise_scale:
-      torch.nn.init.normal_(self.noise_proj.weight, std=noise_scale)
-    else:
-      torch.nn.init.zeros_(self.noise_proj.weight)
-    torch.nn.init.zeros_(self.noise_proj.bias)
-    self._noise = None
-    embed_module.register_forward_hook(self._add_noise)
-
-  def set_noise_step(self, step):
-    """Point the warmup ramp at `step` (the trainer's global step)."""
-    self._noise_step = int(step)
-
-  @property
-  def noise_gain(self):
-    """Multiplier on the injected vector: 0 at step 0, 1 once warmed up.
-
-    Derived from the step rather than accumulated, so a resumed run picks the
-    schedule back up where it left off and the ramp is identical on every rank
-    without any communication.
-    """
-    if self.warmup_steps <= 0 or self._noise_step is None:
-      return 1.0
-    return min(1.0, max(0.0, self._noise_step / self.warmup_steps))
-
-  def effective_weight(self):
-    """The projection actually applied, i.e. after the magnitude schedule.
-
-    `rms(effective_weight)` is the injection's `noise/snr` (see the class
-    docstring), so this is also what the diagnostics read.
-    """
-    w = self.noise_proj.weight
-    if self.hold_rms:
-      # Differentiable normalisation: the gradient through `rms` cancels the
-      # radial component, so the optimizer spends its updates on the direction
-      # instead of pushing against a constraint that silently undoes them.
-      rms = w.pow(2).mean().sqrt().clamp_min(1e-12)
-      w = w * (self.noise_scale / rms)
-    gain = self.noise_gain
-    return w if gain == 1.0 else gain * w
-
-  def _add_noise(self, module, inputs, output):
-    if self._noise is None:
-      return output
-    # Shared noise has length 1 and broadcasts over the position axis.
-    gain = self.noise_gain
-    bias = self.noise_proj.bias
-    injected = self.noise_out_scale * F.linear(
-      self._noise, self.effective_weight(),
-      bias if gain == 1.0 else gain * bias)
-    # At gain == 0 this adds an exact zero (the forward is bit-identical to the
-    # unwrapped checkpoint) but still touches `noise_proj`, so DDP does not have
-    # to be told the projection is unused for the duration of the ramp's first
-    # step.
-    return output + injected.to(output.dtype)
-
-  def forward(self, xt, sigma=None, *args, **kwargs):
-    length = 1 if self.shared_noise else xt.shape[1]
-    self._noise = torch.randn(
-      xt.shape[0], length, self.noise_dim,
-      device=xt.device, dtype=torch.float32)
-    try:
-      return self.backbone(xt, sigma, *args, **kwargs)
-    finally:
-      self._noise = None
-
-
-def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden,
-                              shared_noise=False, noise_scale=1.0,
-                              warmup_steps=0, hold_rms=False):
-  """Locate the token-embedding module of `backbone` and wrap it so a learned
-  Gaussian-noise projection is added to the embedding residual."""
-  embed_module = None
-  for name, module in backbone.named_modules():
-    if name.endswith('vocab_embed'):
-      embed_module = module
-      break
-  assert embed_module is not None, (
-    'Could not locate a `vocab_embed` module for noise conditioning.')
-  if hasattr(embed_module, 'embedding'):
-    hidden_size = embed_module.embedding.shape[-1]
-  elif hasattr(embed_module, 'embedding_dim'):
-    hidden_size = embed_module.embedding_dim
-  else:
-    hidden_size = default_hidden
-  return _NoiseConditionedBackbone(
-    backbone, embed_module, noise_dim, hidden_size,
-    shared_noise=shared_noise, noise_scale=noise_scale,
-    warmup_steps=warmup_steps, hold_rms=hold_rms)
-
-
-class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
+class MDLM(trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):
+    # `main` resolves this before constructing the model so the printed config
+    # is truthful. Keep the model-level guard as well for direct construction
+    # and `load_from_checkpoint` callers outside that entry point.
+    if bool(config.training.get('continue_teacher', False)):
+      config.adversarial_distill.is_distill = False
     super().__init__(config, tokenizer)
     self._validate_configuration()
     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
@@ -458,44 +213,10 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       self.automatic_optimization = False
       self.teacher = copy.deepcopy(self.backbone)
       utils.freeze_model(self.teacher)
-
+      
       self.fake_model = copy.deepcopy(self.backbone)
       utils.activate_model(self.fake_model)
-
-      # Optional generator input-noise conditioning (D-MMD Sec. 6.5): wrap the
-      # student backbone so a learned Gaussian-noise projection is injected into
-      # the embedding residual. The position in this block is load-bearing --
-      # AFTER the teacher/fake deepcopies above, so both critics stay noise-free
-      # and keep measuring the student against an unperturbed reference, and
-      # BEFORE the EMA rebuild below, so `noise_proj` is tracked and swapped in
-      # at eval like every other student parameter.
-      distill_cfg = self.config.adversarial_distill
-      noise_dim = int(distill_cfg.get('noise_dim', 0) or 0)
-      if noise_dim > 0:
-        self.backbone = _wrap_backbone_with_noise(
-          self.backbone, noise_dim, self.config.model.hidden_size,
-          shared_noise=bool(distill_cfg.get('noise_shared', False)),
-          noise_scale=float(distill_cfg.get('noise_scale', 0.0) or 0.0),
-          warmup_steps=int(distill_cfg.get('noise_warmup_steps', 0) or 0),
-          hold_rms=bool(distill_cfg.get('noise_hold_rms', False)))
-        shared = distill_cfg.get('noise_shared', False)
-        print(f'[noise] {noise_dim}-dim '
-              f"{'shared' if shared else 'per-token'} injection, "
-              f"scale={distill_cfg.get('noise_scale', 0.0)}, "
-              f"warmup={distill_cfg.get('noise_warmup_steps', 0)}, "
-              f"hold_rms={distill_cfg.get('noise_hold_rms', False)}", flush=True)
       utils.activate_model(self.backbone)
-      # Resolved lazily by `_student_embed_std`. A NAME, not the module: this is
-      # an `nn.Module`, so assigning a submodule to an attribute registers it,
-      # and the embedding would then be emitted a second time in `state_dict`
-      # under `_embed_module_cache.embedding` -- which resume rejects as an
-      # unexpected key.
-      self._embed_module_name = None
-      # Keep the attribute present even for deliberately tiny overfit runs
-      # with `training.ema=0`. EMA is useful for normal training, but it is not
-      # part of the IDLM objective and disabling it should not make manual
-      # adversarial optimization crash.
-      self.ema_fake = None
       if self.ema is not None:
         del self.ema
         self.ema = models.ema.ExponentialMovingAverage(
@@ -510,7 +231,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       self._fake_accum_counter = 0
       self._student_accum_counter = 0
       self.fake_frequency = self.config.adversarial_distill.fake_frequency
-      self.fake_iter = 0
+      self.fake_iter = 0 
       # Upstream starts on a fake step so the critic is warm before the
       # generator first consults it. With dmd_weight=0 there is no critic to
       # warm, and starting there would train one nothing reads.
@@ -518,51 +239,20 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       self.total_loss_student = 0
       self.total_loss_fake = 0
       self.f_loss_ar = []
-
-  def _student_param_groups(self):
-    """Student optimizer parameter groups.
-
-    If the backbone is noise-conditioned and `adversarial_distill.noise_lr` is
-    set, the learned noise-projection matrix gets its own learning rate; every
-    other parameter uses `optim.lr`. Worth its own knob because the two move on
-    different scales: under the output rescaling in
-    `_NoiseConditionedBackbone`, Adam moves `noise/snr` by roughly `noise_lr`
-    per step, while the student's weights want whatever `optim.lr` the
-    distillation needs -- often several orders of magnitude apart.
-    """
-    base_lr = self.config.optim.lr
-    noise_lr = self.config.adversarial_distill.get('noise_lr', None)
-    if noise_lr is None or not hasattr(self.backbone, 'noise_proj'):
-      return [{'params': list(self.backbone.parameters()), 'lr': base_lr}]
-    noise_params = list(self.backbone.noise_proj.parameters())
-    noise_ids = {id(p) for p in noise_params}
-    other_params = [p for p in self.backbone.parameters()
-                    if id(p) not in noise_ids]
-    return [{'params': other_params, 'lr': base_lr},
-            {'params': noise_params, 'lr': float(noise_lr)}]
-
+  
   def configure_optimizers(self):
     if self.config.adversarial_distill.is_distill:
       optimizer_student = torch.optim.AdamW(
-        self._student_param_groups(),
+        self.backbone.parameters(),
         lr=self.config.optim.lr,
         betas=(self.config.optim.beta1,
               self.config.optim.beta2),
         eps=self.config.optim.eps,
         weight_decay=self.config.optim.weight_decay)
-
-      # The critic chases a moving student, so it need not share the
-      # generator's (often tiny) learning rate -- the two-time-scale setup.
-      # `null` keeps the original IDLM behaviour of one shared `optim.lr`.
-      # It matters most with `mmd_reward_type=idlm`, where the reward IS
-      # `nll_fake - nll_teacher`: a critic that cannot keep up stays a copy of
-      # the teacher and the reward collapses to ~0 for every sample.
-      fake_lr = self.config.adversarial_distill.get('fake_lr', None)
-      if fake_lr is None:
-        fake_lr = self.config.optim.lr
+      
       optimizer_fake = torch.optim.AdamW(
         self.fake_model.parameters(),
-        lr=float(fake_lr),
+        lr=self.config.optim.lr,
         betas=(self.config.optim.beta1,
               self.config.optim.beta2),
         eps=self.config.optim.eps,
@@ -602,8 +292,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
 
   def on_train_start(self):
     if self.is_adversarial_distill:
-      if self.ema_fake is not None:
-        self.ema_fake.move_shadow_params_to_device(self.device)
+      self.ema_fake.move_shadow_params_to_device(self.device)
       # Upstream opens on a fake step, so it hands the gradient to the critic
       # and freezes the student. With dmd_weight=0 there is no fake phase and
       # the very first step is the generator's, which would otherwise find its
@@ -614,157 +303,70 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       else:
         utils.activate_model(self.backbone)
         utils.freeze_model(self.fake_model)
-      self._sync_noise_schedule()
     super().on_train_start()
 
-  def _sync_noise_schedule(self):
-    """Point the injection's warmup ramp at the current global step.
-
-    A no-op unless the backbone is noise-conditioned with
-    `adversarial_distill.noise_warmup_steps > 0`. Called from `on_train_start`
-    (so a sanity-check validation and the first training forward already see the
-    right gain, whether the run is fresh or resumed) and from
-    `on_train_batch_start` (so the ramp advances). Validation reuses whatever the
-    last training batch set, which is the level the student was just trained at.
-
-    `self.global_step` counts optimizer steps -- student *and* fake updates --
-    the same x-axis the `noise/*` diagnostics are logged against, so the logged
-    `noise/gain` visibly reaches 1.0 at `noise_warmup_steps` on the plot.
-    """
-    setter = getattr(self.backbone, 'set_noise_step', None)
-    if setter is not None:
-      setter(self.global_step)
-
-  def on_train_batch_start(self, batch, batch_idx):
-    if self.is_adversarial_distill:
-      self._sync_noise_schedule()
-    return super().on_train_batch_start(batch, batch_idx)
-
-  def _student_embed_std(self):
-    """Per-entry std of the (possibly noise-wrapped) student's embedding.
-
-    Re-read rather than cached as a number, because the embedding drifts during
-    training and `noise/embed_std` is the scale the injection is compared
-    against. Only the module's NAME is remembered -- caching the module itself
-    on `self` would register it as a submodule and duplicate its parameter in
-    `state_dict`.
-    """
-    if getattr(self, '_embed_module_name', None) is None:
-      inner = getattr(self.backbone, 'backbone', self.backbone)
-      for name, module in inner.named_modules():
-        if name.endswith('vocab_embed'):
-          self._embed_module_name = name
-          break
-    name = getattr(self, '_embed_module_name', None)
-    if name is None:
-      return 0.02
-    inner = getattr(self.backbone, 'backbone', self.backbone)
-    return _embedding_std(inner.get_submodule(name))
-
-  def _noise_conditioning_stats(self):
-    """Diagnostics for the generator's input-noise conditioning, or `{}` when
-    it is disabled (`noise_dim=0`).
-
-    Logged every generator step so it is visible whether the student is
-    actually *using* the noise source or ignoring it:
-
-    * `noise/proj_norm` -- Frobenius norm of the *raw* learned projection. Flat
-      means the generator is not learning to use the noise; the run is then
-      equivalent to `noise_dim=0` regardless of `noise_lr`. Under
-      `noise_hold_rms` this is the one number the schedule does not pin, so it is
-      how hard the objective is pushing against the constraint (drifting down =>
-      it wants less noise than `noise_scale`).
-    * `noise/gain` -- the warmup ramp, 0 at step 0 and 1 after
-      `noise_warmup_steps`. Every number below is post-gain, so at gain 0 they
-      are 0 no matter what `W` holds.
-    * `noise/inject_std` -- per-hidden-dim std of the injected vector,
-      `noise_out_scale * ||W||_F / sqrt(hidden)` for unit-Gaussian input. The
-      `noise_out_scale` factor is what `_add_noise` actually applies; dropping it
-      here would under-report the injection by `embed_std / sqrt(noise_dim)`
-      (~37x at `noise_dim=128` on mdlm-owt). Compare against `noise/embed_std`.
-    * `noise/embed_std` -- per-entry std of the student's token embedding
-      (constant up to training drift), the scale the injection competes with.
-    * `noise/snr` -- ratio of the two, and with the output rescaling also just
-      `rms(W)`. At ~0.06 the injection is a few-percent perturbation that
-      LayerNorm largely absorbs; ~1.0 means the noise is as large as the token
-      identity itself; ~10 means the token identity is a tenth of the residual
-      and the student can barely read its own input.
-    """
-    proj = getattr(self.backbone, 'noise_proj', None)
-    if proj is None:
-      return {}
-    with torch.no_grad():
-      raw = proj.weight.detach().float()
-      # The magnitude schedule (warmup gain, `hold_rms` normalisation) is part of
-      # the forward pass, so read the projection the hook actually applies --
-      # otherwise the ramp is invisible and `snr` over-reports it.
-      w = self.backbone.effective_weight().detach().float()
-      proj_norm = raw.norm()
-      # E[||Wz||^2] = ||W||_F^2 for z ~ N(0, I), spread over `hidden` dims,
-      # then the constant output rescaling `_add_noise` applies.
-      out_scale = float(getattr(self.backbone, 'noise_out_scale', 1.0))
-      inject_std = out_scale * w.norm() / (w.shape[0] ** 0.5)
-      embed_std = self._student_embed_std()
-      gain = float(getattr(self.backbone, 'noise_gain', 1.0))
-    return {
-      'noise/proj_norm': proj_norm,
-      'noise/gain': torch.as_tensor(gain, device=raw.device),
-      'noise/inject_std': inject_std,
-      'noise/embed_std': torch.as_tensor(embed_std, device=raw.device),
-      'noise/snr': inject_std / max(embed_std, 1e-12)}
-
   def on_load_checkpoint(self, checkpoint):
+    continue_teacher = bool(
+      self.config.training.get('continue_teacher', False))
+    if continue_teacher:
+      state_dict = collections.OrderedDict(checkpoint['state_dict'])
+      teacher_prefix = 'teacher.'
+      has_frozen_teacher = any(
+        key.startswith(teacher_prefix) for key in state_dict)
+      if has_frozen_teacher:
+        missing_teacher = [
+          f'{teacher_prefix}{name}'
+          for name, _ in self.backbone.named_parameters()
+          if f'{teacher_prefix}{name}' not in state_dict
+        ]
+        if missing_teacher:
+          raise ValueError(
+            'Cannot continue the frozen teacher from an incomplete '
+            'distillation checkpoint; missing parameter '
+            f'{missing_teacher[0]!r}.')
+        # A distillation checkpoint contains both the trained student under
+        # `backbone.*` and the original frozen teacher under `teacher.*`.
+        # Continuing the *teacher* must select the latter explicitly.
+        for key, value in list(state_dict.items()):
+          if key.startswith(teacher_prefix):
+            suffix = key[len(teacher_prefix):]
+            state_dict[f'backbone.{suffix}'] = value
+        state_dict = collections.OrderedDict(
+          (key, value) for key, value in state_dict.items()
+          if not key.startswith(('teacher.', 'fake_model.')))
+        checkpoint['state_dict'] = state_dict
+
+        # The checkpoint EMA belongs to the student. Seed the continuation EMA
+        # from the selected teacher too, otherwise validation at step zero
+        # would silently evaluate the student while optimization updates the
+        # teacher.
+        teacher_shadow = [
+          state_dict[f'backbone.{name}'].detach().clone()
+          for name, _ in self.backbone.named_parameters()
+        ]
+        if self.ema is not None:
+          checkpoint['ema'] = {
+            'decay': self.config.training.ema,
+            'num_updates': 0,
+            'shadow_params': teacher_shadow,
+          }
     if self.is_adversarial_distill:
       state_dict = collections.OrderedDict(checkpoint['state_dict'])
-      # A plain MDLM checkpoint stores `backbone.<key>`, while a student with
-      # input-noise conditioning wraps that same model and therefore expects
-      # `backbone.backbone.<key>` plus a newly initialized noise projection.
-      # Convert only when starting distillation from such a plain checkpoint;
-      # normal resumes already carry `backbone.noise_proj.*` and bypass this
-      # block. Prefix depth is not a safe discriminator: the HF MDLM itself
-      # owns a `.backbone`, so its *plain* keys already begin with
-      # `backbone.backbone.` before our noise wrapper adds the third level.
-      if hasattr(self.backbone, 'noise_proj'):
-        wrapped_prefix = 'backbone.backbone.'
-        has_noise_state = any(
-          key.startswith('backbone.noise_proj.') for key in state_dict)
-        plain_keys = [
-          key for key in state_dict
-          if key.startswith('backbone.')]
-        if plain_keys and not has_noise_state:
-          for key in plain_keys:
-            suffix = key[len('backbone.'):]
-            state_dict[f'{wrapped_prefix}{suffix}'] = state_dict.pop(key)
-          for name, value in self.backbone.noise_proj.state_dict().items():
-            state_dict.setdefault(
-              f'backbone.noise_proj.{name}', value.detach().clone())
-      # The critics are seeded from the student when a checkpoint carries no
-      # weights of their own. Noise conditioning inserts a level in the student
-      # -- `backbone.backbone.blocks…` plus `backbone.noise_proj.*` -- while the
-      # teacher and fake stay UNWRAPPED, so mirroring the raw prefix would hand
-      # them `teacher.backbone.…` and a `teacher.noise_proj.weight` they have no
-      # parameter for, and Lightning's strict load would reject both. Strip the
-      # wrapper's level and drop the projection instead.
-      student_prefix = ('backbone.backbone.'
-                        if hasattr(self.backbone, 'noise_proj')
-                        else 'backbone.')
       for key, value in list(state_dict.items()):
-        if key.startswith(student_prefix):
-          suffix = key[len(student_prefix):]
+        if key.startswith('backbone.'):
+          suffix = key[len('backbone.'):]
           state_dict.setdefault(f'teacher.{suffix}', value)
           state_dict.setdefault(f'fake_model.{suffix}', value)
       checkpoint['state_dict'] = state_dict
     super().on_load_checkpoint(checkpoint)
-    if (self.is_adversarial_distill
-        and getattr(self, 'ema_fake', None) is not None):
+    if self.is_adversarial_distill and self.ema_fake is not None:
       ema_fake_state = checkpoint.get('ema_fake', checkpoint.get('ema'))
       if ema_fake_state is not None:
         self.ema_fake.load_state_dict(ema_fake_state)
 
   def on_save_checkpoint(self, checkpoint):
     super().on_save_checkpoint(checkpoint)
-    if (self.is_adversarial_distill
-        and getattr(self, 'ema_fake', None) is not None):
+    if self.is_adversarial_distill and self.ema_fake is not None:
       checkpoint['ema_fake'] = self.ema_fake.state_dict()
 
   def _preserve_prompt_probs(self, probs, x0, valid_tokens):
@@ -781,19 +383,17 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
   def _sample_distill_generator_t(self, n, current_accumulation_step):
     """Sample generator corruption, optionally emphasizing high-mask rows.
 
-    The knobs describe expected mask probabilities instead of raw diffusion
-    times. For the log-linear schedule used here,
-    `mask_probability = (1 - noise.eps) * t`; expressing the option in mask
-    space makes its effect explicit and keeps it meaningful to few-NFE runs.
+    The public knobs are expressed as expected mask probabilities rather than
+    raw diffusion times. They coincide only approximately even for this repo's
+    log-linear schedule (`mask_probability = (1 - noise.eps) * t`), and mask
+    probability is the quantity relevant to a few-NFE student.
 
-    With a zero mixture fraction, return the original `_sample_t` tensor before
-    drawing any more randomness. This keeps disabled runs bit-compatible with
-    the historical schedule.
+    The ordinary `_sample_t` draw is made first and returned untouched when the
+    mixture is disabled. Keeping that fast path free of any extra random draw
+    makes `high_mask_fraction=0` exactly backward compatible, not merely equal
+    in distribution.
     """
     t = self._sample_t(n, current_accumulation_step)
-    schedule = getattr(self, '_mask_schedule', None)
-    if schedule is not None and schedule.mode != 'original':
-      return schedule.sample(t)
     cfg = self.config.adversarial_distill
     fraction = float(cfg.get('high_mask_fraction', 0.0))
     minimum = float(cfg.get('high_mask_min', 0.7))
@@ -809,41 +409,27 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       return t
 
     high_mask_probability = minimum + (maximum - minimum) * torch.rand_like(t)
-    # LogLinear gives `1 - alpha_t = (1 - noise.eps) * t`, so this is
-    # the exact inverse in the mask-probability parameterization above.
-    high_t = (high_mask_probability / (1.0 - self.noise.eps)).clamp(
-      self.sampling_eps, 1.0)
+    high_t = self._alpha_to_t(1.0 - high_mask_probability)
     choose_high = torch.rand_like(t) < fraction
     return torch.where(choose_high, high_t.to(t.dtype), t)
 
   def multistep_generation(self, x0, valid_tokens, current_accumulation_step,
                            return_xt=False):
-    force_full_mask = bool(self.config.adversarial_distill.get(
-      'generator_force_full_mask', False))
-    if force_full_mask:
-      # `q_xt(x0, alpha(1))` still leaves about eps*length clean tokens on
-      # average. Inference starts from the literal all-MASK prior, so construct
-      # that state explicitly. Prompt positions, when present, stay visible.
-      t = torch.ones(x0.shape[0], device=x0.device)
-      _, alpha_t = self.noise(t)
-      alpha_t = alpha_t.unsqueeze(-1)
-      sigma = self._sigma_from_alphat(alpha_t)
-      xt = torch.full_like(x0, self.mask_index)
-      xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
-    else:
-      t = self._sample_distill_generator_t(
-        x0.shape[0], current_accumulation_step)
-      _, alpha_t = self.noise(t)
-      alpha_t = alpha_t.unsqueeze(-1)
-      assert alpha_t.ndim == 2
-      sigma = self._sigma_from_alphat(alpha_t)
-      xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    t = self._sample_distill_generator_t(
+      x0.shape[0], current_accumulation_step)
+    dalpha_t, alpha_t = self.noise(t)
+    alpha_t = alpha_t.unsqueeze(-1)
+    assert alpha_t.ndim == 2
+    sigma = self._sigma_from_alphat(alpha_t)
+
+    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
 
     log_x_theta = self.forward(xt, sigma=sigma)
     student_probs = log_x_theta.exp()
     student_probs = self._preserve_prompt_probs(student_probs, x0, valid_tokens)
     # `return_xt` exists for the MMD reward: the positions masked in `xt` are
-    # exactly the ones the student wrote, and so the only ones worth scoring.
+    # precisely the ones the student wrote, and hence the only ones a score
+    # estimator may take credit for.
     if return_xt:
       return student_probs, xt
     return student_probs
@@ -872,10 +458,10 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
 
     `dmd_weight=0` normally means nothing reads the fake, so its phase is
     skipped. `mmd_reward_type=idlm` breaks that inference: the reward *is*
-    `nll_fake - nll_teacher`, so an untrained fake stays a copy of the teacher
-    and the reward collapses to ~0 for every sample -- a silent null run rather
-    than a crash. Both gates consult this instead of `dmd_weight` directly so
-    they cannot disagree.
+    `log p_fake - log p_teacher`, so an untrained fake stays a copy of the
+    teacher and the reward collapses to ~0 for every sample -- a silent null
+    run rather than a crash. Both gates consult this instead of `dmd_weight`
+    directly so they cannot disagree.
     """
     cfg = self.config.adversarial_distill
     if bool(getattr(cfg, 'dmd_weight', 1.0)):
@@ -885,7 +471,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
 
   @property
   def _mmd_critic(self):
-    """The frozen feature map, built on first use.
+    """The frozen AR feature map, built on first use.
 
     Constructed lazily so a run with `mmd_reward_weight=0` never downloads or
     holds it, and the published objective stays exactly as upstream wrote it.
@@ -898,12 +484,9 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         raise ValueError('adversarial_distill.mmd_reward_type must be '
                          f'feature|idlm, got {kind!r}')
       kernel = str(cfg.get('mmd_kernel', 'linear'))
-      if kernel not in ('linear', 'rbf', 'cosine', 'pseudo_huber'):
+      if kernel not in ('linear', 'rbf', 'pseudo_huber'):
         raise ValueError('adversarial_distill.mmd_kernel must be '
-                         f'linear|rbf|cosine|pseudo_huber, got {kernel!r}')
-      if kernel == 'cosine' and kind != 'feature':
-        raise ValueError('adversarial_distill.mmd_kernel=cosine requires '
-                         'mmd_reward_type=feature')
+                         f'linear|rbf|pseudo_huber, got {kernel!r}')
       level = str(cfg.get('mmd_kernel_level', 'token'))
       if level not in ('token', 'sentence'):
         raise ValueError('adversarial_distill.mmd_kernel_level must be '
@@ -917,16 +500,6 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         raise ValueError('adversarial_distill.mmd_kernel=pseudo_huber requires '
                          'mmd_kernel_source=draws, mmd_kernel_level=sentence '
                          'and mmd_reward_type=feature')
-      source = getattr(cfg, 'mmd_feature_source', 'ar')
-      sentence_pooling = str(cfg.get('mmd_sentence_pooling', 'mean'))
-      if sentence_pooling not in ('mean', 'last_token'):
-        raise ValueError('adversarial_distill.mmd_sentence_pooling must be '
-                         f'mean|last_token, got {sentence_pooling!r}')
-      if sentence_pooling == 'last_token' and (
-          kind != 'feature' or source != 'ar' or level != 'sentence'):
-        raise ValueError('adversarial_distill.mmd_sentence_pooling=last_token '
-                         'requires mmd_reward_type=feature, '
-                         'mmd_feature_source=ar and mmd_kernel_level=sentence')
       if kind == 'idlm':
         # Scores samples by the teacher/fake ratio instead of by feature
         # distance to x0, so no feature map is built at all.
@@ -935,78 +508,93 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
               f'reward, group={cfg.mmd_group_size}, '
               f'weight={cfg.mmd_reward_weight}', flush=True)
         return self._mmd_critic_cached
-      if source == 'ar':
-        # Both the native TinyGSM checkpoint and the published OWT AR read
-        # clean sequences on the student's vocabulary, hence noise_level=0.
-        ar_model = str(cfg.mmd_ar_model)
-        if ar_model.endswith('.ckpt'):
-          backbone = mmd_reward.load_ar_backbone(
-            ar_model, self.config, self.tokenizer, self.device)
-          what = f'AR checkpoint {ar_model} (clean, no masking)'
-        else:
-          backbone = mmd_reward.load_owt_ar_backbone(
-            ar_model, self.device,
-            weights_dir=getattr(self.config, 'model_weights_dir', None))
-          what = f'owt-ar {ar_model} (clean, no masking)'
-        self._mmd_critic_cached = mmd_reward.FrozenBackboneFeatures(
-          backbone, self.mask_index,
-          layer_index=cfg.mmd_feature_layer,
-          layer_weights=cfg.get('mmd_feature_layer_weights', None),
-          noise_level=0.0)
-      elif source == 'diffusion':
-        # The teacher is a frozen copy of the student taken before training:
-        # already in memory, same vocabulary, and its features are about this
-        # corpus rather than about text at large. A denoiser never saw a clean
-        # sequence, so both rows are lightly masked first.
+      source = getattr(cfg, 'mmd_feature_source', 'ar')
+      if source == 'diffusion':
+        # The teacher is a frozen copy of the student taken before training,
+        # i.e. the finetune_path weights. Already in memory, same vocabulary,
+        # and its features are about TinyGSM rather than about text at large.
         self._mmd_critic_cached = mmd_reward.FrozenBackboneFeatures(
           self.teacher, self.mask_index,
           layer_index=cfg.mmd_feature_layer,
           layer_weights=cfg.get('mmd_feature_layer_weights', None),
           noise_level=cfg.mmd_noise_level)
         what = f'diffusion teacher (noise={cfg.mmd_noise_level})'
+      elif source == 'ar' and str(cfg.mmd_ar_model).endswith('.ckpt'):
+        # One of this repo's own AR checkpoints -- S-FLM's TinyGSM AR. In
+        # domain, on the student's exact tokenizer, and independent of the model
+        # being distilled. noise_level=0: unlike a denoiser it *did* see clean
+        # sequences, so masking would inject a difference into a comparison
+        # meant to isolate what the student wrote.
+        backbone = mmd_reward.load_ar_backbone(
+          str(cfg.mmd_ar_model), self.config, self.tokenizer, self.device)
+        self._mmd_critic_cached = mmd_reward.FrozenBackboneFeatures(
+          backbone, self.mask_index,
+          layer_index=cfg.mmd_feature_layer,
+          layer_weights=cfg.get('mmd_feature_layer_weights', None),
+          noise_level=0.0)
+        what = f'AR checkpoint {cfg.mmd_ar_model} (clean, no masking)'
+      elif source == 'ar':
+        self._mmd_critic_cached = mmd_reward.FrozenARFeatures(
+          cfg.mmd_ar_model, layer_index=cfg.mmd_feature_layer,
+          layer_weights=cfg.get('mmd_feature_layer_weights', None),
+          device=self.device)
+        what = f'HF AR {cfg.mmd_ar_model}'
       else:
         raise ValueError('adversarial_distill.mmd_feature_source must be '
                          f'ar|diffusion, got {source!r}')
       self._mmd_critic_cached.kernel = kernel
       self._mmd_critic_cached.kernel_level = level
-      self._mmd_critic_cached.sentence_pooling = sentence_pooling
       self._mmd_critic_cached.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
       self._mmd_critic_cached.rbf_block_size = int(
         cfg.get('mmd_rbf_block_size', 0) or 0)
       self._mmd_critic_cached.kernel_batch_size = max(
         1, int(cfg.get('mmd_kernel_batch_size', 1) or 1))
-      kernel_batch = (
-        f'{self._mmd_critic_cached.kernel_batch_size} draws/candidate'
-        if kernel_source == 'draws'
-        else f'rows of {self._mmd_critic_cached.kernel_batch_size}')
+      kernel_batch = (f'{self._mmd_critic_cached.kernel_batch_size} '
+                      'draws/candidate' if kernel_source == 'draws' else
+                      f'rows of {self._mmd_critic_cached.kernel_batch_size}')
       print(f'[mmd] {what}, block '
             f'{self._mmd_critic_cached.layer_description}, '
             f'{kernel} kernel over {level}s, '
-            f'sentence_pooling={sentence_pooling}, '
             f'{kernel_batch}, '
             f'group={cfg.mmd_group_size}, '
             f'weight={cfg.mmd_reward_weight}', flush=True)
     return self._mmd_critic_cached
 
   def _mmd_content_mask(self, x0, valid_tokens):
-    """Which positions carry real content worth pooling features over.
+    """Which positions the reward scores, per `mmd_scored_positions`.
 
-    Unconditional OpenWebText (`valid_tokens is None`) is packed text: `wrap`
-    concatenates documents and cuts the stream into fixed rows, so every
-    position is content and there is no padding. In particular EOS is a
-    *document separator* that recurs inside a row rather than a terminator --
-    the conditional branch below stops at the first one, which on OWT would
-    throw away most of every sequence.
+    `answer` (the default) keeps real answer content only: not padding, and not
+    past the answer's end. Mirrors yrOPDLM's `_valid_response_positions`
+    (`not_pad & before_im`), and it matters more here than there --
+    `data.train_on_pad=True` makes the loss mask run to the end of the
+    512-token row, so on TinyGSM 68% of the positions it marks are padding
+    after EOS. Pooling features over those averages in ~313 positions per row
+    where the clean and generated rows trivially agree, diluting the ~145 that
+    carry the answer by about 3x.
+
+    EOS doubles as BOS in this tokenizer, so the search for the answer's end is
+    confined to `valid_tokens`, which is already zero across the prompt. The
+    terminator itself is kept -- knowing where to stop is part of the answer --
+    and everything after it is dropped.
+
+    `non_prompt` keeps everything outside the prompt, padding and post-EOS
+    included. That is not a worse version of `answer`; it scores a different
+    thing. The student GENERATES at those positions too -- `train_on_pad=True`
+    puts them inside the mask -- so `answer` rewards the solution while
+    ignoring whatever the model emitted afterwards, and `non_prompt` holds it
+    to the whole of what it wrote. The cost is the 3x dilution above: on a row
+    that is 68% padding, most of the pooled feature is positions where both
+    sides trivially agree.
     """
-    if valid_tokens is None:
-      return torch.ones_like(x0, dtype=torch.bool)
-
-    # Conditional data (TinyGSM): real answer content only -- not padding, and
-    # not past the answer's end. EOS doubles as BOS in that tokenizer, so the
-    # search for the end is confined to `valid_tokens`, which is already zero
-    # across the prompt. The terminator itself is kept; knowing where to stop
-    # is part of the answer.
-    content = valid_tokens.bool()
+    content = (valid_tokens.bool() if valid_tokens is not None
+               else torch.ones_like(x0, dtype=torch.bool))
+    scored = str(getattr(self.config.adversarial_distill,
+                         'mmd_scored_positions', 'answer'))
+    if scored == 'non_prompt':
+      return content
+    if scored != 'answer':
+      raise ValueError('adversarial_distill.mmd_scored_positions must be '
+                       f'answer|non_prompt, got {scored!r}')
     pad_id = self.tokenizer.pad_token_id
     if pad_id is not None:
       content = content & x0.ne(pad_id)
@@ -1018,18 +606,19 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
     return content
 
   def _mmd_term(self, x0, valid_tokens, student_probs, xt):
-    """The configured hard-sample reward as a REINFORCE term, or zero."""
+    """yrOPDLM's paired feature reward as a REINFORCE term, or zero."""
     import mmd_reward
     cfg = self.config.adversarial_distill
+    # `mmd_scored_positions` already chose WHICH positions count as content
+    # (answer only, or everything outside the prompt). This is the orthogonal
+    # question: within that content, score only what the student wrote, or all
+    # of it.
     content = self._mmd_content_mask(x0, valid_tokens)
     # The WRITTEN span: what the student filled in, hence what the REINFORCE
     # surrogate sums log-probabilities over. Never widened.
     selected = (xt == self.mask_index) & content
     if not bool(selected.any()):
       return student_probs.new_zeros(())
-    # The SCORED span, which `mmd_score_positions` may widen to every content
-    # position. Outside the written span the two token sequences are identical,
-    # so this adds signal only through the feature map's context sensitivity.
     where = str(cfg.get('mmd_score_positions', 'written'))
     if where == 'written':
       scored = selected
@@ -1043,14 +632,11 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       group_size=cfg.mmd_group_size,
       eos_id=self.tokenizer.eos_token_id,
       reward_weight=cfg.mmd_reward_weight,
+      shuffle_rewards=bool(cfg.get('mmd_shuffle_rewards', False)),
       baseline=str(cfg.get('mmd_baseline', 'auto')),
       scored=scored,
       kernel_source=str(cfg.get('mmd_kernel_source', 'rows')),
-      kernel_draws=max(1, int(cfg.get('mmd_kernel_batch_size', 1) or 1)),
-      # Keep the endpoint independent of the written/scored span. Packed OWT
-      # includes every position, even document-separator EOS tokens.
-      sequence_mask=(content if cfg.get('mmd_sentence_pooling', 'mean')
-                     == 'last_token' else None))
+      kernel_draws=cfg.get('mmd_kernel_batch_size', 1))
     stats['mmd/generator_mask_fraction'] = (
       selected.sum().to(student_probs.dtype)
       / content.sum().clamp_min(1).to(student_probs.dtype)).detach()
@@ -1058,9 +644,10 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
     return loss
 
   def generator_loss(self, x0, valid_tokens, current_accumulation_step):
-    cfg = self.config.adversarial_distill
-    mmd_weight = getattr(cfg, 'mmd_reward_weight', 0.0)
-    dmd_weight = getattr(cfg, 'dmd_weight', 1.0)
+    mmd_weight = getattr(
+      self.config.adversarial_distill, 'mmd_reward_weight', 0.0)
+    dmd_weight = getattr(
+      self.config.adversarial_distill, 'dmd_weight', 1.0)
     assert mmd_weight or dmd_weight, (
       'adversarial_distill.dmd_weight and mmd_reward_weight are both 0, which '
       'leaves the generator with no objective at all.')
@@ -1069,13 +656,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         x0, valid_tokens, current_accumulation_step, return_xt=True)
     else:
       student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
-
-    if not dmd_weight:
-      # Reward-only: skip the differentiable DMD teacher/fake pair. The IDLM
-      # ratio reward still consults both critics internally on hard samples;
-      # the paired feature reward does not.
-      return self._mmd_term(x0, valid_tokens, student_probs, mmd_xt)
-
+    
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
@@ -1087,6 +668,11 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
     xt = trainer_base.sample_categorical(probs_xt)
     xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
     
+    if not dmd_weight:
+      # MMD-only: the teacher/fake pair is never consulted, so their two
+      # forwards are skipped rather than computed and multiplied by zero.
+      return self._mmd_term(x0, valid_tokens, student_probs, mmd_xt)
+
     with torch.cuda.amp.autocast(dtype=torch.float32):
       model_output_teacher = self.teacher(xt, sigma)
     logits_teacher = self._process_model_output(model_output=model_output_teacher, xt=xt, sigma=sigma)
@@ -1097,7 +683,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
     with torch.cuda.amp.autocast(dtype=torch.float32):
       model_output_fake = self.fake_model(xt, sigma)
     logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
-    fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs,
+    fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs, 
                                 alpha_t=alpha_t, dalpha_t=dalpha_t,
                                 valid_tokens=valid_tokens)
     loss = dmd_weight * (teacher_loss - fake_loss)
@@ -1152,8 +738,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         if self._student_accum_counter == self.accum_batches:
           self._student_accum_counter = 0 
           optimizer_student.step()
-          if self.ema is not None:
-            self.ema.update(self.backbone.parameters())
+          self.ema.update(self.backbone.parameters())
           optimizer_student.zero_grad()
           finish_iter = True
       else:
@@ -1169,8 +754,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         if self._fake_accum_counter == self.accum_batches:
           self._fake_accum_counter = 0 
           optimizer_fake.step()
-          if self.ema_fake is not None:
-            self.ema_fake.update(self.fake_model.parameters())
+          self.ema_fake.update(self.fake_model.parameters())
           optimizer_fake.zero_grad()
           finish_iter = True
 
@@ -1187,14 +771,9 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
           utils.activate_model(self.fake_model)
           utils.freeze_model(self.backbone)
           optimizer_fake.zero_grad()
-        # `f_loss_ar` stays empty when there is no fake phase, and
-        # `torch.stack([])` raises rather than logging nothing.
         stats = {"student_loss": self.total_loss_student}
         if self.f_loss_ar:
           stats["fake_loss"] = torch.stack(self.f_loss_ar).mean()
-        # Rank-identical (read off the parameters, not the batch), so the
-        # `sync_dist=True` below averages equal values.
-        stats.update(self._noise_conditioning_stats())
         self.log_dict(
             stats,
             prog_bar=True,
@@ -1203,7 +782,8 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
             sync_dist=True,
         )
         scheduler_student.step()
-        scheduler_fake.step()
+        if train_fake:
+          scheduler_fake.step()
         self.total_loss_student = 0
         self.f_loss_ar.clear()
       elif finish_iter:
@@ -1502,7 +1082,7 @@ class DUO_BASE(trainer_base.UniformState):
     assert alpha_t.ndim == 2
     
     q_xs = self._compute_posterior(
-      x=self._temper(self.forward(x, sigma_t)).exp(),
+      x=self.forward(x, sigma_t).exp(),
       xt=x,
       alpha_s=alpha_s,
       alpha_t=alpha_t)
@@ -1810,6 +1390,16 @@ class DUO(DUO_BASE):
     fake_loss = self.nll_per_token_with_probs(logits_fake, xt_usdm, student_probs, 
                                 alpha_t=usdm_alpha_t, dalpha_t=usdm_dalpha_t)
     return self._masked_mean(fake_loss, valid_tokens)
+
+  def _apply_checkpoint_ema_to_backbone_state(self, state_dict, checkpoint):
+    ema_state = checkpoint.get('ema', None)
+    if not (ema_state and 'shadow_params' in ema_state):
+      return
+    for (name, _), shadow in zip(
+        self.backbone.named_parameters(), ema_state['shadow_params']):
+      key = f'backbone.{name}'
+      if key in state_dict:
+        state_dict[key] = shadow.detach().clone().to(state_dict[key].dtype)
 
   def _backbone_shadow_params_from_state(self, state_dict):
     shadow_params = []

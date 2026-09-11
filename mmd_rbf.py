@@ -241,37 +241,35 @@ def rbf_pair_sums(feat_real, feat_fake, w, alpha, block_size: int = 0, shard: bo
 
 
 @torch.no_grad()
-def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size: int = 0):
-    """Unbiased MMD^2 between two sets of DIFFERENT size, per row.
+def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha,
+                     block_size: int = 0):
+    """Unbiased MMD^2 between two differently sized feature sets, per row.
 
-    `rbf_pair_sums` carries one weight tensor because its two sets are the same
-    sequence's positions. That does not hold when the fake side is several
-    draws at one state and the real side is a single clean row, so the three
-    sums are taken here with a mask each.
+    Multi-draw rewards compare one clean sequence with K generated sequences,
+    so the real and fake sets contain different numbers of token features. The
+    ordinary ``rbf_pair_sums`` path cannot express that because it shares one
+    mask between equal-sized sets.
 
-        MMD^2 = (S_xx - n)/(n(n-1)) + (S_yy - m)/(m(m-1)) - 2 S_xy/(nm)
+        MMD^2 = (S_xx-n)/(n(n-1)) + (S_yy-m)/(m(m-1)) - 2 S_xy/(nm)
 
-    `- n` and `- m` are exact rather than approximate: the weights are 0/1, so
-    each diagonal contributes `sum_i w_i^2 k(x_i, x_i)` = `sum_i w_i`.
-
-    No-grad only. The reward never carries a gradient -- REINFORCE reaches the
-    student through `log p(sampled token)`, not through the critic -- so the
-    hand-written backward `rbf_pair_sums` exists for is not needed, and this
-    stays a plain blocked reduction.
-
-    Args:
-      real: `(rows, n, dim)`; fake: `(rows, m, dim)`.
-      w_real: `(rows, n)` 0/1; w_fake: `(rows, m)` 0/1.
-
-    Returns `(mmd2, active)`, shapes `(rows,)`; rows with fewer than two
-    weighted samples on either side have no unbiased estimate and are inactive.
+    The reward is detached and reaches the student only through REINFORCE, so
+    this path needs no custom backward.
     """
+    if real.ndim != 3 or fake.ndim != 3:
+        raise ValueError('RBF feature sets must be rank-3, got '
+                         f'{tuple(real.shape)} and {tuple(fake.shape)}')
+    if real.shape[0] != fake.shape[0] or real.shape[2] != fake.shape[2]:
+        raise ValueError('RBF feature sets must share row and feature dimensions, '
+                         f'got {tuple(real.shape)} and {tuple(fake.shape)}')
+    if w_real.shape != real.shape[:2] or w_fake.shape != fake.shape[:2]:
+        raise ValueError('RBF masks must match their feature sets, got '
+                         f'{tuple(w_real.shape)} and {tuple(w_fake.shape)}')
+
     real = real.detach().float()
     fake = fake.detach().float()
     w_real = w_real.to(real.dtype)
     w_fake = w_fake.to(fake.dtype)
-    rows, n, _ = real.shape
-    m = fake.shape[1]
+    rows = real.shape[0]
     n_eff = w_real.sum(dim=1)
     m_eff = w_fake.sum(dim=1)
     active = (n_eff >= 2) & (m_eff >= 2)
@@ -279,16 +277,18 @@ def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size: int = 0):
     if torch.is_tensor(alpha):
         alpha = alpha.detach().to(dtype=real.dtype, device=real.device)
     r2, f2 = _sq_norms(real), _sq_norms(fake)
-    block = pick_block_size(rows, max(n, m)) if block_size <= 0 else block_size
+    block = (pick_block_size(rows, max(real.shape[1], fake.shape[1]))
+             if block_size <= 0 else block_size)
 
     def _sum(a, b, a2, b2, wa, wb, symmetric):
         total = real.new_zeros(rows)
         for i0, i1 in _blocks(a.shape[1], block):
             for j0, j1 in _blocks(b.shape[1], block):
-                k = _kernel_block(a[:, i0:i1], b[:, j0:j1], a2[:, i0:i1],
-                                  b2[:, j0:j1], alpha,
-                                  self_tile=symmetric and i0 == j0)
-                total = total + _wKw(k, wa[:, i0:i1], wb[:, j0:j1])
+                kernel = _kernel_block(
+                    a[:, i0:i1], b[:, j0:j1], a2[:, i0:i1], b2[:, j0:j1],
+                    alpha, self_tile=symmetric and i0 == j0)
+                total = total + _wKw(
+                    kernel, wa[:, i0:i1], wb[:, j0:j1])
         return total
 
     s_xx = _sum(real, real, r2, r2, w_real, w_real, True)
@@ -298,7 +298,9 @@ def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size: int = 0):
     nn = (n_eff * (n_eff - 1)).clamp_min(1.0)
     mm = (m_eff * (m_eff - 1)).clamp_min(1.0)
     nm = (n_eff * m_eff).clamp_min(1.0)
-    mmd2 = (s_xx - n_eff) / nn + (s_yy - m_eff) / mm - 2.0 * s_xy / nm
+    mmd2 = ((s_xx - n_eff) / nn
+            + (s_yy - m_eff) / mm
+            - 2.0 * s_xy / nm)
     return torch.where(active, mmd2, torch.zeros_like(mmd2)), active
 
 
@@ -307,15 +309,15 @@ def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0):
     """MMD^2 from one fixed real vector and K sampled fake vectors per row.
 
     ``real`` is ``(batch, hidden)`` and ``fake`` is
-    ``(batch, draws, hidden)``. The real vector is the observed conditional
-    target, so ``k(real, real)`` is known exactly. When K > 1 the fake-fake
+    ``(batch, draws, hidden)``.  The real vector is the observed conditional
+    target, so ``k(real, real)`` is known exactly.  When K > 1 the fake-fake
     term is the unbiased U-statistic (its diagonal is removed):
 
         k(x,x) + sum_{i != j} k(y_i,y_j) / (K(K-1))
                - 2 sum_i k(x,y_i) / K
 
     With K = 1 there is no off-diagonal fake pair, so this deliberately falls
-    back to the biased empirical estimate ``2 - 2 k(x,y)``. The K > 1 result
+    back to the biased empirical estimate ``2 - 2 k(x,y)``.  The K > 1 result
     is not clamped: a U-statistic can legitimately be negative, and clamping it
     would make the requested estimator biased.
     """

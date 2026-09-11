@@ -2,7 +2,6 @@
 """
 
 import argparse
-import contextlib
 import logging
 import os
 import sys
@@ -17,63 +16,33 @@ from scipy.integrate import quad
 from scipy.stats import norm
 from timm.scheduler import CosineLRScheduler
 
+def repo_root():
+  """Directory this checkout lives in.
 
-class _StubTokenizer:
-  """Stand-in for a `tokenizers.Tokenizer` this environment cannot unpickle."""
-
-  def __init__(self, *args, **kwargs):
-    pass
-
-  def __setstate__(self, state):
-    del state
-
-
-class _TolerantUnpickler(pickle.Unpickler):
-  def find_class(self, module, name):
-    if module.split('.')[0] == 'tokenizers':
-      return _StubTokenizer
-    return super().find_class(module, name)
-
-
-class _tolerant_pickle_module:
-  """`pickle_module` shim: `torch.load` only needs these two names."""
-  Unpickler = _TolerantUnpickler
-  load = pickle.load
-
-
-@contextlib.contextmanager
-def tolerant_checkpoint_load():
-  """Let `torch.load` read checkpoints carrying a newer pickled tokenizer.
-
-  Lightning stores `__init__`'s arguments under `hyper_parameters`, and this
-  repo's modules take `tokenizer=`, so every checkpoint embeds a pickled
-  `tokenizers.Tokenizer`. That object is serialized by the Rust library and
-  refuses to load into an older `tokenizers` than wrote it -- it raises
-  "data did not match any variant of untagged enum ModelWrapper" long before
-  any weight is read. Checkpoints written on a machine with a newer stack than
-  `requirements.txt` pins are therefore unreadable in the repo's own
-  environment, which is exactly the case for the OWT student checkpoints.
-
-  The pickled tokenizer is dead weight regardless: every caller passes
-  `tokenizer=` explicitly, which overrides the stored hyper-parameter. So swap
-  in a stub for that package and let the rest of the checkpoint -- the weights,
-  the EMA, the config -- load normally. Nothing else is relaxed; a genuinely
-  corrupt file still fails.
+  Configs need to name files that ship with the repo (the GSM8K test set, the
+  Pareto reference). An absolute path there pins the whole config tree to one
+  machine, and `${cwd:}` is no help because `hydra.job.chdir` has already moved
+  the process into the run directory by the time a config is read.
   """
-  original = torch.load
+  return os.path.dirname(os.path.abspath(__file__))
 
-  def _load(*args, **kwargs):
-    kwargs.setdefault('pickle_module', _tolerant_pickle_module)
-    # `weights_only` and a custom `pickle_module` are mutually exclusive, and
-    # a weights-only load would reject the stored config anyway.
-    kwargs.pop('weights_only', None)
-    return original(*args, **kwargs)
 
-  torch.load = _load
-  try:
-    yield
-  finally:
-    torch.load = original
+def register_omegaconf_resolvers():
+  """Register every custom resolver the configs use.
+
+  Called by each entry point that composes the config -- `main`, and the
+  standalone scripts. Kept in one place so a config using a new resolver cannot
+  work under `main` and fail under a script. Re-registration is tolerated so
+  importing two entry points in one process is harmless.
+  """
+  import omegaconf
+  for name, fn in (
+      ('cwd', os.getcwd),
+      ('repo_root', repo_root),
+      ('device_count', torch.cuda.device_count),
+      ('eval', eval),
+      ('div_up', lambda x, y: (x + y - 1) // y)):
+    omegaconf.OmegaConf.register_new_resolver(name, fn, replace=True)
 
 
 def freeze_model(model):

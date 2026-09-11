@@ -65,29 +65,41 @@ r, act = R(clean, gen, eq, kernel='rbf', rows_of=4, level='sentence')
 chk('reward stays per sequence', r.shape == (B,))
 chk(f'a row of 4 shares one value (row0={r[:4].tolist()})',
     len(set(r[:4].tolist())) == 1 and len(set(r.tolist())) == B // 4)
-# Identical nonconstant sets have a negative diagonal-excluded estimate.
-# For the two scalar points {-1, 1}, its negative is 1 - exp(-4).
-expected = 1.0 - math.exp(-4.0)
-points = torch.tensor([[[-1.0], [1.0]],
-                       [[-1.0], [1.0]],
-                       [[-1.0], [1.0]]])
-mask = torch.tensor([[True, True], [False, False], [True, False]])
-for block_size in (0, 1):
-    z, active = R(points, points, mask, kernel='rbf', alpha=1.0,
-                  block_size=block_size, level='token')
-    torch.testing.assert_close(z, torch.tensor([expected, 0.0, 0.0]))
-    chk(f'token RBF preserves positive reward and inactive rows, block={block_size}',
+# Identical empirical sets need not score zero under the diagonal-excluded
+# estimator. With atoms {0, 1} and alpha=log(2), each within-set term is 1/2
+# while the cross term is 2*(3/4): MMD^2=-1/2, hence reward=+1/2.
+# Masked features differ deliberately, and rows with 0 or 1 atoms are inactive.
+atoms = torch.tensor([[[0.0], [1.0], [999.0]],
+                      [[0.0], [999.0], [999.0]],
+                      [[999.0], [999.0], [999.0]]])
+selected = torch.tensor([[True, True, False],
+                         [True, False, False],
+                         [False, False, False]])
+generated = torch.where(selected.unsqueeze(-1), atoms, -atoms)
+for block in (0, 1):
+    z, active = R(atoms, generated, selected, kernel='rbf',
+                  alpha=math.log(2), block_size=block)
+    torch.testing.assert_close(z, torch.tensor([0.5, 0.0, 0.0]))
+    chk(f'token RBF keeps negative estimates; masks inactive rows (block={block})',
         active.tolist() == [True, False, False])
 
-# In rows/sentence mode the same two points come from two pooled sequences.
-sentences = torch.tensor([[[-1.0], [-1.0]], [[1.0], [1.0]]])
-for block_size in (0, 1):
-    z, active = R(sentences, sentences, torch.ones(2, 2, dtype=torch.bool),
-                  kernel='rbf', rows_of=2, level='sentence', alpha=1.0,
-                  block_size=block_size)
-    torch.testing.assert_close(z, torch.full((2,), expected))
-    chk(f'sentence RBF shares the unclipped positive reward, block={block_size}',
-        bool(active.all()))
+    # The same atoms as one-position sentences, grouped two at a time.
+    sentence_atoms = torch.tensor(
+        [0.0, 1.0, 0.0, 999.0, 999.0, 999.0]).reshape(6, 1, 1)
+    sentence_selected = torch.tensor(
+        [True, True, True, False, False, False]).reshape(6, 1)
+    sentence_generated = torch.where(
+        sentence_selected.unsqueeze(-1), sentence_atoms, -sentence_atoms)
+    z, active = R(sentence_atoms, sentence_generated, sentence_selected,
+                  kernel='rbf', rows_of=2, level='sentence',
+                  alpha=math.log(2), block_size=block)
+    torch.testing.assert_close(z, torch.tensor([0.5, 0.5, 0.0, 0.0, 0.0, 0.0]))
+    chk(f'sentence rows keep negative estimates; mask inactive groups (block={block})',
+        active.tolist() == [True, True, False, False, False, False])
+
+z, active = R(atoms, generated, torch.zeros_like(selected), kernel='rbf')
+chk('all-inactive RBF rows return zero rewards',
+    not bool(active.any()) and bool((z == 0).all()))
 
 print(f"\n{sum(v for _, v in ok)}/{len(ok)} passed")
 sys.exit(0 if all(v for _, v in ok) else 1)

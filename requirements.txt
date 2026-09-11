@@ -28,3 +28,4 @@ hf_transfer
 huggingface-hub
 # Install flash attention only after installing the above modules via pip install -r requirements.txt
 # flash_attn==2.7.4.post1
+matplotlib==3.9.4

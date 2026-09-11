@@ -57,10 +57,11 @@ class UnderdeepLogger(Logger):
     self._initialized = False
     self._finished = False
     # Lightning calls `finalize` at the end of *every* trainer entry point,
-    # `trainer.validate` included -- so any validation phase driven before
-    # `trainer.fit` closes the run before training logs a single scalar, and
-    # every later write then fails with "Can't log data to finished run".
-    # A caller that runs such a phase sets this to defer the close.
+    # `trainer.validate` included -- so a baseline validation before
+    # `trainer.fit` (see `eval.validate_before_train`) would close the run
+    # before training logs a single scalar, and every later write fails with
+    # "Can't log data to finished run". Callers that run a phase before
+    # training set this to defer the close; see `main._train`.
     self.defer_finalize = False
 
   # -- Lightning Logger interface -------------------------------------- #

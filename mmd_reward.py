@@ -13,19 +13,13 @@ large ones, so a single badly-placed block cannot dominate the gradient the way 
 squared distance would. The reward is per block, and it drives a REINFORCE step whose
 baseline is the leave-one-out mean over a group of samples drawn at the same state.
 
-The ``draws + sentence`` mode uses a different, explicit kernel estimator:
-every sequence is pooled/read out first, then one fixed clean embedding is compared
-with K sampled embeddings. It uses an unclamped U-statistic for K > 1 and a
-biased fallback for K = 1. Besides normalized linear and RBF kernels, the
-``pseudo_huber`` distance-induced kernel extends the original reward: at K = 1
-it is exactly the pseudo-Huber distance above, and at K > 1 it subtracts the
-fake-pair distance correction. Historical linear token/rows paths retain the
-pseudo-Huber behaviour above.
-
-The optional ``cosine`` kernel computes true dot-product MMD on L2-normalized
-token features or sentence readouts. It has no pseudo-Huber transform and no
-extra hidden-dimension average; off-diagonal and loss reduction rules remain
-the same as the corresponding RBF path.
+The ``draws + sentence`` mode added below uses a different, explicit kernel
+estimator: every sequence is mean-pooled first, then one fixed clean embedding
+is compared with K sampled embeddings. It uses an unclamped U-statistic for
+K > 1 and a biased fallback for K = 1, for normalized linear, RBF and
+pseudo-Huber distance-induced kernels. The last recovers the historical
+pseudo-Huber reward at K = 1. All MMD estimators retain negative estimates;
+their negated rewards can therefore be positive.
 
 Two things differ here from the OPDLM implementation, both forced by the model:
 
@@ -50,7 +44,6 @@ import os
 import torch
 
 import mmd_rbf
-import mmd_cosine
 
 # yrOPDLM's MMD_PSEUDO_HUBER_C. Kept at its value there so rewards are comparable.
 PSEUDO_HUBER_C = 0.001
@@ -71,11 +64,6 @@ def ar_decoder_layers(core):
     # This repo's own DiT, so the frozen *diffusion teacher* can serve as the
     # feature map instead of an external causal LM.
     getattr(core, 'blocks', None),
-    # `algo.backbone=hf_dit`, which the OpenWebText recipe uses: the teacher is
-    # then `kuleshov-group/mdlm-owt`'s `MDLM` wrapper, whose blocks sit one
-    # level down on the `DITBackbone` it holds. Without this the diffusion
-    # feature source raises on OWT while working on TinyGSM's local `dit`.
-    getattr(getattr(core, 'backbone', None), 'blocks', None),
   )
   for layers in candidates:
     if layers is not None and len(layers) > 0:
@@ -95,37 +83,28 @@ def ar_decoder_layers(core):
 def embedding_module(core):
   """The token-embedding module, whose output is layer -1.
 
-  That is the bag-of-embeddings floor: a pure lookup table, no attention and no
-  mixing, so its pooled features carry the token *multiset* and nothing about
-  order. Useful as the reference a real block has to beat, rather than as a
-  reward on its own.
-
-  The `backbone` probe is what makes `algo.backbone=hf_dit` work: on
-  `kuleshov-group/mdlm-owt` the embedding is at `backbone.vocab_embed`, one
-  level down on the `DITBackbone` the wrapper holds -- the same indirection
-  `ar_decoder_layers` already handles for the blocks.
+  That is the bag-of-embeddings floor: a pure lookup table with no attention
+  and no mixing, so its pooled features carry the answer's token *multiset* and
+  nothing about order. `scripts/probe_mmd_features.py` measures it at exactly
+  0.000 structure, against 0.841 for block 6 -- which is what makes it the
+  reference any real block has to beat rather than a sensible reward on its own.
   """
   for attr in ('vocab_embed', 'embed_tokens', 'wte'):
-    for holder in (core,
-                   getattr(core, 'model', None),
-                   getattr(core, 'backbone', None)):
-      module = None if holder is None else getattr(holder, attr, None)
-      if module is not None:
-        return module
+    module = getattr(core, attr, None)
+    if module is not None:
+      return module
+    inner = getattr(core, 'model', None)
+    module = None if inner is None else getattr(inner, attr, None)
+    if module is not None:
+      return module
   getter = getattr(core, 'get_input_embeddings', None)
   if callable(getter):
-    try:
-      module = getter()
-    except NotImplementedError:
-      # `mdlm-owt`'s wrapper defines the method and raises from it, so this
-      # cannot be treated as "no such method".
-      module = None
+    module = getter()
     if module is not None:
       return module
   raise ValueError(
     'mmd_feature_layer=-1 needs a token-embedding module; looked for '
-    'vocab_embed, embed_tokens and wte on the model, its `.model` and its '
-    '`.backbone`, then get_input_embeddings()')
+    'vocab_embed, embed_tokens, wte and get_input_embeddings()')
 
 
 def resolve_feature_layers(core, layer_index):
@@ -136,6 +115,14 @@ def resolve_feature_layers(core, layer_index):
   layers specialize toward the next-token head and early ones barely differ from
   the embedding, so neither end says much about whether two sequences *mean* the
   same thing.
+
+  `-1` selects the token embeddings themselves, matching the convention in
+  `scripts/probe_mmd_features.py`. That is a lookup table with no attention and
+  no mixing, so the pooled feature is the answer's token multiset and the reward
+  reduces to a soft bag-of-words distance -- order-blind by construction. The
+  probe measures it at exactly 0.000 structure against block 6's 0.841, so it is
+  the floor a real block has to beat, useful as a control arm rather than as a
+  reward to train on for its own sake.
 
   A sequence asks for a *summed* reward -- one pseudo-Huber term per block. That
   is worth knowing about before using it: on this repo's TinyGSM teacher the
@@ -167,9 +154,9 @@ def resolve_feature_layers(core, layer_index):
                        'mmd_feature_layer_weights instead')
   for index in indices:
     # -1 is the embedding output, the bag-of-embeddings floor; it is a real
-    # choice rather than an out-of-range index, so it is admitted explicitly
-    # instead of falling through to Python's from-the-end indexing, which
-    # would silently hand back the last block.
+    # choice here rather than an out-of-range index, so it is admitted
+    # explicitly instead of falling through to Python's from-the-end indexing,
+    # which would silently hand back the last block.
     if index < -1 or index >= len(layers):
       raise ValueError(
         f'mmd_feature_layer={index} is outside [-1,{len(layers) - 1}] '
@@ -260,42 +247,6 @@ def pool_over_selected(features, selected):
   weight = selected.unsqueeze(-1).to(torch.float32)
   denom = selected.sum(dim=1).clamp_min(1).to(torch.float32).unsqueeze(-1)
   return (features.float() * weight).sum(dim=1) / denom, selected.any(dim=1)
-
-
-def pool_sentence_features(features, selected, pooling='mean',
-                           sequence_mask=None):
-  """Represent a sequence by its scored mean or its final valid AR feature.
-
-  `selected` controls activity, not the endpoint in `last_token` mode. The
-  endpoint is the last True position in `sequence_mask`, or the final physical
-  position when no mask is supplied (packed OWT). It need not have been written
-  by the student: its causal hidden state sees the preceding changed tokens.
-  The same endpoint is used for the clean sequence and every generated draw.
-  Empty scored/valid rows return zero and are inactive. `sequence_mask` only
-  chooses the readout position; it must not hide the prompt from AR attention.
-  """
-  if pooling not in ('mean', 'last_token'):
-    raise ValueError('mmd_sentence_pooling must be mean|last_token, got '
-                     f'{pooling!r}')
-  if features.ndim != 3 or selected.shape != features.shape[:2]:
-    raise ValueError('sentence pooling expects (batch, length, hidden) '
-                     'features and a matching (batch, length) selected mask')
-  if sequence_mask is not None and sequence_mask.shape != selected.shape:
-    raise ValueError(f'sequence mask must be {tuple(selected.shape)}, got '
-                     f'{tuple(sequence_mask.shape)}')
-  if pooling == 'mean':
-    return pool_over_selected(features, selected)
-
-  batch, length, hidden = features.shape
-  valid = (torch.ones_like(selected, dtype=torch.bool)
-           if sequence_mask is None else sequence_mask.bool())
-  active = selected.bool().any(dim=1) & valid.any(dim=1)
-  if length == 0:
-    return features.new_zeros((batch, hidden), dtype=torch.float32), active
-  positions = torch.arange(length, device=features.device).expand(batch, -1)
-  last = positions.masked_fill(~valid, -1).max(dim=1).values.clamp_min(0)
-  pooled = features[torch.arange(batch, device=features.device), last].float()
-  return torch.where(active.unsqueeze(-1), pooled, torch.zeros_like(pooled)), active
 
 
 def sequence_pooled_delta(clean, generated, selected):
@@ -401,8 +352,8 @@ def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0):
   mmd2 = ((s_xx - safe_n) / pairs
           + (s_yy - safe_n) / pairs
           - 2.0 * s_xy / square)
-  # Preserve negative finite-sample estimates; clipping would change the
-  # estimator. Their corresponding rewards are positive.
+  # A U-statistic can be negative; preserve it instead of biasing the reward
+  # by clipping the estimate at zero.
   reward = -mmd2
   return torch.where(active, reward, torch.zeros_like(reward)), active
 
@@ -440,19 +391,17 @@ def merge_kernel_rows(clean, generated, selected, rows_of):
 
 def paired_sequence_reward(clean, generated, selected, kernel='linear',
                            alpha=None, block_size=0, rows_of=1,
-                           level='token', sentence_pooling='mean',
-                           sequence_mask=None):
+                           level='token'):
   """One reward per sequence; rows selecting nothing score zero.
 
-  `kernel='linear'` is the historical name for pooling both sides and scoring
-  the difference with pseudo-Huber; it is not the squared linear-kernel MMD.
+  `kernel='linear'` is the original: pool both sides and score the difference
+  with pseudo-Huber. This historical robust score is not linear-kernel MMD^2.
   `kernel='rbf'` compares the two feature distributions instead. See
-  `rbf_sequence_reward`. `kernel='cosine'` uses true linear-kernel MMD on
-  individually L2-normalized feature vectors, with self-pairs removed.
+  `rbf_sequence_reward`.
 
   `level` chooses what one sample is. `token` (the default) hands the kernel
-  every scored POSITION of the row. `sentence` represents each sequence by
-  `sentence_pooling` and hands it the row's `rows_of` SENTENCE vectors instead.
+  every scored POSITION of the row. `sentence` mean-pools each sequence first
+  and hands it the row's `rows_of` SENTENCE vectors instead.
 
   `rows_of > 1` computes the statistic over that many sequences at once (see
   `merge_kernel_rows`) and hands every sequence in a row its row's reward.
@@ -465,29 +414,29 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
                      'mmd_kernel_source=draws and mmd_kernel_level=sentence')
   batch = clean.shape[0]
   if level == 'sentence':
-    # One sample per SEQUENCE: read out its sentence representation first,
-    # then let the kernel see the row's `rows_of` sentence vectors as its
-    # sample set. Token level instead hands it every scored position.
+    # One sample per SEQUENCE: mean-pool it over its own scored positions
+    # first, then let the kernel see the row's `rows_of` sentence vectors as
+    # its sample set. Token level instead hands the kernel every scored
+    # position of the row.
     #
-    # With mean pooling, linear gives the same reward whenever the sequences in a
+    # For the linear kernel this is the same reward whenever the sequences in a
     # row carry equal numbers of scored positions, since a mean of means then
     # equals the pooled mean -- exactly so at `rows_of=1`. It differs when the
     # counts differ, because pooling weights a sequence by its length while
-    # this weights every sequence alike. For rbf it is a different statistic
-    # outright: the distribution being matched is over sentences, not tokens.
-    if rows_of < 2 and kernel in ('rbf', 'cosine'):
+    # this weights every sequence alike. On TinyGSM those counts differ a lot:
+    # answers vary in length and `t ~ U(0,1)` masks a different fraction of
+    # each. For rbf it is a different statistic outright.
+    if rows_of < 2 and kernel == 'rbf':
       raise ValueError(
-        f'mmd_kernel_level=sentence with mmd_kernel={kernel} needs '
+        'mmd_kernel_level=sentence with mmd_kernel=rbf needs '
         'mmd_kernel_batch_size >= 2: a row of one sentence gives the unbiased '
         'MMD^2 a single sample per side, which has no estimate at all')
     if batch % rows_of:
       raise ValueError(
         f'mmd_kernel_batch_size={rows_of} does not divide the batch size '
         f'{batch}; a row would straddle the end of the batch')
-    clean_m, active_seq = pool_sentence_features(
-      clean, selected, pooling=sentence_pooling, sequence_mask=sequence_mask)
-    gen_m, _ = pool_sentence_features(
-      generated, selected, pooling=sentence_pooling, sequence_mask=sequence_mask)
+    clean_m, active_seq = pool_over_selected(clean, selected)
+    gen_m, _ = pool_over_selected(generated, selected)
     rows = batch // rows_of
     clean = clean_m.reshape(rows, rows_of, -1)
     generated = gen_m.reshape(rows, rows_of, -1)
@@ -498,18 +447,12 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
   if kernel == 'rbf':
     reward, active = rbf_sequence_reward(clean, generated, selected,
                                          alpha=alpha, block_size=block_size)
-  elif kernel == 'cosine':
-    # At sentence level the readout above happens BEFORE normalization.
-    # At token level every scored token is a separate normalized sample.
-    mmd2, active = mmd_cosine.cosine_mmd2_unequal(
-      clean, generated, selected, selected)
-    reward = -mmd2
   elif kernel == 'linear':
     delta, active = sequence_pooled_delta(clean, generated, selected)
     reward = pseudo_huber_reward(delta)
     reward = torch.where(active, reward, torch.zeros_like(reward))
   else:
-    raise ValueError(f'mmd_kernel must be linear|rbf|cosine, got {kernel!r}')
+    raise ValueError(f'mmd_kernel must be linear|rbf, got {kernel!r}')
   if rows_of > 1:
     # Every sequence in a row carries that row's reward. The group baseline
     # then subtracts a per-row quantity from a per-row quantity, so the
@@ -522,8 +465,7 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
 
 def summed_paired_reward(features, batch, selected, indices, weights,
                          kernel='linear', alpha=None, block_size=0,
-                         rows_of=1, level='token', sentence_pooling='mean',
-                         sequence_mask=None):
+                         rows_of=1, level='token'):
   """`R = sum_l w_l * R_l` over the requested blocks.
 
   Args:
@@ -535,7 +477,7 @@ def summed_paired_reward(features, batch, selected, indices, weights,
 
   Summing rather than, say, averaging keeps a single-block config numerically
   identical to what it was before multi-block support existed. `active` depends
-  only on the masks, so it is the same for every block.
+  only on `selected`, so it is the same for every block.
 
   Returns `(reward, active, per_layer)`; `per_layer` is unweighted, for logging.
   """
@@ -544,8 +486,7 @@ def summed_paired_reward(features, batch, selected, indices, weights,
     stacked = features[index]
     reward, active = paired_sequence_reward(
       stacked[:batch], stacked[batch:], selected, kernel=kernel,
-      alpha=alpha, block_size=block_size, rows_of=rows_of, level=level,
-      sentence_pooling=sentence_pooling, sequence_mask=sequence_mask)
+      alpha=alpha, block_size=block_size, rows_of=rows_of, level=level)
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight
   return total, active, per_layer
@@ -587,75 +528,64 @@ def linear_mmd2_fixed_real(real, fake):
 
 @torch.no_grad()
 def pseudo_huber_mmd2_fixed_real(real, fake):
-  """Distance-induced MMD^2 for one fixed real vector and K fake draws.
+  """MMD^2 for the kernel induced by the historical pseudo-Huber distance.
 
-  Let rho(a,b) = -pseudo_huber_reward(a-b), using the historical c = 0.001
-  and averaging over hidden dimensions. This is a distance of negative type:
-  sqrt(c^2+t)-c is a Bernstein function of the squared coordinate distance.
-  The induced positive-semidefinite kernel is
+  With rho(a,b) = mean_d(sqrt((a_d-b_d)^2+c^2)-c), the statistic is
+  mean_i rho(real,fake_i) minus half the off-diagonal mean fake-pair distance.
+  K > 1 is unbiased over independent fake draws conditional on the fixed real
+  vector. K = 1 omits the unavailable pair correction and exactly recovers
+  the historical distance. This defines a different kernel, rather than
+  applying pseudo-Huber to a linear/RBF MMD estimate. Its coordinate-additive
+  distance need not distinguish distributions differing only in dependence
+  between feature dimensions. Negative U-statistics are retained.
 
-      k(a,b) = (rho(a,0) + rho(b,0) - rho(a,b)) / 2.
-
-  For one observed real vector x, its MMD^2 is
-  E rho(x,Y) - E rho(Y,Y') / 2. At K > 1, the estimator below uses distinct
-  fake pairs and is unbiased over the fake draws conditional on x. At K = 1,
-  the biased fallback is rho(x,y), exactly the original pooled Huber distance.
-  This is a separate kernel, not Huber applied to a linear/RBF MMD estimate.
-  The coordinatewise sum compares marginals, not arbitrary joint dependence.
-
-  Inputs have shapes (batch, hidden) and (batch, draws, hidden). Pairwise
-  distances use O(batch * hidden) scratch instead of a (batch,K,K,hidden)
-  tensor. No clamping: a U-statistic can legitimately be negative.
+  Pair distances are accumulated with (batch, hidden) scratch tensors, never
+  a (batch, draws, draws, hidden) allocation. Arithmetic stays in fp32.
   """
   if real.ndim != 2 or fake.ndim != 3:
-    raise ValueError('fixed-real pseudo_huber MMD expects (batch, hidden) real '
+    raise ValueError('fixed-real pseudo-Huber MMD expects (batch, hidden) real '
                      'and (batch, draws, hidden) fake features, got '
                      f'{tuple(real.shape)} and {tuple(fake.shape)}')
   if real.shape[0] != fake.shape[0] or real.shape[1] != fake.shape[2]:
-    raise ValueError('fixed-real pseudo_huber MMD features must share batch '
+    raise ValueError('fixed-real pseudo-Huber MMD features must share batch '
                      f'and hidden dimensions, got {tuple(real.shape)} and '
                      f'{tuple(fake.shape)}')
   draws = fake.shape[1]
   if draws < 1:
-    raise ValueError('fixed-real pseudo_huber MMD needs at least one fake draw')
+    raise ValueError('fixed-real pseudo-Huber MMD needs at least one fake draw')
 
   real = real.detach().float()
   fake = fake.detach().float()
+  cross = -pseudo_huber_reward(fake[:, 0] - real)
   if draws == 1:
-    return -pseudo_huber_reward(fake[:, 0] - real)
-
-  cross_sum = real.new_zeros(real.shape[0])
-  pair_sum = real.new_zeros(real.shape[0])
-  for i in range(draws):
-    cross_sum -= pseudo_huber_reward(fake[:, i] - real)
-    for j in range(i):
-      pair_sum -= pseudo_huber_reward(fake[:, i] - fake[:, j])
-  # Each unordered pair appears twice in the ordered off-diagonal sum,
-  # canceling the 1/2 in the distance-induced MMD formula.
-  return cross_sum / draws - pair_sum / (draws * (draws - 1))
+    return cross
+  for index in range(1, draws):
+    cross = cross - pseudo_huber_reward(fake[:, index] - real)
+  pair_sum = torch.zeros_like(cross)
+  for left in range(draws):
+    for right in range(left + 1, draws):
+      pair_sum = pair_sum - pseudo_huber_reward(fake[:, left] - fake[:, right])
+  return cross / draws - pair_sum / (draws * (draws - 1))
 
 
 def summed_multi_draw_reward(features, batch, draw_count, length, selected,
                              indices, weights, kernel='linear', alpha=None,
-                             block_size=0, level='token',
-                             sentence_pooling='mean', sequence_mask=None):
+                             block_size=0, level='token'):
   """Score K draws from each state as one feature distribution.
 
   ``features`` contains the clean batch followed by K generated batches.
   ``level='token'`` retains the historical multi-draw estimator: one side has
   ``n_scored`` real token features and the other ``K * n_scored`` fake token
-  features. ``level='sentence'`` reads every sequence using ``sentence_pooling``
-  (a scored-position mean by default), yielding one fixed real and K fake vectors.
+  features. ``level='sentence'`` first mean-pools every sequence over its own
+  scored positions, yielding one fixed real vector and K fake vectors.
 
-  At sentence level all four kernels use the same estimator rule. K > 1 removes
+  At sentence level all three kernels use the same estimator rule. K > 1 removes
   fake self-pairs and is unbiased over draws conditional on the fixed real
   vector; K = 1 uses the biased empirical estimate. The sentence-level linear
   path is a normalized linear-kernel MMD rather than the historical
-  pseudo-Huber transform used by paired/token rewards. ``pseudo_huber`` uses
-  the distance-induced kernel, preserving that historical reward at K = 1.
-  ``cosine`` normalizes each sentence readout (or each token at token level)
-  to unit L2 norm and uses dot products, with no hidden-dimension averaging
-  and no pseudo-Huber transform.
+  pseudo-Huber transform used by paired/token rewards. The separate
+  ``pseudo_huber`` kernel uses the distance-induced estimator and recovers the
+  historical reward at K = 1.
 
   Returns ``(reward, active, per_layer)`` with one reward per original row.
   """
@@ -681,13 +611,10 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
     fake_by_draw = hidden[batch:].reshape(draw_count, batch, length, -1)
 
     if level == 'sentence':
-      real_sentence, real_active = pool_sentence_features(
-        real, selected, pooling=sentence_pooling, sequence_mask=sequence_mask)
-      fake_sentence, fake_active = pool_sentence_features(
+      real_sentence, real_active = pool_over_selected(real, selected)
+      fake_sentence, fake_active = pool_over_selected(
         fake_by_draw.reshape(draw_count * batch, length, -1),
-        selected.repeat(draw_count, 1), pooling=sentence_pooling,
-        sequence_mask=(None if sequence_mask is None else
-                       sequence_mask.repeat(draw_count, 1)))
+        selected.repeat(draw_count, 1))
       fake_sentence = fake_sentence.reshape(
         draw_count, batch, -1).permute(1, 0, 2)
       layer_active = real_active & fake_active.reshape(
@@ -705,12 +632,10 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
           block_size=block_size)
       elif kernel == 'linear':
         mmd2 = linear_mmd2_fixed_real(real_sentence, fake_sentence)
-      elif kernel == 'cosine':
-        mmd2 = mmd_cosine.cosine_mmd2_fixed_real(real_sentence, fake_sentence)
       elif kernel == 'pseudo_huber':
         mmd2 = pseudo_huber_mmd2_fixed_real(real_sentence, fake_sentence)
       else:
-        raise ValueError('mmd_kernel must be linear|rbf|cosine|pseudo_huber, got '
+        raise ValueError('mmd_kernel must be linear|rbf|pseudo_huber, got '
                          f'{kernel!r}')
       reward = torch.where(layer_active, -mmd2, torch.zeros_like(mmd2))
     else:
@@ -724,10 +649,7 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
           layer_alpha = median_alpha(real.detach().float(), selected)
         mmd2, layer_active = mmd_rbf.rbf_mmd2_unequal(
           real, fake, w_real, w_fake, layer_alpha, block_size=block_size)
-        reward = -mmd2
-      elif kernel == 'cosine':
-        mmd2, layer_active = mmd_cosine.cosine_mmd2_unequal(
-          real, fake, w_real, w_fake)
+        # Keep negative U-statistics, just as in the sentence-level path.
         reward = -mmd2
       elif kernel == 'linear':
         real_mean, layer_active = pool_over_selected(real, selected)
@@ -735,7 +657,7 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
         reward = pseudo_huber_reward(fake_mean - real_mean)
         reward = torch.where(layer_active, reward, torch.zeros_like(reward))
       else:
-        raise ValueError(f'mmd_kernel must be linear|rbf|cosine, got {kernel!r}')
+        raise ValueError(f'mmd_kernel must be linear|rbf, got {kernel!r}')
 
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight
@@ -745,28 +667,20 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
 
 
 def batch_advantages(reward, active):
-  """Leave-one-out advantages over the *batch* axis, for a group of one.
+  """Leave-one-out advantages over the batch axis for a group of one.
 
-  With `group_size=1` there is no second sample at the same state, so the
-  group baseline does not exist. The other sequences in the batch are the
-  next best comparison set: `A_i = r_i - mean_{j != i, active} r_j`, which is
-  still independent of the sample it scores and so still unbiased.
-
-  It is a noisier baseline than the group one, and not for a subtle reason:
-  those rows carry different `x0` and different masking fractions, so their
-  rewards are not measurements of the same quantity. It removes the reward's
-  overall offset. MMD estimates are unclipped, so rewards can have either sign.
-
-  Inactive rows are excluded from the baseline rather than counted as zero,
-  which would drag it toward 0 by however many rows scored nothing.
+  There is no within-state baseline when `group_size=1`. The other active
+  sequences provide an unbiased, though noisier, control variate because each
+  row carries a different question, answer, and masking fraction. Inactive
+  rows are excluded rather than treated as zero rewards.
   """
   if reward.shape[0] < 2:
     raise ValueError(
       'batch_advantages needs at least 2 sequences in the batch when '
       f'group_size=1, got {reward.shape[0]}; there is no baseline otherwise')
-  weight = active.to(reward.dtype).unsqueeze(-1)      # (batch, 1)
-  count = weight.sum(dim=0, keepdim=True)             # (1, 1)
-  total = (reward * weight).sum(dim=0, keepdim=True)  # (1, group)
+  weight = active.to(reward.dtype).unsqueeze(-1)
+  count = weight.sum(dim=0, keepdim=True)
+  total = (reward * weight).sum(dim=0, keepdim=True)
   loo = (total - reward * weight) / (count - weight).clamp_min(1.0)
   return reward - loo
 
@@ -794,7 +708,6 @@ class _LayeredFeatures:
   # maps get the plumbing instead of each threading its own copy.
   kernel = 'linear'
   kernel_level = 'token'
-  sentence_pooling = 'mean'
   rbf_alpha = None
   rbf_block_size = 0
   kernel_batch_size = 1
@@ -812,11 +725,16 @@ class _LayeredFeatures:
       return self.resolved_layers[0]
     return list(self.resolved_layers)
 
+  @staticmethod
+  def _layer_tag(index):
+    """`-1` prints as `embed`, so a log line says what was actually read."""
+    return 'embed' if index == -1 else str(index)
+
   @property
   def layer_description(self):
     if len(self.resolved_layers) == 1:
-      return str(self.resolved_layers[0])
-    return ' + '.join(f'{w:g}*L{i}' for i, w
+      return self._layer_tag(self.resolved_layers[0])
+    return ' + '.join(f'{w:g}*L{self._layer_tag(i)}' for i, w
                       in zip(self.resolved_layers, self.layer_weights))
 
 
@@ -835,21 +753,13 @@ class FrozenARFeatures(_LayeredFeatures):
   than clamped to an arbitrary row. Those positions are excluded from `selected`
   anyway; the remap only keeps the forward legal, and because attention is
   causal it cannot disturb any earlier position's features.
-
-  For sentence `last_token` readout, `sequence_mask` chooses the endpoint
-  independently of the scored positions. If omitted, an existing 2-D
-  `attention_mask` also serves as the padding mask for endpoint selection;
-  without either mask the final physical position is read. A supplied
-  `sequence_mask` never changes the attention mask sent to the model.
   """
 
   def __init__(self, model_name, layer_index=None, device='cuda',
-               dtype=torch.bfloat16, layer_weights=None, weights_dir=None):
+               dtype=torch.bfloat16, layer_weights=None):
     import transformers
-    from model_assets import pretrained_kwargs
     self.model = transformers.AutoModelForCausalLM.from_pretrained(
-      **pretrained_kwargs(model_name, weights_dir),
-      torch_dtype=dtype).to(device).eval()
+      model_name, torch_dtype=dtype).to(device).eval()
     for param in self.model.parameters():
       param.requires_grad_(False)
     self.vocab_size = int(self.model.config.vocab_size)
@@ -873,8 +783,7 @@ class FrozenARFeatures(_LayeredFeatures):
 
   @torch.no_grad()
   def multi_draw_reward(self, clean_tokens, draws, selected, eos_id,
-                        attention_mask=None, return_per_layer=False,
-                        sequence_mask=None):
+                        attention_mask=None, return_per_layer=False):
     """Compare K generated answers from one state with its clean answer."""
     if draws.ndim != 3:
       raise ValueError('multi_draw_reward expects (K, batch, length) draws, '
@@ -897,17 +806,14 @@ class FrozenARFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_multi_draw_reward(
       feats, batch, draw_count, length, selected, self.resolved_layers,
       self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
-      block_size=self.rbf_block_size, level=self.kernel_level,
-      sentence_pooling=self.sentence_pooling,
-      sequence_mask=(attention_mask if sequence_mask is None else sequence_mask))
+      block_size=self.rbf_block_size, level=self.kernel_level)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
 
   @torch.no_grad()
   def paired_reward(self, clean_tokens, generated_tokens, selected,
-                    eos_id, attention_mask=None, return_per_layer=False,
-                    sequence_mask=None):
+                    eos_id, attention_mask=None, return_per_layer=False):
     """Per-sequence reward comparing a generated answer against the clean one.
 
     Both rows go through the *same* forward so they share a kernel launch and
@@ -929,8 +835,7 @@ class FrozenARFeatures(_LayeredFeatures):
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
-      level=self.kernel_level, sentence_pooling=self.sentence_pooling,
-      sequence_mask=(attention_mask if sequence_mask is None else sequence_mask))
+      level=self.kernel_level)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
@@ -938,13 +843,13 @@ class FrozenARFeatures(_LayeredFeatures):
 
 def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
                        group_size, eos_id, reward_weight=1.0,
-                       baseline='auto', scored=None, kernel_source='rows',
-                       kernel_draws=1, sequence_mask=None):
+                       shuffle_rewards=False, baseline='auto', scored=None,
+                       kernel_source='rows', kernel_draws=1):
   """REINFORCE loss driving the student toward the clean answer's AR features.
 
   `group_size` hard answers are drawn from the student's differentiable
   one-step prediction at the *same* state; each is scored against the clean
-  `x0` using the configured frozen AR feature representation, and
+  `x0` by pooling the frozen AR's features over the generated positions, and
   the group's leave-one-out mean is the baseline. Gradient reaches the student
   only through `log p(sampled token)` -- the sampling is not differentiable,
   which is the whole reason for a score estimator rather than a
@@ -959,36 +864,42 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
   Args:
     student_probs: `(batch, length, vocab)`, differentiable, sums to 1.
     x0: `(batch, length)` clean tokens.
-    selected: `(batch, length)` bool; the positions the student generated (the
-      masked ones). These are the WRITTEN positions: they decide which tokens
-      are replaced by the student's draw and whose log-probabilities carry the
-      gradient. Scoring is a separate question -- see `scored`.
     scored: `(batch, length)` bool, or None for `selected`. Which positions the
-      reward is measured over. Widening it past `selected` is meaningful only
-      because the features are CONTEXTUAL: outside the written span the two
-      token sequences are identical, but their hidden states are not, because
-      the surrounding tokens changed. So `scored` beyond `selected` measures
-      how the student's writing perturbed the rest of the sequence's
-      representation rather than only the span itself. It must never be used
-      for the log-prob sum -- the student did not write those positions and
-      cannot be credited or blamed for them directly.
-    sequence_mask: `(batch, length)` bool, or None for all positions. In
-      sentence `last_token` mode, selects the sequence endpoint independently
-      of `scored`. This never changes sampling, attention, or log-probabilities.
+      REWARD is measured over, as distinct from which the student wrote.
+      Widening it is meaningful only because the features are CONTEXTUAL: the
+      two token sequences are identical outside the written span, so the extra
+      positions contribute through the hidden state moving when its neighbours
+      change, not through any token difference. It must never reach the
+      log-prob sum -- the student did not write those positions.
+    selected: `(batch, length)` bool; the positions the student generated (the
+      masked ones), and always the only positions entering the log-probability.
     critic: a `FrozenARFeatures`.
     group_size: samples per state. At >= 2 the group's own leave-one-out mean
       is the baseline. At 1 there is no second sample at the same state, so
       `baseline` decides what stands in; the sampling cost falls with the
-      group, since each member costs one critic forward. Candidate surrogate
-      terms are averaged over this axis, as in GRPO, so changing the group size
-      does not also rescale `reward_weight`.
+      group, since each member costs one critic forward.
     baseline: which control variate subtracts off the reward's offset.
       `auto` picks `group` when group_size >= 2 and `none` when it is 1.
-      `batch` uses the other sequences in the batch -- unbiased, free, but
-      noisier, since those rows carry different `x0`. `none` subtracts
-      nothing, which is still unbiased but leaves the reward's potentially
-      large offset in the estimator; it is mainly useful for measuring the
-      baseline's worth.
+      `batch` uses the other sequences in the batch -- unbiased and free, but
+      noisier because TinyGSM rows carry different conditions and masking
+      fractions. `none` subtracts nothing; it is mainly a control because it
+      leaves the reward's potentially large offset in the estimator.
+    shuffle_rewards: permute each row's rewards across the group before the
+      baseline, breaking the correspondence between a reward and the sample
+      that earned it. A control, not a training mode: the reward *values* are
+      untouched, so scale, spread and the leave-one-out statistics are
+      distributed exactly as in a real run, and every logged `mmd/*` series
+      looks normal. Only the credit assignment is destroyed. If an arm trained
+      this way matches one trained honestly, the reward's content is not what
+      is driving the result -- which no amount of staring at `mmd/reward` can
+      tell you, since that series is identical by construction.
+    kernel_source: ``rows`` preserves the historical one-draw candidate and
+      lets the critic's kernel batch merge adjacent device-batch rows.
+      ``draws`` makes each candidate a set of ``kernel_draws`` complete answers
+      sampled from the same student state.
+    kernel_draws: number of complete answers inside a candidate when
+      ``kernel_source=draws``. This is ``mmd_kernel_batch_size`` at the config
+      boundary; it is unrelated to the data-loader batch size in this mode.
 
   Returns `(loss, stats)`; `loss` already carries `reward_weight`.
   """
@@ -1012,34 +923,22 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
   if scored.shape != selected.shape:
     raise ValueError(f'scored mask must be {tuple(selected.shape)}, got '
                      f'{tuple(scored.shape)}')
-  if sequence_mask is not None and sequence_mask.shape != selected.shape:
-    raise ValueError(f'sequence mask must be {tuple(selected.shape)}, got '
-                     f'{tuple(sequence_mask.shape)}')
-  # Older/custom critics keep their original call signature. Only sentence
-  # endpoint readout needs a mask separate from the scored/written positions.
-  readout_kwargs = {}
-  if (getattr(critic, 'sentence_pooling', 'mean') == 'last_token'
-      and sequence_mask is not None):
-    readout_kwargs['sequence_mask'] = sequence_mask
 
   if kernel_source not in ('rows', 'draws'):
     raise ValueError('mmd_kernel_source must be rows|draws, got '
                      f'{kernel_source!r}')
-  if (getattr(critic, 'kernel', None) == 'pseudo_huber'
-      and (kernel_source != 'draws'
-           or getattr(critic, 'kernel_level', 'token') != 'sentence')):
+  if getattr(critic, 'kernel', None) == 'pseudo_huber' and (
+      kernel_source != 'draws' or
+      getattr(critic, 'kernel_level', None) != 'sentence'):
     raise ValueError('mmd_kernel=pseudo_huber requires '
                      'mmd_kernel_source=draws and mmd_kernel_level=sentence')
-  # `draws` mode makes each REINFORCE candidate a SET of `kernel_draws` samples
-  # at the same state, pooled into one MMD estimate, instead of a single
-  # sample. The candidate is then the set, so its log-probability is the sum
-  # over its members and the group still supplies the leave-one-out spread.
   per_candidate = int(kernel_draws) if kernel_source == 'draws' else 1
   if per_candidate < 1:
     raise ValueError(f'mmd_kernel_batch_size must be >= 1, got {kernel_draws}')
-  if kernel_source == 'draws' and not hasattr(critic, 'multi_draw_reward'):
-    raise ValueError('mmd_kernel_source=draws needs a critic exposing '
-                     'multi_draw_reward; the idlm-ratio reward does not')
+  if kernel_source == 'draws':
+    if not hasattr(critic, 'multi_draw_reward'):
+      raise ValueError('mmd_kernel_source=draws needs a feature critic exposing '
+                       'multi_draw_reward; mmd_reward_type=idlm is unsupported')
 
   # Sampling and the reward are no-grad; only the log-prob gather carries
   # gradient.
@@ -1054,55 +953,50 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
 
     rewards, actives, breakdown = [], [], {}
     multi = len(getattr(critic, 'resolved_layers', [None])) > 1
-    grouped = getattr(critic, 'grouped_reward', None)
     if kernel_source == 'draws':
       # Candidate g is a SET of K answers, scored together as one empirical
-      # feature distribution. This branch is source-based rather than K-based:
-      # K=1 still needs the sentence-level biased MMD fallback, not the
-      # historical paired pseudo-Huber path.
+      # feature distribution. G remains the outer leave-one-out group.
       blocks = samples.view(group_size, per_candidate, batch, length)
       for group_index in range(group_size):
         if multi:
           out = critic.multi_draw_reward(
-            x0, blocks[group_index], scored, eos_id,
-            return_per_layer=True, **readout_kwargs)
+            x0, blocks[group_index], scored, eos_id, return_per_layer=True)
         else:
           out = critic.multi_draw_reward(
-            x0, blocks[group_index], scored, eos_id, **readout_kwargs)
+            x0, blocks[group_index], scored, eos_id)
         member_reward, member_active = out[0], out[1]
         if multi:
           for index, value in out[2].items():
             breakdown.setdefault(index, []).append(value)
         rewards.append(member_reward)
         actives.append(member_active)
-      reward = torch.stack(rewards, dim=-1)
-      active = actives[0]
-    elif callable(grouped):
-      reward, active = grouped(x0, samples, scored, eos_id)
-      if reward.shape != (batch, group_size):
-        raise ValueError('grouped critic reward must be '
-                         f'{(batch, group_size)}, got {tuple(reward.shape)}')
     else:
-      for k in range(group_size):
-        out = critic.paired_reward(x0, samples[k], scored, eos_id,
-                                   return_per_layer=multi, **readout_kwargs)
+      for group_index in range(group_size):
+        out = critic.paired_reward(
+          x0, samples[group_index], scored, eos_id,
+          return_per_layer=multi)
         member_reward, member_active = out[0], out[1]
         if multi:
           for index, value in out[2].items():
             breakdown.setdefault(index, []).append(value)
         rewards.append(member_reward)
         actives.append(member_active)
-      reward = torch.stack(rewards, dim=-1)        # (batch, group)
-      active = actives[0]                          # identical across the group
+    reward = torch.stack(rewards, dim=-1)          # (batch, group)
+    active = actives[0]                            # identical across the group
+
+    if shuffle_rewards:
+      # Independent permutation per row. Shuffling the whole tensor would also
+      # move rewards between sequences, changing each row's baseline and its
+      # spread; permuting within the row leaves both exactly as they were and
+      # isolates the one thing under test -- which sample gets the credit.
+      reward = reward.gather(
+        -1, torch.argsort(torch.rand_like(reward), dim=-1))
 
     if baseline == 'group':
       advantage = group_advantages(reward)
     elif baseline == 'batch':
       advantage = batch_advantages(reward, active)
     else:  # 'none'
-      # Unbiased but high variance because the reward offset remains. Most
-      # distance rewards are non-positive; unclipped MMD estimates can instead
-      # make the reward positive.
       advantage = reward
     advantage = torch.where(active.unsqueeze(-1), advantage,
                             torch.zeros_like(advantage))
@@ -1110,22 +1004,22 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
   # log p(sampled token), summed over the positions the student wrote.
   logp = torch.log(student_probs.clamp_min(1e-12))
   surrogate = student_probs.new_zeros(())
-  for k in range(group_size):
-    # A candidate's action is all `per_candidate` of its draws, so its
-    # log-probability is their sum.
+  for group_index in range(group_size):
+    # The action earning one reward is the whole K-draw set, so its joint log
+    # probability is the sum of the member log probabilities.
     seq_logp = student_probs.new_zeros(batch)
-    for j in range(per_candidate):
-      drawn = samples[k * per_candidate + j]
+    for draw_index in range(per_candidate):
+      drawn = samples[group_index * per_candidate + draw_index]
       token_logp = logp.gather(-1, drawn.unsqueeze(-1)).squeeze(-1)
-      seq_logp = seq_logp + (token_logp * selected.to(token_logp.dtype)).sum(1)
-    surrogate = surrogate + (advantage[:, k] * seq_logp).sum()
+      seq_logp = seq_logp + (
+        token_logp * selected.to(token_logp.dtype)).sum(dim=1)
+    surrogate = surrogate + (advantage[:, group_index] * seq_logp).sum()
 
-  # Negated: maximizing reward means descending this. Normalize by generated
-  # tokens and average the Monte Carlo candidates, as in GRPO's `1 / G`
-  # reduction. A larger group should improve the within-state comparison, not
-  # silently multiply the reward weight and its gradient.
-  denom = (selected.sum().clamp_min(1) * group_size
-            * per_candidate).to(surrogate.dtype)
+  # Negated: maximizing reward means descending this. Normalized by generated
+  # tokens and by the K draws inside a candidate. Deliberately do NOT divide by
+  # `group_size`: TinyGSM's historical runs omitted the 1/G normalization, and
+  # preserving that omission is required for comparable reward strength.
+  denom = (selected.sum().clamp_min(1) * per_candidate).to(surrogate.dtype)
   loss = -reward_weight * surrogate / denom
 
   with torch.no_grad():
@@ -1180,7 +1074,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
 
   @torch.no_grad()
   def multi_draw_reward(self, clean_tokens, draws, selected, eos_id,
-                        sigma=None, return_per_layer=False, sequence_mask=None):
+                        sigma=None, return_per_layer=False):
     """Compare K generated answers from one state with its clean answer."""
     del eos_id  # This backbone uses the student's vocabulary directly.
     if draws.ndim != 3:
@@ -1214,15 +1108,14 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_multi_draw_reward(
       feats, batch, draw_count, length, selected, self.resolved_layers,
       self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
-      block_size=self.rbf_block_size, level=self.kernel_level,
-      sentence_pooling=self.sentence_pooling, sequence_mask=sequence_mask)
+      block_size=self.rbf_block_size, level=self.kernel_level)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
 
   @torch.no_grad()
   def paired_reward(self, clean_tokens, generated_tokens, selected, eos_id,
-                    sigma=None, return_per_layer=False, sequence_mask=None):
+                    sigma=None, return_per_layer=False):
     """Per-sequence reward comparing a generated answer against the clean one."""
     del eos_id  # same vocabulary; nothing to remap
     if clean_tokens.shape != generated_tokens.shape:
@@ -1251,142 +1144,53 @@ class FrozenBackboneFeatures(_LayeredFeatures):
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
-      level=self.kernel_level, sentence_pooling=self.sentence_pooling,
-      sequence_mask=sequence_mask)
+      level=self.kernel_level)
     if return_per_layer:
       return reward, active, per_layer
     return reward, active
 
 
-class _CausalBackboneAdapter(torch.nn.Module):
-  """Give `owt-ar`'s `DITLegacy` the `(indices, sigma)` call shape used here.
-
-  `FrozenBackboneFeatures` calls its denoiser positionally, as this repo's own
-  DiT wants. `DITLegacy.forward` is `(input_ids, attention_mask, ...)`, so the
-  same positional call would land `sigma` in `attention_mask` -- and a tensor of
-  zeros there reads as "attend to nothing", which would not raise, it would
-  quietly return features computed under a broken mask. Hence an explicit
-  adapter rather than a positional call that happens to typecheck.
-
-  `blocks` is a property, not an assignment: assigning the inner `ModuleList`
-  would register the same 12 blocks a second time under this module.
-  """
-
-  def __init__(self, inner):
-    super().__init__()
-    self.inner = inner
-
-  @property
-  def blocks(self):
-    return self.inner.blocks
-
-  @property
-  def vocab_embed(self):
-    # Same reason as `blocks`: a property rather than an assignment, so the
-    # inner embedding is not registered a second time under this module.
-    # Without it `mmd_feature_layer=-1` cannot find owt-ar's embedding, since
-    # it sits on the wrapped `DITLegacy` rather than on the adapter.
-    return self.inner.vocab_embed
-
-  def forward(self, indices, sigma=None):
-    # A causal LM has no noise conditioning, and owt-ar is `adaln: false`, so
-    # the backbone ignores sigma anyway. Dropped explicitly to document that
-    # the AR feature map reads *clean* sequences (`noise_level=0`).
-    del sigma
-    return self.inner(input_ids=indices)
-
-
 def load_ar_backbone(ckpt_path, config, tokenizer, device):
-  """Load a frozen native AR checkpoint, including S-FLM's TinyGSM AR.
+  """Load a frozen causal AR from one of this repo's checkpoints.
 
-  The native checkpoint uses this repo's causal DiT and the student's model
-  dimensions and tokenizer. Construct its private configuration without
-  inheriting the student's distillation or diffusion mask schedule.
+  Built for S-FLM's `tinygsm/ar.ckpt`: a causal DiT trained 250k steps on
+  TinyGSM with the student's own SmolLM-135M tokenizer, which makes it a far
+  better feature map for a TinyGSM reward than a generic pretrained LM. It loads
+  here rather than through `AutoModelForCausalLM` because it is a Lightning
+  checkpoint of `algo.AR`, not an HF model.
+
+  The run's own config is reused for everything but the `algo` block, which is
+  swapped for an autoregressive one -- the student and this AR are both
+  `model=small` at `length=512`, which is why the architectures line up. Only
+  the backbone is returned; `ar_decoder_layers` already finds its `.blocks`.
   """
-  # Import locally because algo accesses this module from its lazy MMD loader.
+  # Local, not module-level: `algo` imports this module (lazily, inside
+  # `_mmd_critic`), so importing it at the top would close the cycle.
   import algo
   import omegaconf
   import utils
-  from model_assets import resolve_checkpoint
 
-  ckpt_path = resolve_checkpoint(
-    ckpt_path, getattr(config, 'model_weights_dir', None))
-  if not os.path.isfile(ckpt_path):
-    raise FileNotFoundError(f'MMD AR checkpoint not found: {ckpt_path}')
+  if not os.path.exists(ckpt_path):
+    raise FileNotFoundError(
+      f'MMD AR checkpoint not found: {ckpt_path}\n'
+      'Fetch it with: bash scripts/fetch_sflm_ar.sh\n'
+      'The released file must be stripped of its pickled tokenizer first -- it '
+      'was written by a newer `tokenizers` than requirements.txt pins, so a '
+      'plain torch.load fails before reading a single weight.')
 
   cfg = omegaconf.OmegaConf.create(
     omegaconf.OmegaConf.to_container(config, resolve=True))
   cfg.algo.name = 'ar'
-  cfg.algo.backbone = 'dit'
   cfg.algo.parameterization = 'ar'
   cfg.algo.causal_attention = True
   cfg.algo.time_conditioning = False
   cfg.algo.T = 0
   cfg.algo.subs_masking = False
+  # A distillation run's config carries the critics; this is a plain AR.
   cfg.adversarial_distill.is_distill = False
-  if cfg.adversarial_distill.get('mask_schedule'):
-    cfg.adversarial_distill.mask_schedule.mode = 'original'
 
   model = algo.AR.load_from_checkpoint(
     ckpt_path, tokenizer=tokenizer, config=cfg, weights_only=False)
   model = model.to(device).eval()
   utils.freeze_model(model)
   return model.backbone
-
-
-def load_owt_ar_backbone(model_id_or_path, device, weights_dir=None):
-  """Load `kuleshov-group/owt-ar` as a frozen feature map.
-
-  The OpenWebText analogue of the TinyGSM branch's S-FLM AR: a causal DiT
-  trained on the student's exact corpus and vocabulary (50258 embeddings,
-  matching `mdlm-owt` token for token), so no id remapping is needed and
-  `FrozenBackboneFeatures` can be used directly rather than `FrozenARFeatures`.
-
-  Loaded by instantiating the vendored backbone rather than through
-  `AutoModelForCausalLM`: the published `trust_remote_code` module imports
-  `transformers.models.qwen3`, which transformers 4.38.2 in this environment
-  does not have, so the auto path fails before reading a weight. Only the
-  backbone is needed -- `ar_decoder_layers` finds its `.blocks` through the
-  adapter.
-  """
-  import json
-
-  import huggingface_hub
-
-  from models import backbone_dit_legacy
-  from model_assets import resolve_pretrained_path
-
-  model_id_or_path = resolve_pretrained_path(model_id_or_path, weights_dir)
-  if os.path.isdir(model_id_or_path):
-    config_path = os.path.join(model_id_or_path, 'config.json')
-    weights_path = os.path.join(model_id_or_path, 'pytorch_model.bin')
-  else:
-    config_path = huggingface_hub.hf_hub_download(
-      model_id_or_path, 'config.json')
-    weights_path = huggingface_hub.hf_hub_download(
-      model_id_or_path, 'pytorch_model.bin')
-
-  with open(config_path) as f:
-    hf_config = json.load(f)
-  backbone_config = dict(hf_config['backbone_config'])
-  backbone_config.pop('_target_', None)
-  # Never let the vendored backbone pull weights of its own; the published
-  # owt-ar tensors are loaded explicitly below.
-  backbone_config['pretrained_model_name_or_path'] = None
-  model = backbone_dit_legacy.DITLegacy(**backbone_config)
-
-  state_dict = torch.load(weights_path, map_location='cpu', weights_only=False)
-  if isinstance(state_dict, dict) and 'state_dict' in state_dict:
-    state_dict = state_dict['state_dict']
-  backbone_state = {key[len('backbone.'):]: value
-                    for key, value in state_dict.items()
-                    if key.startswith('backbone.')}
-  missing, _ = model.load_state_dict(backbone_state, strict=False)
-  if missing:
-    raise RuntimeError(
-      f'Missing weights when loading owt-ar backbone: {missing}')
-
-  model = _CausalBackboneAdapter(model).to(device).eval()
-  for param in model.parameters():
-    param.requires_grad_(False)
-  return model
