@@ -176,6 +176,28 @@ The TinyGSM recipes train IDLM students for conditional mathematical reasoning o
 bash scripts/train_idlm_mdlm_tynigsm.sh
 ```
 
+To use the same fixed clipped generator schedule as OWT, add these overrides
+to a TinyGSM MDLM distillation command (DMD, MMD, or their combination):
+
+```bash
+adversarial_distill.mask_schedule.mode=clipped \
+adversarial_distill.mask_schedule.min=0.45 \
+adversarial_distill.mask_schedule.max=0.95
+```
+
+This remaps the original stratified draws into 45--95% expected masking
+probability, without drawing new times. It applies to generator inputs in
+both student and fake-critic training. With `data.train_on_prompt=False`,
+prompts remain visible; padding follows `data.train_on_pad`. The subsequent
+teacher/fake loss corruption, validation NLL and GSM8K evaluation retain their
+existing schedules. Actual mask counts remain Bernoulli draws.
+
+The default `mask_schedule.mode=original` preserves existing runs, including
+the high-mask mixture below. For `clipped`, keep
+`adversarial_distill.high_mask_fraction=0.0` (the default); replace the
+`high_mask_fraction=1.0` workaround if you previously used it. Fixed clipping
+requires distillation, so it cannot be combined with teacher continuation.
+
 To bias distillation toward the heavily masked states that matter most at low
 NFE, enable the optional high-mask mixture. This example keeps the original
 uniform schedule for half of the rows and draws the other half from 70--100%

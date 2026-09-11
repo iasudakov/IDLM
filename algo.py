@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 import trainer_base
+from mask_schedule import ClippedMaskSchedule
 import utils
 import hydra.utils
 import models
@@ -207,6 +208,8 @@ class MDLM(trainer_base.AbsorbingState):
     if bool(config.training.get('continue_teacher', False)):
       config.adversarial_distill.is_distill = False
     super().__init__(config, tokenizer)
+    self._mask_schedule = ClippedMaskSchedule.from_config(
+      config.adversarial_distill, self.sampling_eps, self.noise.eps)
     self._validate_configuration()
     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
     if self.is_adversarial_distill:
@@ -381,19 +384,21 @@ class MDLM(trainer_base.AbsorbingState):
     return torch.where(valid_tokens.bool(), tokens, x0)
 
   def _sample_distill_generator_t(self, n, current_accumulation_step):
-    """Sample generator corruption, optionally emphasizing high-mask rows.
+    """Sample generator corruption with optional clipping or high-mask rows.
 
     The public knobs are expressed as expected mask probabilities rather than
     raw diffusion times. They coincide only approximately even for this repo's
     log-linear schedule (`mask_probability = (1 - noise.eps) * t`), and mask
     probability is the quantity relevant to a few-NFE student.
 
-    The ordinary `_sample_t` draw is made first and returned untouched when the
-    mixture is disabled. Keeping that fast path free of any extra random draw
-    makes `high_mask_fraction=0` exactly backward compatible, not merely equal
-    in distribution.
+    The ordinary `_sample_t` draw is made first. Fixed clipping remaps it
+    without extra random draws. In original mode, disabling the mixture
+    returns it untouched, preserving the historical values and RNG stream.
     """
     t = self._sample_t(n, current_accumulation_step)
+    schedule = getattr(self, '_mask_schedule', None)
+    if schedule is not None and schedule.mode != 'original':
+      return schedule.sample(t)
     cfg = self.config.adversarial_distill
     fraction = float(cfg.get('high_mask_fraction', 0.0))
     minimum = float(cfg.get('high_mask_min', 0.7))

@@ -283,6 +283,18 @@ adversarial_distill:
   high_mask_min: 0.7
   high_mask_max: 1.0
 
+  # Fixed clipping of generator expected masking probability, matching OWT.
+  # Original preserves the existing sampler/high-mask mixture exactly.
+  # Clipped remaps its stratified draws into [min, max]; use high_mask_fraction=0.
+  # Applies to generator inputs in both student and fake-critic training.
+  # Prompt masking, teacher/fake loss corruption and evaluation are unchanged.
+  # Bounds intersect the log-linear noise support (max=1 becomes 0.999);
+  # realized mask counts remain Bernoulli draws, not hard count constraints.
+  mask_schedule:
+    mode: original
+    min: 0.45
+    max: 0.95
+
   # CONTROL, not a training mode. Permutes each row's rewards across the group
   # before the leave-one-out baseline, so a sample is credited with some other
   # sample's score. Reward values are untouched, so `mmd/reward`,
