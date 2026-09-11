@@ -398,7 +398,8 @@ class TrainerBase(L.LightningModule):
         self.metrics.record_entropy(samples)
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
-        if self.config.eval.get('owt_gm', False):
+        if (metrics.GRADIENT_MOMENT_ENABLED
+            and self.config.eval.get('owt_gm', False)):
           gm_samples.extend(text_samples)
         if self.config.eval.compute_generative_perplexity:
           self.metrics.record_generative_perplexity(
@@ -555,7 +556,8 @@ class TrainerBase(L.LightningModule):
     Decoding is not free, so this stops as soon as `gm_eval_samples` rows are
     held and does nothing at all when the metric is off.
     """
-    if not self.config.eval.get('owt_gm', False):
+    if (not metrics.GRADIENT_MOMENT_ENABLED
+        or not self.config.eval.get('owt_gm', False)):
       return
     # The rows only feed Gradient Moment, which the window may have switched
     # off for this validation; decoding them anyway would be pure waste.
@@ -579,7 +581,8 @@ class TrainerBase(L.LightningModule):
     model degrades. GM compares gradients against real data, so collapse moves
     it the right way.
     """
-    if not self.config.eval.get('owt_gm', False):
+    if (not metrics.GRADIENT_MOMENT_ENABLED
+        or not self.config.eval.get('owt_gm', False)):
       return
     refs = getattr(self, '_gm_ref_texts', None) or []
     if not sample_texts or not refs:
@@ -657,7 +660,8 @@ class TrainerBase(L.LightningModule):
       # axis most vulnerable to collapse -- a degenerate sampler scores *better*
       # on it -- and GM is the one number in this sweep that moves the right way
       # when that happens. Cheap budgets are where collapse shows up first.
-      gm_on = bool(self.config.eval.get('owt_gm', False))
+      gm_on = (metrics.GRADIENT_MOMENT_ENABLED
+               and bool(self.config.eval.get('owt_gm', False)))
       gm_refs = getattr(self, '_gm_ref_texts', None) or []
       if gm_on and not gm_refs:
         print('[owt-pareto] GM requested but no reference rows; '

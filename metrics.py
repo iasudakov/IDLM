@@ -11,6 +11,10 @@ from model_assets import pretrained_kwargs
 
 LOG2 = math.log(2)
 
+# GM is disabled even when legacy commands request eval.owt_gm=True.
+# Gate both evaluation collection/call sites and direct metric calls.
+GRADIENT_MOMENT_ENABLED = False
+
 
 class NLL(torchmetrics.aggregation.MeanMetric):
   def update(self,
@@ -187,6 +191,8 @@ class Metrics:
                              batch_size=4, device='cuda'):
     """Gradient Moment (arXiv:2603.20155): `||E_samples[grad L] - E_data[grad L]||^2`.
 
+    Currently disabled: returns None before any import, model load or scoring.
+
     Ported from yrELF's `metrics_utils.Metrics.record_gradient_moment`, so the
     numbers are comparable with that project's.
 
@@ -202,6 +208,8 @@ class Metrics:
     when the `gradient_moment` package is not installed -- it is an optional
     sibling repo, and a missing one must not take the run down.
     """
+    if not GRADIENT_MOMENT_ENABLED:
+      return None
     try:
       from gradient_moment import evaluate, make_generative_llm_metrics
       from gradient_moment.huggingface import text_causal_lm_forward

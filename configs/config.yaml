@@ -500,41 +500,11 @@ eval:
   # `eval_step_range`, both have to admit the step.
   eval_at_steps: null             # e.g. [1000, 2000, 4000]
 
-  # --- Gradient Moment (arXiv:2603.20155) -----------------------------------
-  # `||E_samples[grad L] - E_data[grad L]||^2` under the `gen_ppl` reference LM:
-  # how far the gradient our samples give it sits from the gradient real text
-  # gives it. Ported from yrELF so the numbers are comparable with that project.
-  #
-  # Worth the cost because it answers what generative perplexity cannot. gen_ppl
-  # rewards text the reference LM finds predictable, which a COLLAPSING model
-  # produces more of -- an OWT run here drove gen_ppl 68 -> 11.9 while entropy
-  # fell and held-out NLL rose, i.e. the metric improved because the model was
-  # degrading. GM backprops through the reference LM and compares against real
-  # data, so collapse moves it the right way.
-  #
-  # Needs the `gradient_moment` sibling package:
-  #   pip install -e /path/to/gradient-moment --no-deps
-  # Missing package, too few rows, or any error inside it is reported and
-  # skipped, never fatal.
-  #
-  # When `owt_pareto_steps` is also set, GM is computed PER BUDGET as well, so
-  # the frontier carries an axis that collapse cannot flatter. That is where it
-  # earns its cost: gen_ppl rewards a degenerate sampler, and the cheap budgets
-  # are where degeneracy appears first. Budget GM is scored once per seed and
-  # averaged, so its spread means what the other spreads mean.
-  #
-  # Mind the multiplication: budgets x seeds GM calls per validation, at
-  # ~2s for 16 rows and ~4s for 64. [2,4,8,16,32,64] with 5 seeds is 30 calls,
-  # a minute or two on top of the sampling. `owt_pareto_every_n_validations` is
-  # the knob if that is too much.
+  # Legacy GM options remain accepted for command/checkpoint compatibility.
+  # Gradient Moment is disabled in code, including when owt_gm=True: no
+  # reference collection or GM scoring in validation or Pareto sweeps.
   owt_gm: false
-  # Cap on sample rows AND real reference rows. Reference rows are collected
-  # from the validation batches; sample rows come from the existing sampling
-  # loop, so `sampling.num_sample_batches * loader.eval_batch_size` bounds them.
   gm_eval_samples: 64
-  # Rows per half-batch. One GM pair is 2x this per side, split in half
-  # internally -- the halves' inner product is what makes the squared norm
-  # unbiased, so a pair cannot be formed from fewer rows than this.
   gm_eval_batch_size: 4
 
   # --- Sampling-steps frontier (quality vs diversity) -----------------------
