@@ -153,6 +153,27 @@ class IdlmRatioReward:
 
   def __init__(self, algo):
     self.algo = algo
+    self.reward_batch_size = getattr(
+      algo.config.adversarial_distill, 'idlm_reward_batch_size', 8)
+    if (isinstance(self.reward_batch_size, bool)
+        or not isinstance(self.reward_batch_size, int)
+        or self.reward_batch_size < 1):
+      raise ValueError('adversarial_distill.idlm_reward_batch_size must be '
+                       'a positive integer')
+
+  def _nll_for_tokens(self, model, xt, x, sigma, alpha_t, dalpha_t, valid):
+    # Keep the original outer autocast policy; backbones may use BF16 inside.
+    # Hard targets only need their token log-probabilities, promoted to FP32
+    # as the old float32 one-hot multiplication did. Avoid allocating int64
+    # and float32 targets of shape (batch, length, vocab).
+    with torch.cuda.amp.autocast(enabled=False):
+      log_probs = self.algo._process_model_output(
+        model_output=model(xt, sigma), xt=xt, sigma=sigma)
+    token_log_probs = log_probs.gather(-1, x.unsqueeze(-1)).squeeze(-1).float()
+    del log_probs
+    loss = token_log_probs * dalpha_t / (1 - alpha_t)
+    loss = loss * valid
+    return loss.sum(-1) / valid.sum(-1).clamp_min(1)
 
   @torch.no_grad()
   def grouped_reward(self, clean_tokens, generated_tokens, selected, eos_id):
@@ -162,7 +183,8 @@ class IdlmRatioReward:
     Giving each candidate its own diffusion time and mask would instead rank
     how lucky its corruption was. Draw one `t` and one corruption mask per
     underlying batch row, broadcast both across the group, and evaluate the
-    flattened group in one teacher and one fake forward.
+    flattened group in bounded teacher/fake batches. Chunking changes only
+    scoring memory, not the sampled candidates, times, masks or group baseline.
     """
     del clean_tokens, eos_id  # absolute score; nothing to compare or remap
     algo = self.algo
@@ -196,20 +218,20 @@ class IdlmRatioReward:
       dalpha_t = dalpha_t.reshape(batch, -1).repeat(group, 1)
     sigma = algo._process_sigma(algo._sigma_from_alphat(alpha_t))
 
-    onehot = F.one_hot(x, num_classes=algo.vocab_size).to(torch.float32)
-    with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits_teacher = algo._process_model_output(
-        model_output=algo.teacher(xt, sigma), xt=xt, sigma=sigma)
-    nll_teacher = algo.nll_per_token_with_probs(
-      logits_teacher, xt, onehot, alpha_t=alpha_t, dalpha_t=dalpha_t,
-      valid_tokens=valid)
-    del logits_teacher
-    with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits_fake = algo._process_model_output(
-        model_output=algo.fake_model(xt, sigma), xt=xt, sigma=sigma)
-    nll_fake = algo.nll_per_token_with_probs(
-      logits_fake, xt, onehot, alpha_t=alpha_t, dalpha_t=dalpha_t,
-      valid_tokens=valid)
+    reward = torch.empty(group * batch, device=x.device, dtype=torch.float32)
+    for start in range(0, group * batch, self.reward_batch_size):
+      end = start + self.reward_batch_size
+      sigma_chunk = sigma[start:end] if sigma is not None else None
+      dalpha_chunk = dalpha_t
+      if torch.is_tensor(dalpha_t) and dalpha_t.ndim > 0:
+        dalpha_chunk = dalpha_t[start:end]
+      args = (xt[start:end], x[start:end], sigma_chunk, alpha_t[start:end],
+              dalpha_chunk, valid[start:end])
+      # Each helper returns only one scalar per sequence; its vocabulary
+      # logits are released before scoring the other critic or the next chunk.
+      nll_teacher = self._nll_for_tokens(algo.teacher, *args)
+      nll_fake = self._nll_for_tokens(algo.fake_model, *args)
+      reward[start:end] = nll_fake - nll_teacher
 
     # Sign, since the helper's name invites getting this backwards: it computes
     # `sum(x * log p) * dalpha_t / (1 - alpha_t)`, and `LogLinear` returns
@@ -219,7 +241,7 @@ class IdlmRatioReward:
     # The generator minimises `nll_teacher - nll_fake`, which makes a sample
     # likelier under the teacher and unlikelier under the fake. The reward to
     # MAXIMISE is therefore that quantity negated.
-    reward = (nll_fake - nll_teacher).float().view(group, batch).transpose(0, 1)
+    reward = reward.view(group, batch).transpose(0, 1)
     active = selected.any(dim=1)
     reward = torch.where(active.unsqueeze(-1), reward,
                          torch.zeros_like(reward))
@@ -933,6 +955,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         self._mmd_critic_cached = IdlmRatioReward(self)
         print(f'[mmd] IDLM teacher/fake log-density ratio, per-sequence '
               f'reward, group={cfg.mmd_group_size}, '
+              f'critic_batch={self._mmd_critic_cached.reward_batch_size}, '
               f'weight={cfg.mmd_reward_weight}', flush=True)
         return self._mmd_critic_cached
       if source == 'ar':

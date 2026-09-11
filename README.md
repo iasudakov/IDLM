@@ -158,6 +158,21 @@ The OpenWebText recipes train IDLM students for unconditional language generatio
 bash scripts/train_idlm_mdlm.sh
 ```
 
+For the IDLM ratio reward, add these overrides to an OWT reward-distillation
+command:
+
+```bash
+adversarial_distill.mmd_reward_type=idlm \
+adversarial_distill.idlm_reward_batch_size=8
+```
+
+`idlm_reward_batch_size` limits generated sequences per teacher/fake scoring
+forward; it defaults to 8. It leaves `loader.batch_size`, `mmd_group_size`,
+gradient accumulation, shared corruption and the group baseline unchanged.
+Hard-token rewards use token lookups instead of dense one-hot targets. Lower
+this positive integer if reward scoring needs less memory; this adds critic
+forwards. It does not control fake-critic training or feature-reward batches.
+
 For OWT MMD distillation, the portable launcher can bias the generator toward
 the heavily masked states that matter most at low NFE. This keeps the original
 schedule for half of the rows and draws the other half from 70--100% expected

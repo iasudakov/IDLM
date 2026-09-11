@@ -62,6 +62,13 @@ adversarial_distill:
   #              mostly ranks corruption luck rather than generated quality.
   mmd_reward_type: feature
 
+  # Maximum generated sequences per teacher/fake forward for the IDLM ratio
+  # reward. Bounds vocabulary-logit memory without changing loader.batch_size,
+  # mmd_group_size, shared corruption or the group baseline. Positive integer;
+  # smaller values use less memory and more critic forwards. Feature rewards
+  # and fake-critic training do not use this setting.
+  idlm_reward_batch_size: 8
+
   # Which frozen model supplies the features.
   #   ar        -- `kuleshov-group/owt-ar`, a causal DiT on the student's exact
   #                corpus and vocabulary (50258 ids, matching mdlm-owt token for
