@@ -942,7 +942,8 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         # hence noise_level=0, since masking would inject a difference into a
         # comparison meant to isolate what the student wrote.
         backbone = mmd_reward.load_owt_ar_backbone(
-          str(cfg.mmd_ar_model), self.device)
+          str(cfg.mmd_ar_model), self.device,
+          weights_dir=getattr(self.config, 'model_weights_dir', None))
         self._mmd_critic_cached = mmd_reward.FrozenBackboneFeatures(
           backbone, self.mask_index,
           layer_index=cfg.mmd_feature_layer,

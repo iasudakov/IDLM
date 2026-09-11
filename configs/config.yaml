@@ -14,6 +14,10 @@ mode: train  # train / ppl_eval / sample_eval
 debug: False
 seed: 1
 
+# Optional local model/tokenizer bundle. When set, model loads use only local
+# files and fail on missing assets. Native checkpoint paths can be bundle-relative.
+model_weights_dir: null
+
 adversarial_distill:
   is_distill: False
 

@@ -81,6 +81,33 @@ IDLM/
 ## Getting Started
 <a name="getting_started"></a>
 
+### Use existing model weights without downloading
+
+Add this override to your OWT training or evaluation command:
+
+```bash
+model_weights_dir="$SOURCE_CODE_PATH/code/cache_dir/owt_mmd_offline_bundle"
+```
+
+You can also use `/home/iasudakov/owt_mmd_offline_bundle`. Keep the usual model
+IDs in the command: `eval.checkpoint_path=kuleshov-group/mdlm-owt`,
+`adversarial_distill.mmd_ar_model=kuleshov-group/owt-ar`,
+`data.tokenizer_name_or_path=gpt2`, and
+`eval.gen_ppl_eval_model_name_or_path=gpt2-large`. They resolve to the bundled
+MDLM, AR, training tokenizer, and evaluation assets. Perplexity, temperature
+sweeps, and Gradient Moment share the local evaluation model.
+
+With the option set, model/tokenizer loaders use local files only and report
+missing assets instead of downloading them. Leaving it unset preserves normal
+loading. The resolver supports the bundle's `manifest.json`, pinned `hf-cache`
+snapshots, and folders named by model ID or basename. Explicit local paths also
+work; native checkpoint paths can be relative to the bundle. Existing native
+checkpoint paths relative to the launch directory take precedence.
+
+The bundle option changes where model assets are read. Logical tokenizer IDs,
+dataset cache keys, training, and sampling are preserved. Configure the dataset
+cache separately with `data.cache_dir`.
+
 ### 1. Clone the repository
 
 ```bash

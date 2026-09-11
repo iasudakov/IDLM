@@ -844,10 +844,12 @@ class FrozenARFeatures(_LayeredFeatures):
   """
 
   def __init__(self, model_name, layer_index=None, device='cuda',
-               dtype=torch.bfloat16, layer_weights=None):
+               dtype=torch.bfloat16, layer_weights=None, weights_dir=None):
     import transformers
+    from model_assets import pretrained_kwargs
     self.model = transformers.AutoModelForCausalLM.from_pretrained(
-      model_name, torch_dtype=dtype).to(device).eval()
+      **pretrained_kwargs(model_name, weights_dir),
+      torch_dtype=dtype).to(device).eval()
     for param in self.model.parameters():
       param.requires_grad_(False)
     self.vocab_size = int(self.model.config.vocab_size)
@@ -1294,7 +1296,7 @@ class _CausalBackboneAdapter(torch.nn.Module):
     return self.inner(input_ids=indices)
 
 
-def load_owt_ar_backbone(model_id_or_path, device):
+def load_owt_ar_backbone(model_id_or_path, device, weights_dir=None):
   """Load `kuleshov-group/owt-ar` as a frozen feature map.
 
   The OpenWebText analogue of the TinyGSM branch's S-FLM AR: a causal DiT
@@ -1314,7 +1316,9 @@ def load_owt_ar_backbone(model_id_or_path, device):
   import huggingface_hub
 
   from models import backbone_dit_legacy
+  from model_assets import resolve_pretrained_path
 
+  model_id_or_path = resolve_pretrained_path(model_id_or_path, weights_dir)
   if os.path.isdir(model_id_or_path):
     config_path = os.path.join(model_id_or_path, 'config.json')
     weights_path = os.path.join(model_id_or_path, 'pytorch_model.bin')
