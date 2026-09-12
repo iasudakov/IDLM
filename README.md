@@ -253,6 +253,35 @@ gradient. Omit the new option or set `mmd_sentence_pooling=mean` to retain the
 previous behavior. Diffusion features and token-level kernels do not support
 `last_token`.
 
+To use pseudo-Huber distance inside an RBF kernel, add these overrides to an
+existing feature-MMD command:
+
+```bash
+adversarial_distill.mmd_reward_type=feature \
+adversarial_distill.mmd_kernel=rbf \
+adversarial_distill.mmd_rbf_distance=pseudo_huber \
+adversarial_distill.mmd_rbf_huber_delta=0.001 \
+adversarial_distill.mmd_rbf_alpha=null
+```
+
+The kernel is `k(x,y) = exp(-alpha * D(x,y))`, where
+`D(x,y) = sum_d(sqrt((x_d - y_d)^2 + delta^2) - delta)`.
+This sums feature coordinates, with no extra division by feature dimension or
+factor of delta. Positive `delta` (default `0.001`) controls the transition
+from quadratic behavior for small differences to linear behavior for large
+ones, reducing the influence of large coordinate differences.
+
+Leave `mmd_rbf_alpha=null` to use `alpha = 1 / (2 * median(D))` estimated from
+the selected real features. Recalibrate an explicit alpha when changing the
+distance. The default distance remains `squared_euclidean`.
+
+This works with AR or diffusion features and the existing valid combinations
+of `rows`/`draws` and token/sentence kernels. It requires an active feature
+reward (`mmd_reward_weight > 0`); DMD-only and IDLM-ratio rewards do not use
+these options. `mmd_kernel=pseudo_huber` remains the separate additive kernel.
+The coordinatewise distance is computed in tiles to limit memory use, but
+requires more work than the matrix-multiplication squared-distance path.
+
 To use cosine similarity as the MMD kernel, change only the kernel in your
 feature-reward command (keep its existing source, level, K, G and pooling):
 

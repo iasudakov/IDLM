@@ -324,8 +324,12 @@ def sequence_pooled_delta(clean, generated, selected):
   return gen_mean - clean_mean, active
 
 
-def median_alpha(feat, selected, max_samples=512, generator=None):
-  """`alpha = 1 / (2 * sigma^2)` from the median pairwise squared distance.
+def median_alpha(feat, selected, max_samples=512, generator=None,
+                 distance='squared_euclidean', huber_delta=0.001):
+  """`alpha = 1 / (2 * median(D))` from real pairwise distances.
+
+  `D` is squared Euclidean by default, or the sum of coordinatewise smooth
+  pseudo-Huber distances selected by `distance` and `huber_delta`.
 
   The standard bandwidth heuristic, measured on the REAL branch only, so it
   never needs a gradient and never moves with the student. A bandwidth fitted to
@@ -339,6 +343,7 @@ def median_alpha(feat, selected, max_samples=512, generator=None):
   Falls back to `alpha = 1` when the distances degenerate -- an all-masked row,
   or identical features -- so a zero median cannot divide by zero.
   """
+  mmd_rbf.validate_distance(distance, huber_delta)
   valid = feat[selected.bool()]
   if valid.shape[0] < 2:
     return 1.0
@@ -346,19 +351,25 @@ def median_alpha(feat, selected, max_samples=512, generator=None):
     idx = torch.randperm(valid.shape[0], device=valid.device,
                          generator=generator)[:max_samples]
     valid = valid[idx]
-  d2 = torch.cdist(valid.float(), valid.float()).pow_(2)
+  if distance == 'squared_euclidean':
+    distances = torch.cdist(valid.float(), valid.float()).pow_(2)
+  else:
+    vectors = valid.detach().float().unsqueeze(0)
+    distances = mmd_rbf.pairwise_distance(
+      vectors, vectors, distance=distance, huber_delta=huber_delta)[0]
   # Off-diagonal only: the diagonal is exactly 0 and would drag the median down
   # by however many samples were drawn.
-  n = d2.shape[0]
-  off = d2[~torch.eye(n, dtype=torch.bool, device=d2.device)]
+  n = distances.shape[0]
+  off = distances[~torch.eye(n, dtype=torch.bool, device=distances.device)]
   med = off.median()
   if not torch.isfinite(med) or med <= 0:
     return 1.0
   return float(1.0 / (2.0 * med))
 
 
-def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0):
-  """`-MMD^2` per sequence under a Gaussian kernel, over the scored positions.
+def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0,
+                        distance='squared_euclidean', huber_delta=0.001):
+  """`-MMD^2` per sequence under an exponential distance kernel.
 
   The linear-kernel reward compares the two feature sets by their MEANS, which
   is all a linear kernel can see -- `sequence_pooled_delta` is literally that
@@ -380,6 +391,7 @@ def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0):
 
   Returns `(reward, active)`, matching the linear path.
   """
+  mmd_rbf.validate_distance(distance, huber_delta)
   weights = selected.to(torch.float32)
   n = weights.sum(dim=1)
   active = n >= 2
@@ -390,10 +402,12 @@ def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0):
   real = clean.detach().float()
   fake = generated.detach().float()
   if alpha is None:
-    alpha = median_alpha(real, selected)
+    alpha = median_alpha(real, selected, distance=distance,
+                         huber_delta=huber_delta)
 
   s_xx, s_yy, s_xy = mmd_rbf.rbf_pair_sums(
-    real, fake, weights, alpha, block_size=block_size)
+    real, fake, weights, alpha, block_size=block_size,
+    distance=distance, huber_delta=huber_delta)
 
   safe_n = n.clamp_min(2.0)
   pairs = safe_n * (safe_n - 1.0)
@@ -441,7 +455,8 @@ def merge_kernel_rows(clean, generated, selected, rows_of):
 def paired_sequence_reward(clean, generated, selected, kernel='linear',
                            alpha=None, block_size=0, rows_of=1,
                            level='token', sentence_pooling='mean',
-                           sequence_mask=None):
+                           sequence_mask=None,
+                           distance='squared_euclidean', huber_delta=0.001):
   """One reward per sequence; rows selecting nothing score zero.
 
   `kernel='linear'` is the historical name for pooling both sides and scoring
@@ -496,8 +511,9 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
     clean, generated, selected = merge_kernel_rows(
       clean, generated, selected, rows_of)
   if kernel == 'rbf':
-    reward, active = rbf_sequence_reward(clean, generated, selected,
-                                         alpha=alpha, block_size=block_size)
+    reward, active = rbf_sequence_reward(
+      clean, generated, selected, alpha=alpha, block_size=block_size,
+      distance=distance, huber_delta=huber_delta)
   elif kernel == 'cosine':
     # At sentence level the readout above happens BEFORE normalization.
     # At token level every scored token is a separate normalized sample.
@@ -523,7 +539,8 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
 def summed_paired_reward(features, batch, selected, indices, weights,
                          kernel='linear', alpha=None, block_size=0,
                          rows_of=1, level='token', sentence_pooling='mean',
-                         sequence_mask=None):
+                         sequence_mask=None,
+                         distance='squared_euclidean', huber_delta=0.001):
   """`R = sum_l w_l * R_l` over the requested blocks.
 
   Args:
@@ -544,7 +561,8 @@ def summed_paired_reward(features, batch, selected, indices, weights,
     stacked = features[index]
     reward, active = paired_sequence_reward(
       stacked[:batch], stacked[batch:], selected, kernel=kernel,
-      alpha=alpha, block_size=block_size, rows_of=rows_of, level=level,
+      alpha=alpha, block_size=block_size, distance=distance,
+      huber_delta=huber_delta, rows_of=rows_of, level=level,
       sentence_pooling=sentence_pooling, sequence_mask=sequence_mask)
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight
@@ -638,7 +656,8 @@ def pseudo_huber_mmd2_fixed_real(real, fake):
 def summed_multi_draw_reward(features, batch, draw_count, length, selected,
                              indices, weights, kernel='linear', alpha=None,
                              block_size=0, level='token',
-                             sentence_pooling='mean', sequence_mask=None):
+                             sentence_pooling='mean', sequence_mask=None,
+                             distance='squared_euclidean', huber_delta=0.001):
   """Score K draws from each state as one feature distribution.
 
   ``features`` contains the clean batch followed by K generated batches.
@@ -699,10 +718,11 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
           # Estimate the sentence-scale bandwidth from real sentences across
           # the device batch, never from the moving student samples.
           layer_alpha = median_alpha(
-            real_sentence.unsqueeze(1), real_active.unsqueeze(1))
+            real_sentence.unsqueeze(1), real_active.unsqueeze(1),
+            distance=distance, huber_delta=huber_delta)
         mmd2 = mmd_rbf.rbf_mmd2_fixed_real(
           real_sentence, fake_sentence, layer_alpha,
-          block_size=block_size)
+          block_size=block_size, distance=distance, huber_delta=huber_delta)
       elif kernel == 'linear':
         mmd2 = linear_mmd2_fixed_real(real_sentence, fake_sentence)
       elif kernel == 'cosine':
@@ -721,9 +741,12 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
       if kernel == 'rbf':
         layer_alpha = alpha
         if layer_alpha is None:
-          layer_alpha = median_alpha(real.detach().float(), selected)
+          layer_alpha = median_alpha(
+            real.detach().float(), selected, distance=distance,
+            huber_delta=huber_delta)
         mmd2, layer_active = mmd_rbf.rbf_mmd2_unequal(
-          real, fake, w_real, w_fake, layer_alpha, block_size=block_size)
+          real, fake, w_real, w_fake, layer_alpha, block_size=block_size,
+          distance=distance, huber_delta=huber_delta)
         reward = -mmd2
       elif kernel == 'cosine':
         mmd2, layer_active = mmd_cosine.cosine_mmd2_unequal(
@@ -796,6 +819,8 @@ class _LayeredFeatures:
   kernel_level = 'token'
   sentence_pooling = 'mean'
   rbf_alpha = None
+  rbf_distance = 'squared_euclidean'
+  rbf_huber_delta = 0.001
   rbf_block_size = 0
   kernel_batch_size = 1
 
@@ -897,6 +922,7 @@ class FrozenARFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_multi_draw_reward(
       feats, batch, draw_count, length, selected, self.resolved_layers,
       self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
+      distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       block_size=self.rbf_block_size, level=self.kernel_level,
       sentence_pooling=self.sentence_pooling,
       sequence_mask=(attention_mask if sequence_mask is None else sequence_mask))
@@ -928,6 +954,7 @@ class FrozenARFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_paired_reward(
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
+      distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
       level=self.kernel_level, sentence_pooling=self.sentence_pooling,
       sequence_mask=(attention_mask if sequence_mask is None else sequence_mask))
@@ -1214,6 +1241,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_multi_draw_reward(
       feats, batch, draw_count, length, selected, self.resolved_layers,
       self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
+      distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       block_size=self.rbf_block_size, level=self.kernel_level,
       sentence_pooling=self.sentence_pooling, sequence_mask=sequence_mask)
     if return_per_layer:
@@ -1250,6 +1278,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_paired_reward(
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
+      distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
       level=self.kernel_level, sentence_pooling=self.sentence_pooling,
       sequence_mask=sequence_mask)
