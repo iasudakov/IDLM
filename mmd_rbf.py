@@ -1,4 +1,9 @@
-"""Blocked Gaussian-kernel MMD: the same estimator, without the (R, N, N) matrix.
+"""Blocked MMD kernels without retaining the (R, N, N) Gram matrix.
+
+The default is the Gaussian kernel discussed below. The optional
+``distance='pseudo_huber'`` uses exp(-alpha * D), where
+D = sum_d(sqrt((a_d-b_d)**2 + delta**2) - delta). It tiles both pairs and
+feature coordinates and recomputes its own exact fake-only derivative.
 
 The rbf branch of an MMD loss only ever consumes three SCALARS per kernel row:
 
@@ -44,6 +49,8 @@ Sharding is sound because the tiles are summed: each rank reduces a disjoint
 subset and one all-reduce of the three (R,) sums makes every rank's result the
 complete one. The backward all-reduces its two accumulators for the same reason.
 """
+
+import math
 
 import torch
 import torch.distributed as dist
@@ -224,17 +231,27 @@ class _RBFPairSums(torch.autograd.Function):
         return None, v_acc, None, None, None, None
 
 
-def rbf_pair_sums(feat_real, feat_fake, w, alpha, block_size: int = 0, shard: bool = False):
+def rbf_pair_sums(feat_real, feat_fake, w, alpha, block_size: int = 0, shard: bool = False,
+                  distance: str = 'squared_euclidean', huber_delta: float = 0.001):
     """Per row: (sum_ij w_i w_j k(x_i,x_j), ... k(y_i,y_j), ... k(x_i,y_j)).
 
     `alpha` = 1 / (2 sigma^2), a float or a 0-dim tensor; it is measured from the
     detached real branch, so it never needs a gradient. `block_size` 0 picks a
     tile from the scratch budget (see `pick_block_size`).
 
+    `distance='pseudo_huber'` replaces squared Euclidean distance with
+    SUM_d(sqrt((x_d-y_d)**2 + huber_delta**2) - huber_delta), using a finite
+    positive `huber_delta`. Its coordinate scratch budget can further reduce
+    an explicitly requested tile size. The default Gaussian path is unchanged.
+
     `shard` splits the tiles across ranks and all-reduces, which only makes sense
     when every rank holds the same samples. The result is the unsharded one on
     every rank.
     """
+    distance, huber_delta = validate_distance(distance, huber_delta)
+    if distance == 'pseudo_huber':
+        return _PseudoHuberPairSums.apply(
+            feat_real, feat_fake, w, alpha, int(block_size), bool(shard), huber_delta)
     if torch.is_tensor(alpha):
         alpha = alpha.detach().to(dtype=feat_fake.dtype, device=feat_fake.device)
     return _RBFPairSums.apply(feat_real, feat_fake, w, alpha, int(block_size), bool(shard))
@@ -242,7 +259,8 @@ def rbf_pair_sums(feat_real, feat_fake, w, alpha, block_size: int = 0, shard: bo
 
 @torch.no_grad()
 def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha,
-                     block_size: int = 0):
+                     block_size: int = 0, distance: str = 'squared_euclidean',
+                     huber_delta: float = 0.001):
     """Unbiased MMD^2 between two differently sized feature sets, per row.
 
     Multi-draw rewards compare one clean sequence with K generated sequences,
@@ -264,6 +282,11 @@ def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha,
     if w_real.shape != real.shape[:2] or w_fake.shape != fake.shape[:2]:
         raise ValueError('RBF masks must match their feature sets, got '
                          f'{tuple(w_real.shape)} and {tuple(w_fake.shape)}')
+
+    distance, huber_delta = validate_distance(distance, huber_delta)
+    if distance == 'pseudo_huber':
+        return _pseudo_huber_mmd2_unequal(
+            real, fake, w_real, w_fake, alpha, block_size, huber_delta)
 
     real = real.detach().float()
     fake = fake.detach().float()
@@ -305,7 +328,8 @@ def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha,
 
 
 @torch.no_grad()
-def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0):
+def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0,
+                       distance: str = 'squared_euclidean', huber_delta: float = 0.001):
     """MMD^2 from one fixed real vector and K sampled fake vectors per row.
 
     ``real`` is ``(batch, hidden)`` and ``fake`` is
@@ -332,6 +356,10 @@ def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0):
     draws = fake.shape[1]
     if draws < 1:
         raise ValueError('fixed-real RBF needs at least one fake draw')
+
+    distance, huber_delta = validate_distance(distance, huber_delta)
+    if distance == 'pseudo_huber':
+        return _pseudo_huber_mmd2_fixed_real(real, fake, alpha, block_size, huber_delta)
 
     real = real.detach().float()
     fake = fake.detach().float()
@@ -360,4 +388,247 @@ def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0):
         fake_term = fake_sum
     else:
         fake_term = (fake_sum - draws) / (draws * (draws - 1))
+    return 1.0 + fake_term - 2.0 * cross_sum / draws
+
+
+
+def validate_distance(distance='squared_euclidean', huber_delta=0.001):
+    """Validate the kernel distance; delta is used only by pseudo-Huber."""
+    if distance not in ('squared_euclidean', 'pseudo_huber'):
+        raise ValueError(
+            "RBF distance must be 'squared_euclidean' or 'pseudo_huber', "
+            f'got {distance!r}')
+    if distance == 'pseudo_huber':
+        try:
+            delta = float(huber_delta)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError('pseudo-Huber delta must be finite and positive') from exc
+        if isinstance(huber_delta, bool) or not math.isfinite(delta) or delta <= 0:
+            raise ValueError(
+                f'pseudo-Huber delta must be finite and positive, got {huber_delta!r}')
+        huber_delta = delta
+    return distance, huber_delta
+
+
+def _distance_inputs(real, fake):
+    if real.ndim != 3 or fake.ndim != 3:
+        raise ValueError('RBF feature sets must be rank-3, got '
+                         f'{tuple(real.shape)} and {tuple(fake.shape)}')
+    if real.shape[0] != fake.shape[0] or real.shape[2] != fake.shape[2]:
+        raise ValueError('RBF feature sets must share row and feature dimensions, '
+                         f'got {tuple(real.shape)} and {tuple(fake.shape)}')
+    if real.device != fake.device:
+        raise ValueError('RBF feature sets must be on the same device')
+    dtype = (torch.float64 if torch.float64 in (real.dtype, fake.dtype)
+             else torch.float32)
+    return real.detach().to(dtype=dtype), fake.detach().to(dtype=dtype)
+
+
+_PSEUDO_HUBER_SCRATCH_BYTES = 128 << 20
+
+
+def _pseudo_huber_layout(rows, n, hidden, element_size, block_size):
+    """Cap all pair-coordinate scratch, even for an explicit oversized tile.
+
+    Four coordinate buffers fit in 128 MiB. The distance/kernel and reduction
+    buffers are smaller by at least the feature-chunk factor. Inputs, outputs
+    and the full fake-feature gradient are separate linear-sized storage.
+    """
+    pair_budget = max(1, _PSEUDO_HUBER_SCRATCH_BYTES // (4 * element_size * max(rows, 1)))
+    feature_chunk = max(1, min(hidden, 32, pair_budget))
+    safe_edge = max(1, math.isqrt(max(1, pair_budget // feature_chunk)))
+    requested = n if block_size <= 0 else int(block_size)
+    return max(1, min(max(n, 1), max(requested, 1), safe_edge)), feature_chunk
+
+
+def _pseudo_huber_distance_block(a, b, delta, feature_chunk):
+    """SUM sqrt(diff**2 + delta**2) - delta without near-zero cancellation."""
+    distance = a.new_zeros((a.shape[0], a.shape[1], b.shape[1]))
+    delta = torch.as_tensor(delta, dtype=a.dtype, device=a.device)
+    for h0, h1 in _blocks(a.shape[2], feature_chunk):
+        diff = a[:, :, None, h0:h1] - b[:, None, :, h0:h1]
+        denominator = torch.hypot(diff, delta).add_(delta)
+        # diff**2 / (hypot(diff, delta) + delta), arranged to avoid overflow
+        # when squaring a large finite difference.
+        contribution = diff / denominator
+        contribution.mul_(diff)
+        # A positive Python delta can underflow to zero in the working dtype.
+        # Equal coordinates still have exactly zero distance.
+        contribution.masked_fill_(diff == 0, 0.0)
+        distance.add_(contribution.sum(dim=-1))
+    return distance
+
+
+def _pseudo_huber_kernel_block(a, b, alpha, delta, feature_chunk, self_tile=False):
+    kernel = _pseudo_huber_distance_block(a, b, delta, feature_chunk)
+    kernel.mul_(-alpha).exp_()
+    if self_tile:
+        kernel.diagonal(dim1=1, dim2=2).fill_(1.0)
+    return kernel
+
+
+@torch.no_grad()
+def pairwise_distance(real, fake, distance='squared_euclidean', huber_delta=0.001,
+                      block_size=0):
+    """Detached (rows, n, m) distances for two rank-3 feature sets.
+
+    Pseudo-Huber uses SUM_d(sqrt((x_d-y_d)**2 + delta**2) - delta).
+    Half/BF16 features are promoted to FP32; FP64 inputs retain FP64. Pair and
+    coordinate tiles bound intermediate storage; the returned matrix is dense.
+    """
+    distance, huber_delta = validate_distance(distance, huber_delta)
+    real, fake = _distance_inputs(real, fake)
+    rows, n, hidden = real.shape
+    m = fake.shape[1]
+    output = real.new_empty((rows, n, m))
+    if distance == 'pseudo_huber':
+        block, chunk = _pseudo_huber_layout(
+            rows, max(n, m), hidden, real.element_size(), int(block_size))
+    else:
+        block = (pick_block_size(rows, max(n, m))
+                 if block_size <= 0 else int(block_size))
+        block = max(1, block)
+        r2, f2 = _sq_norms(real), _sq_norms(fake)
+    # Do not let surrounding mixed precision demote the squared-distance bmm.
+    with torch.autocast(device_type=real.device.type, enabled=False):
+        for i0, i1 in _blocks(n, block):
+            for j0, j1 in _blocks(m, block):
+                if distance == 'pseudo_huber':
+                    tile = _pseudo_huber_distance_block(
+                        real[:, i0:i1], fake[:, j0:j1], huber_delta, chunk)
+                else:
+                    tile = torch.bmm(real[:, i0:i1], fake[:, j0:j1].transpose(1, 2))
+                    tile.mul_(-2.0).add_(r2[:, i0:i1, None]).add_(f2[:, None, j0:j1])
+                    tile.clamp_(min=0)
+                output[:, i0:i1, j0:j1] = tile
+    return output
+
+
+def _pseudo_huber_sums(real, fake, w_real, w_fake, alpha, block, delta, chunk,
+                       shard=False):
+    """Blocked weighted sums, supporting unequal set sizes and tile sharding."""
+    rows = real.shape[0]
+    part = _shard_ctx(shard)
+    tile_index = 0
+    sums = []
+    for a, b, wa, wb, symmetric in (
+            (real, real, w_real, w_real, True),
+            (fake, fake, w_fake, w_fake, True),
+            (real, fake, w_real, w_fake, False)):
+        total = real.new_zeros(rows)
+        spans_b = _blocks(b.shape[1], block)
+        for bi, (i0, i1) in enumerate(_blocks(a.shape[1], block)):
+            for j0, j1 in (spans_b[bi:] if symmetric else spans_b):
+                tile_index += 1
+                if part and tile_index % part[1] != part[0]:
+                    continue
+                diagonal = symmetric and i0 == j0
+                kernel = _pseudo_huber_kernel_block(
+                    a[:, i0:i1], b[:, j0:j1], alpha, delta, chunk, diagonal)
+                # Elementwise reduction avoids autocast changing FP32 to BF16.
+                kernel.mul_(wa[:, i0:i1, None]).mul_(wb[:, None, j0:j1])
+                total.add_(kernel.sum(dim=(1, 2)),
+                           alpha=2.0 if symmetric and not diagonal else 1.0)
+        sums.append(total)
+    if part:
+        reduced = torch.stack(sums)
+        dist.all_reduce(reduced)
+        return tuple(reduced.unbind(0))
+    return tuple(sums)
+
+
+class _PseudoHuberPairSums(torch.autograd.Function):
+    """Recomputed pseudo-Huber kernels with an exact fake-only first derivative."""
+
+    @staticmethod
+    def forward(ctx, real, fake, w, alpha, block_size, shard, delta):
+        x, y = _distance_inputs(real, fake)
+        if x.shape != y.shape or w.shape != x.shape[:2]:
+            raise ValueError('paired RBF features and their shared mask must have matching shapes')
+        weights = w.detach().to(dtype=x.dtype, device=x.device)
+        if torch.is_tensor(alpha):
+            alpha = alpha.detach().to(dtype=x.dtype, device=x.device)
+        block, chunk = _pseudo_huber_layout(
+            x.shape[0], x.shape[1], x.shape[2], x.element_size(), block_size)
+        sums = _pseudo_huber_sums(x, y, weights, weights, alpha, block, delta, chunk, shard)
+        ctx.save_for_backward(x, y, weights)
+        ctx.alpha, ctx.block, ctx.chunk = alpha, block, chunk
+        ctx.delta, ctx.shard, ctx.fake_dtype = delta, shard, fake.dtype
+        return sums
+
+    @staticmethod
+    @torch.no_grad()
+    def backward(ctx, g_xx, g_yy, g_xy):
+        if not ctx.needs_input_grad[1]:
+            return (None,) * 7
+        x, y, w = ctx.saved_tensors
+        rows, n, hidden = y.shape
+        grad = torch.zeros_like(y)
+        part = _shard_ctx(ctx.shard)
+        tile_index = 0
+        delta = torch.as_tensor(ctx.delta, dtype=y.dtype, device=y.device)
+        # y appears twice in S_yy, once in S_xy. The coordinate derivative
+        # of the distance is diff/hypot(diff, delta), not 2*diff.
+        for other, upstream, factor in ((y, g_yy, -2.0), (x, g_xy, -1.0)):
+            coefficient = (upstream * (factor * ctx.alpha)).reshape(rows, 1, 1)
+            for i0, i1 in _blocks(n, ctx.block):
+                for j0, j1 in _blocks(n, ctx.block):
+                    tile_index += 1
+                    if part and tile_index % part[1] != part[0]:
+                        continue
+                    kernel = _pseudo_huber_kernel_block(
+                        y[:, i0:i1], other[:, j0:j1], ctx.alpha,
+                        ctx.delta, ctx.chunk, other is y and i0 == j0)
+                    kernel.mul_(w[:, i0:i1, None]).mul_(w[:, None, j0:j1])
+                    kernel.mul_(coefficient)
+                    for h0, h1 in _blocks(hidden, ctx.chunk):
+                        diff = y[:, i0:i1, None, h0:h1] - other[:, None, j0:j1, h0:h1]
+                        denominator = torch.hypot(diff, delta)
+                        diff.div_(denominator).masked_fill_(denominator == 0, 0.0)
+                        diff.mul_(kernel.unsqueeze(-1))
+                        grad[:, i0:i1, h0:h1].add_(diff.sum(dim=2))
+                        # Release coordinate scratch before recomputing another kernel.
+                        del diff, denominator
+        if part:
+            dist.all_reduce(grad)
+        return None, grad.to(dtype=ctx.fake_dtype), None, None, None, None, None
+
+
+def _pseudo_huber_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size, delta):
+    real, fake = _distance_inputs(real, fake)
+    if w_real.shape != real.shape[:2] or w_fake.shape != fake.shape[:2]:
+        raise ValueError('RBF masks must match their feature sets')
+    # Match the reward estimators' existing FP32 precision.
+    real, fake = real.float(), fake.float()
+    w_real = w_real.to(dtype=real.dtype, device=real.device)
+    w_fake = w_fake.to(dtype=fake.dtype, device=fake.device)
+    if torch.is_tensor(alpha):
+        alpha = alpha.detach().to(dtype=real.dtype, device=real.device)
+    block, chunk = _pseudo_huber_layout(
+        real.shape[0], max(real.shape[1], fake.shape[1]), real.shape[2],
+        real.element_size(), int(block_size))
+    s_xx, s_yy, s_xy = _pseudo_huber_sums(
+        real, fake, w_real, w_fake, alpha, block, delta, chunk)
+    n, m = w_real.sum(dim=1), w_fake.sum(dim=1)
+    active = (n >= 2) & (m >= 2)
+    result = ((s_xx - n) / (n * (n - 1)).clamp_min(1.0)
+              + (s_yy - m) / (m * (m - 1)).clamp_min(1.0)
+              - 2.0 * s_xy / (n * m).clamp_min(1.0))
+    return torch.where(active, result, torch.zeros_like(result)), active
+
+
+def _pseudo_huber_mmd2_fixed_real(real, fake, alpha, block_size, delta):
+    real, fake = real.detach().float(), fake.detach().float()
+    if torch.is_tensor(alpha):
+        alpha = alpha.detach().to(dtype=real.dtype, device=real.device)
+    rows, draws, hidden = fake.shape
+    block, chunk = _pseudo_huber_layout(
+        rows, draws, hidden, fake.element_size(), int(block_size))
+    # A singleton real set has known self-kernel 1; do not use the unequal
+    # estimator's inactive-row rule for this conditional target.
+    ones_real = real.new_ones((rows, 1))
+    ones_fake = fake.new_ones((rows, draws))
+    _, fake_sum, cross_sum = _pseudo_huber_sums(
+        real.unsqueeze(1), fake, ones_real, ones_fake, alpha, block, delta, chunk)
+    fake_term = fake_sum if draws == 1 else (fake_sum - draws) / (draws * (draws - 1))
     return 1.0 + fake_term - 2.0 * cross_sum / draws

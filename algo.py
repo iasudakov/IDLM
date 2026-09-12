@@ -492,6 +492,13 @@ class MDLM(trainer_base.AbsorbingState):
       if kernel not in ('linear', 'rbf', 'pseudo_huber'):
         raise ValueError('adversarial_distill.mmd_kernel must be '
                          f'linear|rbf|pseudo_huber, got {kernel!r}')
+      rbf_distance = str(cfg.get('mmd_rbf_distance', 'squared_euclidean'))
+      rbf_huber_delta = cfg.get('mmd_rbf_huber_delta', 0.001)
+      if kernel == 'rbf' and kind == 'feature':
+        mmd_reward.mmd_rbf.validate_distance(rbf_distance, rbf_huber_delta)
+      rbf_description = (
+        f'distance={rbf_distance}, huber_delta={rbf_huber_delta}, '
+        if kernel == 'rbf' else '')
       level = str(cfg.get('mmd_kernel_level', 'token'))
       if level not in ('token', 'sentence'):
         raise ValueError('adversarial_distill.mmd_kernel_level must be '
@@ -551,6 +558,8 @@ class MDLM(trainer_base.AbsorbingState):
       self._mmd_critic_cached.kernel = kernel
       self._mmd_critic_cached.kernel_level = level
       self._mmd_critic_cached.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
+      self._mmd_critic_cached.rbf_distance = rbf_distance
+      self._mmd_critic_cached.rbf_huber_delta = rbf_huber_delta
       self._mmd_critic_cached.rbf_block_size = int(
         cfg.get('mmd_rbf_block_size', 0) or 0)
       self._mmd_critic_cached.kernel_batch_size = max(
@@ -561,6 +570,7 @@ class MDLM(trainer_base.AbsorbingState):
       print(f'[mmd] {what}, block '
             f'{self._mmd_critic_cached.layer_description}, '
             f'{kernel} kernel over {level}s, '
+            f'{rbf_description}'
             f'{kernel_batch}, '
             f'group={cfg.mmd_group_size}, '
             f'weight={cfg.mmd_reward_weight}', flush=True)

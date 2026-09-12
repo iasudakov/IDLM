@@ -179,11 +179,22 @@ adversarial_distill:
   # default), then compares one real vector with K fake vectors. The IDLM-ratio
   # critic remains unsupported because it exposes no feature distribution.
   mmd_kernel_source: rows
-  # Bandwidth as `alpha = 1 / (2 sigma^2)`. `null` measures it per call by the
-  # median heuristic on the REAL branch -- fitting it to the student would let
-  # it drift as the student does, making the reward a moving target.
+  # Exponent scale: `null` uses 1 / (2 * median(D)) on REAL features per call.
+  # For squared Euclidean, this is alpha = 1 / (2 sigma^2). Fitting bandwidth
+  # to the student would let it drift as the student does.
   mmd_rbf_alpha: null
+  # Distance inside exp(-alpha * D), used only by mmd_kernel: rbf.
+  #   squared_euclidean -- D = sum_d (x_d-y_d)^2 (historical default).
+  #   pseudo_huber -- D = sum_d (sqrt((x_d-y_d)^2 + delta^2) - delta).
+  # This is coordinatewise and summed, using the existing feature loss's
+  # smooth pseudo-Huber shape. It is distinct from mmd_kernel: pseudo_huber.
+  # With either distance, null alpha uses 1 / (2 * median(D)) on real features.
+  # Explicit alpha values tuned for squared Euclidean need recalibration.
+  mmd_rbf_distance: squared_euclidean
+  # Positive transition scale in feature units, used only for pseudo_huber.
+  mmd_rbf_huber_delta: 0.001
   # Tile edge for the blocked kernel; 0 sizes it from a 256MB scratch budget.
+  # Pseudo-Huber also chunks feature dimensions and caps pair tiles to fit.
   mmd_rbf_block_size: 0
   # Kernel-batch size K. Its meaning is selected by `mmd_kernel_source`:
   #
