@@ -928,10 +928,13 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
                          'mmd_reward_type=feature')
       rbf_distance = str(cfg.get('mmd_rbf_distance', 'squared_euclidean'))
       rbf_huber_delta = cfg.get('mmd_rbf_huber_delta', 0.001)
+      rbf_exclude_same_sentence = bool(
+        cfg.get('mmd_rbf_exclude_same_sentence', False))
       if kernel == 'rbf' and kind == 'feature':
         mmd_reward.mmd_rbf.validate_distance(rbf_distance, rbf_huber_delta)
       rbf_description = (
         f'distance={rbf_distance}, huber_delta={rbf_huber_delta}, '
+        f'exclude_same_sentence={rbf_exclude_same_sentence}, '
         if kernel == 'rbf' else '')
       level = str(cfg.get('mmd_kernel_level', 'token'))
       if level not in ('token', 'sentence'):
@@ -941,6 +944,15 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       if kernel_source not in ('rows', 'draws'):
         raise ValueError('adversarial_distill.mmd_kernel_source must be '
                          f'rows|draws, got {kernel_source!r}')
+      if rbf_exclude_same_sentence:
+        if (kind != 'feature' or kernel != 'rbf' or kernel_source != 'draws'
+            or level != 'token'):
+          raise ValueError('adversarial_distill.mmd_rbf_exclude_same_sentence '
+                           'requires mmd_reward_type=feature, mmd_kernel=rbf, '
+                           'mmd_kernel_source=draws and mmd_kernel_level=token')
+        if int(cfg.get('mmd_kernel_batch_size', 1) or 1) < 2:
+          raise ValueError('adversarial_distill.mmd_rbf_exclude_same_sentence '
+                           'requires mmd_kernel_batch_size >= 2')
       if kernel == 'pseudo_huber' and (
           kernel_source != 'draws' or level != 'sentence' or kind != 'feature'):
         raise ValueError('adversarial_distill.mmd_kernel=pseudo_huber requires '
@@ -1000,6 +1012,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       self._mmd_critic_cached.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
       self._mmd_critic_cached.rbf_distance = rbf_distance
       self._mmd_critic_cached.rbf_huber_delta = rbf_huber_delta
+      self._mmd_critic_cached.rbf_exclude_same_sentence = rbf_exclude_same_sentence
       self._mmd_critic_cached.rbf_block_size = int(
         cfg.get('mmd_rbf_block_size', 0) or 0)
       self._mmd_critic_cached.kernel_batch_size = max(
