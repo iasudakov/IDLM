@@ -392,6 +392,101 @@ def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0,
 
 
 
+@torch.no_grad()
+def rbf_mmd2_cross_sentence(real, fake, selected, alpha, block_size=0,
+                            distance='squared_euclidean', huber_delta=0.001):
+    """Cross-sentence token-kernel statistic with no reference self-term.
+
+    real is (batch, length, hidden), fake is
+    (batch, K, length, hidden), and selected is the shared token mask.
+    For n selected positions, this returns
+
+      sum_{r != s} sum_{i,j} k(y_ri, y_sj) / (K (K-1) n**2)
+        - 2 sum_r sum_{i,j} k(x_i, y_rj) / (K n**2).
+
+    All pairs of tokens within the same generated sentence are excluded;
+    matching positions in different sentences are retained. The reference
+    sentence's entire real-real term is deliberately omitted. This is a
+    signed training statistic, not the complete nonnegative population MMD^2.
+    The fake-fake term is unbiased over independent sentence draws conditional
+    on the state and feature map, without assuming tokens within a sentence
+    are independent. K >= 2 is required, and rows with n >= 1 are active.
+
+    Sentence pairs and token tiles are traversed separately, so excluded
+    within-sentence blocks are never computed or materialized.
+    """
+    distance, huber_delta = validate_distance(distance, huber_delta)
+    if real.ndim != 3 or fake.ndim != 4:
+        raise ValueError('cross-sentence RBF expects (batch, length, hidden) real '
+                         'and (batch, draws, length, hidden) fake features, got '
+                         f'{tuple(real.shape)} and {tuple(fake.shape)}')
+    if (fake.shape[0] != real.shape[0]
+            or fake.shape[2:] != real.shape[1:]):
+        raise ValueError('cross-sentence RBF features must share batch, length '
+                         f'and hidden dimensions, got {tuple(real.shape)} and '
+                         f'{tuple(fake.shape)}')
+    if selected.shape != real.shape[:2]:
+        raise ValueError('cross-sentence RBF selected mask must match real '
+                         f'features, got {tuple(selected.shape)} and '
+                         f'{tuple(real.shape)}')
+    draws = fake.shape[1]
+    if draws < 2:
+        raise ValueError('cross-sentence RBF requires at least 2 independent '
+                         f'fake draws (mmd_kernel_batch_size >= 2), got {draws}')
+    if real.device != fake.device:
+        raise ValueError('cross-sentence RBF features must be on the same device')
+
+    real, fake = real.detach().float(), fake.detach().float()
+    weight = selected.to(dtype=real.dtype, device=real.device)
+    if torch.is_tensor(alpha):
+        alpha = alpha.detach().to(dtype=real.dtype, device=real.device)
+    rows, length, hidden = real.shape
+    if distance == 'pseudo_huber':
+        block, chunk = _pseudo_huber_layout(
+            rows, length, hidden, real.element_size(), int(block_size))
+        real2 = fake2 = None
+    else:
+        block = (pick_block_size(rows, length)
+                 if block_size <= 0 else int(block_size))
+        block = max(1, block)
+        real2, fake2 = _sq_norms(real), _sq_norms(fake)
+    spans = _blocks(length, block)
+
+    def pair_sum(left, right, left2, right2):
+        total = real.new_zeros(rows)
+        for i0, i1 in spans:
+            for j0, j1 in spans:
+                if distance == 'pseudo_huber':
+                    kernel = _pseudo_huber_kernel_block(
+                        left[:, i0:i1], right[:, j0:j1],
+                        alpha, huber_delta, chunk)
+                else:
+                    kernel = _kernel_block(
+                        left[:, i0:i1], right[:, j0:j1],
+                        left2[:, i0:i1], right2[:, j0:j1], alpha)
+                total.add_(_wKw(kernel, weight[:, i0:i1], weight[:, j0:j1]))
+        return total
+
+    fake_sum, cross_sum = real.new_zeros(rows), real.new_zeros(rows)
+    with torch.autocast(device_type=real.device.type, enabled=False):
+        for left in range(draws):
+            left2 = None if fake2 is None else fake2[:, left]
+            cross_sum.add_(pair_sum(real, fake[:, left], real2, left2))
+            for right in range(left + 1, draws):
+                right2 = None if fake2 is None else fake2[:, right]
+                fake_sum.add_(
+                    pair_sum(fake[:, left], fake[:, right], left2, right2),
+                    alpha=2.0)
+    count = weight.sum(dim=1)
+    active = count >= 1
+    nn = count.square()
+    statistic = (fake_sum / (draws * (draws - 1) * nn).clamp_min(1.0)
+                 - 2.0 * cross_sum / (draws * nn).clamp_min(1.0))
+    return torch.where(active, statistic, torch.zeros_like(statistic)), active
+
+
+
+
 def validate_distance(distance='squared_euclidean', huber_delta=0.001):
     """Validate the kernel distance; delta is used only by pseudo-Huber."""
     if distance not in ('squared_euclidean', 'pseudo_huber'):

@@ -406,7 +406,8 @@ def merge_kernel_rows(clean, generated, selected, rows_of):
 def paired_sequence_reward(clean, generated, selected, kernel='linear',
                            alpha=None, block_size=0, rows_of=1,
                            level='token',
-                           distance='squared_euclidean', huber_delta=0.001):
+                           distance='squared_euclidean', huber_delta=0.001,
+                           exclude_same_sentence=False):
   """One reward per sequence; rows selecting nothing score zero.
 
   `kernel='linear'` is the original: pool both sides and score the difference
@@ -424,6 +425,9 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
   the return has to stay per sequence whatever the row size -- the row only
   changes what the number means, not its shape.
   """
+  if exclude_same_sentence:
+    raise ValueError('mmd_rbf_exclude_same_sentence requires '
+                     'mmd_kernel_source=draws')
   if kernel == 'pseudo_huber':
     raise ValueError('mmd_kernel=pseudo_huber requires '
                      'mmd_kernel_source=draws and mmd_kernel_level=sentence')
@@ -482,7 +486,8 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
 def summed_paired_reward(features, batch, selected, indices, weights,
                          kernel='linear', alpha=None, block_size=0,
                          rows_of=1, level='token',
-                         distance='squared_euclidean', huber_delta=0.001):
+                         distance='squared_euclidean', huber_delta=0.001,
+                         exclude_same_sentence=False):
   """`R = sum_l w_l * R_l` over the requested blocks.
 
   Args:
@@ -504,7 +509,8 @@ def summed_paired_reward(features, batch, selected, indices, weights,
     reward, active = paired_sequence_reward(
       stacked[:batch], stacked[batch:], selected, kernel=kernel,
       alpha=alpha, block_size=block_size, distance=distance,
-      huber_delta=huber_delta, rows_of=rows_of, level=level)
+      huber_delta=huber_delta, exclude_same_sentence=exclude_same_sentence,
+      rows_of=rows_of, level=level)
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight
   return total, active, per_layer
@@ -589,7 +595,8 @@ def pseudo_huber_mmd2_fixed_real(real, fake):
 def summed_multi_draw_reward(features, batch, draw_count, length, selected,
                              indices, weights, kernel='linear', alpha=None,
                              block_size=0, level='token',
-                             distance='squared_euclidean', huber_delta=0.001):
+                             distance='squared_euclidean', huber_delta=0.001,
+                             exclude_same_sentence=False):
   """Score K draws from each state as one feature distribution.
 
   ``features`` contains the clean batch followed by K generated batches.
@@ -606,6 +613,11 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
   ``pseudo_huber`` kernel uses the distance-induced estimator and recovers the
   historical reward at K = 1.
 
+  With RBF token kernels, ``exclude_same_sentence=True`` keeps only
+  cross-draw fake-fake token pairs and omits the real-real term. It requires
+  K >= 2, retains all real-fake pairs, and is active with one scored position.
+  The reward is the negative of that signed statistic, not a full MMD^2.
+
   Returns ``(reward, active, per_layer)`` with one reward per original row.
   """
   if selected.shape != (batch, length):
@@ -618,6 +630,13 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
   if kernel == 'pseudo_huber' and level != 'sentence':
     raise ValueError('mmd_kernel=pseudo_huber requires '
                      'mmd_kernel_source=draws and mmd_kernel_level=sentence')
+  if exclude_same_sentence:
+    if kernel != 'rbf' or level != 'token':
+      raise ValueError('mmd_rbf_exclude_same_sentence requires '
+                       'mmd_kernel=rbf and mmd_kernel_level=token')
+    if draw_count < 2:
+      raise ValueError('mmd_rbf_exclude_same_sentence requires '
+                       'mmd_kernel_batch_size >= 2')
   expected_rows = (draw_count + 1) * batch
   total, active, per_layer = None, None, {}
   for index, weight in zip(indices, weights):
@@ -659,19 +678,27 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
                          f'{kernel!r}')
       reward = torch.where(layer_active, -mmd2, torch.zeros_like(mmd2))
     else:
-      fake = fake_by_draw.permute(1, 0, 2, 3).reshape(
-        batch, draw_count * length, -1)
-      w_real = selected.to(real.dtype)
-      w_fake = w_real.repeat(1, draw_count)
+      if not exclude_same_sentence:
+        fake = fake_by_draw.permute(1, 0, 2, 3).reshape(
+          batch, draw_count * length, -1)
+        w_real = selected.to(real.dtype)
+        w_fake = w_real.repeat(1, draw_count)
       if kernel == 'rbf':
         layer_alpha = alpha
         if layer_alpha is None:
           layer_alpha = median_alpha(
             real.detach().float(), selected, distance=distance,
             huber_delta=huber_delta)
-        mmd2, layer_active = mmd_rbf.rbf_mmd2_unequal(
-          real, fake, w_real, w_fake, layer_alpha, block_size=block_size,
-          distance=distance, huber_delta=huber_delta)
+        if exclude_same_sentence:
+          # Keep independent sentence draws separate for the fake-fake term.
+          # The single real sentence supplies only the real-fake term.
+          mmd2, layer_active = mmd_rbf.rbf_mmd2_cross_sentence(
+            real, fake_by_draw.permute(1, 0, 2, 3), selected, layer_alpha,
+            block_size=block_size, distance=distance, huber_delta=huber_delta)
+        else:
+          mmd2, layer_active = mmd_rbf.rbf_mmd2_unequal(
+            real, fake, w_real, w_fake, layer_alpha, block_size=block_size,
+            distance=distance, huber_delta=huber_delta)
         # Keep negative U-statistics, just as in the sentence-level path.
         reward = -mmd2
       elif kernel == 'linear':
@@ -734,6 +761,7 @@ class _LayeredFeatures:
   rbf_alpha = None
   rbf_distance = 'squared_euclidean'
   rbf_huber_delta = 0.001
+  rbf_exclude_same_sentence = False
   rbf_block_size = 0
   kernel_batch_size = 1
 
@@ -834,6 +862,7 @@ class FrozenARFeatures(_LayeredFeatures):
       feats, batch, draw_count, length, selected, self.resolved_layers,
       self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
+      exclude_same_sentence=self.rbf_exclude_same_sentence,
       block_size=self.rbf_block_size, level=self.kernel_level)
     if return_per_layer:
       return reward, active, per_layer
@@ -863,6 +892,7 @@ class FrozenARFeatures(_LayeredFeatures):
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
+      exclude_same_sentence=self.rbf_exclude_same_sentence,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
       level=self.kernel_level)
     if return_per_layer:
@@ -1138,6 +1168,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
       feats, batch, draw_count, length, selected, self.resolved_layers,
       self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
+      exclude_same_sentence=self.rbf_exclude_same_sentence,
       block_size=self.rbf_block_size, level=self.kernel_level)
     if return_per_layer:
       return reward, active, per_layer
@@ -1174,6 +1205,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
+      exclude_same_sentence=self.rbf_exclude_same_sentence,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
       level=self.kernel_level)
     if return_per_layer:

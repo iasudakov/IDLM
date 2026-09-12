@@ -253,6 +253,33 @@ these options. `mmd_kernel=pseudo_huber` remains the separate additive kernel.
 The coordinatewise distance is computed in tiles to limit memory use, but
 requires more work than the matrix-multiplication squared-distance path.
 
+For active feature rewards (`mmd_reward_type=feature`), token RBF can exclude
+pairs of tokens from the same generated sentence:
+
+```bash
+adversarial_distill.mmd_kernel=rbf \
+adversarial_distill.mmd_kernel_source=draws \
+adversarial_distill.mmd_kernel_level=token \
+adversarial_distill.mmd_kernel_batch_size=4 \
+adversarial_distill.mmd_rbf_exclude_same_sentence=True
+```
+
+The flag defaults to `False` and requires the combination above with at least
+two draws (`K >= 2`). With `K=4`, it removes the four diagonal sentence blocks
+and keeps the twelve ordered cross-sentence blocks. Each retained block still
+compares **all token-position pairs**, including equal position indices;
+sentence features are not mean-pooled first.
+
+For `n` selected positions shared by all K draws, the statistic is
+`FF_between - 2 * RF`. The generated-generated sum uses the denominator
+`K * (K - 1) * n^2`; the reference-generated sum includes all pairs and uses
+`K * n^2`. The reward is the negative of this statistic. One selected position
+is sufficient; rows with none receive zero reward.
+
+The reference-reference term is omitted, so the raw statistic is not the
+full MMD squared. Negative values are retained. This option works with both RBF distances,
+`squared_euclidean` and `pseudo_huber`.
+
 #### Continue training the TinyGSM teacher
 
 Use the same data, checkpoint, validation, and logging setup while optimizing
