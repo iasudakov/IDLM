@@ -2,16 +2,27 @@
 
 This is a task adaptation, not a claim that DiDi's paper used TinyGSM. The
 two-step trajectory, optimizer updates, rewards, KL/entropy terms, schedules,
-and normalization stay in the released implementation. Only the positions
-allowed to change or contribute to its existing masks are restricted.
+and normalization stay in the released implementation. The adapter restricts
+the target positions, routes teacher predictions through native MDLM processing,
+and scores sampled actions with the same student forward that generated them.
 """
 
 from contextlib import contextmanager
 import inspect
+from pathlib import Path
+from time import perf_counter
 
 import torch
 
 from .runtime import TRAINING_REPAIRS, repaired_function
+
+
+TRAINING_CORRECTIONS = {
+    'version': 1,
+    'teacher_distribution': 'native-mdlm-sigma-and-subs',
+    'teacher_mode': 'frozen-eval',
+    'trajectory_probabilities': 'single-forward-sample-and-score',
+}
 
 
 def install_tinygsm_runtime(upstream_main):
@@ -32,11 +43,20 @@ def install_tinygsm_runtime(upstream_main):
         'disc_acc = (real_preds.sum() + fake_preds.sum()) / (real_logits.numel() + fake_logits.numel())',
         'disc_acc = ((real_preds.squeeze(-1) * mask_real).sum() + '
         '(fake_preds.squeeze(-1) * mask_fake).sum()) / '
-        '(mask_real.sum() + mask_fake.sum()).clamp_min(1)'),))
+        '(mask_real.sum() + mask_fake.sum()).clamp_min(1)'), (
+        '# Logging\n',
+        '# Logging\n    self._tinygsm_record_training_progress(original_batch_size, update_student)\n'),))
+    regularization = repaired_function(original._get_regularization, (
+        ('self.teacher(x_T, sigma=sigma_hi)',
+         'self._tinygsm_teacher_log_probs(x_T, sigma_hi)'),
+        ('self.teacher(x_tau, sigma=sigma_gen)',
+         'self._tinygsm_teacher_log_probs(x_tau, sigma_gen)'),
+    ))
 
     class TinyGSMDiDi(base):
         _didi_tinygsm_installed = True
         _didi_training_step_impl = training
+        _get_regularization = regularization
 
         def __init__(self, config, tokenizer):
             if config.data.get('train') != 'tiny_gsm':
@@ -49,6 +69,12 @@ def install_tinygsm_runtime(upstream_main):
                 raise ValueError('TinyGSM DiDi supports ancestral, ancestral_cache or guided sampling.')
             self._didi_target_state = None
             super().__init__(config, tokenizer)
+            from .tinygsm_training_monitor import TinyGSMTrainingCounters, source_provenance
+            self._tinygsm_training_counters = TinyGSMTrainingCounters()
+            self._tinygsm_step_started = None
+            self._tinygsm_source_provenance = source_provenance(Path(__file__).resolve().parents[1])
+            self._didi_effective_hyperparameters['training_corrections'] = dict(TRAINING_CORRECTIONS)
+            self._didi_effective_hyperparameters['wrapper_source'] = self._tinygsm_source_provenance
             self._didi_effective_hyperparameters['conditional_task'] = {
                 'dataset': 'tiny_gsm',
                 'training_target': 'attention_mask (answer and optionally padding)',
@@ -57,6 +83,48 @@ def install_tinygsm_runtime(upstream_main):
                 'reward_positions': 'corrupted training-target positions',
                 'rerank_positions': 'entire generated suffix, excluding prompt',
             }
+
+        def train(self, mode=True):
+            super().train(mode)
+            # Lightning recursively switches submodules back to train mode.
+            # A no_grad context alone would still leave teacher dropout active.
+            if hasattr(self, 'teacher'):
+                self.teacher.eval()
+            if hasattr(self, 'student_ema'):
+                self.student_ema.eval()
+            return self
+
+        @torch.no_grad()
+        def _tinygsm_teacher_log_probs(self, xt, sigma):
+            if sigma.ndim == 1:
+                sigma = sigma.unsqueeze(-1)
+            sigma = self._process_sigma(sigma)
+            self.teacher.eval()
+            # Match TrainerBase.forward's precision as well as its native
+            # time-conditioning and output parameterization.
+            with torch.amp.autocast('cuda', dtype=torch.float32):
+                output = self.teacher(xt, sigma)
+            return self._process_model_output(output, xt, sigma)
+
+        @torch.no_grad()
+        def _get_ancestral_update(self, x, t, dt, p_x0=None, noise_removal_step=False):
+            _, alpha_t = self.noise(t)
+            if noise_removal_step:
+                alpha_s = torch.ones_like(alpha_t)
+            else:
+                _, alpha_s = self.noise(t - dt)
+            if p_x0 is None:
+                alpha_2d = alpha_t.unsqueeze(-1) if alpha_t.ndim == 1 else alpha_t
+                with torch.enable_grad():
+                    sigma = self._sigma_from_alphat(alpha_2d)
+                    p_x0 = self.forward(x, sigma).exp()
+            # The sampling operation does not need gradients, but REINFORCE
+            # must score the SAME policy, including the same dropout draw.
+            q_xs = p_x0.detach() * (alpha_s - alpha_t)[:, None, None]
+            q_xs[:, :, self.mask_index] = (1 - alpha_s)[:, None]
+            sampled = upstream_main.algo.trainer_base.sample_categorical(q_xs)
+            copy_flag = (x != self.mask_index).to(x.dtype)
+            return p_x0, copy_flag * x + (1 - copy_flag) * sampled
 
         def _conditional_checkpoint_metadata(self):
             """Persist task semantics independently of the optimizer protocol.
@@ -99,6 +167,11 @@ def install_tinygsm_runtime(upstream_main):
         def on_save_checkpoint(self, checkpoint):
             super().on_save_checkpoint(checkpoint)
             checkpoint['didi_tinygsm'] = self._conditional_checkpoint_metadata()
+            checkpoint['didi_tinygsm_training'] = {
+                'corrections': dict(TRAINING_CORRECTIONS),
+                'counters': self._tinygsm_training_counters.state_dict(),
+                'wrapper_source': self._tinygsm_source_provenance,
+            }
 
         def on_load_checkpoint(self, checkpoint):
             expected = self._conditional_checkpoint_metadata()
@@ -118,7 +191,21 @@ def install_tinygsm_runtime(upstream_main):
                                  + ', '.join(differing)
                                  + '. Preserve its tokenizer, separator, sequence length '
                                  'and prompt/padding mask settings.')
-            return super().on_load_checkpoint(checkpoint)
+            training_state = checkpoint.get('didi_tinygsm_training')
+            if self.config.mode == 'train':
+                if (not isinstance(training_state, dict)
+                        or training_state.get('corrections') != TRAINING_CORRECTIONS):
+                    raise ValueError('TinyGSM training corrections differ from the checkpoint. '
+                                     'Start the corrected baseline in a new output directory '
+                                     'from training.finetune_path; an older DiDi run cannot '
+                                     'silently resume with changed teacher or policy scoring.')
+                from .tinygsm_training_monitor import TinyGSMTrainingCounters
+                restored_counters = TinyGSMTrainingCounters()
+                restored_counters.load_state_dict(training_state.get('counters'))
+            result = super().on_load_checkpoint(checkpoint)
+            if self.config.mode == 'train':
+                self._tinygsm_training_counters = restored_counters
+            return result
 
         def _validate_targets(self, tokens, mask):
             if tokens.ndim != 2 or mask.shape != tokens.shape:
@@ -170,7 +257,27 @@ def install_tinygsm_runtime(upstream_main):
             group = self.num_samples_per_prompt
             with self._target_context(tokens.repeat_interleave(group, dim=0),
                                       target.repeat_interleave(group, dim=0)):
-                return super().training_step(batch, batch_idx)
+                self._tinygsm_step_started = perf_counter()
+                try:
+                    return super().training_step(batch, batch_idx)
+                finally:
+                    self._tinygsm_step_started = None
+
+        def _tinygsm_record_training_progress(self, local_prompt_rows, update_student):
+            # Called after optimizer updates and before upstream's in-step
+            # checkpoint, so saved counters include the just-completed update.
+            rows = int(local_prompt_rows) * int(self.trainer.world_size)
+            self._tinygsm_training_counters.observe_step(
+                global_prompt_rows=rows,
+                candidate_trajectories=rows * self.num_samples_per_prompt,
+                student_updates=int(update_student), discriminator_updates=1,
+                elapsed_seconds=perf_counter() - self._tinygsm_step_started,
+            )
+            # Float64 preserves integer counts beyond FP32's 2**24 limit.
+            metrics = {key: torch.tensor(value, device=self.device, dtype=torch.float64)
+                       for key, value in self._tinygsm_training_counters.metrics().items()}
+            self.log_dict(metrics,
+                          on_step=True, on_epoch=False, sync_dist=True)
 
         def _get_masked_input(self, batch_size):
             tokens = super()._get_masked_input(batch_size)

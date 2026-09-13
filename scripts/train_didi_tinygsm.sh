@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Conditional TinyGSM adapter; released DiDi training settings, not MMD.
+# Corrected conditional TinyGSM baseline with released DiDi hyperparameters.
 # TEACHER_CHECKPOINT=/path/mdlm_notok.ckpt OWT_CACHE is NOT used here.
 # TINYGSM_CACHE=/path/cache_dir GSM8K_DATA=/path/gsm8k_test.json \
 # SAVE_DIR=/path/new_run GPUS=0,1,2,3,4,5,6,7 bash scripts/train_didi_tinygsm.sh
-# Optional threshold sweeps: append '+eval.gsm8k_pareto_thresholds=[0.5,0.7,0.9]'.
+# GSM8K evaluation includes the shared 27-threshold MMD comparison grid at T=0.
+# Override it with '++eval.gsm8k_pareto_thresholds=[0.5,0.7,0.9]'.
 # Images require Matplotlib; +eval.gsm8k_pareto_plot=false keeps numeric curves.
 set -euo pipefail
 
@@ -82,9 +83,31 @@ DIDI_TINY_COMMAND=(python -u -m torch.distributed.run --standalone
   "+eval.gsm8k_every_n_validations=${GSM8K_EVERY:-1}"
   +didi_monitor.gm=false +didi_monitor.gen_ppl=false
   "+underdeep.experiment=${EXPERIMENT:-generative-models/tinygsm}"
-  "+underdeep.name=${RUN_NAME:-didi-tinygsm-released-training}"
+  "+underdeep.name=${RUN_NAME:-didi-tinygsm-corrected-baseline}"
   +underdeep.force_new_run=true +didi_runtime.strict_environment=true
 )
+if [[ "$GSM8K_EVAL" == true ]]; then
+  # Preserve existing +key=value overrides as well as ++ and bare overrides.
+  # Hydra rejects a scalar + override if the launcher already set that key.
+  DIDI_TINY_DEFAULT_THRESHOLDS=true
+  DIDI_TINY_DEFAULT_TEMPERATURE=true
+  for DIDI_TINY_OVERRIDE in "$@"; do
+    case "$DIDI_TINY_OVERRIDE" in
+      +eval.gsm8k_pareto_thresholds=*|++eval.gsm8k_pareto_thresholds=*)
+        DIDI_TINY_DEFAULT_THRESHOLDS=false ;;
+      +eval.gsm8k_pareto_temperature=*|++eval.gsm8k_pareto_temperature=*)
+        DIDI_TINY_DEFAULT_TEMPERATURE=false ;;
+    esac
+  done
+  if [[ "$DIDI_TINY_DEFAULT_THRESHOLDS" == true ]]; then
+    DIDI_TINY_COMMAND+=(
+      '++eval.gsm8k_pareto_thresholds=[0.325,0.35,0.375,0.4,0.425,0.45,0.475,0.5,0.525,0.55,0.575,0.6,0.625,0.65,0.675,0.7,0.725,0.75,0.775,0.8,0.825,0.85,0.875,0.9,0.925,0.95,0.98]'
+    )
+  fi
+  if [[ "$DIDI_TINY_DEFAULT_TEMPERATURE" == true ]]; then
+    DIDI_TINY_COMMAND+=(++eval.gsm8k_pareto_temperature=0.0)
+  fi
+fi
 if [[ "${DIDI_DRY_RUN:-0}" == 1 ]]; then
   printf '%q ' "${DIDI_TINY_COMMAND[@]}" "$@"
   printf '\n'

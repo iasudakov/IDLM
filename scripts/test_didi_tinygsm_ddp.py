@@ -83,7 +83,7 @@ class CheckConditionalDistributedState(L.Callback):
         self.backward_checks = 0
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        del outputs, batch, batch_idx
+        del outputs, batch_idx
         assert self.backward_checks == 2
         assert len(self.corruption_masks) == 2
         assert len(self.discriminator_outputs) == 2
@@ -101,6 +101,17 @@ class CheckConditionalDistributedState(L.Callback):
         torch.testing.assert_close(
             trainer.logged_metrics['monitor/discriminator_acc'], expected_accuracy,
             rtol=1e-6, atol=1e-7)
+        completed = self.batch_checks + 1
+        expected_rows = completed * len(batch['input_ids']) * trainer.world_size
+        expected = {'didi/student_updates': completed,
+                    'didi/discriminator_updates': completed,
+                    'didi/optimizer_updates': 2 * completed,
+                    'didi/prompt_rows': expected_rows,
+                    'didi/candidate_trajectories': expected_rows * pl_module.num_samples_per_prompt}
+        for name, value in expected.items():
+            measured = trainer.logged_metrics[name]
+            assert measured.dtype == torch.float64
+            assert measured.item() == value, (name, measured, value)
         assert pl_module._didi_target_state is None
         assert all(torch.isfinite(torch.as_tensor(value)).all()
                    for value in trainer.logged_metrics.values())

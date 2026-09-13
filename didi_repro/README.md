@@ -10,15 +10,21 @@ The 43 files in `vendor/didi_instruct` are byte-identical to that revision.
 The original MIT license and dependency specification are included. Demo GIFs
 and repository metadata are omitted. All adaptations live in `didi_repro`.
 
-For the conditional TinyGSM adaptation, see [TINYGSM.md](TINYGSM.md).
-Its `scripts/train_didi_tinygsm.sh` keeps the **released** training settings,
-not the paper-informed OWT launcher settings described next. Selecting
-`data=tiny-gsm` opts into separate data, prompt masking and answer evaluation;
-it is not an authors-published TinyGSM reproduction.
+For the corrected conditional TinyGSM baseline, see [TINYGSM.md](TINYGSM.md).
+Its `scripts/train_didi_tinygsm.sh` keeps the **released hyperparameters**,
+including the 10,000-optimizer-update budget (about 5,000 student updates),
+while correcting TinyGSM teacher KL evaluation and ensuring that sampling and
+policy scoring share one student forward pass. These conditional-runtime
+corrections are separate from the paper-informed OWT launcher settings below;
+the vendored source remains unchanged. The launcher now evaluates the shared
+27-threshold GSM8K grid at temperature zero by default. Start a fresh output
+directory from the native TinyGSM teacher; older TinyGSM DiDi checkpoints do
+not resume under the corrected training protocol. This is a first corrected
+task baseline, not an authors-published TinyGSM reproduction.
 
 There are now two explicitly different protocols:
 
-- Direct `python -m didi_repro`, without the correction flags below, retains
+- Direct OWT `python -m didi_repro`, without the correction flags below, retains
   the released-code defaults plus the documented runtime/checkpoint repairs.
 - The OWT launchers select the corrected paper-reported iteration/LR/EMA
   settings and guided evaluation described below. They do **not** silently

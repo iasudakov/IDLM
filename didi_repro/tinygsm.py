@@ -126,6 +126,7 @@ def install_tinygsm(upstream):
 def adaptation_record(config):
   if not is_tinygsm(config):
     return None
+  from .tinygsm_runtime import TRAINING_CORRECTIONS
   return {
     'dataset': 'tiny_gsm',
     'reference_branch': 'tinygsm-upstream-repro',
@@ -134,7 +135,8 @@ def adaptation_record(config):
     'conditioning': 'fixed prompt; target-only corruption, policy, KL, entropy and discriminator reward',
     'train_on_pad': bool(config.data.train_on_pad),
     'separator': config.data.separator,
-    'training_settings': 'released DiDi defaults unless explicitly overridden',
+    'training_settings': 'released DiDi hyperparameters with explicit TinyGSM training corrections',
+    'training_corrections': dict(TRAINING_CORRECTIONS),
     'checkpoint': 'native TinyGSM MDLM raw backbone initializes student, teacher and discriminator trunk',
     'student_ema_initialization': config.get('didi_init', {}).get('tinygsm_student_ema', 'checkpoint'),
     'student_ema_resume': 'saved DiDi student_ema tensors and initialization provenance take precedence',

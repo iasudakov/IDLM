@@ -9,11 +9,28 @@ Both DiDi vendor source trees remain byte-identical to their manifests.
 ## What stays the same and what changes
 
 The two-step student trajectory, discriminator update, group-normalized
-reward, timestep weighting, policy objective, KL/entropy coefficients, EMA
-update and optimizer normalization remain DiDi's released implementation.
+reward, timestep weighting, KL/entropy coefficients, EMA update and optimizer
+normalization retain DiDi's released settings. The current TinyGSM runtime
+corrects two implementation problems in the earlier conditional adapter:
+
+- Teacher KL targets use evaluation mode, the native model's timestep handling
+  (`sigma=0` for this time-unconditioned checkpoint), and the same SUBS
+  parameterization as the student. This avoids comparing processed student
+  probabilities with bare teacher logits at an unintended noise condition.
+- Student sampling and policy log-probabilities use one forward pass. With
+  dropout enabled, recomputing the probabilities would score a different
+  policy from the one that generated the sample.
+
+These corrections live in the TinyGSM runtime; both vendored DiDi trees and
+the OWT training path remain unchanged. This launcher is the **first corrected
+conditional DiDi baseline**, not a guarantee of improved GSM8K accuracy or
+equivalence to earlier runs described as released-code reproductions. Start
+from the native teacher in a fresh output directory. Checkpoints from the
+older conditional training protocol are rejected on resume.
+
 No MMD kernel, feature model, `1/G` change, or adaptive training-mask schedule
-is introduced. The optional confidence-threshold sampler below is evaluation
-only; it does not replace either of DiDi's training trajectory steps.
+is introduced. The confidence-threshold sweep is evaluation only; it does not
+replace either of DiDi's training trajectory steps.
 
 The TinyGSM-specific behavior follows the reference:
 
@@ -75,10 +92,11 @@ decay/counter are **not** imported into DiDi's update rule: `algo.ema_beta`
 and all optimizer/training settings remain unchanged. OWT initialization is
 unchanged.
 
-This option is for fresh native initialization. A training resume restores its
-saved DiDi `student_ema` tensors and initialization provenance; it does not
-replace a trained EMA with the original teacher's EMA or repair an older run's
-EMA history. Use a fresh output directory for the corrected baseline.
+This option is for fresh native initialization. A compatible training resume
+restores its saved DiDi `student_ema` tensors and initialization provenance;
+it does not replace a trained EMA with the original teacher's EMA or repair
+an older run's EMA history. Use a fresh output directory for the corrected
+baseline; older checkpoints cannot bypass the corrected-protocol resume check.
 
 For comparison with run `612b02f3`, match the adaptive evaluation batch size
 with `+eval.gsm8k_batch_size=16` and keep temperature zero, the same checkpoint,
@@ -104,7 +122,8 @@ for training hyperparameters, rather than the paper-informed OWT launcher:
 
 `didi_training.iterations=null` retains the original scheduler's mixed-unit
 behavior: its LR horizon is 10,000 while the iteration counter reaches about
-5,000. This is intentional released-code fidelity, not a corrected schedule.
+5,000. This released schedule convention is intentionally retained alongside
+the TinyGSM runtime corrections; this is not the paper-informed OWT recipe.
 The existing runtime/checkpoint repairs remain enabled. Gradient accumulation
 is not supported by the released manual-optimization loop; keep it at 1.
 
@@ -135,7 +154,7 @@ conda activate didi-authors
 TEACHER_CHECKPOINT="$SOURCE_CODE_PATH/code/checkpoints/tinygsm/mdlm_notok.ckpt" \
 TINYGSM_CACHE="$SOURCE_CODE_PATH/code/cache_dir" \
 GSM8K_DATA="$SOURCE_CODE_PATH/code/data/gsm8k_test.json" \
-SAVE_DIR="$SOURCE_CODE_PATH/code/tinygsm_didi" \
+SAVE_DIR="$SOURCE_CODE_PATH/code/tinygsm_didi_corrected" \
 GPUS=0,1,2,3,4,5,6,7 \
 bash scripts/train_didi_tinygsm.sh
 ```
@@ -160,21 +179,40 @@ described below.
 
 ### Threshold sweeps: accuracy versus NFE
 
-To add the same adaptive evaluation rule used by `tinygsm-upstream-repro`,
-append these overrides to the training command (or the launcher):
+With `GSM8K_EVAL=true` (the default), the launcher evaluates the same greedy
+adaptive rule and 27-threshold grid used by the TinyGSM MMD comparison runs:
 
-```bash
-  '+eval.gsm8k_pareto_thresholds=[0.5,0.6,0.7,0.8,0.9,0.95]' \
-  +eval.gsm8k_pareto_temperature=0.0 \
-  +eval.gsm8k_pareto_plot=true
+```text
+[0.325,0.35,0.375,0.4,0.425,0.45,0.475,0.5,0.525,0.55,0.575,0.6,0.625,0.65,0.675,0.7,0.725,0.75,0.775,0.8,0.825,0.85,0.875,0.9,0.925,0.95,0.98]
 ```
 
-Any explicit list of distinct values in `[0,1]` is accepted, including the denser threshold list
-from the TinyGSM MMD runs. `null` or `[]` disables this sweep; the default is
-disabled. `eval.gsm8k_at_validation=true` must also be enabled, as it already
-is in the supplied training command. Matplotlib is required for images;
+Temperature is `0.0`, and frontier plots are enabled by default. To replace
+the grid or disable plotting, append overrides to the launcher command:
+
+```bash
+  '++eval.gsm8k_pareto_thresholds=[0.5,0.7,0.9]' \
+  ++eval.gsm8k_pareto_temperature=0.0 \
+  +eval.gsm8k_pareto_plot=false
+```
+
+Any explicit list of distinct values in `[0,1]` is accepted. Appending
+`'++eval.gsm8k_pareto_thresholds=[]'` or
+`'++eval.gsm8k_pareto_thresholds=null'` disables only the sweep.
+Setting `GSM8K_EVAL=false` disables the GSM8K benchmark and omits the launcher's
+threshold defaults; conditional TinyGSM validation still runs. Direct
+`python -m didi_repro` launches must opt into thresholds explicitly.
+`eval.gsm8k_at_validation=true` is required whenever a nonempty grid is set.
+Matplotlib is required for images;
 `+eval.gsm8k_pareto_plot=false` keeps scalar curves, tables and on-disk history
 without it. Missing plotting dependencies fail before training model loading.
+
+The full default sweep generates **35,613 answers per validation**
+(27 thresholds times all 1,319 GSM8K examples), plus the separate fixed-budget
+and conditional evaluations. It also runs before training by default. Each
+answer may need multiple forwards, so evaluation can account for a substantial
+part of the run time. These forwards do not consume the 10,000 optimizer-update
+training budget. Use `GSM8K_EVERY` to change the evaluation cadence if needed;
+keep the same threshold grid when comparing frontiers with MMD.
 
 The sampler keeps the question fixed, proposes tokens, and commits every
 remaining position whose **raw model probability is strictly greater than
@@ -288,6 +326,21 @@ Underdeep receives existing DiDi loss/reward/gradient/LR metrics plus:
   `pareto/gsm8k_thresholds` tables.
 - Question/generated/reference sample tables and task/sampler/grader provenance.
 
+Training also logs `didi/student_updates`, `didi/discriminator_updates`,
+`didi/optimizer_updates`, `didi/prompt_rows`, `didi/candidate_trajectories`,
+and `didi/train_wall_seconds` as float64 scalars without the metric logger's
+integer rounding. Prompt and candidate counts are global exposures across
+ranks, including repeated examples. The wall timer covers `training_step`
+through optimization, before logging/checkpoint saving; it excludes validation
+and data loading and reports the mean of rank-local elapsed times. It is not
+a GPU-hours benchmark.
+
+Checkpoints persist these complete counters and the corrected TinyGSM training
+protocol. Provenance records the source Git SHA, dirty status and source-file
+hash manifest; `didi/config` and the resolved YAML retain the full parameters.
+These records support comparisons by student updates and prompt/candidate
+exposure without inferring training work from Lightning's optimizer-step axis.
+
 Execution grading runs generated Python with the reference restricted
 builtins/timeout. **It is not an OS security sandbox.** The launcher enables
 it for this trusted reproduction workflow; disable it with
@@ -303,6 +356,8 @@ CPU tests (run each in its own process; no GPU/download/tracker required):
 ```bash
 python scripts/test_didi_tinygsm_data.py
 python scripts/test_didi_tinygsm_runtime.py
+python scripts/test_didi_tinygsm_training_corrections.py
+python scripts/test_didi_tinygsm_training_monitor.py
 python scripts/test_didi_tinygsm_initialization.py
 python scripts/test_didi_tinygsm_eval.py
 python scripts/test_didi_tinygsm_entrypoint.py

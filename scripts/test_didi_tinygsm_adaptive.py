@@ -332,7 +332,10 @@ class AdaptiveTests(unittest.TestCase):
                             if isinstance(node, ast.FunctionDef) and node.name == name)
             module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
             exec(compile(module, '<pinned-tinygsm-reference>', 'exec'), namespace)
-            return namespace[name]
+            compiled = namespace[name]
+            # This extracted method is assigned directly to an instance;
+            # unwrap the class descriptor (not callable before Python 3.10).
+            return compiled.__func__ if isinstance(compiled, staticmethod) else compiled
         select = compile_function('confidence_sampling.py', None, 'select_threshold')
         namespace['confidence_sampling'] = types.SimpleNamespace(
             select_threshold=select, ADAPTIVE_STRATEGIES=('low_confidence_dynamic',))

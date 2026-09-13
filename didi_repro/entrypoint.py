@@ -134,7 +134,7 @@ def _check_cached_data(config):
 
 def _write_provenance(config, record):
   from omegaconf import OmegaConf
-  from .tinygsm import adaptation_record
+  from .tinygsm import adaptation_record, is_tinygsm
   if int(os.environ.get('RANK', 0)) != 0:
     return
   directory = Path(config.checkpointing.save_dir)
@@ -144,6 +144,10 @@ def _write_provenance(config, record):
   (directory / 'didi_environment.json').write_text(json.dumps(record, indent=2) + '\n')
   from hydra.core.hydra_config import HydraConfig
   overrides = list(HydraConfig.get().overrides.task) if HydraConfig.initialized() else []
+  source = {}
+  if is_tinygsm(config):
+    from .tinygsm_training_monitor import source_provenance
+    source['wrapper_source'] = source_provenance(Path(__file__).resolve().parents[1])
   (directory / 'didi_provenance.json').write_text(json.dumps({
     'upstream_revision': UPSTREAM_REVISION,
     'overrides': overrides,
@@ -152,6 +156,7 @@ def _write_provenance(config, record):
     'training_protocol': training_protocol(config),
     'runtime_fix_ledger': 'didi_repro/README.md',
     'dataset_adaptation': adaptation_record(config),
+    **source,
   }, indent=2) + '\n')
 
 

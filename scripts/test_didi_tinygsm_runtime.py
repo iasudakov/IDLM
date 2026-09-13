@@ -290,6 +290,12 @@ class TinyGSMRuntimeTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 trainer = self.fixture.trainer(directory, max_steps=2)
                 trainer.fit(model, train_dataloaders=torch.utils.data.DataLoader([batch], batch_size=None))
+                # Upstream saves inside training_step, before its iteration
+                # increment. Counters must already include that update.
+                saved = torch.load(Path(directory) / 'student_iters_0.ckpt',
+                                   map_location='cpu', weights_only=False)
+                self.assertEqual(saved['didi_tinygsm_training']['counters'],
+                                 model._tinygsm_training_counters.state_dict())
         finally:
             hook.remove()
         self.assertEqual(model.global_steps, 1)
@@ -298,6 +304,14 @@ class TinyGSMRuntimeTests(unittest.TestCase):
         for output in discriminator_outputs:
             self.assertTrue(bool((output.grad.squeeze(-1)[~target] == 0).all()))
         self.assertIsNone(model._didi_target_state)
+        counters = model._tinygsm_training_counters.metrics()
+        self.assertEqual(counters['didi/student_updates'], 1)
+        self.assertEqual(counters['didi/discriminator_updates'], 1)
+        self.assertEqual(counters['didi/prompt_rows'], 2)
+        self.assertEqual(counters['didi/candidate_trajectories'], 4)
+        self.assertGreater(counters['didi/train_wall_seconds'], 0)
+        self.assertFalse(model.teacher.training)
+        self.assertTrue(all(p.grad is None for p in model.teacher.parameters()))
         for key, value in model.teacher.state_dict().items():
             torch.testing.assert_close(value, teacher_before[key], rtol=0, atol=0)
 
@@ -392,6 +406,11 @@ class TinyGSMRuntimeTests(unittest.TestCase):
             self.assertEqual(restored.global_steps, 2)
             self.assertEqual(second.global_step, 4)
             self.assertEqual(restored._didi_teacher_metadata, model._didi_teacher_metadata)
+            counters = restored._tinygsm_training_counters.metrics()
+            self.assertEqual(counters['didi/student_updates'], 2)
+            self.assertEqual(counters['didi/discriminator_updates'], 2)
+            self.assertEqual(counters['didi/prompt_rows'], 4)
+            self.assertEqual(counters['didi/candidate_trajectories'], 8)
 
 
 if __name__ == '__main__':
