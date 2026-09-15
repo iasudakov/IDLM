@@ -170,6 +170,13 @@ bash scripts/train_idlm_dcd.sh
 
 The TinyGSM recipes train IDLM students for conditional mathematical reasoning on TinyGSM-style question-answer examples. Before executing the scripts, configure `cache_dir` in `configs/data/tiny-gsm.yaml` and replace the `training.finetune_path` placeholder in each script with the corresponding pretrained teacher checkpoint. Our TinyGSM distillation runs use the teacher checkpoints from the [S-FLM repository](https://github.com/jdeschena/s-flm): [MDLM](https://huggingface.co/jdeschena/s-flm/blob/main/tinygsm/mdlm.ckpt) for IDLM-MDLM and [Duo](https://huggingface.co/jdeschena/s-flm/blob/main/tinygsm/duo.ckpt) for IDLM-Duo.
 
+To set different student and fake-model base learning rates, add
+`optim.lr=1e-5 optim.fake_lr=1e-6` to an MDLM or Duo distillation command.
+When omitted, `optim.fake_lr` follows `optim.lr`, including for older checkpoint
+configs without this field. Both optimizers keep the configured learning-rate
+schedule, each using its own base LR. This also applies to IDLM-ratio rewards;
+feature-only MMD does not train the fake model.
+
 #### MDLM teacher → IDLM-MDLM TinyGSM student
 
 ```bash

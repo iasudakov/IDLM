@@ -255,7 +255,7 @@ class MDLM(trainer_base.AbsorbingState):
       
       optimizer_fake = torch.optim.AdamW(
         self.fake_model.parameters(),
-        lr=self.config.optim.lr,
+        lr=self.config.optim.get('fake_lr', self.config.optim.lr),
         betas=(self.config.optim.beta1,
               self.config.optim.beta2),
         eps=self.config.optim.eps,
@@ -1372,7 +1372,7 @@ class DUO(DUO_BASE):
       
       optimizer_fake = torch.optim.AdamW(
         self.fake_model.parameters(),
-        lr=self.config.optim.lr,
+        lr=self.config.optim.get('fake_lr', self.config.optim.lr),
         betas=(self.config.optim.beta1,
               self.config.optim.beta2),
         eps=self.config.optim.eps,

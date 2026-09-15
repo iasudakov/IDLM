@@ -447,6 +447,8 @@ eval:
 optim:
   weight_decay: 0
   lr: 3e-4
+  # Fake-model base LR for distillation; follows the student LR unless overridden.
+  fake_lr: ${optim.lr}
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
