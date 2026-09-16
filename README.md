@@ -287,6 +287,35 @@ The reference-reference term is omitted, so the raw statistic is not the
 full MMD squared. Negative values are retained. This option works with both RBF distances,
 `squared_euclidean` and `pseudo_huber`.
 
+#### Initialize TinyGSM MMD models from checkpoint EMA
+
+Add this override to a fresh native MDLM distillation command:
+
+```bash
+training.finetune_weights=ema \
+checkpointing.resume_from_ckpt=False \
+```
+
+The student, frozen diffusion teacher, and fake model all start from the EMA
+parameters saved in `training.finetune_path`. With diffusion features, MMD
+uses this EMA-initialized teacher. With a native AR `.ckpt` feature model,
+the feature extractor uses that AR checkpoint's own EMA parameters. Published
+Hugging Face feature models still use their single exported weight set.
+
+The default `training.finetune_weights=raw` preserves existing behavior.
+EMA initialization preserves the saved EMA decay and update counter; it does
+not restart EMA averaging. Student and fake EMA shadows are independent.
+EMA checkpoints contain averaged parameters, not averaged buffers; model
+buffers retain their checkpoint values.
+
+This option requires `algo=mdlm`, `algo.backbone=dit`, distillation enabled,
+and `training.ema > 0` (the default). It cannot be combined with teacher
+continuation. Checkpoints must contain compatible EMA parameters; missing or
+incompatible EMA is an error, with no fallback to raw weights. On a full
+training resume, saved student/teacher/fake weights and EMA states take
+precedence; this initialization is not reapplied. Evaluation loading also
+leaves saved training weights intact.
+
 #### Continue training the TinyGSM teacher
 
 Use the same data, checkpoint, validation, and logging setup while optimizing

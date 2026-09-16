@@ -1230,6 +1230,7 @@ def load_ar_backbone(ckpt_path, config, tokenizer, device):
   # Local, not module-level: `algo` imports this module (lazily, inside
   # `_mmd_critic`), so importing it at the top would close the cycle.
   import algo
+  import checkpoint_ema
   import omegaconf
   import utils
   from model_assets import resolve_checkpoint
@@ -1257,6 +1258,8 @@ def load_ar_backbone(ckpt_path, config, tokenizer, device):
 
   model = algo.AR.load_from_checkpoint(
     ckpt_path, tokenizer=tokenizer, config=cfg, weights_only=False)
+  if checkpoint_ema.finetune_weights(config) == 'ema':
+    checkpoint_ema.initialize_backbones_from_ema(model)
   model = model.to(device).eval()
   utils.freeze_model(model)
   return model.backbone

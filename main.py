@@ -14,6 +14,7 @@ import torch
 from tqdm import trange
 
 import algo
+import checkpoint_ema
 import dataloader
 import model_assets
 import sandbox_gsm8k
@@ -71,12 +72,13 @@ def _load_from_checkpoint(diffusion_model, config, tokenizer):
 
 
 def _configure_training_mode(config):
-  """Make teacher continuation a first-class alternative to distillation.
+  """Validate initialization and configure teacher continuation.
 
   `training.finetune_path` has always been a weights-only warm start. The new
   flag deliberately keeps that behavior, but forces the ordinary model loss
   even when a shared command line already set `is_distill=True`.
   """
+  checkpoint_ema.validate_finetune_weights(config)
   if (config.mode != 'train'
       or not bool(config.training.get('continue_teacher', False))):
     return
@@ -268,6 +270,11 @@ def _train(diffusion_model, config, logger, tokenizer):
       tokenizer=tokenizer,
       config=config,
       weights_only=False)
+    if checkpoint_ema.apply_finetune_weights(
+        model, config, resuming=ckpt_path is not None):
+      logger.info(
+        'Initialized student, frozen teacher and fake model from checkpoint '
+        'EMA weights; preserved EMA decay and update counter.')
   else:
     model = diffusion_model(config, tokenizer=valid_ds.tokenizer)
 

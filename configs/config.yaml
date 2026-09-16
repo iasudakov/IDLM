@@ -386,6 +386,11 @@ training:
   change_of_variables: False
   loss_precision: 'bf16'  # bf16, float32, float64
   finetune_path: ''
+  # Native MDLM distillation warm start: raw (existing behavior) or ema.
+  # ema initializes student, frozen teacher and fake model from checkpoint EMA;
+  # DM features use that teacher, and native AR features use their own EMA.
+  # Keeps the checkpoint EMA decay/counter. Does not rewrite resumed weights.
+  finetune_weights: raw
   # Train the checkpoint itself with the original model objective instead of
   # constructing the frozen-teacher/fake-model distillation system. This takes
   # precedence over adversarial_distill.is_distill so an existing distillation
