@@ -1,4 +1,4 @@
-"""Restore the native TinyGSM MDLM evaluation EMA without changing training.
+"""Select raw or EMA native TinyGSM MDLM weights for fresh initialization.
 
 The reference EMA saves an unnamed list in backbone.parameters() followed by
 noise.parameters() order, excluding frozen parameters. The supported native
@@ -21,6 +21,17 @@ def student_ema_source(config):
     return source
 
 
+def training_weights_source(config):
+    source = config.get('didi_init', {}).get('tinygsm_weights', 'raw')
+    if source not in ('raw', 'ema'):
+        raise ValueError('didi_init.tinygsm_weights must be raw or ema.')
+    if source == 'ema' and student_ema_source(config) != 'checkpoint':
+        raise ValueError('didi_init.tinygsm_weights=ema initializes every model copy '
+                         'from checkpoint EMA; tinygsm_student_ema must be checkpoint, '
+                         'not raw.')
+    return source
+
+
 def _tensor(value, expected, label):
     if (not isinstance(value, torch.Tensor) or value.layout != torch.strided
             or value.device.type == 'meta' or value.is_complex()):
@@ -37,6 +48,29 @@ def _tensor(value, expected, label):
             raise ValueError(f'{label} overflows the destination dtype {expected.dtype}.')
 
 
+def validate_ema_destinations(model, state):
+    """Check every destination before applying the shared EMA initializer.
+
+    The discriminator has a newly initialized classification head in place of
+    the MDLM vocabulary head. Validate/copy only its shared backbone tensors,
+    including frozen parameters and non-EMA buffers.
+    """
+    for label in ('backbone', 'teacher', 'student_ema', 'discriminator'):
+        expected = getattr(model, label).state_dict()
+        selected = state
+        if label == 'discriminator':
+            expected = {key: value for key, value in expected.items()
+                        if not key.startswith('output_layer.')}
+            selected = {key: value for key, value in state.items()
+                        if not key.startswith('output_layer.')}
+        if set(selected) != set(expected):
+            raise ValueError(f'Native EMA/{label} state mismatch: '
+                             f'missing={sorted(set(expected) - set(selected))}, '
+                             f'unexpected={sorted(set(selected) - set(expected))}.')
+        for name, value in selected.items():
+            _tensor(value, expected[name], f'Native EMA/{label}.{name}')
+
+
 def prepare_student_ema(model, checkpoint):
     """Return a validated full EMA state and JSON-safe provenance; never mutate.
 
@@ -46,6 +80,7 @@ def prepare_student_ema(model, checkpoint):
     No source EMA decay/update counter is applied to DiDi's training schedule.
     """
     source = student_ema_source(model.config)
+    training_source = training_weights_source(model.config)
     state = checkpoint.get('state_dict')
     if not isinstance(state, Mapping):
         raise ValueError('Native TinyGSM checkpoint needs a state_dict mapping.')
@@ -60,6 +95,7 @@ def prepare_student_ema(model, checkpoint):
         _tensor(value, expected[name], f'Native backbone.{name}')
     metadata = {
         'kind': 'native_tinygsm_initialization',
+        'training_weights': training_source,
         'backbone': 'raw backbone.*',
         'teacher': 'raw backbone.*; unchanged',
         'discriminator': 'raw backbone trunk; newly initialized head unchanged',
@@ -70,8 +106,9 @@ def prepare_student_ema(model, checkpoint):
         return raw, metadata
 
     prefix = ('Native TinyGSM checkpoint EMA is incompatible. '
-              'Use a complete native MDLM checkpoint, or explicitly set '
-              '+didi_init.tinygsm_student_ema=raw for the previous raw baseline. ')
+              'Use a complete native MDLM checkpoint, or explicitly select '
+              'didi_init.tinygsm_weights=raw and tinygsm_student_ema=raw '
+              'for raw-only initialization. ')
     ema = checkpoint.get('ema')
     if not isinstance(ema, Mapping):
         raise ValueError(prefix + "Missing checkpoint['ema'] mapping.")
@@ -112,4 +149,12 @@ def prepare_student_ema(model, checkpoint):
         'checkpoint_decay': float(decay),
         'checkpoint_num_updates': None if updates is None else int(updates),
     }
+    if training_source == 'ema':
+        validate_ema_destinations(model, overlay)
+        metadata.update({
+            'backbone': 'checkpoint EMA parameters; raw backbone buffers',
+            'teacher': 'checkpoint EMA parameters; raw backbone buffers',
+            'discriminator': 'checkpoint EMA trunk parameters; raw backbone buffers; '
+                             'newly initialized head unchanged',
+        })
     return overlay, metadata

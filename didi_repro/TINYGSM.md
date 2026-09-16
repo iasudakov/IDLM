@@ -59,22 +59,33 @@ Actual teacher loading still checks every backbone tensor strictly.
 
 ### Native checkpoint EMA initialization
 
-Fresh TinyGSM runs now default to
-`+didi_init.tinygsm_student_ema=checkpoint`. The native `mdlm_notok.ckpt`
-contains two weight sets, and the adapter keeps their roles separate:
+The native `mdlm_notok.ckpt` contains raw parameters and a saved EMA. Fresh
+runs default to `+didi_init.tinygsm_weights=raw` and
+`+didi_init.tinygsm_student_ema=checkpoint`, preserving the earlier corrected
+baseline. To initialize every model copy from the saved EMA instead, add:
 
-| Destination | Native checkpoint source |
-| --- | --- |
-| Trainable student `backbone` | Raw `state_dict['backbone.*']` |
-| Frozen teacher | Same raw backbone weights |
-| Discriminator trunk | Same raw backbone weights; head remains newly initialized |
-| Evaluation `student_ema` | Saved `ema.shadow_params`, with raw backbone buffers |
+```bash
++didi_init.tinygsm_weights=ema \
+checkpointing.resume_from_ckpt=false
+```
 
-This matches the TinyGSM MMD reference's raw training initialization and saved
-EMA evaluation baseline. Previously this adapter also seeded `student_ema`
-from raw weights, so selecting `didi_eval.weights=student_ema` did **not**
-recover the native checkpoint's EMA at step zero. Keep
-`+didi_eval.weights=student_ema` to evaluate the restored average.
+Use a fresh output directory and run name for this initialization experiment.
+Both choices use the same pretrained checkpoint:
+
+| Destination | Default: `tinygsm_weights=raw` | Opt-in: `tinygsm_weights=ema` |
+| --- | --- | --- |
+| Trainable student `backbone` | Raw `state_dict['backbone.*']` parameters | Saved `ema.shadow_params` |
+| Frozen teacher | Raw backbone parameters | Saved EMA parameters |
+| Discriminator trunk | Raw backbone parameters | Saved EMA parameters |
+| Evaluation `student_ema` | Saved EMA parameters | Saved EMA parameters |
+
+The discriminator's classification head stays newly initialized in both
+cases. Buffers come from the checkpoint backbone because the native EMA
+contains only parameters. The EMA option does not change the learning rates,
+optimizer state initialization, training budget, warmup, loss coefficients,
+or DiDi EMA decay. Keep `+didi_eval.weights=student_ema` to evaluate the
+student average. This is a TinyGSM adaptation experiment, not a change to the
+released-settings launcher defaults or evidence of improved benchmark scores.
 
 The checkpoint EMA is an unnamed list. Loading follows the pinned native
 backbone's parameter order, excluding the rotary buffer, with strict count,
@@ -83,20 +94,27 @@ or incompatible EMA is an error rather than a silent raw fallback. As with
 the reference format, permutations among equal-shaped EMA tensors cannot be
 detected; use a trusted native checkpoint.
 
-For the previous raw initialization, explicitly set
-`+didi_init.tinygsm_student_ema=raw` (use `++` when overriding the launcher's
-existing setting). The selected source, checkpoint identity, source EMA
+With `tinygsm_weights=raw`, setting `+didi_init.tinygsm_student_ema=raw`
+also initializes the evaluation EMA from raw weights, matching the adapter
+before native EMA restoration was added. Use `++` when overriding the
+launcher's existing setting. Combining `tinygsm_weights=ema` with
+`tinygsm_student_ema=raw` is rejected: all model copies must start from the
+saved EMA in this mode. The selected sources, checkpoint identity, source EMA
 decay/update count and number of raw-versus-EMA differing parameters are logged
 in initialization provenance and saved in DiDi checkpoints. The source EMA's
 decay/counter are **not** imported into DiDi's update rule: `algo.ema_beta`
 and all optimizer/training settings remain unchanged. OWT initialization is
 unchanged.
 
-This option is for fresh native initialization. A compatible training resume
-restores its saved DiDi `student_ema` tensors and initialization provenance;
-it does not replace a trained EMA with the original teacher's EMA or repair
-an older run's EMA history. Use a fresh output directory for the corrected
-baseline; older checkpoints cannot bypass the corrected-protocol resume check.
+These options control fresh native initialization. A compatible full training
+resume restores the saved student, frozen teacher, discriminator,
+`student_ema`, optimizer/scheduler state, and initialization provenance. The
+initialization flag is not reapplied after restoring those tensors. The
+configuration's adaptation record describes the requested fresh initialization;
+the saved initialization provenance is authoritative for a resumed run. This
+does not replace a trained model with the original teacher's EMA or repair an
+older run's EMA history. Older checkpoints cannot bypass the corrected-protocol
+resume check.
 
 For comparison with run `612b02f3`, match the adaptive evaluation batch size
 with `+eval.gsm8k_batch_size=16` and keep temperature zero, the same checkpoint,

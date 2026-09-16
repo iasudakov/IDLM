@@ -10,6 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import lightning as L
 from omegaconf import open_dict
 import torch
 
@@ -26,11 +27,15 @@ class NativeEMAInitializationTests(unittest.TestCase):
     def tearDownClass(cls):
         runtime_fixtures.TinyGSMRuntimeTests.tearDownClass()
 
-    def uninitialized(self, source=None):
+    def uninitialized(self, source=None, *, weights=None):
         config = self.helpers.config()
-        if source is not None:
+        if source is not None or weights is not None:
             with open_dict(config):
-                config.didi_init = {'tinygsm_student_ema': source}
+                config.didi_init = {}
+                if source is not None:
+                    config.didi_init.tinygsm_student_ema = source
+                if weights is not None:
+                    config.didi_init.tinygsm_weights = weights
         return self.helpers.fixture.model(config)
 
     def native_checkpoint(self, model):
@@ -55,6 +60,7 @@ class NativeEMAInitializationTests(unittest.TestCase):
 
     def assert_rejected_without_mutation(self, model, checkpoint):
         before = copy.deepcopy(model.state_dict())
+        old_ema = copy.deepcopy(model.ema.state_dict()) if model.ema is not None else None
         old_teacher = copy.deepcopy(model._didi_teacher_metadata)
         old_student = copy.deepcopy(model._didi_student_metadata)
         with self.assertRaises((ValueError, RuntimeError, TypeError)):
@@ -62,6 +68,95 @@ class NativeEMAInitializationTests(unittest.TestCase):
         self.assert_state_equal(model.state_dict(), before)
         self.assertEqual(model._didi_teacher_metadata, old_teacher)
         self.assertEqual(model._didi_student_metadata, old_student)
+        if old_ema is not None:
+            torch.testing.assert_close(model.ema.state_dict(), old_ema, rtol=0, atol=0)
+
+    def test_opt_in_initializes_all_backbones_from_ema_and_preserves_head_and_buffers(self):
+        model = self.uninitialized(weights='ema')
+        for module in (model.backbone, model.teacher, model.student_ema, model.discriminator):
+            module.register_buffer('rotary_test_buffer', torch.tensor([.1, .2, .3]))
+        checkpoint = self.native_checkpoint(model)
+        untouched = copy.deepcopy(checkpoint)
+        head = copy.deepcopy(model.discriminator.output_layer.state_dict())
+        # The released discriminator head has spectral-normalization state;
+        # copying teacher trunk weights must leave those buffers intact too.
+        self.assertTrue(any(key.endswith('weight_u') for key in head))
+        old_legacy_ema = copy.deepcopy(model.ema.state_dict())
+        model.initialize_teacher_checkpoint(checkpoint)
+        expected = {key.removeprefix('backbone.'): value
+                    for key, value in checkpoint['state_dict'].items()}
+        for (name, _), shadow in zip(model.backbone.named_parameters(),
+                                    checkpoint['ema']['shadow_params']):
+            expected[name] = shadow
+        for module in (model.backbone, model.teacher, model.student_ema):
+            self.assert_state_equal(module.state_dict(), expected)
+        for key, value in model.discriminator.state_dict().items():
+            if not key.startswith('output_layer.'):
+                torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
+        self.assert_state_equal(model.discriminator.output_layer.state_dict(), head)
+        torch.testing.assert_close(checkpoint, untouched, rtol=0, atol=0)
+        self.assertFalse(any(p.requires_grad for p in model.teacher.parameters()))
+        self.assertFalse(any(p.requires_grad for p in model.student_ema.parameters()))
+        self.assertEqual(model.ema_beta, .999)
+        self.assertEqual(model.ema.decay, old_legacy_ema['decay'])
+        self.assertEqual(model.ema.num_updates, old_legacy_ema['num_updates'])
+        for shadow, parameter in zip(model.ema.shadow_params, model.backbone.parameters()):
+            torch.testing.assert_close(shadow, parameter, rtol=0, atol=0)
+            self.assertNotEqual(shadow.data_ptr(), parameter.data_ptr())
+        self.assertEqual(model._didi_student_metadata['training_weights'], 'ema')
+        self.assertIn('ema.shadow_params', model._didi_teacher_metadata['weights'])
+
+    def test_opt_in_has_independent_parameter_storage_and_does_not_mutate_source(self):
+        model = self.uninitialized(weights='ema')
+        checkpoint = self.native_checkpoint(model)
+        untouched = copy.deepcopy(checkpoint)
+        model.initialize_teacher_checkpoint(checkpoint)
+        copies = [dict(module.named_parameters()) for module in
+                  (model.backbone, model.teacher, model.student_ema, model.discriminator)]
+        for (name, parameter), shadow in zip(model.backbone.named_parameters(),
+                                            checkpoint['ema']['shadow_params']):
+            parameters = [state[name] for state in copies
+                          if name in state and not (state is copies[-1]
+                                                    and name.startswith('output_layer.'))]
+            addresses = [value.data_ptr() for value in parameters] + [shadow.data_ptr()]
+            self.assertEqual(len(set(addresses)), len(addresses), name)
+            self.assertNotEqual(parameter.data_ptr(), checkpoint['state_dict'][f'backbone.{name}'].data_ptr())
+        teacher = copy.deepcopy(model.teacher.state_dict())
+        ema = copy.deepcopy(model.student_ema.state_dict())
+        disc = copy.deepcopy(model.discriminator.state_dict())
+        with torch.no_grad():
+            next(model.backbone.parameters()).add_(1)
+        self.assert_state_equal(model.teacher.state_dict(), teacher)
+        self.assert_state_equal(model.student_ema.state_dict(), ema)
+        self.assert_state_equal(model.discriminator.state_dict(), disc)
+        torch.testing.assert_close(checkpoint, untouched, rtol=0, atol=0)
+
+    def test_opt_in_rejects_missing_or_malformed_ema_without_altering_any_copy(self):
+        for corruption in ('missing', 'count', 'shape', 'nan'):
+            with self.subTest(corruption=corruption):
+                model = self.uninitialized(weights='ema')
+                checkpoint = self.native_checkpoint(model)
+                if corruption == 'missing':
+                    del checkpoint['ema']
+                elif corruption == 'count':
+                    checkpoint['ema']['shadow_params'].pop()
+                elif corruption == 'shape':
+                    checkpoint['ema']['shadow_params'][0] = torch.zeros(1)
+                else:
+                    checkpoint['ema']['shadow_params'][0].flatten()[0] = float('nan')
+                self.assert_rejected_without_mutation(model, checkpoint)
+
+    def test_opt_in_rejects_incompatible_destination_before_loading_any_copy(self):
+        for destination in ('teacher', 'student_ema', 'discriminator'):
+            with self.subTest(destination=destination):
+                model = self.uninitialized(weights='ema')
+                getattr(model, destination).register_buffer('unexpected_buffer', torch.ones(1))
+                self.assert_rejected_without_mutation(model, self.native_checkpoint(model))
+
+    def test_opt_in_cannot_mix_ema_training_weights_with_raw_evaluation_ema(self):
+        with self.assertRaisesRegex(ValueError, 'tinygsm_student_ema|checkpoint'):
+            model = self.uninitialized('raw', weights='ema')
+            model.initialize_teacher_checkpoint(self.native_checkpoint(model))
 
     def test_default_only_student_ema_uses_native_checkpoint_shadows_in_order(self):
         model = self.uninitialized()
@@ -279,6 +374,76 @@ class NativeEMAInitializationTests(unittest.TestCase):
             self.assert_state_equal(trained[0][name], trained[1][name])
         self.assertTrue(any(not torch.equal(value, trained[1]['student_ema'][key])
                             for key, value in trained[0]['student_ema'].items()))
+
+    def test_ema_initialized_training_updates_student_and_discriminator_but_freezes_teacher(self):
+        torch.manual_seed(802)
+        model = self.uninitialized(weights='ema')
+        model.initialize_teacher_checkpoint(self.native_checkpoint(model))
+        before = {name: copy.deepcopy(getattr(model, name).state_dict())
+                  for name in ('backbone', 'teacher', 'discriminator', 'student_ema')}
+        loader = torch.utils.data.DataLoader([self.helpers.batch()], batch_size=None)
+        with tempfile.TemporaryDirectory(prefix='tinygsm-all-ema-training-') as directory:
+            trainer = self.helpers.fixture.trainer(directory, max_steps=2)
+            trainer.fit(model, train_dataloaders=loader)
+        self.assertEqual(trainer.global_step, 2)
+        self.assertEqual(model.global_steps, 1)
+        self.assert_state_equal(model.teacher.state_dict(), before['teacher'])
+        self.assertTrue(all(parameter.grad is None for parameter in model.teacher.parameters()))
+        for name in ('backbone', 'discriminator', 'student_ema'):
+            self.assertTrue(any(not torch.equal(value, before[name][key])
+                                for key, value in getattr(model, name).state_dict().items()), name)
+        self.assertTrue(all(parameter.grad is None for parameter in model.student_ema.parameters()))
+        for value in trainer.logged_metrics.values():
+            self.assertTrue(bool(torch.isfinite(torch.as_tensor(value)).all()))
+
+    def test_lightning_resume_restores_all_trained_copies_and_optimizers_despite_new_init_option(self):
+        for initial_weights, launch_weights in (('ema', 'raw'), ('raw', 'ema')):
+            with self.subTest(initial=initial_weights, launch=launch_weights):
+                torch.manual_seed(803)
+                model = self.uninitialized(weights=initial_weights)
+                model.initialize_teacher_checkpoint(self.native_checkpoint(model))
+                loader = torch.utils.data.DataLoader([self.helpers.batch()], batch_size=None)
+                with tempfile.TemporaryDirectory(prefix='tinygsm-all-ema-resume-') as directory:
+                    trainer = self.helpers.fixture.trainer(directory, max_steps=2)
+                    trainer.fit(model, train_dataloaders=loader)
+                    path = str(Path(directory) / 'resume.ckpt')
+                    trainer.save_checkpoint(path)
+                    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+                    saved_state = copy.deepcopy(checkpoint['state_dict'])
+                    provenance = copy.deepcopy(model._didi_student_metadata)
+                    teacher_metadata = copy.deepcopy(model._didi_teacher_metadata)
+                    restored = self.uninitialized(weights=launch_weights)
+                    # The launcher can initialize fresh copies before Lightning
+                    # restores the full training checkpoint. Neither source mode
+                    # may overwrite the checkpoint's learned states afterward.
+                    restored.initialize_teacher_checkpoint(self.native_checkpoint(restored))
+                    self.assertNotEqual(restored._didi_student_metadata['training_weights'],
+                                        provenance['training_weights'])
+                    test = self
+                    observed = []
+
+                    class CheckRestoredState(L.Callback):
+                        def on_train_start(self, trainer, pl_module):
+                            test.assert_state_equal(pl_module.state_dict(), saved_state)
+                            test.assertEqual(pl_module._didi_student_metadata, provenance)
+                            test.assertEqual(pl_module._didi_teacher_metadata, teacher_metadata)
+                            test.assertEqual(pl_module.global_steps, 1)
+                            test.assertEqual(trainer.global_step, 2)
+                            torch.testing.assert_close(pl_module.ema.state_dict(),
+                                                       checkpoint['ema'], rtol=0, atol=0)
+                            torch.testing.assert_close(
+                                [optimizer.state_dict() for optimizer in trainer.optimizers],
+                                checkpoint['optimizer_states'], rtol=0, atol=0)
+                            observed.append(True)
+
+                    continuation = self.helpers.fixture.trainer(directory, max_steps=4)
+                    continuation.callbacks.append(CheckRestoredState())
+                    continuation.fit(restored, train_dataloaders=loader, ckpt_path=path)
+                    self.assertEqual(observed, [True])
+                    self.assertEqual(continuation.global_step, 4)
+                    self.assertEqual(restored.global_steps, 2)
+                    self.assert_state_equal(restored.teacher.state_dict(), model.teacher.state_dict())
+                    self.assertEqual(restored._didi_student_metadata, provenance)
 
 
 if __name__ == '__main__':

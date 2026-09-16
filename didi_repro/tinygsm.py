@@ -25,11 +25,14 @@ def prepare_tinygsm_config(config):
   if not is_tinygsm(config):
     return
   from omegaconf import open_dict
-  from .tinygsm_initialization import student_ema_source
+  from .tinygsm_initialization import student_ema_source, training_weights_source
   with open_dict(config.didi_init):
+    if 'tinygsm_weights' not in config.didi_init:
+      config.didi_init.tinygsm_weights = 'raw'
     if 'tinygsm_student_ema' not in config.didi_init:
       config.didi_init.tinygsm_student_ema = 'checkpoint'
   student_ema_source(config)
+  training_weights_source(config)
   defaults = {
     'tinygsm_exec': False, 'tinygsm_exec_timeout': 5.0,
     'gsm8k_at_validation': False, 'gsm8k_every_n_validations': 1,
@@ -126,7 +129,10 @@ def install_tinygsm(upstream):
 def adaptation_record(config):
   if not is_tinygsm(config):
     return None
+  from .tinygsm_initialization import training_weights_source
   from .tinygsm_runtime import TRAINING_CORRECTIONS
+  weights = training_weights_source(config)
+  checkpoint_source = 'EMA parameters' if weights == 'ema' else 'raw backbone'
   return {
     'dataset': 'tiny_gsm',
     'reference_branch': 'tinygsm-upstream-repro',
@@ -137,7 +143,10 @@ def adaptation_record(config):
     'separator': config.data.separator,
     'training_settings': 'released DiDi hyperparameters with explicit TinyGSM training corrections',
     'training_corrections': dict(TRAINING_CORRECTIONS),
-    'checkpoint': 'native TinyGSM MDLM raw backbone initializes student, teacher and discriminator trunk',
+    'checkpoint': f'native TinyGSM MDLM {checkpoint_source} initializes student, teacher and discriminator trunk',
+    'training_weights_initialization': weights,
+    'initialization_scope': 'requested fresh initialization; saved provenance is authoritative on resume',
+    'training_weights_resume': 'saved DiDi model tensors and initialization provenance take precedence',
     'student_ema_initialization': config.get('didi_init', {}).get('tinygsm_student_ema', 'checkpoint'),
     'student_ema_resume': 'saved DiDi student_ema tensors and initialization provenance take precedence',
     'evaluation': 'prefix-only generation and reference TinyGSM/S-FLM program grader',

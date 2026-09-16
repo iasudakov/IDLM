@@ -88,6 +88,7 @@ class EntryTests(unittest.TestCase):
         self.assertEqual(training_protocol(cfg)['lr_warmup_steps'], 1000)
         self.assertEqual(training_protocol(cfg)['ema_beta'], .999)
         self.assertIsNone(cfg.didi_training.iterations)
+        self.assertEqual(cfg.didi_init.tinygsm_weights, 'raw')
         self.assertEqual(cfg.didi_init.tinygsm_student_ema, 'checkpoint')
         self.assertEqual(cfg.data.separator, r'\n')
         self.assertFalse(cfg.didi_monitor.gm)
@@ -118,6 +119,31 @@ class EntryTests(unittest.TestCase):
         for value in ('student', 'none', 'true', 'null'):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 prepare_config(self.config([f'+didi_init.tinygsm_student_ema={value}']))
+
+    def test_all_model_ema_initialization_preserves_training_protocol(self):
+        default = prepare_config(self.config())
+        raw = prepare_config(self.config(['+didi_init.tinygsm_weights=raw']))
+        ema = prepare_config(self.config(['+didi_init.tinygsm_weights=ema']))
+        self.assertEqual(raw.didi_init.tinygsm_weights, 'raw')
+        self.assertEqual(ema.didi_init.tinygsm_weights, 'ema')
+        self.assertEqual(ema.didi_init.tinygsm_student_ema, 'checkpoint')
+        for cfg in (raw, ema):
+            self.assertEqual(cfg.algo, default.algo)
+            self.assertEqual(cfg.optim, default.optim)
+            self.assertEqual(cfg.trainer, default.trainer)
+            self.assertEqual(training_protocol(cfg), training_protocol(default))
+        self.assertEqual(adaptation_record(raw)['training_weights_initialization'], 'raw')
+        self.assertIn('raw backbone', adaptation_record(raw)['checkpoint'])
+        self.assertEqual(adaptation_record(ema)['training_weights_initialization'], 'ema')
+        self.assertIn('EMA parameters', adaptation_record(ema)['checkpoint'])
+
+    def test_all_model_ema_initialization_rejects_invalid_or_conflicting_sources(self):
+        for value in ('checkpoint', 'student', 'true', 'null', 'EMA'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                prepare_config(self.config([f'+didi_init.tinygsm_weights={value}']))
+        with self.assertRaises(ValueError):
+            prepare_config(self.config([
+                '+didi_init.tinygsm_weights=ema', '+didi_init.tinygsm_student_ema=raw']))
 
     def test_unused_gpt2_tokenizer_is_not_loaded(self):
         with mock.patch('transformers.AutoTokenizer.from_pretrained',

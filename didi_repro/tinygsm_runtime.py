@@ -155,11 +155,23 @@ def install_tinygsm_runtime(upstream_main):
 
         def initialize_teacher_checkpoint(self, checkpoint, source_path=None):
             # Validate the entire native EMA before the common initializer can
-            # alter any model copy. Keep raw training/teacher/discriminator
-            # weights; only the evaluation EMA gets the saved MDLM average.
+            # alter any model copy. The opt-in overlay uses the same copy path
+            # as raw initialization, preserving the new discriminator head and
+            # initializing the legacy EMA consistently with the live student.
             from .tinygsm_initialization import prepare_student_ema
             ema_state, metadata = prepare_student_ema(self, checkpoint)
-            super().initialize_teacher_checkpoint(checkpoint, source_path)
+            initialization_checkpoint = checkpoint
+            if metadata['training_weights'] == 'ema':
+                # Do not mutate the checkpoint or import its optimizer/counter
+                # state. Non-parameter buffers retain their native values.
+                initialization_checkpoint = {
+                    'state_dict': {f'backbone.{name}': value
+                                   for name, value in ema_state.items()},
+                }
+            super().initialize_teacher_checkpoint(initialization_checkpoint, source_path)
+            if metadata['training_weights'] == 'ema':
+                self._didi_teacher_metadata['weights'] = (
+                    'checkpoint ema.shadow_params; raw backbone buffers')
             self.student_ema.load_state_dict(ema_state, strict=True)
             metadata['checkpoint'] = dict(self._didi_teacher_metadata)
             self._didi_student_metadata = metadata
