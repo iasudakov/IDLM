@@ -257,8 +257,18 @@ This works with AR or diffusion features and the existing valid combinations
 of `rows`/`draws` and token/sentence kernels. It requires an active feature
 reward (`mmd_reward_weight > 0`); DMD-only and IDLM-ratio rewards do not use
 these options. `mmd_kernel=pseudo_huber` remains the separate additive kernel.
-The coordinatewise distance is computed in tiles to limit memory use, but
-requires more work than the matrix-multiplication squared-distance path.
+On CUDA with Triton available, this option automatically uses the fused
+distance and gradient reductions in `mmd_laplace_cuda.py`, adapted from the
+provided L1 implementation to the pseudo-Huber formula above. Coordinate
+intermediates stay inside the kernel instead of allocating pair-by-feature
+tensors in GPU memory. The same path accelerates automatic bandwidth
+estimation; no additional configuration is needed.
+
+CPU, FP64, and installations without Triton retain the tiled PyTorch fallback.
+Triton is imported lazily and compiles the CUDA kernels on their first use.
+Keep `mmd_rbf_block_size=0` to choose tiles for the active backend. Existing
+distance scaling, bandwidth selection, masks, and MMD estimators are preserved,
+up to floating-point reduction differences.
 
 For active feature rewards (`mmd_reward_type=feature`), token RBF can exclude
 pairs of tokens from the same generated sentence:

@@ -2,8 +2,9 @@
 
 The default is the Gaussian kernel discussed below. The optional
 ``distance='pseudo_huber'`` uses exp(-alpha * D), where
-D = sum_d(sqrt((a_d-b_d)**2 + delta**2) - delta). It tiles both pairs and
-feature coordinates and recomputes its own exact fake-only derivative.
+D = sum_d(sqrt((a_d-b_d)**2 + delta**2) - delta). It uses fused Triton
+distance/gradient reductions on supported CUDA inputs and a tiled PyTorch
+fallback otherwise, recomputing its own exact fake-only derivative.
 
 The rbf branch of an MMD loss only ever consumes three SCALARS per kernel row:
 
@@ -54,6 +55,8 @@ import math
 
 import torch
 import torch.distributed as dist
+
+import mmd_laplace_cuda
 
 
 def _sq_norms(a):
@@ -443,7 +446,8 @@ def rbf_mmd2_cross_sentence(real, fake, selected, alpha, block_size=0,
     rows, length, hidden = real.shape
     if distance == 'pseudo_huber':
         block, chunk = _pseudo_huber_layout(
-            rows, length, hidden, real.element_size(), int(block_size))
+            rows, length, hidden, real.element_size(), int(block_size),
+            fused=mmd_laplace_cuda.supports_pseudo_huber_cuda(real, huber_delta))
         real2 = fake2 = None
     else:
         block = (pick_block_size(rows, length)
@@ -522,22 +526,26 @@ def _distance_inputs(real, fake):
 _PSEUDO_HUBER_SCRATCH_BYTES = 128 << 20
 
 
-def _pseudo_huber_layout(rows, n, hidden, element_size, block_size):
+def _pseudo_huber_layout(rows, n, hidden, element_size, block_size, fused=False):
     """Cap all pair-coordinate scratch, even for an explicit oversized tile.
 
     Four coordinate buffers fit in 128 MiB. The distance/kernel and reduction
     buffers are smaller by at least the feature-chunk factor. Inputs, outputs
     and the full fake-feature gradient are separate linear-sized storage.
+    Fused CUDA keeps coordinate intermediates in registers, so its pair tiles
+    can use the same budget without the feature-chunk multiplier.
     """
     pair_budget = max(1, _PSEUDO_HUBER_SCRATCH_BYTES // (4 * element_size * max(rows, 1)))
     feature_chunk = max(1, min(hidden, 32, pair_budget))
-    safe_edge = max(1, math.isqrt(max(1, pair_budget // feature_chunk)))
+    safe_edge = max(1, math.isqrt(max(1, pair_budget // (1 if fused else feature_chunk))))
     requested = n if block_size <= 0 else int(block_size)
     return max(1, min(max(n, 1), max(requested, 1), safe_edge)), feature_chunk
 
 
 def _pseudo_huber_distance_block(a, b, delta, feature_chunk):
     """SUM sqrt(diff**2 + delta**2) - delta without near-zero cancellation."""
+    if mmd_laplace_cuda.supports_pseudo_huber_cuda(a, delta):
+        return mmd_laplace_cuda.pseudo_huber_pairwise_distance_cuda(a, b, delta)
     distance = a.new_zeros((a.shape[0], a.shape[1], b.shape[1]))
     delta = torch.as_tensor(delta, dtype=a.dtype, device=a.device)
     for h0, h1 in _blocks(a.shape[2], feature_chunk):
@@ -578,7 +586,8 @@ def pairwise_distance(real, fake, distance='squared_euclidean', huber_delta=0.00
     output = real.new_empty((rows, n, m))
     if distance == 'pseudo_huber':
         block, chunk = _pseudo_huber_layout(
-            rows, max(n, m), hidden, real.element_size(), int(block_size))
+            rows, max(n, m), hidden, real.element_size(), int(block_size),
+            fused=mmd_laplace_cuda.supports_pseudo_huber_cuda(real, huber_delta))
     else:
         block = (pick_block_size(rows, max(n, m))
                  if block_size <= 0 else int(block_size))
@@ -644,7 +653,8 @@ class _PseudoHuberPairSums(torch.autograd.Function):
         if torch.is_tensor(alpha):
             alpha = alpha.detach().to(dtype=x.dtype, device=x.device)
         block, chunk = _pseudo_huber_layout(
-            x.shape[0], x.shape[1], x.shape[2], x.element_size(), block_size)
+            x.shape[0], x.shape[1], x.shape[2], x.element_size(), block_size,
+            fused=mmd_laplace_cuda.supports_pseudo_huber_cuda(x, delta))
         sums = _pseudo_huber_sums(x, y, weights, weights, alpha, block, delta, chunk, shard)
         ctx.save_for_backward(x, y, weights)
         ctx.alpha, ctx.block, ctx.chunk = alpha, block, chunk
@@ -676,6 +686,10 @@ class _PseudoHuberPairSums(torch.autograd.Function):
                         ctx.delta, ctx.chunk, other is y and i0 == j0)
                     kernel.mul_(w[:, i0:i1, None]).mul_(w[:, None, j0:j1])
                     kernel.mul_(coefficient)
+                    if mmd_laplace_cuda.supports_pseudo_huber_cuda(y, ctx.delta):
+                        grad[:, i0:i1].add_(mmd_laplace_cuda.pseudo_huber_weighted_grad_sum(
+                            y[:, i0:i1], other[:, j0:j1], kernel, ctx.delta))
+                        continue
                     for h0, h1 in _blocks(hidden, ctx.chunk):
                         diff = y[:, i0:i1, None, h0:h1] - other[:, None, j0:j1, h0:h1]
                         denominator = torch.hypot(diff, delta)
@@ -701,7 +715,8 @@ def _pseudo_huber_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size, de
         alpha = alpha.detach().to(dtype=real.dtype, device=real.device)
     block, chunk = _pseudo_huber_layout(
         real.shape[0], max(real.shape[1], fake.shape[1]), real.shape[2],
-        real.element_size(), int(block_size))
+        real.element_size(), int(block_size),
+        fused=mmd_laplace_cuda.supports_pseudo_huber_cuda(real, delta))
     s_xx, s_yy, s_xy = _pseudo_huber_sums(
         real, fake, w_real, w_fake, alpha, block, delta, chunk)
     n, m = w_real.sum(dim=1), w_fake.sum(dim=1)
@@ -718,7 +733,8 @@ def _pseudo_huber_mmd2_fixed_real(real, fake, alpha, block_size, delta):
         alpha = alpha.detach().to(dtype=real.dtype, device=real.device)
     rows, draws, hidden = fake.shape
     block, chunk = _pseudo_huber_layout(
-        rows, draws, hidden, fake.element_size(), int(block_size))
+        rows, draws, hidden, fake.element_size(), int(block_size),
+        fused=mmd_laplace_cuda.supports_pseudo_huber_cuda(fake, delta))
     # A singleton real set has known self-kernel 1; do not use the unequal
     # estimator's inactive-row rule for this conditional target.
     ones_real = real.new_ones((rows, 1))
