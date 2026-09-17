@@ -58,11 +58,17 @@ adversarial_distill:
   #  * 'ar': an external causal LM, the direct analogue of yrOPDLM's frozen
   #    Qwen3. Must share the student's tokenizer.
   # What a sampled answer is scored ON. The group sampling, the leave-one-out
-  # baseline and the REINFORCE surrogate are identical either way; only the
-  # reward function changes.
+  # baseline and REINFORCE machinery are shared; the reward function changes.
   #   feature -- pooled-feature distance to x0 under a frozen model. A
   #              similarity to one particular reference answer, which is why the
   #              probe finds it behaving close to a soft edit distance.
+  #   feature_mse -- negative MSE of real/generated features at matching masked
+  #              token positions, averaged over hidden coordinates and tokens.
+  #              Uses the same feature source/layers/noise; requires
+  #              mmd_score_positions: written. Ignores kernel/RBF/pooling
+  #              settings. With source=rows, scores each row independently
+  #              (ignores kernel_batch_size). With source=draws, averages K
+  #              per-draw MSE rewards; the surrogate does not divide by K again.
   #   idlm    -- the ELBO log-density ratio log p_teacher(x) - log p_fake(x),
   #              the same quantity DMD differentiates, reached by a score
   #              estimator instead. Judges the sample on its own merits rather
@@ -274,6 +280,7 @@ adversarial_distill:
   # heavily-masked rows. Expect the dilution to be WORSE here under
   # `mmd_scored_positions=non_prompt`, which already pools a 68% padding tail
   # the two rows agree on.
+  # feature_mse requires written: only the masked/content intersection counts.
   mmd_score_positions: written
 
   # Samples drawn per state, each costing one critic forward. At >= 2 the

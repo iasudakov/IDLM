@@ -231,6 +231,35 @@ the other active sequences on the same device as a leave-one-out baseline; it
 removes the reward offset but is noisier because TinyGSM rows have different
 questions and masking fractions.
 
+To replace MMD with **position-aligned masked-token feature MSE**, add:
+
+```bash
+adversarial_distill.mmd_reward_type=feature_mse \
+adversarial_distill.mmd_score_positions=written
+```
+
+For each generated sequence and selected layer, the reward is
+`-mean_{t in masked content, d}((h_fake[t,d] - h_real[t,d])**2)`.
+Squared differences are computed before averaging tokens; swapping token
+features cannot cancel the error just because their pooled means match.
+The existing feature source, layer selection/weights and diffusion feature
+noise remain in use. Set `mmd_noise_level=0.0` for clean diffusion features.
+The feature model stays frozen, and the student learns through the existing
+sample-group REINFORCE baseline, weighted by `mmd_reward_weight`.
+
+This mode requires `mmd_score_positions=written`. TinyGSM's default
+`mmd_scored_positions=answer` also excludes prompt, padding and post-EOS
+positions; `non_prompt` retains the existing broader content definition.
+MMD kernel, bandwidth, same-sentence exclusion and sentence-pooling settings
+are ignored. With `mmd_kernel_source=rows`, each sequence has its own aligned
+reference and `mmd_kernel_batch_size` is ignored. With
+`mmd_kernel_source=draws`, each candidate retains K draws and its reward
+averages their individual MSEs; the surrogate omits MMD's extra division by K,
+keeping the expected MSE gradient scale independent of K. Empty masks
+contribute zero; a single masked token is valid. Distances accumulate in FP32.
+Existing `feature` and `idlm` rewards are unchanged. MSE has a different reward
+scale from MMD, so its learning rate or reward weight may need separate tuning.
+
 To use pseudo-Huber distance inside an RBF kernel, add these overrides to an
 existing feature-MMD command:
 
