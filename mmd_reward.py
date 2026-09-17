@@ -298,6 +298,34 @@ def pool_sentence_features(features, selected, pooling='mean',
   return torch.where(active.unsqueeze(-1), pooled, torch.zeros_like(pooled)), active
 
 
+@torch.no_grad()
+def aligned_feature_mse_reward(clean, generated, selected):
+  """Negative MSE of aligned masked-token features, one value per sequence.
+
+  Square the coordinate differences BEFORE averaging over hidden dimensions
+  and selected positions. Token permutations and opposing feature errors must
+  not cancel as they can when comparing pooled feature means. Reductions use
+  fp32; unselected positions, including non-finite values, contribute nothing.
+  Empty rows return zero and are inactive; one selected token is sufficient.
+  """
+  if clean.ndim != 3 or clean.shape != generated.shape:
+    raise ValueError('feature_mse expects matching (batch, length, hidden) '
+                     f'features, got {tuple(clean.shape)} and '
+                     f'{tuple(generated.shape)}')
+  if selected.shape != clean.shape[:2]:
+    raise ValueError(f'feature_mse selected mask must be '
+                     f'{tuple(clean.shape[:2])}, got {tuple(selected.shape)}')
+  if clean.shape[-1] == 0:
+    raise ValueError('feature_mse needs at least one hidden coordinate')
+  selected = selected.bool()
+  delta = (generated.detach().float() - clean.detach().float()).masked_fill(
+    ~selected.unsqueeze(-1), 0.0)
+  token_mse = delta.square().mean(dim=-1)
+  counts = selected.sum(dim=-1)
+  reward = -token_mse.sum(dim=-1) / counts.clamp_min(1).float()
+  return reward, counts > 0
+
+
 def sequence_pooled_delta(clean, generated, selected):
   """Mean-pool both feature streams over `selected`, and subtract.
 
@@ -545,7 +573,7 @@ def summed_paired_reward(features, batch, selected, indices, weights,
                          rows_of=1, level='token', sentence_pooling='mean',
                          sequence_mask=None,
                          distance='squared_euclidean', huber_delta=0.001,
-                         exclude_same_sentence=False):
+                         exclude_same_sentence=False, reward_type='feature'):
   """`R = sum_l w_l * R_l` over the requested blocks.
 
   Args:
@@ -559,17 +587,28 @@ def summed_paired_reward(features, batch, selected, indices, weights,
   identical to what it was before multi-block support existed. `active` depends
   only on the masks, so it is the same for every block.
 
+  ``reward_type='feature_mse'`` compares aligned token features per row and
+  ignores the kernel, row grouping and pooling options.
+
   Returns `(reward, active, per_layer)`; `per_layer` is unweighted, for logging.
   """
+  if reward_type not in ('feature', 'feature_mse'):
+    raise ValueError(f'unknown feature reward type {reward_type!r}')
   total, active, per_layer = None, None, {}
   for index, weight in zip(indices, weights):
     stacked = features[index]
-    reward, active = paired_sequence_reward(
-      stacked[:batch], stacked[batch:], selected, kernel=kernel,
-      alpha=alpha, block_size=block_size, distance=distance,
-      huber_delta=huber_delta, exclude_same_sentence=exclude_same_sentence,
-      rows_of=rows_of, level=level,
-      sentence_pooling=sentence_pooling, sequence_mask=sequence_mask)
+    if reward_type == 'feature_mse':
+      # Always compare each original sequence independently; kernel row
+      # grouping and sentence pooling do not apply to aligned token MSE.
+      reward, active = aligned_feature_mse_reward(
+        stacked[:batch], stacked[batch:], selected)
+    else:
+      reward, active = paired_sequence_reward(
+        stacked[:batch], stacked[batch:], selected, kernel=kernel,
+        alpha=alpha, block_size=block_size, distance=distance,
+        huber_delta=huber_delta, exclude_same_sentence=exclude_same_sentence,
+        rows_of=rows_of, level=level,
+        sentence_pooling=sentence_pooling, sequence_mask=sequence_mask)
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight
   return total, active, per_layer
@@ -664,7 +703,7 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
                              block_size=0, level='token',
                              sentence_pooling='mean', sequence_mask=None,
                              distance='squared_euclidean', huber_delta=0.001,
-                             exclude_same_sentence=False):
+                             exclude_same_sentence=False, reward_type='feature'):
   """Score K draws from each state as one feature distribution.
 
   ``features`` contains the clean batch followed by K generated batches.
@@ -688,25 +727,31 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
   K >= 2, retains all real-fake pairs, and is active with one scored position.
   The reward is the negative of that signed statistic, not a full MMD^2.
 
+  ``reward_type='feature_mse'`` averages K aligned masked-token MSE rewards
+  per original row, with no kernel or feature pooling.
+
   Returns ``(reward, active, per_layer)`` with one reward per original row.
   """
+  if reward_type not in ('feature', 'feature_mse'):
+    raise ValueError(f'unknown feature reward type {reward_type!r}')
   if selected.shape != (batch, length):
     raise ValueError(f'multi-draw selected mask must be {(batch, length)}, got '
                      f'{tuple(selected.shape)}')
   if draw_count < 1:
     raise ValueError(f'multi-draw needs at least one draw, got {draw_count}')
-  if level not in ('token', 'sentence'):
-    raise ValueError(f'mmd_kernel_level must be token|sentence, got {level!r}')
-  if kernel == 'pseudo_huber' and level != 'sentence':
-    raise ValueError('mmd_kernel=pseudo_huber requires '
-                     'mmd_kernel_source=draws and mmd_kernel_level=sentence')
-  if exclude_same_sentence:
-    if kernel != 'rbf' or level != 'token':
-      raise ValueError('mmd_rbf_exclude_same_sentence requires '
-                       'mmd_kernel=rbf and mmd_kernel_level=token')
-    if draw_count < 2:
-      raise ValueError('mmd_rbf_exclude_same_sentence requires '
-                       'mmd_kernel_batch_size >= 2')
+  if reward_type == 'feature':
+    if level not in ('token', 'sentence'):
+      raise ValueError(f'mmd_kernel_level must be token|sentence, got {level!r}')
+    if kernel == 'pseudo_huber' and level != 'sentence':
+      raise ValueError('mmd_kernel=pseudo_huber requires '
+                       'mmd_kernel_source=draws and mmd_kernel_level=sentence')
+    if exclude_same_sentence:
+      if kernel != 'rbf' or level != 'token':
+        raise ValueError('mmd_rbf_exclude_same_sentence requires '
+                         'mmd_kernel=rbf and mmd_kernel_level=token')
+      if draw_count < 2:
+        raise ValueError('mmd_rbf_exclude_same_sentence requires '
+                         'mmd_kernel_batch_size >= 2')
   expected_rows = (draw_count + 1) * batch
   total, active, per_layer = None, None, {}
   for index, weight in zip(indices, weights):
@@ -718,7 +763,16 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
     real = hidden[:batch]
     fake_by_draw = hidden[batch:].reshape(draw_count, batch, length, -1)
 
-    if level == 'sentence':
+    if reward_type == 'feature_mse':
+      # Average the K independently aligned errors, not their feature means.
+      # No cross-draw/token kernel terms or variance correction belong here.
+      draw_rewards = []
+      for generated in fake_by_draw:
+        draw_reward, layer_active = aligned_feature_mse_reward(
+          real, generated, selected)
+        draw_rewards.append(draw_reward)
+      reward = torch.stack(draw_rewards, dim=0).mean(dim=0)
+    elif level == 'sentence':
       real_sentence, real_active = pool_sentence_features(
         real, selected, pooling=sentence_pooling, sequence_mask=sequence_mask)
       fake_sentence, fake_active = pool_sentence_features(
@@ -842,6 +896,7 @@ class _LayeredFeatures:
 
   # Set by the critics' constructors; kept on the shared base so both feature
   # maps get the plumbing instead of each threading its own copy.
+  reward_type = 'feature'
   kernel = 'linear'
   kernel_level = 'token'
   sentence_pooling = 'mean'
@@ -950,6 +1005,7 @@ class FrozenARFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_multi_draw_reward(
       feats, batch, draw_count, length, selected, self.resolved_layers,
       self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
+      reward_type=self.reward_type,
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       exclude_same_sentence=self.rbf_exclude_same_sentence,
       block_size=self.rbf_block_size, level=self.kernel_level,
@@ -983,6 +1039,7 @@ class FrozenARFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_paired_reward(
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
+      reward_type=self.reward_type,
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       exclude_same_sentence=self.rbf_exclude_same_sentence,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
@@ -1047,6 +1104,10 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
       large offset in the estimator; it is mainly useful for measuring the
       baseline's worth.
 
+  For ``feature_mse``, ``scored`` must equal the written ``selected`` mask.
+  K-draw candidates average their K MSE rewards; the surrogate omits the
+  historical kernel-MMD /K factor so its expected scale stays constant in K.
+
   Returns `(loss, stats)`; `loss` already carries `reward_weight`.
   """
   if group_size < 1:
@@ -1063,12 +1124,17 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
                      'baseline=batch')
   batch, length, _ = student_probs.shape
   selected = selected.bool()
+  feature_mse = getattr(critic, 'reward_type', 'feature') == 'feature_mse'
   # The written span drives sampling and the surrogate; `scored` only ever
   # reaches the critic.
   scored = selected if scored is None else scored.bool()
   if scored.shape != selected.shape:
     raise ValueError(f'scored mask must be {tuple(selected.shape)}, got '
                      f'{tuple(scored.shape)}')
+  if feature_mse and not torch.equal(scored, selected):
+    raise ValueError('mmd_reward_type=feature_mse requires scored positions '
+                     'to equal the written/masked positions '
+                     '(mmd_score_positions=written)')
   if sequence_mask is not None and sequence_mask.shape != selected.shape:
     raise ValueError(f'sequence mask must be {tuple(selected.shape)}, got '
                      f'{tuple(sequence_mask.shape)}')
@@ -1082,7 +1148,8 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
   if kernel_source not in ('rows', 'draws'):
     raise ValueError('mmd_kernel_source must be rows|draws, got '
                      f'{kernel_source!r}')
-  if (getattr(critic, 'kernel', None) == 'pseudo_huber'
+  if (not feature_mse
+      and getattr(critic, 'kernel', None) == 'pseudo_huber'
       and (kernel_source != 'draws'
            or getattr(critic, 'kernel_level', 'token') != 'sentence')):
     raise ValueError('mmd_kernel=pseudo_huber requires '
@@ -1181,8 +1248,12 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
   # tokens and average the Monte Carlo candidates, as in GRPO's `1 / G`
   # reduction. A larger group should improve the within-state comparison, not
   # silently multiply the reward weight and its gradient.
+  # feature_mse already averages K independent errors. Its joint-score
+  # estimator needs no second /K: cross-draw score terms cancel in expectation.
+  # Keep the historical kernel-MMD normalization unchanged.
+  draw_divisor = 1 if feature_mse else per_candidate
   denom = (selected.sum().clamp_min(1) * group_size
-            * per_candidate).to(surrogate.dtype)
+            * draw_divisor).to(surrogate.dtype)
   loss = -reward_weight * surrogate / denom
 
   with torch.no_grad():
@@ -1271,6 +1342,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_multi_draw_reward(
       feats, batch, draw_count, length, selected, self.resolved_layers,
       self.layer_weights, kernel=self.kernel, alpha=self.rbf_alpha,
+      reward_type=self.reward_type,
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       exclude_same_sentence=self.rbf_exclude_same_sentence,
       block_size=self.rbf_block_size, level=self.kernel_level,
@@ -1309,6 +1381,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     reward, active, per_layer = summed_paired_reward(
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,
+      reward_type=self.reward_type,
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       exclude_same_sentence=self.rbf_exclude_same_sentence,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,

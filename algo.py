@@ -916,10 +916,16 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       import mmd_reward
       cfg = self.config.adversarial_distill
       kind = str(getattr(cfg, 'mmd_reward_type', 'feature'))
-      if kind not in ('feature', 'idlm'):
+      if kind not in ('feature', 'feature_mse', 'idlm'):
         raise ValueError('adversarial_distill.mmd_reward_type must be '
-                         f'feature|idlm, got {kind!r}')
-      kernel = str(cfg.get('mmd_kernel', 'linear'))
+                         f'feature|feature_mse|idlm, got {kind!r}')
+      feature_mse = kind == 'feature_mse'
+      if feature_mse and str(cfg.get('mmd_score_positions', 'written')) != 'written':
+        raise ValueError('adversarial_distill.mmd_reward_type=feature_mse '
+                         'requires mmd_score_positions=written')
+      # Aligned MSE has no kernel, bandwidth or sentence readout. Normalize
+      # unused settings so an existing MMD command can switch only reward type.
+      kernel = 'linear' if feature_mse else str(cfg.get('mmd_kernel', 'linear'))
       if kernel not in ('linear', 'rbf', 'cosine', 'pseudo_huber'):
         raise ValueError('adversarial_distill.mmd_kernel must be '
                          f'linear|rbf|cosine|pseudo_huber, got {kernel!r}')
@@ -928,15 +934,15 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
                          'mmd_reward_type=feature')
       rbf_distance = str(cfg.get('mmd_rbf_distance', 'squared_euclidean'))
       rbf_huber_delta = cfg.get('mmd_rbf_huber_delta', 0.001)
-      rbf_exclude_same_sentence = bool(
-        cfg.get('mmd_rbf_exclude_same_sentence', False))
+      rbf_exclude_same_sentence = (not feature_mse and bool(
+        cfg.get('mmd_rbf_exclude_same_sentence', False)))
       if kernel == 'rbf' and kind == 'feature':
         mmd_reward.mmd_rbf.validate_distance(rbf_distance, rbf_huber_delta)
       rbf_description = (
         f'distance={rbf_distance}, huber_delta={rbf_huber_delta}, '
         f'exclude_same_sentence={rbf_exclude_same_sentence}, '
         if kernel == 'rbf' else '')
-      level = str(cfg.get('mmd_kernel_level', 'token'))
+      level = 'token' if feature_mse else str(cfg.get('mmd_kernel_level', 'token'))
       if level not in ('token', 'sentence'):
         raise ValueError('adversarial_distill.mmd_kernel_level must be '
                          f'token|sentence, got {level!r}')
@@ -959,7 +965,8 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
                          'mmd_kernel_source=draws, mmd_kernel_level=sentence '
                          'and mmd_reward_type=feature')
       source = getattr(cfg, 'mmd_feature_source', 'ar')
-      sentence_pooling = str(cfg.get('mmd_sentence_pooling', 'mean'))
+      sentence_pooling = ('mean' if feature_mse else
+                          str(cfg.get('mmd_sentence_pooling', 'mean')))
       if sentence_pooling not in ('mean', 'last_token'):
         raise ValueError('adversarial_distill.mmd_sentence_pooling must be '
                          f'mean|last_token, got {sentence_pooling!r}')
@@ -1006,6 +1013,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       else:
         raise ValueError('adversarial_distill.mmd_feature_source must be '
                          f'ar|diffusion, got {source!r}')
+      self._mmd_critic_cached.reward_type = kind
       self._mmd_critic_cached.kernel = kernel
       self._mmd_critic_cached.kernel_level = level
       self._mmd_critic_cached.sentence_pooling = sentence_pooling
@@ -1017,15 +1025,21 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         cfg.get('mmd_rbf_block_size', 0) or 0)
       self._mmd_critic_cached.kernel_batch_size = max(
         1, int(cfg.get('mmd_kernel_batch_size', 1) or 1))
+      if feature_mse and kernel_source == 'rows':
+        # Position-aligned targets belong to their own sequence, never to a
+        # neighbouring prompt/row selected by MMD's kernel batching.
+        self._mmd_critic_cached.kernel_batch_size = 1
       kernel_batch = (
         f'{self._mmd_critic_cached.kernel_batch_size} draws/candidate'
         if kernel_source == 'draws'
         else f'rows of {self._mmd_critic_cached.kernel_batch_size}')
+      reward_description = (
+        'negative aligned masked-token MSE, ' if feature_mse else
+        f'{kernel} kernel over {level}s, {rbf_description}'
+        f'sentence_pooling={sentence_pooling}, ')
       print(f'[mmd] {what}, block '
             f'{self._mmd_critic_cached.layer_description}, '
-            f'{kernel} kernel over {level}s, '
-            f'{rbf_description}'
-            f'sentence_pooling={sentence_pooling}, '
+            f'{reward_description}'
             f'{kernel_batch}, '
             f'group={cfg.mmd_group_size}, '
             f'weight={cfg.mmd_reward_weight}', flush=True)
@@ -1092,8 +1106,10 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       kernel_draws=max(1, int(cfg.get('mmd_kernel_batch_size', 1) or 1)),
       # Keep the endpoint independent of the written/scored span. Packed OWT
       # includes every position, even document-separator EOS tokens.
-      sequence_mask=(content if cfg.get('mmd_sentence_pooling', 'mean')
-                     == 'last_token' else None))
+      sequence_mask=(content if
+                     cfg.get('mmd_reward_type', 'feature') == 'feature' and
+                     cfg.get('mmd_sentence_pooling', 'mean') == 'last_token'
+                     else None))
     stats['mmd/generator_mask_fraction'] = (
       selected.sum().to(student_probs.dtype)
       / content.sum().clamp_min(1).to(student_probs.dtype)).detach()

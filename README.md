@@ -253,6 +253,33 @@ gradient. Omit the new option or set `mmd_sentence_pooling=mean` to retain the
 previous behavior. Diffusion features and token-level kernels do not support
 `last_token`.
 
+To replace MMD with **position-aligned masked-token feature MSE**, add:
+
+```bash
+adversarial_distill.mmd_reward_type=feature_mse \
+adversarial_distill.mmd_score_positions=written
+```
+
+For each generated sequence and selected layer, the reward is
+`-mean_{t in masked content, d}((h_fake[t,d] - h_real[t,d])**2)`.
+Squared differences are computed before averaging tokens; swapping token
+features cannot cancel the error just because their pooled means match.
+The existing feature source, layer selection/weights and diffusion feature
+noise remain in use. Set `mmd_noise_level=0.0` for clean diffusion features.
+The feature model stays frozen, and the student learns through the existing
+sample-group REINFORCE baseline, weighted by `mmd_reward_weight`.
+
+This mode requires `mmd_score_positions=written`. MMD kernel, bandwidth,
+same-sentence exclusion and sentence-pooling settings are ignored. With
+`mmd_kernel_source=rows`, each sequence has its own aligned reference and
+`mmd_kernel_batch_size` is ignored. With `mmd_kernel_source=draws`, each
+candidate retains K draws and its reward averages their individual MSEs;
+the surrogate omits MMD's extra division by K, keeping the expected MSE
+gradient scale independent of K. Empty masks contribute zero; a single
+masked token is valid. Distances accumulate in FP32. Existing `feature` and
+`idlm` rewards are unchanged. MSE has a different reward scale from MMD,
+so its learning rate or reward weight may need separate tuning.
+
 To use pseudo-Huber distance inside an RBF kernel, add these overrides to an
 existing feature-MMD command:
 

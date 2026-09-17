@@ -307,7 +307,8 @@ def test_algo_propagates_valid_pseudo_huber_config_and_caches_critic():
       assert getter(model) is critic
       assert getter(model) is critic
       if source == 'ar':
-        loader.assert_called_once_with('stub-owt-ar', model.device)
+        loader.assert_called_once_with('stub-owt-ar', model.device,
+                                       weights_dir=None)
         expected_backbone, expected_noise = backbone, 0.0
       else:
         loader.assert_not_called()
