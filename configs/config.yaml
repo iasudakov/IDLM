@@ -209,11 +209,14 @@ adversarial_distill:
   # smooth pseudo-Huber shape. It is distinct from mmd_kernel: pseudo_huber.
   # With either distance, null alpha uses 1 / (2 * median(D)) on real features.
   # Explicit alpha values tuned for squared Euclidean need recalibration.
+  # Pseudo-Huber uses fused Triton reductions on supported CUDA inputs,
+  # otherwise the portable tiled PyTorch implementation.
   mmd_rbf_distance: squared_euclidean
   # Positive transition scale in feature units, used only for pseudo_huber.
   mmd_rbf_huber_delta: 0.001
   # Tile edge for the blocked kernel; 0 sizes it from a 256MB scratch budget.
-  # Pseudo-Huber also chunks feature dimensions and caps pair tiles to fit.
+  # Pseudo-Huber caps pair tiles to its own scratch budget; its portable
+  # fallback also chunks features. Fused CUDA keeps coordinate scratch local.
   mmd_rbf_block_size: 0
   # In draws+token RBF, exclude ALL fake-fake pairs from the same generated
   # sentence. Different draws keep every token pair, including equal positions.
