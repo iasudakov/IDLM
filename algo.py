@@ -942,11 +942,17 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       rbf_huber_delta = cfg.get('mmd_rbf_huber_delta', 0.001)
       rbf_exclude_same_sentence = (not feature_mse and bool(
         cfg.get('mmd_rbf_exclude_same_sentence', False)))
+      rbf_omit_real_real = (not feature_mse and bool(
+        cfg.get('mmd_rbf_omit_real_real', False)))
+      if rbf_omit_real_real and (kind != 'feature' or kernel != 'rbf'):
+        raise ValueError('adversarial_distill.mmd_rbf_omit_real_real requires '
+                         'mmd_reward_type=feature and mmd_kernel=rbf')
       if kernel == 'rbf' and kind == 'feature':
         mmd_reward.mmd_rbf.validate_distance(rbf_distance, rbf_huber_delta)
       rbf_description = (
         f'distance={rbf_distance}, huber_delta={rbf_huber_delta}, '
         f'exclude_same_sentence={rbf_exclude_same_sentence}, '
+        f'omit_real_real={rbf_omit_real_real}, '
         if kernel == 'rbf' else '')
       level = 'token' if feature_mse else str(cfg.get('mmd_kernel_level', 'token'))
       if level not in ('token', 'sentence'):
@@ -1027,6 +1033,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       self._mmd_critic_cached.rbf_distance = rbf_distance
       self._mmd_critic_cached.rbf_huber_delta = rbf_huber_delta
       self._mmd_critic_cached.rbf_exclude_same_sentence = rbf_exclude_same_sentence
+      self._mmd_critic_cached.rbf_omit_real_real = rbf_omit_real_real
       self._mmd_critic_cached.rbf_block_size = int(
         cfg.get('mmd_rbf_block_size', 0) or 0)
       self._mmd_critic_cached.kernel_batch_size = max(

@@ -351,6 +351,35 @@ Keep `mmd_rbf_block_size=0` to choose tiles for the active backend. Existing
 distance scaling, bandwidth selection, masks, and MMD estimators are preserved,
 up to floating-point reduction differences.
 
+To omit only the real-real term from an RBF feature reward, add:
+
+```bash
+adversarial_distill.mmd_kernel=rbf \
+adversarial_distill.mmd_rbf_omit_real_real=True
+```
+
+The reward becomes `2 * RF - FF`. This skips the reference-reference kernel
+sums and leaves fake-fake pairs, real-fake pairs, their normalization, and
+existing activity masks unchanged. The default is `False`. The option works
+with token/sentence features, rows/draws, and squared-Euclidean or pseudo-Huber
+RBF distance. Token-level draws support K=1 and still require at least two
+scored tokens, as before. Sentence-level draws drop the fixed real self-term
+of 1, retaining the existing fake self-term fallback when K=1.
+
+Keep `mmd_rbf_exclude_same_sentence=False` to change only the real-real term.
+When that separate option is `True`, it already omits real-real and excludes
+within-sentence fake-fake pairs; enabling both flags produces the same result.
+Real features are still needed for RF and for automatic bandwidth estimation,
+which still computes real-feature distances. The remaining signed statistic
+is not the full MMD squared.
+
+This requires `mmd_reward_type=feature` and `mmd_kernel=rbf`; the kernel-free
+`feature_mse` reward ignores it. Student sampling, K/G scaling, and baselines
+are unchanged. A reference term shared by every candidate cancels under the
+group baseline, but per-candidate feature noise or automatic bandwidth
+subsampling can make those terms differ; equal training updates are not
+guaranteed merely by removing the term.
+
 For active feature rewards (`mmd_reward_type=feature`), token RBF can exclude
 pairs of tokens from the same generated sentence:
 

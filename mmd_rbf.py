@@ -125,7 +125,7 @@ class _RBFPairSums(torch.autograd.Function):
     """(S_xx, S_yy, S_xy) per row, tiled; gradient to `y` only."""
 
     @staticmethod
-    def forward(ctx, x, y, w, alpha, block, shard):
+    def forward(ctx, x, y, w, alpha, block, shard, omit_real_real):
         x2, y2 = _sq_norms(x), _sq_norms(y)
         rows, n = w.shape
         if block <= 0:
@@ -149,9 +149,10 @@ class _RBFPairSums(torch.autograd.Function):
                     continue
                 wj = w[:, j0:j1]
                 diag = j0 == i0
-                k = _kernel_block(x[:, i0:i1], x[:, j0:j1], x2[:, i0:i1], x2[:, j0:j1],
-                                  alpha, self_tile=diag)
-                s_xx += _wKw(k, wi, wj) * (1.0 if diag else 2.0)
+                if not omit_real_real:
+                    k = _kernel_block(x[:, i0:i1], x[:, j0:j1], x2[:, i0:i1], x2[:, j0:j1],
+                                      alpha, self_tile=diag)
+                    s_xx += _wKw(k, wi, wj) * (1.0 if diag else 2.0)
                 k = _kernel_block(y[:, i0:i1], y[:, j0:j1], y2[:, i0:i1], y2[:, j0:j1],
                                   alpha, self_tile=diag)
                 s_yy += _wKw(k, wi, wj) * (1.0 if diag else 2.0)
@@ -177,7 +178,7 @@ class _RBFPairSums(torch.autograd.Function):
     @staticmethod
     def backward(ctx, g_xx, g_yy, g_xy):
         if not ctx.needs_input_grad[1]:
-            return None, None, None, None, None, None
+            return (None,) * 7
         x, y, w, x2, y2 = ctx.saved_tensors
         alpha, block = ctx.alpha, ctx.block
         rows, n = w.shape
@@ -231,11 +232,12 @@ class _RBFPairSums(torch.autograd.Function):
 
         # grad = w * (y * s_acc - v_acc), in place so no (R, N, H) temporary.
         v_acc.addcmul_(y, s_acc.unsqueeze(-1), value=-1.0).neg_().mul_(w.unsqueeze(-1))
-        return None, v_acc, None, None, None, None
+        return None, v_acc, None, None, None, None, None
 
 
 def rbf_pair_sums(feat_real, feat_fake, w, alpha, block_size: int = 0, shard: bool = False,
-                  distance: str = 'squared_euclidean', huber_delta: float = 0.001):
+                  distance: str = 'squared_euclidean', huber_delta: float = 0.001,
+                  omit_real_real: bool = False):
     """Per row: (sum_ij w_i w_j k(x_i,x_j), ... k(y_i,y_j), ... k(x_i,y_j)).
 
     `alpha` = 1 / (2 sigma^2), a float or a 0-dim tensor; it is measured from the
@@ -249,20 +251,24 @@ def rbf_pair_sums(feat_real, feat_fake, w, alpha, block_size: int = 0, shard: bo
 
     `shard` splits the tiles across ranks and all-reduces, which only makes sense
     when every rank holds the same samples. The result is the unsharded one on
-    every rank.
+    every rank. With `omit_real_real=True`, the first sum is zero and its
+    kernel blocks are skipped; the fake-fake and real-fake sums are unchanged.
     """
     distance, huber_delta = validate_distance(distance, huber_delta)
     if distance == 'pseudo_huber':
         return _PseudoHuberPairSums.apply(
-            feat_real, feat_fake, w, alpha, int(block_size), bool(shard), huber_delta)
+            feat_real, feat_fake, w, alpha, int(block_size), bool(shard), huber_delta,
+            bool(omit_real_real))
     if torch.is_tensor(alpha):
         alpha = alpha.detach().to(dtype=feat_fake.dtype, device=feat_fake.device)
-    return _RBFPairSums.apply(feat_real, feat_fake, w, alpha, int(block_size), bool(shard))
+    return _RBFPairSums.apply(
+        feat_real, feat_fake, w, alpha, int(block_size), bool(shard), bool(omit_real_real))
 
 
 @torch.no_grad()
 def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size: int = 0,
-                     distance: str = 'squared_euclidean', huber_delta: float = 0.001):
+                     distance: str = 'squared_euclidean', huber_delta: float = 0.001,
+                     omit_real_real: bool = False):
     """Unbiased MMD^2 between two sets of DIFFERENT size, per row.
 
     `rbf_pair_sums` carries one weight tensor because its two sets are the same
@@ -286,11 +292,13 @@ def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size: int = 0,
 
     Returns `(mmd2, active)`, shapes `(rows,)`; rows with fewer than two
     weighted samples on either side have no unbiased estimate and are inactive.
+    `omit_real_real=True` skips the real-real sum and removes its entire
+    normalized term. Fake/cross terms and the inactive-row rule are unchanged.
     """
     distance, huber_delta = validate_distance(distance, huber_delta)
     if distance == 'pseudo_huber':
         return _pseudo_huber_mmd2_unequal(
-            real, fake, w_real, w_fake, alpha, block_size, huber_delta)
+            real, fake, w_real, w_fake, alpha, block_size, huber_delta, omit_real_real)
 
     real = real.detach().float()
     fake = fake.detach().float()
@@ -317,20 +325,23 @@ def rbf_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size: int = 0,
                 total = total + _wKw(k, wa[:, i0:i1], wb[:, j0:j1])
         return total
 
-    s_xx = _sum(real, real, r2, r2, w_real, w_real, True)
+    s_xx = (real.new_zeros(rows) if omit_real_real else
+            _sum(real, real, r2, r2, w_real, w_real, True))
     s_yy = _sum(fake, fake, f2, f2, w_fake, w_fake, True)
     s_xy = _sum(real, fake, r2, f2, w_real, w_fake, False)
 
     nn = (n_eff * (n_eff - 1)).clamp_min(1.0)
     mm = (m_eff * (m_eff - 1)).clamp_min(1.0)
     nm = (n_eff * m_eff).clamp_min(1.0)
-    mmd2 = (s_xx - n_eff) / nn + (s_yy - m_eff) / mm - 2.0 * s_xy / nm
+    mmd2 = ((s_yy - m_eff) / mm - 2.0 * s_xy / nm if omit_real_real else
+            (s_xx - n_eff) / nn + (s_yy - m_eff) / mm - 2.0 * s_xy / nm)
     return torch.where(active, mmd2, torch.zeros_like(mmd2)), active
 
 
 @torch.no_grad()
 def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0,
-                       distance: str = 'squared_euclidean', huber_delta: float = 0.001):
+                       distance: str = 'squared_euclidean', huber_delta: float = 0.001,
+                       omit_real_real: bool = False):
     """MMD^2 from one fixed real vector and K sampled fake vectors per row.
 
     ``real`` is ``(batch, hidden)`` and ``fake`` is
@@ -344,7 +355,8 @@ def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0,
     With K = 1 there is no off-diagonal fake pair, so this deliberately falls
     back to the biased empirical estimate ``2 - 2 k(x,y)``. The K > 1 result
     is not clamped: a U-statistic can legitimately be negative, and clamping it
-    would make the requested estimator biased.
+    would make the requested estimator biased. `omit_real_real=True` removes
+    only k(x,x)=1, retaining the fake self-term for the K=1 fallback.
     """
     if real.ndim != 2 or fake.ndim != 3:
         raise ValueError('fixed-real RBF expects (batch, hidden) real and '
@@ -360,7 +372,8 @@ def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0,
 
     distance, huber_delta = validate_distance(distance, huber_delta)
     if distance == 'pseudo_huber':
-        return _pseudo_huber_mmd2_fixed_real(real, fake, alpha, block_size, huber_delta)
+        return _pseudo_huber_mmd2_fixed_real(
+            real, fake, alpha, block_size, huber_delta, omit_real_real)
 
     real = real.detach().float()
     fake = fake.detach().float()
@@ -389,7 +402,8 @@ def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0,
         fake_term = fake_sum
     else:
         fake_term = (fake_sum - draws) / (draws * (draws - 1))
-    return 1.0 + fake_term - 2.0 * cross_sum / draws
+    return (fake_term - 2.0 * cross_sum / draws if omit_real_real else
+            1.0 + fake_term - 2.0 * cross_sum / draws)
 
 
 
@@ -607,18 +621,24 @@ def pairwise_distance(real, fake, distance='squared_euclidean', huber_delta=0.00
 
 
 def _pseudo_huber_sums(real, fake, w_real, w_fake, alpha, block, delta, chunk,
-                       shard=False):
+                       shard=False, omit_real_real=False):
     """Blocked weighted sums, supporting unequal set sizes and tile sharding."""
     rows = real.shape[0]
     part = _shard_ctx(shard)
     tile_index = 0
     sums = []
-    for a, b, wa, wb, symmetric in (
+    for term, (a, b, wa, wb, symmetric) in enumerate((
             (real, real, w_real, w_real, True),
             (fake, fake, w_fake, w_fake, True),
-            (real, fake, w_real, w_fake, False)):
+            (real, fake, w_real, w_fake, False))):
         total = real.new_zeros(rows)
         spans_b = _blocks(b.shape[1], block)
+        if term == 0 and omit_real_real:
+            # Preserve the fake/cross tile assignments when sharding is used,
+            # while skipping every real-real kernel evaluation.
+            tile_index += len(spans_b) * (len(spans_b) + 1) // 2
+            sums.append(total)
+            continue
         for bi, (i0, i1) in enumerate(_blocks(a.shape[1], block)):
             for j0, j1 in (spans_b[bi:] if symmetric else spans_b):
                 tile_index += 1
@@ -643,7 +663,7 @@ class _PseudoHuberPairSums(torch.autograd.Function):
     """Recomputed pseudo-Huber kernels with an exact fake-only first derivative."""
 
     @staticmethod
-    def forward(ctx, real, fake, w, alpha, block_size, shard, delta):
+    def forward(ctx, real, fake, w, alpha, block_size, shard, delta, omit_real_real):
         x, y = _distance_inputs(real, fake)
         if x.shape != y.shape or w.shape != x.shape[:2]:
             raise ValueError('paired RBF features and their shared mask must have matching shapes')
@@ -653,7 +673,8 @@ class _PseudoHuberPairSums(torch.autograd.Function):
         block, chunk = _pseudo_huber_layout(
             x.shape[0], x.shape[1], x.shape[2], x.element_size(), block_size,
             fused=mmd_laplace_cuda.supports_pseudo_huber_cuda(x, delta))
-        sums = _pseudo_huber_sums(x, y, weights, weights, alpha, block, delta, chunk, shard)
+        sums = _pseudo_huber_sums(
+            x, y, weights, weights, alpha, block, delta, chunk, shard, omit_real_real)
         ctx.save_for_backward(x, y, weights)
         ctx.alpha, ctx.block, ctx.chunk = alpha, block, chunk
         ctx.delta, ctx.shard, ctx.fake_dtype = delta, shard, fake.dtype
@@ -663,7 +684,7 @@ class _PseudoHuberPairSums(torch.autograd.Function):
     @torch.no_grad()
     def backward(ctx, g_xx, g_yy, g_xy):
         if not ctx.needs_input_grad[1]:
-            return (None,) * 7
+            return (None,) * 8
         x, y, w = ctx.saved_tensors
         rows, n, hidden = y.shape
         grad = torch.zeros_like(y)
@@ -698,10 +719,11 @@ class _PseudoHuberPairSums(torch.autograd.Function):
                         del diff, denominator
         if part:
             dist.all_reduce(grad)
-        return None, grad.to(dtype=ctx.fake_dtype), None, None, None, None, None
+        return None, grad.to(dtype=ctx.fake_dtype), None, None, None, None, None, None
 
 
-def _pseudo_huber_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size, delta):
+def _pseudo_huber_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size, delta,
+                              omit_real_real=False):
     real, fake = _distance_inputs(real, fake)
     if w_real.shape != real.shape[:2] or w_fake.shape != fake.shape[:2]:
         raise ValueError('RBF masks must match their feature sets')
@@ -716,16 +738,22 @@ def _pseudo_huber_mmd2_unequal(real, fake, w_real, w_fake, alpha, block_size, de
         real.element_size(), int(block_size),
         fused=mmd_laplace_cuda.supports_pseudo_huber_cuda(real, delta))
     s_xx, s_yy, s_xy = _pseudo_huber_sums(
-        real, fake, w_real, w_fake, alpha, block, delta, chunk)
+        real, fake, w_real, w_fake, alpha, block, delta, chunk,
+        omit_real_real=omit_real_real)
     n, m = w_real.sum(dim=1), w_fake.sum(dim=1)
     active = (n >= 2) & (m >= 2)
-    result = ((s_xx - n) / (n * (n - 1)).clamp_min(1.0)
-              + (s_yy - m) / (m * (m - 1)).clamp_min(1.0)
-              - 2.0 * s_xy / (n * m).clamp_min(1.0))
+    if omit_real_real:
+        result = ((s_yy - m) / (m * (m - 1)).clamp_min(1.0)
+                  - 2.0 * s_xy / (n * m).clamp_min(1.0))
+    else:
+        result = ((s_xx - n) / (n * (n - 1)).clamp_min(1.0)
+                  + (s_yy - m) / (m * (m - 1)).clamp_min(1.0)
+                  - 2.0 * s_xy / (n * m).clamp_min(1.0))
     return torch.where(active, result, torch.zeros_like(result)), active
 
 
-def _pseudo_huber_mmd2_fixed_real(real, fake, alpha, block_size, delta):
+def _pseudo_huber_mmd2_fixed_real(real, fake, alpha, block_size, delta,
+                                 omit_real_real=False):
     real, fake = real.detach().float(), fake.detach().float()
     if torch.is_tensor(alpha):
         alpha = alpha.detach().to(dtype=real.dtype, device=real.device)
@@ -738,6 +766,8 @@ def _pseudo_huber_mmd2_fixed_real(real, fake, alpha, block_size, delta):
     ones_real = real.new_ones((rows, 1))
     ones_fake = fake.new_ones((rows, draws))
     _, fake_sum, cross_sum = _pseudo_huber_sums(
-        real.unsqueeze(1), fake, ones_real, ones_fake, alpha, block, delta, chunk)
+        real.unsqueeze(1), fake, ones_real, ones_fake, alpha, block, delta, chunk,
+        omit_real_real=omit_real_real)
     fake_term = fake_sum if draws == 1 else (fake_sum - draws) / (draws * (draws - 1))
-    return 1.0 + fake_term - 2.0 * cross_sum / draws
+    return (fake_term - 2.0 * cross_sum / draws if omit_real_real else
+            1.0 + fake_term - 2.0 * cross_sum / draws)
