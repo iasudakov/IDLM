@@ -838,8 +838,9 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
     choose_high = torch.rand_like(t) < fraction
     return torch.where(choose_high, high_t.to(t.dtype), t)
 
-  def multistep_generation(self, x0, valid_tokens, current_accumulation_step,
-                           return_xt=False):
+  def _distill_generator_state(self, x0, valid_tokens,
+                                current_accumulation_step):
+    """Prepare corruption once for the complete logical batch."""
     force_full_mask = bool(self.config.adversarial_distill.get(
       'generator_force_full_mask', False))
     if force_full_mask:
@@ -860,7 +861,12 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       assert alpha_t.ndim == 2
       sigma = self._sigma_from_alphat(alpha_t)
       xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    return xt, sigma
 
+  def multistep_generation(self, x0, valid_tokens, current_accumulation_step,
+                           return_xt=False):
+    xt, sigma = self._distill_generator_state(
+      x0, valid_tokens, current_accumulation_step)
     log_x_theta = self.forward(xt, sigma=sigma)
     student_probs = log_x_theta.exp()
     student_probs = self._preserve_prompt_probs(student_probs, x0, valid_tokens)
@@ -1074,16 +1080,92 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       content = content & seen.eq(0)
     return content
 
-  def _mmd_term(self, x0, valid_tokens, student_probs, xt):
+  def _mmd_forward_batch_size(self):
+    """Physical forward limit; the loader batch still defines the objective."""
+    cfg = self.config.adversarial_distill
+    value = cfg.get('mmd_forward_batch_size', None)
+    if value is None:
+      return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+      raise ValueError('adversarial_distill.mmd_forward_batch_size must be '
+                       'a positive integer or null')
+    if (cfg.get('dmd_weight', 1.0) != 0
+        or not cfg.get('mmd_reward_weight', 0.0)
+        or cfg.get('mmd_reward_type', 'feature') not in
+           ('feature', 'feature_mse')):
+      raise ValueError('adversarial_distill.mmd_forward_batch_size requires '
+                       'dmd_weight=0, nonzero mmd_reward_weight and '
+                       'mmd_reward_type=feature|feature_mse')
+    return value
+
+  def _mmd_microbatch_loss(self, x0, valid_tokens,
+                           current_accumulation_step, batch_size):
+    """Keep logical-batch rewards while checkpointing smaller student forwards.
+
+    Only sampled IDs and their log probabilities survive each forward. Full
+    vocabulary outputs and model activations are recomputed during backward.
+    Kernels, automatic bandwidth, baselines and the token denominator still
+    see the complete loader batch, including groups that cross forward chunks.
+    """
+    from torch.utils.checkpoint import checkpoint
+    cfg = self.config.adversarial_distill
+    xt, sigma = self._distill_generator_state(
+      x0, valid_tokens, current_accumulation_step)
+    selected = (xt == self.mask_index) & self._mmd_content_mask(x0, valid_tokens)
+    group_size = int(cfg.mmd_group_size)
+    if group_size < 1:
+      raise ValueError('mmd_group_size must be >= 1')
+    source = str(cfg.get('mmd_kernel_source', 'rows'))
+    if source not in ('rows', 'draws'):
+      raise ValueError('mmd_kernel_source must be rows|draws')
+    draws = group_size * (max(1, int(cfg.get('mmd_kernel_batch_size', 1) or 1))
+                          if source == 'draws' else 1)
+
+    def sample_chunk(noisy, noise, clean, valid, written):
+      probs = self.forward(noisy, sigma=noise).exp()
+      probs = self._preserve_prompt_probs(probs, clean, valid)
+      with torch.no_grad():
+        ids = torch.multinomial(
+          probs.detach().reshape(-1, probs.shape[-1]).float(),
+          draws, replacement=True)
+        ids = ids.T.reshape(draws, *clean.shape)
+        ids = torch.where(written.unsqueeze(0), ids, clean.unsqueeze(0))
+      logp = probs.clamp_min(1e-12).log()
+      sampled_logp = logp.gather(2, ids.permute(1, 2, 0)).permute(2, 0, 1)
+      return sampled_logp, ids
+
+    logp_chunks, sample_chunks = [], []
+    for start in range(0, x0.shape[0], batch_size):
+      stop = start + batch_size
+      valid = None if valid_tokens is None else valid_tokens[start:stop]
+      sampled_logp, ids = checkpoint(
+        sample_chunk, xt[start:stop], sigma[start:stop], x0[start:stop],
+        valid, selected[start:stop], use_reentrant=False,
+        preserve_rng_state=True)
+      logp_chunks.append(sampled_logp)
+      sample_chunks.append(ids)
+    sampled_logp = torch.cat(logp_chunks, dim=1)
+    samples = torch.cat(sample_chunks, dim=1)
+    if bool(selected.any()):
+      # Feature extraction is frozen: split its forwards without checkpointing.
+      # Captured features are rejoined before computing the logical-batch reward.
+      self._mmd_critic.forward_batch_size = batch_size
+    return self._mmd_term(x0, valid_tokens, None, xt,
+                          samples=samples, sampled_logp=sampled_logp)
+
+  def _mmd_term(self, x0, valid_tokens, student_probs, xt, *,
+                samples=None, sampled_logp=None):
     """The configured hard-sample reward as a REINFORCE term, or zero."""
     import mmd_reward
     cfg = self.config.adversarial_distill
+    output = student_probs if samples is None else sampled_logp
     content = self._mmd_content_mask(x0, valid_tokens)
     # The WRITTEN span: what the student filled in, hence what the REINFORCE
     # surrogate sums log-probabilities over. Never widened.
     selected = (xt == self.mask_index) & content
     if not bool(selected.any()):
-      return student_probs.new_zeros(())
+      return (output.new_zeros(()) if samples is None
+              else output.sum() * 0.0)
     # The SCORED span, which `mmd_score_positions` may widen to every content
     # position. Outside the written span the two token sequences are identical,
     # so this adds signal only through the feature map's context sensitivity.
@@ -1095,8 +1177,14 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
     else:
       raise ValueError('adversarial_distill.mmd_score_positions must be '
                        f'written|all, got {where!r}')
-    loss, stats = mmd_reward.mmd_reinforce_loss(
-      student_probs, x0, selected, self._mmd_critic,
+    if samples is None:
+      loss_fn = mmd_reward.mmd_reinforce_loss
+      args = (student_probs, x0, selected, self._mmd_critic)
+    else:
+      loss_fn = mmd_reward.mmd_reinforce_loss_from_samples
+      args = (sampled_logp, x0, selected, samples, self._mmd_critic)
+    loss, stats = loss_fn(
+      *args,
       group_size=cfg.mmd_group_size,
       eos_id=self.tokenizer.eos_token_id,
       reward_weight=cfg.mmd_reward_weight,
@@ -1111,8 +1199,8 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
                      cfg.get('mmd_sentence_pooling', 'mean') == 'last_token'
                      else None))
     stats['mmd/generator_mask_fraction'] = (
-      selected.sum().to(student_probs.dtype)
-      / content.sum().clamp_min(1).to(student_probs.dtype)).detach()
+      selected.sum().to(output.dtype)
+      / content.sum().clamp_min(1).to(output.dtype)).detach()
     self.log_dict(stats, on_step=True, on_epoch=False, sync_dist=True)
     return loss
 
@@ -1123,6 +1211,10 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
     assert mmd_weight or dmd_weight, (
       'adversarial_distill.dmd_weight and mmd_reward_weight are both 0, which '
       'leaves the generator with no objective at all.')
+    forward_batch_size = self._mmd_forward_batch_size()
+    if forward_batch_size is not None:
+      return self._mmd_microbatch_loss(
+        x0, valid_tokens, current_accumulation_step, forward_batch_size)
     if mmd_weight:
       student_probs, mmd_xt = self.multistep_generation(
         x0, valid_tokens, current_accumulation_step, return_xt=True)

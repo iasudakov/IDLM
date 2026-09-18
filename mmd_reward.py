@@ -906,6 +906,29 @@ class _LayeredFeatures:
   rbf_exclude_same_sentence = False
   rbf_block_size = 0
   kernel_batch_size = 1
+  # Only the model forward is chunked. Kernel and reward calculations retain
+  # the complete logical batch, including its automatic RBF bandwidth.
+  forward_batch_size = None
+
+  def _capture_forward_chunks(self, core, batch, forward):
+    size = self.forward_batch_size
+    if size is None:
+      size = batch
+    else:
+      size = int(size)
+      if size < 1:
+        raise ValueError('feature forward_batch_size must be a positive integer')
+    if size >= batch:
+      with capture_layer_hidden(core, self.layer_index) as (captured, _):
+        forward(0, batch)
+      return captured
+    parts = {index: [] for index in self.resolved_layers}
+    for start in range(0, batch, size):
+      with capture_layer_hidden(core, self.layer_index) as (captured, _):
+        forward(start, min(start + size, batch))
+      for index in self.resolved_layers:
+        parts[index].append(captured[index])
+    return {index: torch.cat(values, dim=0) for index, values in parts.items()}
 
   def _resolve_layers(self, core, layer_index, layer_weights):
     self.layer_index = layer_index
@@ -975,9 +998,12 @@ class FrozenARFeatures(_LayeredFeatures):
   def features(self, tokens, eos_id, attention_mask=None):
     """`{index: (batch, length, hidden)}` for every configured block."""
     tokens = self._safe_ids(tokens, eos_id)
-    with capture_layer_hidden(self.model, self.layer_index) as (captured, _):
-      self.model(input_ids=tokens, attention_mask=attention_mask)
-    return captured
+    return self._capture_forward_chunks(
+      self.model, tokens.shape[0],
+      lambda start, end: self.model(
+        input_ids=tokens[start:end],
+        attention_mask=(None if attention_mask is None else
+                        attention_mask[start:end])))
 
   @torch.no_grad()
   def multi_draw_reward(self, clean_tokens, draws, selected, eos_id,
@@ -1050,6 +1076,185 @@ class FrozenARFeatures(_LayeredFeatures):
     return reward, active
 
 
+def _prepare_reinforce_inputs(x0, selected, critic, *, group_size,
+                              baseline, scored, kernel_source, kernel_draws,
+                              sequence_mask=None):
+  """Validate reward settings before any sampling or critic work."""
+  if group_size < 1:
+    raise ValueError(f'mmd group_size must be >= 1, got {group_size}')
+  if baseline not in ('auto', 'group', 'batch', 'none'):
+    raise ValueError('mmd_baseline must be auto|group|batch|none, got '
+                     f'{baseline!r}')
+  if baseline == 'auto':
+    baseline = 'group' if group_size > 1 else 'none'
+  if baseline == 'group' and group_size < 2:
+    raise ValueError('mmd_baseline=group needs group_size >= 2 -- '
+                     'leave-one-out has no baseline within a group of one; '
+                     'use baseline=none (the default at group_size=1) or '
+                     'baseline=batch')
+  if x0.ndim != 2:
+    raise ValueError(f'clean tokens must be (batch, length), got {tuple(x0.shape)}')
+  batch, length = x0.shape
+  if selected.shape != x0.shape:
+    raise ValueError(f'selected mask must be {tuple(x0.shape)}, got '
+                     f'{tuple(selected.shape)}')
+  selected = selected.bool()
+  feature_mse = getattr(critic, 'reward_type', 'feature') == 'feature_mse'
+  # The written span drives sampling and the surrogate; `scored` only ever
+  # reaches the critic.
+  scored = selected if scored is None else scored.bool()
+  if scored.shape != selected.shape:
+    raise ValueError(f'scored mask must be {tuple(selected.shape)}, got '
+                     f'{tuple(scored.shape)}')
+  if feature_mse and not torch.equal(scored, selected):
+    raise ValueError('mmd_reward_type=feature_mse requires scored positions '
+                     'to equal the written/masked positions '
+                     '(mmd_score_positions=written)')
+  if sequence_mask is not None and sequence_mask.shape != selected.shape:
+    raise ValueError(f'sequence mask must be {tuple(selected.shape)}, got '
+                     f'{tuple(sequence_mask.shape)}')
+  # Older/custom critics keep their original call signature. Only sentence
+  # endpoint readout needs a mask separate from the scored/written positions.
+  readout_kwargs = {}
+  if (getattr(critic, 'sentence_pooling', 'mean') == 'last_token'
+      and sequence_mask is not None):
+    readout_kwargs['sequence_mask'] = sequence_mask
+
+  if kernel_source not in ('rows', 'draws'):
+    raise ValueError('mmd_kernel_source must be rows|draws, got '
+                     f'{kernel_source!r}')
+  if (not feature_mse
+      and getattr(critic, 'kernel', None) == 'pseudo_huber'
+      and (kernel_source != 'draws'
+           or getattr(critic, 'kernel_level', 'token') != 'sentence')):
+    raise ValueError('mmd_kernel=pseudo_huber requires '
+                     'mmd_kernel_source=draws and mmd_kernel_level=sentence')
+  # `draws` mode makes each REINFORCE candidate a SET of `kernel_draws` samples
+  # at the same state, pooled into one MMD estimate, instead of a single
+  # sample. The candidate is then the set, so its log-probability is the sum
+  # over its members and the group still supplies the leave-one-out spread.
+  per_candidate = int(kernel_draws) if kernel_source == 'draws' else 1
+  if per_candidate < 1:
+    raise ValueError(f'mmd_kernel_batch_size must be >= 1, got {kernel_draws}')
+  if kernel_source == 'draws' and not hasattr(critic, 'multi_draw_reward'):
+    raise ValueError('mmd_kernel_source=draws needs a critic exposing '
+                     'multi_draw_reward; the idlm-ratio reward does not')
+
+  return (batch, length, selected, scored, baseline, per_candidate,
+          feature_mse, readout_kwargs)
+
+
+@torch.no_grad()
+def _score_reinforce_samples(x0, scored, samples, critic, *, group_size,
+                             per_candidate, kernel_source, baseline, eos_id,
+                             readout_kwargs):
+  """Detached scoring sees the complete logical batch, never forward chunks."""
+  batch, length = x0.shape
+  rewards, actives, breakdown = [], [], {}
+  multi = len(getattr(critic, 'resolved_layers', [None])) > 1
+  grouped = getattr(critic, 'grouped_reward', None)
+  if kernel_source == 'draws':
+    # Candidate g is a SET of K answers, scored together as one empirical
+    # feature distribution. This branch is source-based rather than K-based:
+    # K=1 still needs the sentence-level biased MMD fallback, not the
+    # historical paired pseudo-Huber path.
+    blocks = samples.view(group_size, per_candidate, batch, length)
+    for group_index in range(group_size):
+      if multi:
+        out = critic.multi_draw_reward(
+          x0, blocks[group_index], scored, eos_id,
+          return_per_layer=True, **readout_kwargs)
+      else:
+        out = critic.multi_draw_reward(
+          x0, blocks[group_index], scored, eos_id, **readout_kwargs)
+      member_reward, member_active = out[0], out[1]
+      if multi:
+        for index, value in out[2].items():
+          breakdown.setdefault(index, []).append(value)
+      rewards.append(member_reward)
+      actives.append(member_active)
+    reward = torch.stack(rewards, dim=-1)
+    active = actives[0]
+  elif callable(grouped):
+    reward, active = grouped(x0, samples, scored, eos_id)
+    if reward.shape != (batch, group_size):
+      raise ValueError('grouped critic reward must be '
+                       f'{(batch, group_size)}, got {tuple(reward.shape)}')
+  else:
+    for k in range(group_size):
+      out = critic.paired_reward(x0, samples[k], scored, eos_id,
+                                 return_per_layer=multi, **readout_kwargs)
+      member_reward, member_active = out[0], out[1]
+      if multi:
+        for index, value in out[2].items():
+          breakdown.setdefault(index, []).append(value)
+      rewards.append(member_reward)
+      actives.append(member_active)
+    reward = torch.stack(rewards, dim=-1)        # (batch, group)
+    active = actives[0]                          # identical across the group
+
+  if baseline == 'group':
+    advantage = group_advantages(reward)
+  elif baseline == 'batch':
+    advantage = batch_advantages(reward, active)
+  else:  # 'none'
+    # Unbiased but high variance because the reward offset remains. Most
+    # distance rewards are non-positive; unclipped MMD estimates can instead
+    # make the reward positive.
+    advantage = reward
+  advantage = torch.where(active.unsqueeze(-1), advantage,
+                          torch.zeros_like(advantage))
+  return reward, active, advantage, breakdown
+
+
+def _reduce_reinforce_samples(sampled_logp, selected, reward, active,
+                              advantage, breakdown, *, group_size,
+                              per_candidate, feature_mse, reward_weight):
+  """Apply the original logical-batch score estimator and logging reductions."""
+  batch = selected.shape[0]
+  # log p(sampled token), summed over the positions the student wrote.
+  surrogate = sampled_logp.new_zeros(())
+  for k in range(group_size):
+    # A candidate's action is all `per_candidate` of its draws, so its
+    # log-probability is their sum.
+    seq_logp = sampled_logp.new_zeros(batch)
+    for j in range(per_candidate):
+      token_logp = sampled_logp[k * per_candidate + j]
+      seq_logp = seq_logp + (token_logp * selected.to(token_logp.dtype)).sum(1)
+    surrogate = surrogate + (advantage[:, k] * seq_logp).sum()
+
+  # Negated: maximizing reward means descending this. Normalize by generated
+  # tokens and average the Monte Carlo candidates, as in GRPO's `1 / G`
+  # reduction. A larger group should improve the within-state comparison, not
+  # silently multiply the reward weight and its gradient.
+  # feature_mse already averages K independent errors. Its joint-score
+  # estimator needs no second /K: cross-draw score terms cancel in expectation.
+  # Keep the historical kernel-MMD normalization unchanged.
+  draw_divisor = 1 if feature_mse else per_candidate
+  denom = (selected.sum().clamp_min(1) * group_size
+            * draw_divisor).to(surrogate.dtype)
+  loss = -reward_weight * surrogate / denom
+
+  with torch.no_grad():
+    scored = reward[active] if active.any() else reward.new_zeros(1)
+    stats = {'mmd/reward': scored.mean().detach(),
+             'mmd/advantage_absmean': advantage.abs().mean().detach(),
+             'mmd/reward_spread': (reward.std(dim=-1).mean().detach()
+                                   if group_size > 1 else
+                                   reward.new_zeros(()))}
+    # With several blocks summed, the terms differ by orders of magnitude, so
+    # the total alone does not say which block is actually driving the ranking.
+    # `_spread` is the part that survives the leave-one-out baseline.
+    for index, values in breakdown.items():
+      per = torch.stack(values, dim=-1)
+      stats[f'mmd/reward_l{index}'] = per[active].mean().detach() \
+        if active.any() else per.new_zeros(())
+      stats[f'mmd/reward_spread_l{index}'] = (
+        per.std(dim=-1).mean().detach() if group_size > 1
+        else per.new_zeros(()))
+  return loss, stats
+
+
 def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
                        group_size, eos_id, reward_weight=1.0,
                        baseline='auto', scored=None, kernel_source='rows',
@@ -1110,171 +1315,69 @@ def mmd_reinforce_loss(student_probs, x0, selected, critic, *,
 
   Returns `(loss, stats)`; `loss` already carries `reward_weight`.
   """
-  if group_size < 1:
-    raise ValueError(f'mmd group_size must be >= 1, got {group_size}')
-  if baseline not in ('auto', 'group', 'batch', 'none'):
-    raise ValueError('mmd_baseline must be auto|group|batch|none, got '
-                     f'{baseline!r}')
-  if baseline == 'auto':
-    baseline = 'group' if group_size > 1 else 'none'
-  if baseline == 'group' and group_size < 2:
-    raise ValueError('mmd_baseline=group needs group_size >= 2 -- '
-                     'leave-one-out has no baseline within a group of one; '
-                     'use baseline=none (the default at group_size=1) or '
-                     'baseline=batch')
-  batch, length, _ = student_probs.shape
-  selected = selected.bool()
-  feature_mse = getattr(critic, 'reward_type', 'feature') == 'feature_mse'
-  # The written span drives sampling and the surrogate; `scored` only ever
-  # reaches the critic.
-  scored = selected if scored is None else scored.bool()
-  if scored.shape != selected.shape:
-    raise ValueError(f'scored mask must be {tuple(selected.shape)}, got '
-                     f'{tuple(scored.shape)}')
-  if feature_mse and not torch.equal(scored, selected):
-    raise ValueError('mmd_reward_type=feature_mse requires scored positions '
-                     'to equal the written/masked positions '
-                     '(mmd_score_positions=written)')
-  if sequence_mask is not None and sequence_mask.shape != selected.shape:
-    raise ValueError(f'sequence mask must be {tuple(selected.shape)}, got '
-                     f'{tuple(sequence_mask.shape)}')
-  # Older/custom critics keep their original call signature. Only sentence
-  # endpoint readout needs a mask separate from the scored/written positions.
-  readout_kwargs = {}
-  if (getattr(critic, 'sentence_pooling', 'mean') == 'last_token'
-      and sequence_mask is not None):
-    readout_kwargs['sequence_mask'] = sequence_mask
-
-  if kernel_source not in ('rows', 'draws'):
-    raise ValueError('mmd_kernel_source must be rows|draws, got '
-                     f'{kernel_source!r}')
-  if (not feature_mse
-      and getattr(critic, 'kernel', None) == 'pseudo_huber'
-      and (kernel_source != 'draws'
-           or getattr(critic, 'kernel_level', 'token') != 'sentence')):
-    raise ValueError('mmd_kernel=pseudo_huber requires '
-                     'mmd_kernel_source=draws and mmd_kernel_level=sentence')
-  # `draws` mode makes each REINFORCE candidate a SET of `kernel_draws` samples
-  # at the same state, pooled into one MMD estimate, instead of a single
-  # sample. The candidate is then the set, so its log-probability is the sum
-  # over its members and the group still supplies the leave-one-out spread.
-  per_candidate = int(kernel_draws) if kernel_source == 'draws' else 1
-  if per_candidate < 1:
-    raise ValueError(f'mmd_kernel_batch_size must be >= 1, got {kernel_draws}')
-  if kernel_source == 'draws' and not hasattr(critic, 'multi_draw_reward'):
-    raise ValueError('mmd_kernel_source=draws needs a critic exposing '
-                     'multi_draw_reward; the idlm-ratio reward does not')
-
-  # Sampling and the reward are no-grad; only the log-prob gather carries
-  # gradient.
+  (batch, length, selected, scored, baseline, per_candidate,
+   feature_mse, readout_kwargs) = _prepare_reinforce_inputs(
+    x0, selected, critic, group_size=group_size, baseline=baseline,
+    scored=scored, kernel_source=kernel_source, kernel_draws=kernel_draws,
+    sequence_mask=sequence_mask)
   with torch.no_grad():
     flat = student_probs.reshape(-1, student_probs.shape[-1])
-    total_draws = group_size * per_candidate
-    draws = torch.multinomial(flat.float(), total_draws, replacement=True)
-    draws = draws.view(batch, length, total_draws).permute(2, 0, 1)
-    # Outside the generated span the answer is the clean one, so the critic
-    # sees a row differing from the reference *only* where the student wrote.
+    draws = torch.multinomial(
+      flat.float(), group_size * per_candidate, replacement=True)
+    draws = draws.view(batch, length, -1).permute(2, 0, 1)
     samples = torch.where(selected.unsqueeze(0), draws, x0.unsqueeze(0))
-
-    rewards, actives, breakdown = [], [], {}
-    multi = len(getattr(critic, 'resolved_layers', [None])) > 1
-    grouped = getattr(critic, 'grouped_reward', None)
-    if kernel_source == 'draws':
-      # Candidate g is a SET of K answers, scored together as one empirical
-      # feature distribution. This branch is source-based rather than K-based:
-      # K=1 still needs the sentence-level biased MMD fallback, not the
-      # historical paired pseudo-Huber path.
-      blocks = samples.view(group_size, per_candidate, batch, length)
-      for group_index in range(group_size):
-        if multi:
-          out = critic.multi_draw_reward(
-            x0, blocks[group_index], scored, eos_id,
-            return_per_layer=True, **readout_kwargs)
-        else:
-          out = critic.multi_draw_reward(
-            x0, blocks[group_index], scored, eos_id, **readout_kwargs)
-        member_reward, member_active = out[0], out[1]
-        if multi:
-          for index, value in out[2].items():
-            breakdown.setdefault(index, []).append(value)
-        rewards.append(member_reward)
-        actives.append(member_active)
-      reward = torch.stack(rewards, dim=-1)
-      active = actives[0]
-    elif callable(grouped):
-      reward, active = grouped(x0, samples, scored, eos_id)
-      if reward.shape != (batch, group_size):
-        raise ValueError('grouped critic reward must be '
-                         f'{(batch, group_size)}, got {tuple(reward.shape)}')
-    else:
-      for k in range(group_size):
-        out = critic.paired_reward(x0, samples[k], scored, eos_id,
-                                   return_per_layer=multi, **readout_kwargs)
-        member_reward, member_active = out[0], out[1]
-        if multi:
-          for index, value in out[2].items():
-            breakdown.setdefault(index, []).append(value)
-        rewards.append(member_reward)
-        actives.append(member_active)
-      reward = torch.stack(rewards, dim=-1)        # (batch, group)
-      active = actives[0]                          # identical across the group
-
-    if baseline == 'group':
-      advantage = group_advantages(reward)
-    elif baseline == 'batch':
-      advantage = batch_advantages(reward, active)
-    else:  # 'none'
-      # Unbiased but high variance because the reward offset remains. Most
-      # distance rewards are non-positive; unclipped MMD estimates can instead
-      # make the reward positive.
-      advantage = reward
-    advantage = torch.where(active.unsqueeze(-1), advantage,
-                            torch.zeros_like(advantage))
-
-  # log p(sampled token), summed over the positions the student wrote.
+  rewards = _score_reinforce_samples(
+    x0, scored, samples, critic, group_size=group_size,
+    per_candidate=per_candidate, kernel_source=kernel_source, baseline=baseline,
+    readout_kwargs=readout_kwargs, eos_id=eos_id)
   logp = torch.log(student_probs.clamp_min(1e-12))
-  surrogate = student_probs.new_zeros(())
-  for k in range(group_size):
-    # A candidate's action is all `per_candidate` of its draws, so its
-    # log-probability is their sum.
-    seq_logp = student_probs.new_zeros(batch)
-    for j in range(per_candidate):
-      drawn = samples[k * per_candidate + j]
-      token_logp = logp.gather(-1, drawn.unsqueeze(-1)).squeeze(-1)
-      seq_logp = seq_logp + (token_logp * selected.to(token_logp.dtype)).sum(1)
-    surrogate = surrogate + (advantage[:, k] * seq_logp).sum()
+  sampled_logp = torch.stack([
+    logp.gather(-1, drawn.unsqueeze(-1)).squeeze(-1) for drawn in samples])
+  return _reduce_reinforce_samples(
+    sampled_logp, selected, *rewards, group_size=group_size,
+    per_candidate=per_candidate, feature_mse=feature_mse,
+    reward_weight=reward_weight)
 
-  # Negated: maximizing reward means descending this. Normalize by generated
-  # tokens and average the Monte Carlo candidates, as in GRPO's `1 / G`
-  # reduction. A larger group should improve the within-state comparison, not
-  # silently multiply the reward weight and its gradient.
-  # feature_mse already averages K independent errors. Its joint-score
-  # estimator needs no second /K: cross-draw score terms cancel in expectation.
-  # Keep the historical kernel-MMD normalization unchanged.
-  draw_divisor = 1 if feature_mse else per_candidate
-  denom = (selected.sum().clamp_min(1) * group_size
-            * draw_divisor).to(surrogate.dtype)
-  loss = -reward_weight * surrogate / denom
 
-  with torch.no_grad():
-    scored = reward[active] if active.any() else reward.new_zeros(1)
-    stats = {'mmd/reward': scored.mean().detach(),
-             'mmd/advantage_absmean': advantage.abs().mean().detach(),
-             'mmd/reward_spread': (reward.std(dim=-1).mean().detach()
-                                   if group_size > 1 else
-                                   reward.new_zeros(()))}
-    # With several blocks summed, the terms differ by orders of magnitude, so
-    # the total alone does not say which block is actually driving the ranking.
-    # `_spread` is the part that survives the leave-one-out baseline.
-    for index, values in breakdown.items():
-      per = torch.stack(values, dim=-1)
-      stats[f'mmd/reward_l{index}'] = per[active].mean().detach() \
-        if active.any() else per.new_zeros(())
-      stats[f'mmd/reward_spread_l{index}'] = (
-        per.std(dim=-1).mean().detach() if group_size > 1
-        else per.new_zeros(()))
-  return loss, stats
+def mmd_reinforce_loss_from_samples(sampled_logp, x0, selected, samples,
+                                    critic, *, group_size, eos_id,
+                                    reward_weight=1.0,
+                                    baseline='auto', scored=None,
+                                    kernel_source='rows', kernel_draws=1,
+                                    sequence_mask=None):
+  """Score a logical reward batch after sampling in smaller forward chunks.
 
+  `samples` and differentiable `sampled_logp` both have shape (D, B, L),
+  where D = group_size * kernel_draws for source=draws, or group_size for rows.
+  Sample ids outside `selected` must be the corresponding clean `x0` ids.
+  Only selected positions enter the score estimator. All kernel groups,
+  automatic bandwidths, baselines and normalization still see the full B rows,
+  independent of the physical student/feature forward size.
+
+  Other arguments and returned statistics match `mmd_reinforce_loss`.
+  """
+  (batch, length, selected, scored, baseline, per_candidate,
+   feature_mse, readout_kwargs) = _prepare_reinforce_inputs(
+    x0, selected, critic, group_size=group_size, baseline=baseline,
+    scored=scored, kernel_source=kernel_source, kernel_draws=kernel_draws,
+    sequence_mask=sequence_mask)
+  expected = (group_size * per_candidate, batch, length)
+  if samples.shape != expected or sampled_logp.shape != expected:
+    raise ValueError('sample ids and sampled log-probabilities must both be '
+                     f'{expected}, got {tuple(samples.shape)} and '
+                     f'{tuple(sampled_logp.shape)}')
+  if samples.dtype != torch.long:
+    raise ValueError('sample ids must have dtype torch.long')
+  if not sampled_logp.is_floating_point():
+    raise ValueError('sampled log-probabilities must be floating point')
+  rewards = _score_reinforce_samples(
+    x0, scored, samples, critic, group_size=group_size,
+    per_candidate=per_candidate, kernel_source=kernel_source, baseline=baseline,
+    readout_kwargs=readout_kwargs, eos_id=eos_id)
+  return _reduce_reinforce_samples(
+    sampled_logp, selected, *rewards, group_size=group_size,
+    per_candidate=per_candidate, feature_mse=feature_mse,
+    reward_weight=reward_weight)
 
 class FrozenBackboneFeatures(_LayeredFeatures):
   """One of this repo's own DiT backbones, frozen, read at a single block.
@@ -1307,6 +1410,13 @@ class FrozenBackboneFeatures(_LayeredFeatures):
     self._resolve_layers(denoiser, layer_index, layer_weights)
 
   @torch.no_grad()
+  def features(self, tokens, sigma):
+    """Read all requested blocks with an optional physical forward limit."""
+    return self._capture_forward_chunks(
+      self.denoiser, tokens.shape[0],
+      lambda start, end: self.denoiser(tokens[start:end], sigma[start:end]))
+
+  @torch.no_grad()
   def multi_draw_reward(self, clean_tokens, draws, selected, eos_id,
                         sigma=None, return_per_layer=False, sequence_mask=None):
     """Compare K generated answers from one state with its clean answer."""
@@ -1336,8 +1446,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
         raise ValueError(f'sigma must have {batch} rows, got {tuple(sigma.shape)}')
       repeats = (draw_count,) + (1,) * (sigma.ndim - 1)
       sigma = torch.cat([sigma, sigma.repeat(repeats)], dim=0)
-    with capture_layer_hidden(self.denoiser, self.layer_index) as (feats, _):
-      self.denoiser(stacked, sigma)
+    feats = self.features(stacked, sigma)
 
     reward, active, per_layer = summed_multi_draw_reward(
       feats, batch, draw_count, length, selected, self.resolved_layers,
@@ -1376,8 +1485,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
                           dtype=torch.float32)
     else:
       sigma = torch.cat([sigma, sigma], dim=0)
-    with capture_layer_hidden(self.denoiser, self.layer_index) as (feats, _):
-      self.denoiser(stacked, sigma)
+    feats = self.features(stacked, sigma)
     reward, active, per_layer = summed_paired_reward(
       feats, batch, selected, self.resolved_layers, self.layer_weights,
       kernel=self.kernel, alpha=self.rbf_alpha,

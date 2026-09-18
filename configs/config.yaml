@@ -68,6 +68,14 @@ adversarial_distill:
   #              mostly ranks corruption luck rather than generated quality.
   mmd_reward_type: feature
 
+  # Optional physical forward limit for reward-only feature/feature_mse MDLM.
+  # Keep loader.batch_size/global_batch_size unchanged to preserve the objective.
+  # Checkpoints student forwards (extra backward recomputation), splits frozen
+  # feature forwards, then computes rewards/bandwidth/normalization over the
+  # original loader batch. Positive integer or null (legacy path). Not for DMD
+  # or IDLM-ratio/fake training; no guarantee of bitwise/RNG-identical runs.
+  mmd_forward_batch_size: null
+
   # Maximum generated sequences per teacher/fake forward for the IDLM ratio
   # reward. Bounds vocabulary-logit memory without changing loader.batch_size,
   # mmd_group_size, shared corruption or the group baseline. Positive integer;
