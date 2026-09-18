@@ -33,6 +33,43 @@ There are now two explicitly different protocols:
 These corrections address identified code-versus-paper mismatches; they do not
 establish that every implementation detail reproduces the paper's results.
 
+## Retain evaluated training checkpoints
+
+The DiDi entrypoint supports retaining every evaluated model from an inclusive
+Lightning optimizer step. For example:
+
+```bash
++checkpointing.save_evaluated_checkpoints=true \
++checkpointing.save_evaluated_from_step=2000 \
++checkpointing.snapshot=true \
+callbacks.checkpoint_every_n_steps.save_top_k=0 \
+callbacks.checkpoint_every_n_steps.save_last=false \
+callbacks.checkpoint_monitor.monitor=val/nll \
+callbacks.checkpoint_monitor.save_top_k=0 \
+callbacks.checkpoint_monitor.save_last=false
+```
+
+Use `+` for these new checkpointing fields because this entrypoint composes the
+pristine upstream config. The feature is disabled unless explicitly enabled.
+Enabling it suppresses the upstream `student_iters_*.ckpt` writes inside the
+training step; the callback overrides above disable the separate standard
+periodic/best-model savers. Baseline and sanity evaluations do not save.
+
+Files are retained under
+`<checkpointing.save_dir>/checkpoints/eval-step=00002000.ckpt`, etc. They include
+the raw student, student EMA, discriminator, frozen teacher, optimizer state,
+and existing DiDi resume metadata. With the default discriminator/student
+update cadence, DiDi performs two optimizer updates per training batch, so
+`trainer.val_check_interval=1000` evaluates at steps 2000, 4000, 6000, and so on.
+These labels match the logged Pareto step; DiDi iteration numbers are separate.
+
+With `checkpointing.snapshot=true`, rank zero uploads the entire save directory
+through the Nirvana helper after each evaluated checkpoint is fully written.
+Outside Nirvana the upload is a no-op, and transfer failures are logged without
+aborting training. This option does not add automatic snapshot restoration or
+choose a resume checkpoint: DiDi's existing resume path must already be locally
+available when resuming. No `last.ckpt` is created by the evaluated saver.
+
 ## Standalone control using the dedicated authors' inference release
 
 The authors also publish a **different `inference` branch**, pinned here to
@@ -780,6 +817,10 @@ explicit repairs in memory with exact source-match assertions:
     same input-autograd repair from item 5. Its guidance defaults, direct EMA
     timestep path, categorical reranking and raw ancestral cleanup are preserved.
     Temperature interception covers both direct EMA and processed cleanup calls.
+13. When `checkpointing.save_evaluated_checkpoints` is enabled, suppress native
+    in-training checkpoint writes and append a validation-end saver. It retains
+    full models from the requested optimizer step and optionally uploads the
+    completed run directory to Nirvana snapshots. Training updates are unchanged.
 
 The optional `didi_eval.before_training`, `didi_init.student_hf`, and
 `didi_pareto` extensions are disabled by default. Their orchestration, HF weight

@@ -190,6 +190,7 @@ def install_entrypoint(upstream):
   from .initialization import initialize_student_from_hf
   from .pretrain_eval import maybe_evaluate_before_training
   from .pareto import attach_pareto, validate_options
+  from .checkpointing import make_evaluated_checkpoint
   from .tinygsm import is_tinygsm
   upstream.make_underdeep_logger = make_underdeep_logger
   upstream.initialize_underdeep_logger = initialize_underdeep_logger
@@ -198,6 +199,7 @@ def install_entrypoint(upstream):
   upstream.attach_didi_monitor = lambda model, config: attach_monitor(
     model, config, upstream_revision=UPSTREAM_REVISION)
   upstream.attach_didi_pareto = attach_pareto
+  upstream.make_evaluated_checkpoint = make_evaluated_checkpoint
   def attach_conditional(model, config):
     if not is_tinygsm(config):
       return None
@@ -225,7 +227,10 @@ def install_entrypoint(upstream):
      '    callbacks.append(pareto)\n\n'
      '  conditional = attach_didi_conditional(model, config)\n'
      '  if conditional is not None:\n'
-     '    callbacks.append(conditional)\n\n'
+     '    callbacks.append(conditional)\n'
+     '  evaluated_checkpoint = make_evaluated_checkpoint(config)\n'
+     '  if evaluated_checkpoint is not None:\n'
+     '    callbacks.append(evaluated_checkpoint)\n\n'
      '  # Print the number of trainable parameters'),
     ('  trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)',
      '  maybe_evaluate_didi_before_training(trainer, model, valid_ds, ckpt_path=ckpt_path)\n'
