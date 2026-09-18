@@ -194,7 +194,7 @@ class DiDiRuntimeTests(unittest.TestCase):
         original = textwrap.dedent(inspect.getsource(self.original_class.training_step))
         repaired = repaired_function(self.original_class.training_step, TRAINING_REPAIRS)
         restored = repaired.__didi_repaired_source__
-        self.assertEqual(len(TRAINING_REPAIRS), 3)
+        self.assertEqual(len(TRAINING_REPAIRS), 4)
         for before, after in reversed(TRAINING_REPAIRS):
             # The corrected logging expression also already occurs in the
             # differentiated objective; restore only its LAST occurrence.

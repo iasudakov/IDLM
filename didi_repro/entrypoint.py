@@ -175,6 +175,7 @@ def install_entrypoint(upstream):
   from .initialization import initialize_student_from_hf
   from .pretrain_eval import maybe_evaluate_before_training
   from .pareto import attach_pareto, validate_options
+  from .checkpointing import make_evaluated_checkpoint
   upstream.make_underdeep_logger = make_underdeep_logger
   upstream.initialize_underdeep_logger = initialize_underdeep_logger
   upstream.initialize_didi_student = initialize_student_from_hf
@@ -182,6 +183,7 @@ def install_entrypoint(upstream):
   upstream.attach_didi_monitor = lambda model, config: attach_monitor(
     model, config, upstream_revision=UPSTREAM_REVISION)
   upstream.attach_didi_pareto = attach_pareto
+  upstream.make_evaluated_checkpoint = make_evaluated_checkpoint
   patched_train = repaired_function(upstream._train, (
     ("wandb_logger = None\n  if config.get('wandb', None) is not None:\n"
      "    wandb_logger = L.pytorch.loggers.WandbLogger(\n"
@@ -200,7 +202,10 @@ def install_entrypoint(upstream):
      '    callbacks.append(monitor)\n'
      '  pareto = attach_didi_pareto(model, config)\n'
      '  if pareto is not None:\n'
-     '    callbacks.append(pareto)\n\n'
+     '    callbacks.append(pareto)\n'
+     '  evaluated_checkpoint = make_evaluated_checkpoint(config)\n'
+     '  if evaluated_checkpoint is not None:\n'
+     '    callbacks.append(evaluated_checkpoint)\n\n'
      '  # Print the number of trainable parameters'),
     ('  trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)',
      '  maybe_evaluate_didi_before_training(trainer, model, valid_ds, ckpt_path=ckpt_path)\n'

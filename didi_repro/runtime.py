@@ -55,6 +55,10 @@ TRAINING_REPAIRS = (
   # Diagnostic typo only: match the scalar actually differentiated above.
   ('total_student_loss = loss_pg + loss_kl - self.entropy_beta * entropy',
    'total_student_loss = loss_pg + self.kl_beta * loss_kl - self.entropy_beta * entropy'),
+  # The optional evaluated policy saves only after validation. Suppress the
+  # separate upstream in-training saves (including iteration zero) in that mode.
+  ('if (step % self.save_model_every == 0) and (step != self.last_growth_step) and step >= 0:',
+   "if (not self.config.checkpointing.get('save_evaluated_checkpoints', False)) and (step % self.save_model_every == 0) and (step != self.last_growth_step) and step >= 0:"),
 )
 
 
