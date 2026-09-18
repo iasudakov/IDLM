@@ -16,7 +16,9 @@ from tqdm import trange
 import algo
 import checkpoint_ema
 import dataloader
+from evaluated_checkpoint import EvaluatedCheckpoint
 import model_assets
+import nirvana_snapshot
 import sandbox_gsm8k
 import utils
 from ipdb import set_trace as debug
@@ -29,11 +31,14 @@ utils.register_omegaconf_resolvers()
 class PeriodicStepCheckpoint(L.Callback):
   """Save deterministic checkpoints every N completed train batches."""
 
-  def __init__(self, dirpath, every_n_train_steps):
+  def __init__(self, dirpath, every_n_train_steps, snapshot_dir=None,
+               snapshot=False):
     self.dirpath = os.fspath(dirpath)
     self.every_n_train_steps = int(every_n_train_steps)
     self._completed_train_batches = 0
     self._last_saved_step = 0
+    self.snapshot_dir = os.fspath(snapshot_dir or dirpath)
+    self.snapshot = bool(snapshot)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     if self.every_n_train_steps <= 0:
@@ -56,6 +61,8 @@ class PeriodicStepCheckpoint(L.Callback):
       print(
         f'Saved periodic checkpoint at train_batch={save_step}: {ckpt_path}',
         flush=True)
+      nirvana_snapshot.save(self.snapshot_dir, enabled=self.snapshot,
+                            reason=f'periodic train_batch={save_step}')
 
 
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
@@ -232,6 +239,8 @@ def _train(diffusion_model, config, logger, tokenizer):
       'Continuing the teacher with the standard model objective (no frozen '
       'teacher, fake model, DMD, or MMD reward); Lightning gradient '
       f'accumulation={config.trainer.accumulate_grad_batches}.')
+  snapshot = bool(config.checkpointing.get('snapshot', True))
+  snapshot_dir = os.fspath(config.checkpointing.save_dir)
   # wandb_logger = None
   # if config.get('wandb', None) is not None:
   #   wandb_logger = L.pytorch.loggers.WandbLogger(
@@ -255,7 +264,15 @@ def _train(diffusion_model, config, logger, tokenizer):
     if config.checkpointing.get('use_periodic_train_batch_checkpoint', False):
       callbacks.append(PeriodicStepCheckpoint(
         os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
-        config.callbacks.checkpoint_every_n_steps.every_n_train_steps))
+        config.callbacks.checkpoint_every_n_steps.every_n_train_steps,
+        snapshot_dir=snapshot_dir, snapshot=snapshot))
+
+  if config.checkpointing.get('save_evaluated_checkpoints', False):
+    callbacks.append(EvaluatedCheckpoint(
+      dirpath=os.path.join(
+        os.fspath(config.checkpointing.save_dir), 'checkpoints'),
+      start_step=config.checkpointing.get('save_evaluated_from_step', 0),
+      snapshot_dir=snapshot_dir, snapshot=snapshot))
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)
@@ -514,6 +531,12 @@ def main(config):
   model_assets.configure_model_weights(
     config, base_dir=hydra.utils.get_original_cwd())
   _configure_training_mode(config)
+  if config.mode not in ('sample_eval', 'ppl_eval', 'gsm8k_eval'):
+    # Restore before writing the current config, initializing the tracker,
+    # or checking the resume checkpoint in _train.
+    nirvana_snapshot.restore(
+      os.fspath(config.checkpointing.save_dir),
+      enabled=bool(config.checkpointing.get('snapshot', True)))
   L.seed_everything(config.seed)
   _print_config(config, resolve=True, save_cfg=True)
   

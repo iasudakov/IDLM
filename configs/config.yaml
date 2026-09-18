@@ -516,4 +516,12 @@ checkpointing:
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
+  # Restore save_dir from Nirvana before checking resume_ckpt_path; push the
+  # whole directory after each evaluated or custom train-batch checkpoint.
+  # No-op without the Nirvana runtime. Failed transfers are logged, not fatal.
+  snapshot: true
   use_periodic_train_batch_checkpoint: false
+  # Save after each training validation at or above this global optimizer step.
+  # Independent of periodic train-batch checkpoints and best-model selection.
+  save_evaluated_checkpoints: false
+  save_evaluated_from_step: 0

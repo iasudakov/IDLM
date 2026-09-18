@@ -144,6 +144,53 @@ pip install flash_attn==2.7.4.post1
 
 This section provides reference training entry points for unconditional OpenWebText distillation and conditional TinyGSM distillation. The scripts are written as Hydra override recipes, update the dataset cache and checkpoint paths before launching a run.
 
+### Save every evaluated checkpoint
+
+Add these Hydra overrides to the underlying `python -m main` training command
+to keep every evaluated checkpoint starting at global optimizer step 1,000:
+
+```bash
+checkpointing.save_evaluated_checkpoints=True \
+checkpointing.save_evaluated_from_step=1000 \
+checkpointing.save_dir=/absolute/path/to/run
+```
+
+The threshold is inclusive and defaults to zero when this option is enabled.
+Its step is Lightning's global optimizer-step count, which can include both
+student and fake-model updates; it is different from the training-batch count
+used by periodic checkpoints. Saving follows each validation inside training,
+including NLL-only validation. Sanity checks and standalone validation, such
+as the initial `trainer.validate` call, do not create these checkpoints.
+
+Files are written under `checkpointing.save_dir/checkpoints`, for example
+`eval-step=00001000.ckpt`. Each global step is saved once, with duplicate
+protection restored on resume. Existing files receive a versioned successor
+instead of being overwritten. These are full Lightning checkpoints with model
+and training state, including the model's saved EMA state. Use
+`checkpointing.resume_ckpt_path` to select one for resuming; this does not
+guarantee exact continuation of every manual-optimization phase.
+
+This option is disabled by default and is independent of the existing periodic
+and best-model callbacks. Change the overrides in your launch command or the
+corresponding config fields. `scripts/train_tinygsm_mmd.sh` does not forward
+extra shell arguments, so appending these overrides to that wrapper would not
+apply them.
+
+On Nirvana, `checkpointing.snapshot=True` (the default) uploads the entire
+`checkpointing.save_dir` after each evaluated checkpoint has been written.
+This includes all retained checkpoints and the run's logs/metadata in that
+directory. The custom periodic train-batch saver also uploads after its saves.
+The standard Lightning periodic/best-model callbacks do not trigger uploads
+themselves; the evaluated saver is sufficient for the command above.
+
+At training startup, the directory is restored before initializing the tracker
+and checking `checkpointing.resume_ckpt_path`. Restoring files does not choose
+a checkpoint automatically: the evaluated saver does not create `last.ckpt`,
+so set `checkpointing.resume_ckpt_path` to a saved `eval-step=...ckpt` when
+resuming from one. To turn off both snapshot upload and restore, use
+`checkpointing.snapshot=False`. Outside Nirvana, missing `yt_tools` makes the
+snapshot calls no-ops; transfer failures are logged without aborting training.
+
 ### Unconditional OpenWebText Distillation
 
 The OpenWebText recipes train IDLM students for unconditional language generation. Before executing the scripts, configure the `cache_dir` parameter in `configs/data/openwebtext-split.yaml` to specify the desired output path.
