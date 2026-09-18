@@ -162,6 +162,7 @@ def _runtime_class():
   names = ('__init__', '_validate_configuration', '_needs_fake_phase',
            '_process_model_output', '_preserve_prompt_probs',
            '_preserve_prompt_tokens', '_sample_distill_generator_t',
+           '_distill_generator_state', '_mmd_forward_batch_size',
            'multistep_generation', 'q_xt_with_probs',
            'nll_per_token_with_probs', 'generator_loss', 'fake_loss')
   parent = next(node for node in tree.body

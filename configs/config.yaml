@@ -82,6 +82,14 @@ adversarial_distill:
   #              as usual, but give the generator only the REINFORCE term.
   mmd_reward_type: feature
 
+  # Optional physical forward limit for reward-only feature/feature_mse MDLM.
+  # Keep loader.batch_size/global_batch_size unchanged to preserve the objective.
+  # Checkpoints student forwards (extra backward recomputation), splits frozen
+  # feature forwards, then computes rewards/bandwidth/normalization over the
+  # original loader batch. Positive integer or null (legacy path). Not for DMD
+  # or IDLM-ratio/fake training; no guarantee of bitwise/RNG-identical runs.
+  mmd_forward_batch_size: null
+
   mmd_feature_source: diffusion
   # Used when mmd_feature_source='ar'. Either one of this repo's AR checkpoints
   # (a path ending in .ckpt) or an HF repo id for AutoModelForCausalLM.

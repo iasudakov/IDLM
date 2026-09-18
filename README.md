@@ -278,6 +278,38 @@ the other active sequences on the same device as a leave-one-out baseline; it
 removes the reward offset but is noisier because TinyGSM rows have different
 questions and masking fractions.
 
+To reduce model-forward memory while preserving a batch-32 feature-reward
+objective, keep the logical loader batch and add a separate forward limit:
+
+```bash
+loader.batch_size=32 loader.global_batch_size=512 \
+adversarial_distill.mmd_forward_batch_size=8
+```
+
+This runs the student and frozen feature model on at most 8 sequences per
+forward. Student activations are checkpointed and recomputed during backward;
+only sampled token IDs and their differentiable log probabilities are retained
+between chunks. Captured frozen features are concatenated before reward
+calculation. Thus masked-token normalization, automatic RBF bandwidth, K-row
+groups, G-candidate baselines, and optional batch baselines still use the
+original 32 examples. Groups may cross a forward-chunk boundary. Feature
+tensors and kernel workspaces still use the logical batch; this option does
+not promise that all memory scales with the forward limit.
+
+Keep `loader.batch_size`, `loader.global_batch_size`, device count, K, G and
+other training settings fixed when comparing forward limits. With 8 GPUs and
+global batch 512, logical batch 32 still requires 2 accumulation steps in the
+existing manual training loop. Validation and scheduler timing also stay the
+same. Changing `loader.batch_size` to 8 instead still changes the objective.
+
+The default `null` preserves the existing path. A positive integer enables
+this option for MDLM with `dmd_weight=0`, nonzero `mmd_reward_weight`, and
+`mmd_reward_type=feature` or `feature_mse`; DMD and IDLM-ratio runs reject it.
+The loss and gradients agree for the same examples, corruptions and sampled
+tokens, up to floating-point rounding. RNG ordering, dropout draws and GPU
+kernels can differ, so identical seeds do not guarantee identical trajectories.
+The memory saving trades extra student-forward computation during backward.
+
 To replace MMD with **position-aligned masked-token feature MSE**, add:
 
 ```bash
