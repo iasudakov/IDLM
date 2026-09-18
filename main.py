@@ -12,6 +12,7 @@ import torch
 
 import algo
 import dataloader
+from evaluated_checkpoint import EvaluatedCheckpoint
 import model_assets
 import nirvana_snapshot
 import owt_pareto_plot
@@ -567,6 +568,12 @@ def _train(diffusion_model, config, logger, tokenizer):
     if snapshot:
       callbacks.append(SnapshotSync(snapshot_dir, enabled=True))
     _check_eval_window_monitors(config, callbacks)
+
+  if config.checkpointing.get('save_evaluated_checkpoints', False):
+    callbacks.append(EvaluatedCheckpoint(
+      os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
+      start_step=config.checkpointing.get('save_evaluated_from_step', 0),
+      snapshot_dir=snapshot_dir, snapshot=snapshot))
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)

@@ -682,3 +682,8 @@ checkpointing:
   # run.
   snapshot: true
   use_periodic_train_batch_checkpoint: false
+  # Keep one full checkpoint after each training validation (including NLL-only
+  # validations), from this inclusive optimizer/global step onward. Sanity
+  # checks and standalone evaluation do not save. Other savers are independent.
+  save_evaluated_checkpoints: false
+  save_evaluated_from_step: 0
