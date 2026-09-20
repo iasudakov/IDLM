@@ -220,6 +220,13 @@ adversarial_distill:
   # Independent of exclude_same_sentence, which already omits real-real.
   # Auto bandwidth still measures distances between real features.
   mmd_rbf_omit_real_real: false
+  # Omit the entire fake-fake contribution and skip its kernel sums.
+  # Reward = 2*RF - RR, or 2*RF if real-real is also omitted.
+  # This changes the objective by removing the generated-sample repulsion.
+  # Same supported RBF modes/distances as omit_real_real; masks, bandwidth,
+  # RF normalization and K/G scaling are unchanged. Also skips cross-sentence
+  # FF when exclude_same_sentence=true (that mode still requires K>=2).
+  mmd_rbf_omit_fake_fake: false
   # In draws+token RBF, exclude ALL fake-fake pairs from the same generated
   # sentence. Different draws keep every token pair, including equal positions.
   # With K draws and n scored positions, normalize fake-fake by K*(K-1)*n^2

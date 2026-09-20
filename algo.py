@@ -513,12 +513,18 @@ class MDLM(trainer_base.AbsorbingState):
       if rbf_omit_real_real and (kind != 'feature' or kernel != 'rbf'):
         raise ValueError('adversarial_distill.mmd_rbf_omit_real_real requires '
                          'mmd_reward_type=feature and mmd_kernel=rbf')
+      rbf_omit_fake_fake = (not feature_mse and bool(
+        cfg.get('mmd_rbf_omit_fake_fake', False)))
+      if rbf_omit_fake_fake and (kind != 'feature' or kernel != 'rbf'):
+        raise ValueError('adversarial_distill.mmd_rbf_omit_fake_fake requires '
+                         'mmd_reward_type=feature and mmd_kernel=rbf')
       if kernel == 'rbf' and kind == 'feature':
         mmd_reward.mmd_rbf.validate_distance(rbf_distance, rbf_huber_delta)
       rbf_description = (
         f'distance={rbf_distance}, huber_delta={rbf_huber_delta}, '
         f'exclude_same_sentence={rbf_exclude_same_sentence}, '
         f'omit_real_real={rbf_omit_real_real}, '
+        f'omit_fake_fake={rbf_omit_fake_fake}, '
         if kernel == 'rbf' else '')
       level = 'token' if feature_mse else str(cfg.get('mmd_kernel_level', 'token'))
       if level not in ('token', 'sentence'):
@@ -593,6 +599,7 @@ class MDLM(trainer_base.AbsorbingState):
       self._mmd_critic_cached.rbf_huber_delta = rbf_huber_delta
       self._mmd_critic_cached.rbf_exclude_same_sentence = rbf_exclude_same_sentence
       self._mmd_critic_cached.rbf_omit_real_real = rbf_omit_real_real
+      self._mmd_critic_cached.rbf_omit_fake_fake = rbf_omit_fake_fake
       self._mmd_critic_cached.rbf_block_size = int(
         cfg.get('mmd_rbf_block_size', 0) or 0)
       self._mmd_critic_cached.kernel_batch_size = max(
