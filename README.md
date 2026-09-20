@@ -380,6 +380,36 @@ group baseline, but per-candidate feature noise or automatic bandwidth
 subsampling can make those terms differ; equal training updates are not
 guaranteed merely by removing the term.
 
+To omit the entire fake-fake term from an RBF feature reward, add:
+
+```bash
+adversarial_distill.mmd_rbf_omit_fake_fake=True
+```
+
+With real-real retained, the reward becomes `2 * RF - RR`. To keep only the
+real-fake attraction, use both flags:
+
+```bash
+adversarial_distill.mmd_rbf_omit_real_real=True \
+adversarial_distill.mmd_rbf_omit_fake_fake=True
+```
+
+The reward is then `2 * RF`; the factor of two is preserved. Omitting FF changes
+the training objective by removing the term that discourages similarity
+between generated samples. The resulting objective is not full MMD squared.
+
+The new flag defaults to `False` and supports the same RBF modes and distances
+as `mmd_rbf_omit_real_real`. It skips FF kernel sums and their feature gradients,
+including the sentence-level K=1 self-term. Real-fake pairs, normalization,
+bandwidth selection, existing activity masks, sampling and K/G scaling stay
+unchanged. Automatic bandwidth still uses real-feature distances.
+`feature_mse` ignores the flag; active non-RBF and IDLM-ratio rewards reject it.
+
+With `mmd_rbf_exclude_same_sentence=True`, the flag also removes the remaining
+cross-sentence FF pairs. That mode already omits RR, so its reward becomes
+`2 * RF` regardless of the RR flag; its existing `K >= 2` requirement remains.
+You can leave `mmd_rbf_exclude_same_sentence=False` when omitting all FF pairs.
+
 For active feature rewards (`mmd_reward_type=feature`), token RBF can exclude
 pairs of tokens from the same generated sentence:
 

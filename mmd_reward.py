@@ -397,7 +397,7 @@ def median_alpha(feat, selected, max_samples=512, generator=None,
 
 def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0,
                         distance='squared_euclidean', huber_delta=0.001,
-                        omit_real_real=False):
+                        omit_real_real=False, omit_fake_fake=False):
   """`-MMD^2` per sequence under an exponential distance kernel.
 
   The linear-kernel reward compares the two feature sets by their MEANS, which
@@ -420,6 +420,8 @@ def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0,
 
   ``omit_real_real=True`` skips the entire real-real contribution without
   changing the fake-fake or real-fake normalization or the active mask.
+  ``omit_fake_fake=True`` independently skips the entire fake-fake term,
+  including diagonal subtraction, while retaining the real-fake factor of 2.
 
   Returns `(reward, active)`, matching the linear path.
   """
@@ -439,12 +441,18 @@ def rbf_sequence_reward(clean, generated, selected, alpha=None, block_size=0,
 
   s_xx, s_yy, s_xy = mmd_rbf.rbf_pair_sums(
     real, fake, weights, alpha, block_size=block_size,
-    distance=distance, huber_delta=huber_delta, omit_real_real=omit_real_real)
+    distance=distance, huber_delta=huber_delta, omit_real_real=omit_real_real,
+    omit_fake_fake=omit_fake_fake)
 
   safe_n = n.clamp_min(2.0)
   pairs = safe_n * (safe_n - 1.0)
   square = safe_n * safe_n
-  if omit_real_real:
+  if omit_fake_fake:
+    # Drop the entire normalized term, including its diagonal subtraction.
+    mmd2 = -2.0 * s_xy / square
+    if not omit_real_real:
+      mmd2 = (s_xx - safe_n) / pairs + mmd2
+  elif omit_real_real:
     mmd2 = (s_yy - safe_n) / pairs - 2.0 * s_xy / square
   else:
     mmd2 = ((s_xx - safe_n) / pairs
@@ -493,7 +501,7 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
                            sequence_mask=None,
                            distance='squared_euclidean', huber_delta=0.001,
                            exclude_same_sentence=False,
-                           omit_real_real=False):
+                           omit_real_real=False, omit_fake_fake=False):
   """One reward per sequence; rows selecting nothing score zero.
 
   `kernel='linear'` is the historical name for pooling both sides and scoring
@@ -514,6 +522,8 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
   """
   if omit_real_real and kernel != 'rbf':
     raise ValueError('mmd_rbf_omit_real_real requires mmd_kernel=rbf')
+  if omit_fake_fake and kernel != 'rbf':
+    raise ValueError('mmd_rbf_omit_fake_fake requires mmd_kernel=rbf')
   if exclude_same_sentence:
     raise ValueError('mmd_rbf_exclude_same_sentence requires '
                      'mmd_kernel_source=draws')
@@ -555,7 +565,8 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
   if kernel == 'rbf':
     reward, active = rbf_sequence_reward(
       clean, generated, selected, alpha=alpha, block_size=block_size,
-      distance=distance, huber_delta=huber_delta, omit_real_real=omit_real_real)
+      distance=distance, huber_delta=huber_delta, omit_real_real=omit_real_real,
+      omit_fake_fake=omit_fake_fake)
   elif kernel == 'cosine':
     # At sentence level the readout above happens BEFORE normalization.
     # At token level every scored token is a separate normalized sample.
@@ -584,7 +595,7 @@ def summed_paired_reward(features, batch, selected, indices, weights,
                          sequence_mask=None,
                          distance='squared_euclidean', huber_delta=0.001,
                          exclude_same_sentence=False, reward_type='feature',
-                         omit_real_real=False):
+                         omit_real_real=False, omit_fake_fake=False):
   """`R = sum_l w_l * R_l` over the requested blocks.
 
   Args:
@@ -618,7 +629,7 @@ def summed_paired_reward(features, batch, selected, indices, weights,
         stacked[:batch], stacked[batch:], selected, kernel=kernel,
         alpha=alpha, block_size=block_size, distance=distance,
         huber_delta=huber_delta, exclude_same_sentence=exclude_same_sentence,
-        omit_real_real=omit_real_real,
+        omit_real_real=omit_real_real, omit_fake_fake=omit_fake_fake,
         rows_of=rows_of, level=level,
         sentence_pooling=sentence_pooling, sequence_mask=sequence_mask)
     per_layer[index] = reward
@@ -716,7 +727,7 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
                              sentence_pooling='mean', sequence_mask=None,
                              distance='squared_euclidean', huber_delta=0.001,
                              exclude_same_sentence=False, reward_type='feature',
-                             omit_real_real=False):
+                             omit_real_real=False, omit_fake_fake=False):
   """Score K draws from each state as one feature distribution.
 
   ``features`` contains the clean batch followed by K generated batches.
@@ -743,6 +754,9 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
   ``omit_real_real=True`` separately drops only the RBF real-real term,
   retaining the existing fake-fake pairs, normalization and active mask. It
   supports both levels and K >= 1; the cross-sentence mode already omits it.
+  ``omit_fake_fake=True`` independently drops the entire RBF fake-fake term
+  at either level, including the K = 1 sentence fallback constant. It also
+  applies in cross-sentence mode without relaxing its K >= 2 constraint.
 
   ``reward_type='feature_mse'`` averages K aligned masked-token MSE rewards
   per original row, with no kernel or feature pooling.
@@ -759,6 +773,8 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
   if reward_type == 'feature':
     if omit_real_real and kernel != 'rbf':
       raise ValueError('mmd_rbf_omit_real_real requires mmd_kernel=rbf')
+    if omit_fake_fake and kernel != 'rbf':
+      raise ValueError('mmd_rbf_omit_fake_fake requires mmd_kernel=rbf')
     if level not in ('token', 'sentence'):
       raise ValueError(f'mmd_kernel_level must be token|sentence, got {level!r}')
     if kernel == 'pseudo_huber' and level != 'sentence':
@@ -815,7 +831,7 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
         mmd2 = mmd_rbf.rbf_mmd2_fixed_real(
           real_sentence, fake_sentence, layer_alpha,
           block_size=block_size, distance=distance, huber_delta=huber_delta,
-          omit_real_real=omit_real_real)
+          omit_real_real=omit_real_real, omit_fake_fake=omit_fake_fake)
       elif kernel == 'linear':
         mmd2 = linear_mmd2_fixed_real(real_sentence, fake_sentence)
       elif kernel == 'cosine':
@@ -843,12 +859,13 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
           # The single real sentence supplies only the real-fake term.
           mmd2, layer_active = mmd_rbf.rbf_mmd2_cross_sentence(
             real, fake_by_draw.permute(1, 0, 2, 3), selected, layer_alpha,
-            block_size=block_size, distance=distance, huber_delta=huber_delta)
+            block_size=block_size, distance=distance, huber_delta=huber_delta,
+            omit_fake_fake=omit_fake_fake)
         else:
           mmd2, layer_active = mmd_rbf.rbf_mmd2_unequal(
             real, fake, w_real, w_fake, layer_alpha, block_size=block_size,
             distance=distance, huber_delta=huber_delta,
-            omit_real_real=omit_real_real)
+            omit_real_real=omit_real_real, omit_fake_fake=omit_fake_fake)
         reward = -mmd2
       elif kernel == 'cosine':
         mmd2, layer_active = mmd_cosine.cosine_mmd2_unequal(
@@ -926,6 +943,7 @@ class _LayeredFeatures:
   rbf_huber_delta = 0.001
   rbf_exclude_same_sentence = False
   rbf_omit_real_real = False
+  rbf_omit_fake_fake = False
   rbf_block_size = 0
   kernel_batch_size = 1
   # Only the model forward is chunked. Kernel and reward calculations retain
@@ -1057,6 +1075,7 @@ class FrozenARFeatures(_LayeredFeatures):
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       exclude_same_sentence=self.rbf_exclude_same_sentence,
       omit_real_real=self.rbf_omit_real_real,
+      omit_fake_fake=self.rbf_omit_fake_fake,
       block_size=self.rbf_block_size, level=self.kernel_level,
       sentence_pooling=self.sentence_pooling,
       sequence_mask=(attention_mask if sequence_mask is None else sequence_mask))
@@ -1092,6 +1111,7 @@ class FrozenARFeatures(_LayeredFeatures):
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       exclude_same_sentence=self.rbf_exclude_same_sentence,
       omit_real_real=self.rbf_omit_real_real,
+      omit_fake_fake=self.rbf_omit_fake_fake,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
       level=self.kernel_level, sentence_pooling=self.sentence_pooling,
       sequence_mask=(attention_mask if sequence_mask is None else sequence_mask))
@@ -1479,6 +1499,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       exclude_same_sentence=self.rbf_exclude_same_sentence,
       omit_real_real=self.rbf_omit_real_real,
+      omit_fake_fake=self.rbf_omit_fake_fake,
       block_size=self.rbf_block_size, level=self.kernel_level,
       sentence_pooling=self.sentence_pooling, sequence_mask=sequence_mask)
     if return_per_layer:
@@ -1518,6 +1539,7 @@ class FrozenBackboneFeatures(_LayeredFeatures):
       distance=self.rbf_distance, huber_delta=self.rbf_huber_delta,
       exclude_same_sentence=self.rbf_exclude_same_sentence,
       omit_real_real=self.rbf_omit_real_real,
+      omit_fake_fake=self.rbf_omit_fake_fake,
       block_size=self.rbf_block_size, rows_of=self.kernel_batch_size,
       level=self.kernel_level, sentence_pooling=self.sentence_pooling,
       sequence_mask=sequence_mask)
