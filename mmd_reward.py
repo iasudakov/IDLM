@@ -21,6 +21,10 @@ pseudo-Huber distance-induced kernels. The last recovers the historical
 pseudo-Huber reward at K = 1. All MMD estimators retain negative estimates;
 their negated rewards can therefore be positive.
 
+The separate ``linear_l2`` kernel always scores negative MSE between empirical
+feature means, in fp32. It uses the biased/V-statistic form at every draw count,
+without the off-diagonal correction used by the sentence-level estimators above.
+
 Two things differ here from the OPDLM implementation, both forced by the model:
 
 * **No doubled row.** OPDLM stacks `[prompt|x0|x0]` against `[prompt|x0|x0_gen]` in one
@@ -234,6 +238,11 @@ def pseudo_huber_reward(feature_delta):
   delta = feature_delta.float()
   c = PSEUDO_HUBER_C
   return -(torch.sqrt(delta ** 2 + c ** 2) - c).mean(dim=-1)
+
+
+def mean_squared_reward(feature_delta):
+  """Negative MSE of pooled feature means, preserving leading axes, in fp32."""
+  return -feature_delta.float().square().mean(dim=-1)
 
 
 def pool_over_selected(features, selected):
@@ -456,6 +465,8 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
 
   `kernel='linear'` is the original: pool both sides and score the difference
   with pseudo-Huber. This historical robust score is not linear-kernel MMD^2.
+  `kernel='linear_l2'` uses the same pooling and scores negative MSE between
+  the empirical means, the biased/V-statistic normalized linear-kernel MMD.
   `kernel='rbf'` compares the two feature distributions instead. See
   `rbf_sequence_reward`.
 
@@ -516,12 +527,13 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
       clean, generated, selected, alpha=alpha, block_size=block_size,
       distance=distance, huber_delta=huber_delta, omit_real_real=omit_real_real,
       omit_fake_fake=omit_fake_fake)
-  elif kernel == 'linear':
+  elif kernel in ('linear', 'linear_l2'):
     delta, active = sequence_pooled_delta(clean, generated, selected)
-    reward = pseudo_huber_reward(delta)
+    reward = (mean_squared_reward(delta) if kernel == 'linear_l2'
+              else pseudo_huber_reward(delta))
     reward = torch.where(active, reward, torch.zeros_like(reward))
   else:
-    raise ValueError(f'mmd_kernel must be linear|rbf, got {kernel!r}')
+    raise ValueError(f'mmd_kernel must be linear|linear_l2|rbf, got {kernel!r}')
   if rows_of > 1:
     # Every sequence in a row carries that row's reward. The group baseline
     # then subtracts a per-row quantity from a per-row quantity, so the
@@ -668,13 +680,17 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
   features. ``level='sentence'`` first mean-pools every sequence over its own
   scored positions, yielding one fixed real vector and K fake vectors.
 
-  At sentence level all three kernels use the same estimator rule. K > 1 removes
-  fake self-pairs and is unbiased over draws conditional on the fixed real
-  vector; K = 1 uses the biased empirical estimate. The sentence-level linear
+  At sentence level linear, RBF and pseudo-Huber use the same estimator rule.
+  K > 1 removes fake self-pairs and is unbiased over draws conditional on the
+  fixed real vector; K = 1 uses the biased empirical estimate. The linear
   path is a normalized linear-kernel MMD rather than the historical
   pseudo-Huber transform used by paired/token rewards. The separate
   ``pseudo_huber`` kernel uses the distance-induced estimator and recovers the
   historical reward at K = 1.
+
+  ``linear_l2`` scores negative MSE between the empirical real and fake means
+  at either level, in fp32. It is the biased/V-statistic form for every K,
+  with no fake variance correction and no aligned-token comparison.
 
   With RBF token kernels, ``exclude_same_sentence=True`` keeps only
   cross-draw fake-fake token pairs and omits the real-real term. It requires
@@ -761,10 +777,13 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
           omit_real_real=omit_real_real, omit_fake_fake=omit_fake_fake)
       elif kernel == 'linear':
         mmd2 = linear_mmd2_fixed_real(real_sentence, fake_sentence)
+      elif kernel == 'linear_l2':
+        mmd2 = -mean_squared_reward(
+          fake_sentence.mean(dim=1) - real_sentence)
       elif kernel == 'pseudo_huber':
         mmd2 = pseudo_huber_mmd2_fixed_real(real_sentence, fake_sentence)
       else:
-        raise ValueError('mmd_kernel must be linear|rbf|pseudo_huber, got '
+        raise ValueError('mmd_kernel must be linear|linear_l2|rbf|pseudo_huber, got '
                          f'{kernel!r}')
       reward = torch.where(layer_active, -mmd2, torch.zeros_like(mmd2))
     else:
@@ -793,13 +812,15 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
             omit_real_real=omit_real_real, omit_fake_fake=omit_fake_fake)
         # Keep negative U-statistics, just as in the sentence-level path.
         reward = -mmd2
-      elif kernel == 'linear':
+      elif kernel in ('linear', 'linear_l2'):
         real_mean, layer_active = pool_over_selected(real, selected)
         fake_mean, _ = pool_over_selected(fake, w_fake.bool())
-        reward = pseudo_huber_reward(fake_mean - real_mean)
+        delta = fake_mean - real_mean
+        reward = (mean_squared_reward(delta) if kernel == 'linear_l2'
+                  else pseudo_huber_reward(delta))
         reward = torch.where(layer_active, reward, torch.zeros_like(reward))
       else:
-        raise ValueError(f'mmd_kernel must be linear|rbf, got {kernel!r}')
+        raise ValueError(f'mmd_kernel must be linear|linear_l2|rbf, got {kernel!r}')
 
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight

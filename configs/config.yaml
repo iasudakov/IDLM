@@ -33,6 +33,8 @@ adversarial_distill:
   # closing the feature gap. Historical token/rows modes use pseudo-Huber;
   # `mmd_kernel_source=draws` plus `mmd_kernel_level=sentence` uses the explicit
   # linear, RBF or pseudo-Huber distance-induced MMD estimator documented below.
+  # The optional linear_l2 kernel scores MSE between empirical feature means
+  # in every token/sentence and rows/draws mode.
   # Optimized by REINFORCE over `mmd_group_size` samples drawn at the same
   # state. Groups of at least two use a leave-one-out baseline; a group of one
   # uses the separately configured fallback. See `mmd_reward.py`.
@@ -133,6 +135,13 @@ adversarial_distill:
   #             the difference with pseudo-Huber. `draws + sentence` instead
   #             uses the actual normalized linear-kernel MMD: MSE between means,
   #             with the fake-sample variance correction when K > 1.
+  #   linear_l2 -- negative MSE between empirical real/generated feature means:
+  #             -mean_d((mean_real[d] - mean_generated[d])^2), in FP32.
+  #             Requires mmd_reward_type=feature. Supports rows/draws and
+  #             token/sentence at K=1 or K>1, with existing masks, pooling and
+  #             weighted per-layer sums. This is the biased/V-statistic form,
+  #             with no off-diagonal U-statistic or fake variance correction.
+  #             It compares means, not the aligned-token MSE of feature_mse.
   #   rbf    -- Gaussian-kernel MMD^2 over the token or sentence feature
   #             distributions selected below. Estimates are never clipped;
   #             negative U-statistics produce positive rewards.
@@ -147,8 +156,8 @@ adversarial_distill:
   #             The coordinate-additive distance need not distinguish joint
   #             distributions that differ only in feature dependencies.
   #
-  # At token level, both kernels ignore token order. The historical linear
-  # score sees only the pooled means; RBF also detects distribution changes
+  # At token level, these kernels ignore token order. Both linear and linear_l2
+  # see only the pooled means; RBF also detects distribution changes
   # that preserve the mean. An RBF U-statistic can be negative even when the
   # empirical feature sets are identical, producing a positive reward.
   #
@@ -164,8 +173,9 @@ adversarial_distill:
   #               then hand the kernel the row's `mmd_kernel_batch_size`
   #               sentence vectors. The distribution matched is over SENTENCES.
   #
-  # In `rows` mode, linear token/sentence levels agree whenever the sequences in
-  # a row carry equal scored counts -- a mean of means is then the pooled mean.
+  # In `rows` mode, linear/linear_l2 token/sentence levels agree whenever the
+  # sequences in a row carry equal scored counts -- a mean of means is then
+  # the pooled mean.
   # Beyond that they differ in weighting: token pooling weights a sequence by
   # how much of it was written, sentence level weights every sequence alike.
   # Sentence-level RBF in rows mode still needs K >= 2, because both empirical
@@ -177,6 +187,8 @@ adversarial_distill:
   # the observed real embedding treated as fixed. K = 1 uses the biased
   # empirical estimate because no off-diagonal fake pair exists. Unlike rows
   # mode, sentence-level RBF is therefore valid at K = 1.
+  # linear_l2 always compares the real embedding with the mean of K fake
+  # embeddings using MSE, including K > 1, without a variance correction.
   mmd_kernel_level: token
   # What fills the kernel batch selected by `mmd_kernel_batch_size`.
   #   rows  -- adjacent device-batch rows. They have different questions and

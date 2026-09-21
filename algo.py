@@ -501,9 +501,12 @@ class MDLM(trainer_base.AbsorbingState):
       # Aligned MSE has no kernel, bandwidth or sentence readout. Normalize
       # unused settings so an existing MMD command can switch only reward type.
       kernel = 'linear' if feature_mse else str(cfg.get('mmd_kernel', 'linear'))
-      if kernel not in ('linear', 'rbf', 'pseudo_huber'):
+      if kernel not in ('linear', 'linear_l2', 'rbf', 'pseudo_huber'):
         raise ValueError('adversarial_distill.mmd_kernel must be '
-                         f'linear|rbf|pseudo_huber, got {kernel!r}')
+                         f'linear|linear_l2|rbf|pseudo_huber, got {kernel!r}')
+      if kernel == 'linear_l2' and kind != 'feature':
+        raise ValueError('adversarial_distill.mmd_kernel=linear_l2 requires '
+                         'mmd_reward_type=feature')
       rbf_distance = str(cfg.get('mmd_rbf_distance', 'squared_euclidean'))
       rbf_huber_delta = cfg.get('mmd_rbf_huber_delta', 0.001)
       rbf_exclude_same_sentence = (not feature_mse and bool(
