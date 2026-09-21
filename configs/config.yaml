@@ -136,6 +136,13 @@ adversarial_distill:
   #             difference with pseudo-Huber. `draws + sentence` instead uses
   #             the actual normalized linear-kernel MMD: MSE between means,
   #             with the fake-sample variance correction when K > 1.
+  #   linear_l2 -- negative MSE between real and generated mean feature vectors,
+  #             computed in fp32 after pooling. Supports rows/draws and both
+  #             token/sentence levels; draws are averaged before squaring.
+  #             Biased/V-statistic form, with no variance correction at K > 1.
+  #             Compares pooled means; feature_mse instead compares aligned
+  #             token features individually.
+  #             Requires mmd_reward_type: feature; supports AR and diffusion.
   #   rbf    -- Gaussian-kernel MMD^2 over the token or sentence feature
   #             distributions selected below. Sensitive to more than the mean,
   #             which is the point given the probe's finding that the linear
@@ -167,18 +174,20 @@ adversarial_distill:
   #   sentence -- read one feature vector per sequence using
   #               `mmd_sentence_pooling`, then apply the kernel to those vectors.
   #
-  # With mean pooling in `rows` mode, linear token/sentence levels agree when
-  # every sequence in a row has the same scored count; otherwise token pooling
+  # With mean pooling in `rows` mode, linear/linear_l2 token/sentence levels agree
+  # when every sequence in a row has the same scored count; otherwise token pooling
   # weights a sequence by how much was scored while sentence pooling weights every
   # sequence alike. Sentence-level RBF/cosine in rows mode need K >= 2 because
   # both empirical sides contain K independently observed batch rows.
   #
   # In `draws` mode, sentence level produces one pooled REAL embedding and K
-  # independently pooled FAKE embeddings for each state. For all four
-  # kernels, K > 1 removes fake self-pairs: the estimator is unbiased over fake
+  # independently pooled FAKE embeddings for each state. For linear, RBF,
+  # cosine and pseudo_huber, K > 1 removes fake self-pairs: it is unbiased over fake
   # draws with the observed real embedding treated as fixed. K = 1 uses the
   # biased empirical estimate because no off-diagonal fake pair exists.
   # Unlike rows mode, sentence-level RBF/cosine are therefore valid at K = 1.
+  # linear_l2 always compares the real vector with the mean of K fake vectors
+  # using MSE, with no variance correction even at K > 1.
   mmd_kernel_level: token
   # Sentence representation (`mmd_kernel_level: sentence`):
   #   mean       -- average over `mmd_score_positions` (historical default).

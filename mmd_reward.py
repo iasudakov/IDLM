@@ -22,6 +22,10 @@ it is exactly the pseudo-Huber distance above, and at K > 1 it subtracts the
 fake-pair distance correction. Historical linear token/rows paths retain the
 pseudo-Huber behaviour above.
 
+The ``linear_l2`` kernel instead uses the negative MSE between the real and
+generated empirical means of the configured token features or sentence readouts.
+It averages all K generated draws before squaring, with no variance correction.
+
 The optional ``cosine`` kernel computes true dot-product MMD on L2-normalized
 token features or sentence readouts. It has no pseudo-Huber transform and no
 extra hidden-dimension average; off-diagonal and loss reduction rules remain
@@ -247,6 +251,11 @@ def pseudo_huber_reward(feature_delta):
   delta = feature_delta.float()
   c = PSEUDO_HUBER_C
   return -(torch.sqrt(delta ** 2 + c ** 2) - c).mean(dim=-1)
+
+
+def mean_squared_reward(feature_delta):
+  """Negative coordinate-averaged squared difference, in fp32."""
+  return -feature_delta.float().square().mean(dim=-1)
 
 
 def pool_over_selected(features, selected):
@@ -506,6 +515,7 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
 
   `kernel='linear'` is the historical name for pooling both sides and scoring
   the difference with pseudo-Huber; it is not the squared linear-kernel MMD.
+  `kernel='linear_l2'` uses the negative MSE between those pooled mean vectors.
   `kernel='rbf'` compares the two feature distributions instead. See
   `rbf_sequence_reward`. `kernel='cosine'` uses true linear-kernel MMD on
   individually L2-normalized feature vectors, with self-pairs removed.
@@ -573,12 +583,13 @@ def paired_sequence_reward(clean, generated, selected, kernel='linear',
     mmd2, active = mmd_cosine.cosine_mmd2_unequal(
       clean, generated, selected, selected)
     reward = -mmd2
-  elif kernel == 'linear':
+  elif kernel in ('linear', 'linear_l2'):
     delta, active = sequence_pooled_delta(clean, generated, selected)
-    reward = pseudo_huber_reward(delta)
+    reward = (mean_squared_reward(delta) if kernel == 'linear_l2' else
+              pseudo_huber_reward(delta))
     reward = torch.where(active, reward, torch.zeros_like(reward))
   else:
-    raise ValueError(f'mmd_kernel must be linear|rbf|cosine, got {kernel!r}')
+    raise ValueError(f'mmd_kernel must be linear|linear_l2|rbf|cosine, got {kernel!r}')
   if rows_of > 1:
     # Every sequence in a row carries that row's reward. The group baseline
     # then subtracts a per-row quantity from a per-row quantity, so the
@@ -736,15 +747,19 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
   features. ``level='sentence'`` reads every sequence using ``sentence_pooling``
   (a scored-position mean by default), yielding one fixed real and K fake vectors.
 
-  At sentence level all four kernels use the same estimator rule. K > 1 removes
-  fake self-pairs and is unbiased over draws conditional on the fixed real
-  vector; K = 1 uses the biased empirical estimate. The sentence-level linear
+  At sentence level linear, RBF, cosine and pseudo-Huber use the same estimator
+  rule. K > 1 removes fake self-pairs and is unbiased over draws conditional on
+  the fixed real vector; K = 1 uses the biased empirical estimate. The linear
   path is a normalized linear-kernel MMD rather than the historical
   pseudo-Huber transform used by paired/token rewards. ``pseudo_huber`` uses
   the distance-induced kernel, preserving that historical reward at K = 1.
   ``cosine`` normalizes each sentence readout (or each token at token level)
   to unit L2 norm and uses dot products, with no hidden-dimension averaging
   and no pseudo-Huber transform.
+
+  ``linear_l2`` scores negative MSE between the empirical real and fake means
+  at either level, in fp32. It has no fake variance correction at any K and
+  compares pooled means rather than individually aligned token features.
 
   With RBF token kernels, ``exclude_same_sentence=True`` keeps only
   cross-draw fake-fake token pairs and omits the real-real term. It requires
@@ -834,12 +849,16 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
           omit_real_real=omit_real_real, omit_fake_fake=omit_fake_fake)
       elif kernel == 'linear':
         mmd2 = linear_mmd2_fixed_real(real_sentence, fake_sentence)
+      elif kernel == 'linear_l2':
+        # Compare empirical means directly, including at K > 1. Unlike the
+        # legacy linear estimator, this has no fake-sample variance correction.
+        mmd2 = -mean_squared_reward(fake_sentence.mean(dim=1) - real_sentence)
       elif kernel == 'cosine':
         mmd2 = mmd_cosine.cosine_mmd2_fixed_real(real_sentence, fake_sentence)
       elif kernel == 'pseudo_huber':
         mmd2 = pseudo_huber_mmd2_fixed_real(real_sentence, fake_sentence)
       else:
-        raise ValueError('mmd_kernel must be linear|rbf|cosine|pseudo_huber, got '
+        raise ValueError('mmd_kernel must be linear|linear_l2|rbf|cosine|pseudo_huber, got '
                          f'{kernel!r}')
       reward = torch.where(layer_active, -mmd2, torch.zeros_like(mmd2))
     else:
@@ -871,13 +890,15 @@ def summed_multi_draw_reward(features, batch, draw_count, length, selected,
         mmd2, layer_active = mmd_cosine.cosine_mmd2_unequal(
           real, fake, w_real, w_fake)
         reward = -mmd2
-      elif kernel == 'linear':
+      elif kernel in ('linear', 'linear_l2'):
         real_mean, layer_active = pool_over_selected(real, selected)
         fake_mean, _ = pool_over_selected(fake, w_fake.bool())
-        reward = pseudo_huber_reward(fake_mean - real_mean)
+        delta = fake_mean - real_mean
+        reward = (mean_squared_reward(delta) if kernel == 'linear_l2' else
+                  pseudo_huber_reward(delta))
         reward = torch.where(layer_active, reward, torch.zeros_like(reward))
       else:
-        raise ValueError(f'mmd_kernel must be linear|rbf|cosine, got {kernel!r}')
+        raise ValueError(f'mmd_kernel must be linear|linear_l2|rbf|cosine, got {kernel!r}')
 
     per_layer[index] = reward
     total = reward * weight if total is None else total + reward * weight

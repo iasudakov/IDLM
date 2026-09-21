@@ -932,9 +932,12 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
       # Aligned MSE has no kernel, bandwidth or sentence readout. Normalize
       # unused settings so an existing MMD command can switch only reward type.
       kernel = 'linear' if feature_mse else str(cfg.get('mmd_kernel', 'linear'))
-      if kernel not in ('linear', 'rbf', 'cosine', 'pseudo_huber'):
+      if kernel not in ('linear', 'linear_l2', 'rbf', 'cosine', 'pseudo_huber'):
         raise ValueError('adversarial_distill.mmd_kernel must be '
-                         f'linear|rbf|cosine|pseudo_huber, got {kernel!r}')
+                         f'linear|linear_l2|rbf|cosine|pseudo_huber, got {kernel!r}')
+      if kernel == 'linear_l2' and kind != 'feature':
+        raise ValueError('adversarial_distill.mmd_kernel=linear_l2 requires '
+                         'mmd_reward_type=feature')
       if kernel == 'cosine' and kind != 'feature':
         raise ValueError('adversarial_distill.mmd_kernel=cosine requires '
                          'mmd_reward_type=feature')
