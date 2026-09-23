@@ -511,6 +511,8 @@ class MDLM(trainer_base.AbsorbingState):
       rbf_huber_delta = cfg.get('mmd_rbf_huber_delta', 0.001)
       rbf_exclude_same_sentence = (not feature_mse and bool(
         cfg.get('mmd_rbf_exclude_same_sentence', False)))
+      rbf_exclude_same_position = (not feature_mse and bool(
+        cfg.get('mmd_rbf_exclude_same_position', False)))
       rbf_omit_real_real = (not feature_mse and bool(
         cfg.get('mmd_rbf_omit_real_real', False)))
       if rbf_omit_real_real and (kind != 'feature' or kernel != 'rbf'):
@@ -526,6 +528,7 @@ class MDLM(trainer_base.AbsorbingState):
       rbf_description = (
         f'distance={rbf_distance}, huber_delta={rbf_huber_delta}, '
         f'exclude_same_sentence={rbf_exclude_same_sentence}, '
+        f'exclude_same_position={rbf_exclude_same_position}, '
         f'omit_real_real={rbf_omit_real_real}, '
         f'omit_fake_fake={rbf_omit_fake_fake}, '
         if kernel == 'rbf' else '')
@@ -537,6 +540,15 @@ class MDLM(trainer_base.AbsorbingState):
       if kernel_source not in ('rows', 'draws'):
         raise ValueError('adversarial_distill.mmd_kernel_source must be '
                          f'rows|draws, got {kernel_source!r}')
+      if rbf_exclude_same_position:
+        if (kind != 'feature' or kernel != 'rbf' or kernel_source != 'draws'
+            or level != 'token' or not rbf_exclude_same_sentence
+            or int(cfg.get('mmd_kernel_batch_size', 1) or 1) < 2):
+          raise ValueError('adversarial_distill.mmd_rbf_exclude_same_position requires '
+                           'mmd_reward_type=feature, mmd_kernel=rbf, '
+                           'mmd_kernel_source=draws, mmd_kernel_level=token, '
+                           'mmd_kernel_batch_size >= 2 and '
+                           'mmd_rbf_exclude_same_sentence=True')
       if rbf_exclude_same_sentence:
         if (kind != 'feature' or kernel != 'rbf' or kernel_source != 'draws'
             or level != 'token'):
@@ -601,6 +613,7 @@ class MDLM(trainer_base.AbsorbingState):
       self._mmd_critic_cached.rbf_distance = rbf_distance
       self._mmd_critic_cached.rbf_huber_delta = rbf_huber_delta
       self._mmd_critic_cached.rbf_exclude_same_sentence = rbf_exclude_same_sentence
+      self._mmd_critic_cached.rbf_exclude_same_position = rbf_exclude_same_position
       self._mmd_critic_cached.rbf_omit_real_real = rbf_omit_real_real
       self._mmd_critic_cached.rbf_omit_fake_fake = rbf_omit_fake_fake
       self._mmd_critic_cached.rbf_block_size = int(

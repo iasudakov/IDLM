@@ -425,7 +425,7 @@ def rbf_mmd2_fixed_real(real, fake, alpha, block_size: int = 0,
 @torch.no_grad()
 def rbf_mmd2_cross_sentence(real, fake, selected, alpha, block_size=0,
                             distance='squared_euclidean', huber_delta=0.001,
-                            omit_fake_fake=False):
+                            omit_fake_fake=False, exclude_same_position=False):
     """Cross-sentence token-kernel statistic with no reference self-term.
 
     real is (batch, length, hidden), fake is
@@ -436,7 +436,7 @@ def rbf_mmd2_cross_sentence(real, fake, selected, alpha, block_size=0,
         - 2 sum_r sum_{i,j} k(x_i, y_rj) / (K n**2).
 
     All pairs of tokens within the same generated sentence are excluded;
-    matching positions in different sentences are retained. The reference
+    by default matching positions in different sentences are retained. The reference
     sentence's entire real-real term is deliberately omitted. This is a
     signed training statistic, not the complete nonnegative population MMD^2.
     The fake-fake term is unbiased over independent sentence draws conditional
@@ -445,6 +445,9 @@ def rbf_mmd2_cross_sentence(real, fake, selected, alpha, block_size=0,
 
     Sentence pairs and token tiles are traversed separately, so excluded
     within-sentence blocks are never computed or materialized.
+    With ``exclude_same_position=True``, fake-fake pairs also require i != j,
+    with denominator K*(K-1)*n*(n-1). Real-fake pairs and their K*n**2
+    denominator are unchanged. At least two scored positions are then required.
     `omit_fake_fake=True` also skips all remaining fake-fake blocks and removes
     their entire term. The K >= 2 requirement and active-row rule still apply.
     """
@@ -486,7 +489,7 @@ def rbf_mmd2_cross_sentence(real, fake, selected, alpha, block_size=0,
         real2, fake2 = _sq_norms(real), _sq_norms(fake)
     spans = _blocks(length, block)
 
-    def pair_sum(left, right, left2, right2):
+    def pair_sum(left, right, left2, right2, exclude_matching_positions=False):
         total = real.new_zeros(rows)
         for i0, i1 in spans:
             for j0, j1 in spans:
@@ -498,6 +501,8 @@ def rbf_mmd2_cross_sentence(real, fake, selected, alpha, block_size=0,
                     kernel = _kernel_block(
                         left[:, i0:i1], right[:, j0:j1],
                         left2[:, i0:i1], right2[:, j0:j1], alpha)
+                if exclude_matching_positions and i0 == j0:
+                    kernel.diagonal(dim1=1, dim2=2).zero_()
                 total.add_(_wKw(kernel, weight[:, i0:i1], weight[:, j0:j1]))
         return total
 
@@ -510,12 +515,14 @@ def rbf_mmd2_cross_sentence(real, fake, selected, alpha, block_size=0,
                 for right in range(left + 1, draws):
                     right2 = None if fake2 is None else fake2[:, right]
                     fake_sum.add_(
-                        pair_sum(fake[:, left], fake[:, right], left2, right2),
+                        pair_sum(fake[:, left], fake[:, right], left2, right2,
+                                 exclude_matching_positions=exclude_same_position),
                         alpha=2.0)
     count = weight.sum(dim=1)
-    active = count >= 1
+    active = count >= (2 if exclude_same_position else 1)
     nn = count.square()
-    statistic = (fake_sum / (draws * (draws - 1) * nn).clamp_min(1.0)
+    fake_pairs = count * (count - 1) if exclude_same_position else nn
+    statistic = (fake_sum / (draws * (draws - 1) * fake_pairs).clamp_min(1.0)
                  - 2.0 * cross_sum / (draws * nn).clamp_min(1.0))
     return torch.where(active, statistic, torch.zeros_like(statistic)), active
 

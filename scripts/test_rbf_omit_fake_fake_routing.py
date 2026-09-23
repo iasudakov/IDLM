@@ -125,14 +125,15 @@ class OmitFakeFakeRoutingTests(unittest.TestCase):
         return dense_reward(real, fake, self.selected, alpha=self.alpha,
                             delta=self.delta, **kwargs)
 
-    def test_flag_is_last_optional_argument_with_false_default(self):
+    def test_flag_keeps_optional_argument_order_and_false_default(self):
         for helper in (mmd_reward.rbf_sequence_reward,
                        mmd_reward.paired_sequence_reward,
                        mmd_reward.summed_paired_reward,
                        mmd_reward.summed_multi_draw_reward):
             params = list(inspect.signature(helper).parameters.values())
-            self.assertEqual(params[-1].name, 'omit_fake_fake')
-            self.assertIs(params[-1].default, False)
+            position = [param.name for param in params].index('omit_fake_fake')
+            self.assertEqual(params[position - 1].name, 'omit_real_real')
+            self.assertIs(params[position].default, False)
         self.assertIs(mmd_reward._LayeredFeatures.rbf_omit_fake_fake, False)
 
     def test_rows_token_sentence_distances_both_rr_states_and_weighted_layers(self):
