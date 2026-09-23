@@ -265,6 +265,14 @@ adversarial_distill:
   # Both squared_euclidean and pseudo_huber distances are supported.
   # False preserves the historical token-diagonal-only estimator.
   mmd_rbf_exclude_same_sentence: false
+  # Additionally exclude equal token positions (i=j) from cross-draw fake-fake
+  # pairs: keep only r!=s AND i!=j. Requires the cross-sentence mode above
+  # (feature + rbf + draws + token, exclude_same_sentence=true, K>=2).
+  # Fake-fake denominator is K*(K-1)*n*(n-1); rows with n<2 are inactive.
+  # Real-fake still uses ALL i,j and denominator K*n^2. No feature pooling.
+  # Both RBF distances and omit_fake_fake are supported; n>=2 still required.
+  # Automatic bandwidth still uses the existing real-token distance median.
+  mmd_rbf_exclude_same_position: false
   # Kernel sample count K. Its meaning depends on `mmd_kernel_source`:
   #   rows  -- K adjacent device-batch sequences are matched as a group and
   #            share one reward. K must divide the per-device batch size.

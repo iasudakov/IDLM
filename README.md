@@ -437,6 +437,34 @@ The reference-reference term is omitted, so the raw statistic is not the
 full MMD squared. Negative values are retained. This option works with both RBF distances,
 `squared_euclidean` and `pseudo_huber`.
 
+To additionally **exclude matching-position fake-fake pairs** (`i=j`) between
+different draws, add this override to the cross-sentence configuration above:
+
+```bash
+adversarial_distill.mmd_rbf_exclude_same_position=True
+```
+
+This flag defaults to `False` and requires `mmd_rbf_exclude_same_sentence=True`,
+`mmd_kernel=rbf`, `mmd_kernel_source=draws`, `mmd_kernel_level=token`, and `K >= 2`
+with the feature reward. For reference features `x_i` and generated features
+`y_{r,i}`, the statistic becomes
+
+```text
+T = sum_{r != s} sum_{i != j} k(y_{r,i}, y_{s,j}) / (K * (K-1) * n * (n-1))
+    - 2 * sum_r sum_{i,j} k(x_i, y_{r,j}) / (K * n^2).
+```
+
+The reward is `-T`. Fake-fake comparisons now require both different draws and
+different positions. Real-fake comparisons still include every selected position
+pair, including equal positions. Raw token features are not pooled before RBF.
+The reference-only term remains omitted, and the existing masks, layer weights
+and policy-gradient scaling are preserved. At least two selected positions are
+required; rows with fewer receive zero reward and are inactive. Both RBF
+distances and `mmd_rbf_omit_fake_fake` are supported; the two-position minimum
+still applies when omitting fake-fake altogether.
+Automatic bandwidth, if selected with `mmd_rbf_alpha=null`, still uses the
+existing real-token distance median; this flag does not recalibrate it.
+
 To use cosine similarity as the MMD kernel, change only the kernel in your
 feature-reward command (keep its existing source, level, K, G and pooling):
 
