@@ -57,6 +57,9 @@ def _checkpoint_files(model_id, revision, local_path, local_files_only):
   if not model_id or not revision:
     raise ValueError('SDTT feature checkpoint needs an explicit model ID and revision')
   from huggingface_hub import hf_hub_download
+  print(f'[mmd-sdtt] Resolving {model_id}@{revision} in the Hugging Face cache'
+        + (' (offline)' if local_files_only else '; missing files will be downloaded'),
+        flush=True)
   kwargs = dict(repo_id=model_id, revision=revision,
                 local_files_only=bool(local_files_only))
   config_path = Path(hf_hub_download(filename='config.json', **kwargs))

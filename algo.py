@@ -638,6 +638,14 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         utils.freeze_model(self.fake_model)
       self._sync_noise_schedule()
     super().on_train_start()
+    cfg = self.config.adversarial_distill
+    if (self.is_adversarial_distill
+        and cfg.get('mmd_feature_source', 'ar') == 'sdtt_mdlm'
+        and cfg.get('mmd_reward_weight', 0.0)
+        and cfg.get('mmd_reward_type', 'feature') in ('feature', 'feature_mse')):
+      # Resolve/download the external teacher before the first training batch.
+      # HF cache file locks coordinate concurrent DDP ranks; no extra barrier.
+      _ = self._mmd_critic
 
   def _sync_noise_schedule(self):
     """Point the injection's warmup ramp at the current global step.

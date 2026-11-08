@@ -25,18 +25,25 @@ pretraining updates. No SDTT package, training checkpoint paths from its
 config, or remote Python model code is imported.
 
 ```bash
-python scripts/download_sdtt_teacher.py --output-dir /path/to/sdtt-large
-
-SDTT_MODEL_DIR=/path/to/sdtt-large \
-  bash scripts/train_mmd_owt_sdtt_large.sh
+bash scripts/train_mmd_owt_sdtt_large.sh
 ```
 
-`SDTT_MODEL_DIR` enables local-only loading and fails if either file is
-missing. The download helper uses one resolved Hub snapshot and records
-file SHA256 hashes in `sdtt_provenance.json`. Online loading can instead use
-the declared Hub revision directly. Pin `mmd_sdtt_revision` to an immutable
-Hub commit for a repeatable online run. The loader records the resolved
-commit when available and the config hash.
+At training startup, before the first training batch, the model automatically
+downloads missing `config.json` and `model.safetensors` from the declared
+teacher revision. No manual download or `SDTT_MODEL_DIR` is required. Files
+are kept in the standard Hugging Face cache (`HF_HOME`/`HF_HUB_CACHE` can
+change its location); repeat launches reuse cached weights. DDP processes
+share the Hub's cache file locks. Download failures stop the run before
+training updates. Existing `ar`/`diffusion` and disabled-reward paths do not
+prepare or download SDTT. Config-only runs (`--cfg job`) do not download it.
+
+`SDTT_MODEL_DIR` remains an explicit local-only override and fails if either
+file is missing. Optional manual preparation is also available through
+`python scripts/download_sdtt_teacher.py --output-dir /path/to/sdtt-large`;
+that helper records file SHA256 hashes in `sdtt_provenance.json`.
+Pin `mmd_sdtt_revision` to an immutable Hub commit for a repeatable online
+run. The loader pins weights to the config's resolved commit when available
+and records that commit and the config hash.
 
 The supplied launcher recreates the frozen recipe. Defaults are8 GPUs,
 local batch8, accumulation8, global batch512, eval5seeds/128examples each.
@@ -46,7 +53,7 @@ partitions. `MODEL_WEIGHTS_DIR=/path/to/owt_mmd_offline_bundle` optionally
 resolves the original student, tokenizer and PPL evaluator offline.
 
 ```bash
-SDTT_MODEL_DIR=/path/to/sdtt-large TRAIN_DEVICES=4 FEATURE_LAYER=11 \
+TRAIN_DEVICES=4 FEATURE_LAYER=11 \
   bash scripts/train_mmd_owt_sdtt_large.sh
 ```
 
