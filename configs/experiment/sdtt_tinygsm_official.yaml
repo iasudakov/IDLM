@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - sdtt_tinygsm
+  - _self_
+
+# Preserve the official seven rounds x 10k updates. All TinyGSM data,
+# optimizer and evaluation settings remain those of the matched preset.
+algo:
+  grow_dt_every: 10000
+trainer:
+  max_steps: 70000

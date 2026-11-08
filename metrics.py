@@ -257,11 +257,8 @@ class Metrics:
     self.gm = (GradientMoment(gm_eval_model_name_or_path)
                if compute_gm else None)
     self.gen_ppl_eval_model_name_or_path = gen_ppl_eval_model_name_or_path
-    self.tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(gen_ppl_eval_model_name_or_path)
-    if self.tokenizer.pad_token is None:
-      self.tokenizer.pad_token = self.tokenizer.eos_token
-      self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+    # GSM8K execution accuracy does not use a generative-PPL tokenizer.
+    self.tokenizer = None
 
   def to(self, *args, **kwargs):
     self.gen_ppl = self.gen_ppl.to(*args, **kwargs)
@@ -306,6 +303,12 @@ class Metrics:
         attn_mask: Attention mask for the eval model
         eval_context_size: Size of the context for the eval model
     """
+    if self.tokenizer is None:
+      self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+        self.gen_ppl_eval_model_name_or_path)
+      if self.tokenizer.pad_token is None:
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
     if 'llama2' in self.gen_ppl_eval_model_name_or_path:
       tokenizer_kwargs = {
         'text_samples': text_samples,

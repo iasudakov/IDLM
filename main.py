@@ -60,6 +60,11 @@ class PeriodicStepCheckpoint(L.Callback):
 
 
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
+  if config.algo.name == 'sdtt':
+    model = diffusion_model(config, tokenizer=tokenizer, inference_only=True)
+    model.load_evaluation_weights(config.eval.checkpoint_path,
+                                  use_ema=not config.eval.disable_ema)
+    return model.to('cuda')
   if 'hf' in config.algo.backbone:
     model = diffusion_model(config, tokenizer=tokenizer).to('cuda')
     return model
@@ -192,6 +197,12 @@ def _generate_samples(diffusion_model, config, logger,
     diffusion_model=diffusion_model,
     config=config,
     tokenizer=tokenizer)
+  if config.algo.name == 'sdtt' and config.data.train == 'tiny_gsm':
+    from sdtt_eval import evaluate
+    model._eval_mode()
+    with torch.inference_mode():
+      evaluate(model, config)
+    return
   model.metrics.gen_ppl.reset()
   model.metrics.sample_entropy.reset()
   model.metrics.pred_entropy.reset()
@@ -362,7 +373,13 @@ def _train(diffusion_model, config, logger, tokenizer):
     config, tokenizer)
   _print_batch(train_ds, valid_ds, tokenizer)
 
-  if config.training.finetune_path != '':
+  if config.algo.name == 'sdtt':
+    model = diffusion_model(config, tokenizer=tokenizer)
+    if ckpt_path is None:
+      if not config.training.finetune_path:
+        raise ValueError('SDTT requires training.finetune_path for its MDLM teacher.')
+      model.initialize_from_checkpoint(config.training.finetune_path)
+  elif config.training.finetune_path != '':
     assert utils.fsspec_exists(config.training.finetune_path)
     model = diffusion_model.load_from_checkpoint(
       config.training.finetune_path,
@@ -393,6 +410,9 @@ def main(config):
   tokenizer = dataloader.get_tokenizer(config)
   if config.algo.name == 'ar':
     diffusion_model = algo.AR
+  elif config.algo.name == 'sdtt':
+    from sdtt import SDTT
+    diffusion_model = SDTT
   elif config.algo.name == 'mdlm':
     diffusion_model = algo.MDLM_with_AR
   elif config.algo.name == 'mdlm_dmmd':

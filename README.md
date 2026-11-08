@@ -1,5 +1,11 @@
 # [IDLM: Inverse-distilled Diffusion Language Models](https://david-cripto.github.io/idlm-project-page/)
 
+This branch adds a full-sequence **SDTT baseline for TinyGSM**, adapted from
+[the official implementation](https://github.com/jdeschena/sdtt). Run
+`bash scripts/train_sdtt_tinygsm.sh` for the official 70,000-update schedule;
+see [the setup and evaluation commands](docs/sdtt_tinygsm.md) for the settings
+matched to MMD run `3e0ac6b1-7a8f-43c3-af58-d9e21b886da7`.
+
 <p align="center">
   <strong>By</strong><br>
   <a href="https://david-cripto.github.io/Bio-page/">David Li</a>*,

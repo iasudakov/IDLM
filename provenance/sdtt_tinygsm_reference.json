@@ -1,0 +1,981 @@
+{
+  "reference_run_uid": "3e0ac6b1-7a8f-43c3-af58-d9e21b886da7",
+  "reference_run_name": "6e-5 layer6 rbf mmd sflm-dm lr1e-5 g8",
+  "branch": "baseline/sdtt-tinygsm",
+  "base_idlm_commit": "831fbac67fb753d86066f756faa06c63ff9b6dee",
+  "implementation_scope": "Code for SDTT on the existing time-unconditional MDLM and TinyGSM protocol; no training job or GPU evaluation launched.",
+  "official_sdtt": {
+    "repository": "https://github.com/jdeschena/sdtt",
+    "commit": "1150985e90b8f2d5749e4469d5154eff9ec922c4",
+    "implementation_url": "https://github.com/jdeschena/sdtt/blob/1150985e90b8f2d5749e4469d5154eff9ec922c4/src/sdtt/core/distill/multi_round_sdtt.py",
+    "original_teacher_grid": 1024,
+    "teacher_forwards_per_target": 2,
+    "minimum_student_grid": 8,
+    "default_updates_per_round": 10000,
+    "default_optimizer_updates": 70000,
+    "round_student_grids": [
+      512,
+      256,
+      128,
+      64,
+      32,
+      16,
+      8
+    ],
+    "conditional_adaptation": "Use the IDLM TinyGSM attention_mask for answer and padding corruption and loss, keeping BOS, question and separator visible.",
+    "teacher_initialization": "Raw MDLM checkpoint backbone; fresh student optimizer and EMA.",
+    "teacher_promotion": "Copy live student at round boundaries; use_ema_on_growth=false.",
+    "precision_adaptation": "IDLM bf16 model forwards with float32 teacher distributions and reverse KL."
+  },
+  "evaluation_source": {
+    "repository": "dlm-mmd",
+    "commit": "ebb2a6bb013eb87451f2ce0e7471d8f586f3189e",
+    "paths": [
+      "mmd/tinygsm_validation.py",
+      "mmd/sandbox_gsm8k.py"
+    ],
+    "adaptation": "Standalone SDTT evaluation with the reference confidence threshold grid and execution-based GSM8K scoring."
+  },
+  "audit_sources": {
+    "launch_overrides": {
+      "local_audit_path": "/home/iasudakov/underdeep_comparison/training_time_fig2_fig3/a100_fair_comparison/shared/launch_config_3e0ac6b1-7a8f-43c3-af58-d9e21b886da7.json",
+      "sha256": "e25eb9cae2589499b37468a1fae290c4923ad23a17b7b4522b8c46734b9b40ee"
+    },
+    "logged_numeric_parameters": {
+      "local_audit_path": "/home/iasudakov/underdeep_comparison/training_time_fig2_fig3/a100_fair_comparison/mmd/cache/3e0ac6b1-7a8f-43c3-af58-d9e21b886da7.json",
+      "sha256": "e061f492eb5b1fb1ca1f3a80175ccf8dd3e331be1b3a0ce6647eeee5950b2359"
+    },
+    "frozen_source_manifest": {
+      "local_audit_path": "/home/iasudakov/underdeep_comparison/training_time_fig2_fig3/a100_fair_comparison/shared/frozen/3e0ac6b1-7a8f-43c3-af58-d9e21b886da7/manifest.json",
+      "sha256": "6e57ce302a56d0ec46292e052abade82ce894899ef1f82d9ab14b7204c7e2523"
+    }
+  },
+  "reference_effective_launch_overrides": {
+    "data.wrap": [
+      "False"
+    ],
+    "data.train_on_prompt": [
+      "False"
+    ],
+    "data.train_on_pad": [
+      "True"
+    ],
+    "data.filter_too_long": [
+      "True"
+    ],
+    "model": [
+      "small"
+    ],
+    "model.length": [
+      "512"
+    ],
+    "algo": [
+      "mdlm"
+    ],
+    "strategy.find_unused_parameters": [
+      "True"
+    ],
+    "adversarial_distill.is_distill": [
+      "True"
+    ],
+    "adversarial_distill.dmd_weight": [
+      "0.0"
+    ],
+    "adversarial_distill.mmd_reward_weight": [
+      "1.0"
+    ],
+    "training.finetune_path": [
+      "$SOURCE_CODE_PATH/code/checkpoints/tinygsm/mdlm_notok.ckpt"
+    ],
+    "training.loss_precision": [
+      "bf16"
+    ],
+    "loader.batch_size": [
+      "32"
+    ],
+    "loader.eval_batch_size": [
+      "64"
+    ],
+    "loader.global_batch_size": [
+      "512"
+    ],
+    "loader.num_workers": [
+      "4"
+    ],
+    "eval.generate_samples": [
+      "True"
+    ],
+    "eval.compute_generative_perplexity": [
+      "False"
+    ],
+    "eval.validate_before_train": [
+      "True"
+    ],
+    "eval.gsm8k_at_validation": [
+      "True"
+    ],
+    "eval.gsm8k_every_n_validations": [
+      "1"
+    ],
+    "eval.tinygsm_exec": [
+      "True"
+    ],
+    "callbacks.checkpoint_monitor.monitor": [
+      "val/nll"
+    ],
+    "callbacks.checkpoint_every_n_steps.every_n_train_steps": [
+      "2000"
+    ],
+    "callbacks.checkpoint_every_n_steps.save_top_k": [
+      "0"
+    ],
+    "callbacks.checkpoint_every_n_steps.save_last": [
+      "False"
+    ],
+    "checkpointing.use_periodic_train_batch_checkpoint": [
+      "True"
+    ],
+    "trainer.precision": [
+      "bf16"
+    ],
+    "trainer.accumulate_grad_batches": [
+      "1"
+    ],
+    "trainer.gradient_clip_val": [
+      "null"
+    ],
+    "trainer.devices": [
+      "8"
+    ],
+    "trainer.max_steps": [
+      "20000"
+    ],
+    "trainer.val_check_interval": [
+      "1000"
+    ],
+    "trainer.limit_val_batches": [
+      "500"
+    ],
+    "sampling.steps": [
+      "64"
+    ],
+    "sampling.predictor": [
+      "ancestral_cache"
+    ],
+    "sampling.num_sample_batches": [
+      "2"
+    ],
+    "sampling.num_sample_log": [
+      "8"
+    ],
+    "optim.lr": [
+      "1e-5"
+    ],
+    "model_weights_dir": [
+      "$SOURCE_CODE_PATH/code/cache_dir/tinygsm_mmd_offline_bundle"
+    ],
+    "adversarial_distill.mmd_feature_source": [
+      "diffusion"
+    ],
+    "adversarial_distill.mmd_noise_level": [
+      "0.0"
+    ],
+    "adversarial_distill.mmd_ar_model": [
+      "$R/checkpoints/tinygsm/ar_notok.ckpt"
+    ],
+    "adversarial_distill.mmd_group_size": [
+      "8"
+    ],
+    "eval.gsm8k_pareto_thresholds": [
+      "[0.325,0.35,0.375,0.4,0.425,0.45,0.475,0.5,0.525,0.55,0.575,0.6,0.625,0.65,0.675,0.7,0.725,0.75,0.775,0.8,0.825,0.85,0.875,0.9,0.925,0.95,0.98]'"
+    ],
+    "adversarial_distill.mmd_kernel": [
+      "rbf"
+    ],
+    "adversarial_distill.mmd_feature_layer": [
+      "6"
+    ],
+    "adversarial_distill.mmd_rbf_alpha": [
+      "6e-5"
+    ],
+    "adversarial_distill.mmd_forward_batch_size": [
+      "8"
+    ]
+  },
+  "reference_logged_numeric_parameters": {
+    "adversarial_distill/accum_batches": {
+      "metric_uid": "c9c10b5f-9b32-4bdc-8f04-a4f62d3b7ef0",
+      "values": [
+        2
+      ]
+    },
+    "adversarial_distill/dmd_weight": {
+      "metric_uid": "350c26fc-6001-40d7-8711-c9c092ecfd4b",
+      "values": [
+        0.0
+      ]
+    },
+    "adversarial_distill/fake_frequency": {
+      "metric_uid": "76b44422-7828-4105-beea-cdd10dad129d",
+      "values": [
+        1
+      ]
+    },
+    "adversarial_distill/gradient_clipping_val": {
+      "metric_uid": "c962fd68-5f5b-49d7-96c0-896e61d9698a",
+      "values": [
+        1.0
+      ]
+    },
+    "adversarial_distill/high_mask_fraction": {
+      "metric_uid": "c13b5692-2f2d-44bf-be1a-f773f8ecc069",
+      "values": [
+        0.0
+      ]
+    },
+    "adversarial_distill/high_mask_max": {
+      "metric_uid": "499eb3de-0256-4423-8508-fa431024ad81",
+      "values": [
+        1.0
+      ]
+    },
+    "adversarial_distill/high_mask_min": {
+      "metric_uid": "296b556f-70d4-4ff2-b1f1-db505caa0182",
+      "values": [
+        0.7
+      ]
+    },
+    "adversarial_distill/is_distill": {
+      "metric_uid": "69e81dd7-0f8f-4c29-bdf2-ee3a9a09051d",
+      "values": [
+        1.0
+      ]
+    },
+    "adversarial_distill/mask_schedule/max": {
+      "metric_uid": "354ff0ee-ec5f-4d51-9eb7-0413ea2cbcbe",
+      "values": [
+        0.95
+      ]
+    },
+    "adversarial_distill/mask_schedule/min": {
+      "metric_uid": "0bc3f6e4-6b94-4c02-9c41-cb8091c9ef02",
+      "values": [
+        0.45
+      ]
+    },
+    "adversarial_distill/mmd_feature_layer": {
+      "metric_uid": "986c933b-120f-45fc-8379-17f17d536ab0",
+      "values": [
+        6
+      ]
+    },
+    "adversarial_distill/mmd_forward_batch_size": {
+      "metric_uid": "1cf982e4-63ba-40e6-aa07-6329b6a1f993",
+      "values": [
+        8
+      ]
+    },
+    "adversarial_distill/mmd_group_size": {
+      "metric_uid": "f2658897-c464-492e-b14c-37ed5a1b5389",
+      "values": [
+        8
+      ]
+    },
+    "adversarial_distill/mmd_kernel_batch_size": {
+      "metric_uid": "4b0b013c-bd40-44af-b938-658c03dc0fc5",
+      "values": [
+        1
+      ]
+    },
+    "adversarial_distill/mmd_noise_level": {
+      "metric_uid": "de77b9dc-1c28-4514-bcac-de49f5b455c6",
+      "values": [
+        0.0
+      ]
+    },
+    "adversarial_distill/mmd_rbf_alpha": {
+      "metric_uid": "e08a22b4-209d-48e5-be8a-7d9d209bba8e",
+      "values": [
+        6e-05
+      ]
+    },
+    "adversarial_distill/mmd_rbf_block_size": {
+      "metric_uid": "94b362ad-f169-45bd-9940-ce5e61a22eda",
+      "values": [
+        0
+      ]
+    },
+    "adversarial_distill/mmd_rbf_exclude_same_sentence": {
+      "metric_uid": "521d4b67-4406-4447-9c14-c36c23e6bbc2",
+      "values": [
+        0.0
+      ]
+    },
+    "adversarial_distill/mmd_rbf_huber_delta": {
+      "metric_uid": "f62e3582-e565-4e32-871a-5c88fc30590d",
+      "values": [
+        0.001
+      ]
+    },
+    "adversarial_distill/mmd_rbf_omit_fake_fake": {
+      "metric_uid": "e7c3815d-dac7-48cc-9ff0-9bc25dcc1be5",
+      "values": [
+        0.0
+      ]
+    },
+    "adversarial_distill/mmd_rbf_omit_real_real": {
+      "metric_uid": "4de576f7-6956-42c8-a0de-bcac51be4357",
+      "values": [
+        0.0
+      ]
+    },
+    "adversarial_distill/mmd_reward_weight": {
+      "metric_uid": "3b49add5-4e14-4c6d-bce4-b1e0f9b16df6",
+      "values": [
+        1.0
+      ]
+    },
+    "adversarial_distill/mmd_shuffle_rewards": {
+      "metric_uid": "74205798-7993-4eca-8ec6-4180e49e9b74",
+      "values": [
+        0.0
+      ]
+    },
+    "algo/T": {
+      "metric_uid": "e522889b-9b9d-43b3-8437-27f5f465a048",
+      "values": [
+        0
+      ]
+    },
+    "algo/causal_attention": {
+      "metric_uid": "c71d4311-3f50-496e-b0cd-1da75979239a",
+      "values": [
+        0.0
+      ]
+    },
+    "algo/ignore_bos": {
+      "metric_uid": "18423bf5-2c70-4c84-a0bb-21e5727e55d8",
+      "values": [
+        0.0
+      ]
+    },
+    "algo/subs_masking": {
+      "metric_uid": "137ba8dd-5210-4932-8dd6-7b244be1ff18",
+      "values": [
+        0.0
+      ]
+    },
+    "algo/time_conditioning": {
+      "metric_uid": "419eeed6-2ae0-4ceb-ad1b-377a50c4ce5c",
+      "values": [
+        0.0
+      ]
+    },
+    "callbacks/checkpoint_every_n_steps/auto_insert_metric_name": {
+      "metric_uid": "606ec3e2-f2e3-4a39-8f35-2b4780ab1607",
+      "values": [
+        0.0
+      ]
+    },
+    "callbacks/checkpoint_every_n_steps/every_n_train_steps": {
+      "metric_uid": "05e312d3-3e00-4bfa-9cd1-6cddfe48cc79",
+      "values": [
+        2000
+      ]
+    },
+    "callbacks/checkpoint_every_n_steps/save_last": {
+      "metric_uid": "032422c0-d099-47c2-a443-5cf624fa8e45",
+      "values": [
+        0.0
+      ]
+    },
+    "callbacks/checkpoint_every_n_steps/save_top_k": {
+      "metric_uid": "a16823cc-67b2-4e0a-b89d-9609c9096ffd",
+      "values": [
+        0
+      ]
+    },
+    "callbacks/checkpoint_every_n_steps/verbose": {
+      "metric_uid": "785929e0-a562-4b6c-874f-5151eed983b8",
+      "values": [
+        1.0
+      ]
+    },
+    "callbacks/checkpoint_monitor/auto_insert_metric_name": {
+      "metric_uid": "ce5d9ec0-882b-475f-89d3-602166a4a2c8",
+      "values": [
+        0.0
+      ]
+    },
+    "callbacks/checkpoint_monitor/save_last": {
+      "metric_uid": "de798c69-b250-409c-aa55-26d9ab8bb9aa",
+      "values": [
+        0.0
+      ]
+    },
+    "callbacks/checkpoint_monitor/save_top_k": {
+      "metric_uid": "54e3e991-ba04-4e36-922f-64037e96c9e0",
+      "values": [
+        1
+      ]
+    },
+    "callbacks/checkpoint_monitor/verbose": {
+      "metric_uid": "a4568710-08e8-44bc-ac67-458e2a8c7a36",
+      "values": [
+        1.0
+      ]
+    },
+    "checkpointing/resume_from_ckpt": {
+      "metric_uid": "b9bf4e89-0d75-42ac-a535-87d6c3314a7a",
+      "values": [
+        1.0
+      ]
+    },
+    "checkpointing/save_evaluated_checkpoints": {
+      "metric_uid": "cde82614-b167-40f8-820f-1505a29a0b37",
+      "values": [
+        0.0
+      ]
+    },
+    "checkpointing/save_evaluated_from_step": {
+      "metric_uid": "f98fba6e-4c2d-4c26-abc8-6a43a34c6803",
+      "values": [
+        0
+      ]
+    },
+    "checkpointing/snapshot": {
+      "metric_uid": "70ca97d1-17b4-466f-a96d-431cdf89f746",
+      "values": [
+        1.0
+      ]
+    },
+    "checkpointing/use_periodic_train_batch_checkpoint": {
+      "metric_uid": "e8f66c4f-89cd-4eb2-8658-2b6ce74de866",
+      "values": [
+        1.0
+      ]
+    },
+    "data/filter_too_long": {
+      "metric_uid": "6fe999bc-7933-4578-a61c-0b2577ad0a03",
+      "values": [
+        1.0
+      ]
+    },
+    "data/insert_train_eos": {
+      "metric_uid": "5bc067e3-6cce-4d2a-b7aa-4101ecb788db",
+      "values": [
+        1.0
+      ]
+    },
+    "data/insert_valid_eos": {
+      "metric_uid": "36b526a2-343b-48d3-b08c-d3de3809d2e0",
+      "values": [
+        1.0
+      ]
+    },
+    "data/streaming": {
+      "metric_uid": "76fe4354-eb72-4bc9-b694-f5afde7c358a",
+      "values": [
+        0.0
+      ]
+    },
+    "data/train_on_pad": {
+      "metric_uid": "aab6286c-1e7f-41e7-b450-66f543db99ec",
+      "values": [
+        1.0
+      ]
+    },
+    "data/train_on_prompt": {
+      "metric_uid": "2ab4cebb-2c24-488e-a8cf-a57c50f4d773",
+      "values": [
+        0.0
+      ]
+    },
+    "data/val_ratio": {
+      "metric_uid": "18092674-4152-4644-8a0c-3b3a56f5b147",
+      "values": [
+        0.01
+      ]
+    },
+    "data/val_seed": {
+      "metric_uid": "a07f3a47-1c0a-4387-b91f-7311eb4f67b2",
+      "values": [
+        42
+      ]
+    },
+    "data/wrap": {
+      "metric_uid": "d9c154f2-91e7-4ec9-9d1b-ce327266c981",
+      "values": [
+        0.0
+      ]
+    },
+    "debug": {
+      "metric_uid": "ce0c4191-188f-458e-ba1e-1ab80c7c028f",
+      "values": [
+        0.0
+      ]
+    },
+    "eval/compute_generative_perplexity": {
+      "metric_uid": "c772d319-165f-4b74-aaec-66f30e504366",
+      "values": [
+        0.0
+      ]
+    },
+    "eval/compute_perplexity_on_sanity": {
+      "metric_uid": "4b4ec4b3-0508-4f08-ac6e-022656300ac1",
+      "values": [
+        0.0
+      ]
+    },
+    "eval/disable_ema": {
+      "metric_uid": "8e1de0ce-a110-46e1-a322-d20e92ebedbb",
+      "values": [
+        0.0
+      ]
+    },
+    "eval/generate_samples": {
+      "metric_uid": "bffd1937-af27-4cb6-91a0-e4aa807109ff",
+      "values": [
+        1.0
+      ]
+    },
+    "eval/gsm8k_at_validation": {
+      "metric_uid": "31c57983-ffbc-4983-afe9-a8747d739cba",
+      "values": [
+        1.0
+      ]
+    },
+    "eval/gsm8k_batch_size": {
+      "metric_uid": "fc58577f-2ab7-40b2-aa36-66455977a175",
+      "values": [
+        16
+      ]
+    },
+    "eval/gsm8k_every_n_validations": {
+      "metric_uid": "602ae818-ddfd-492d-b896-d4d2c9866937",
+      "values": [
+        1
+      ]
+    },
+    "eval/gsm8k_greedy_token": {
+      "metric_uid": "617467e0-48dd-4dfe-bb81-bc1250781858",
+      "values": [
+        1.0
+      ]
+    },
+    "eval/gsm8k_pareto_temperature": {
+      "metric_uid": "d6b59206-630c-4034-acc9-f5ce57554270",
+      "values": [
+        0.0
+      ]
+    },
+    "eval/perplexity_batch_size": {
+      "metric_uid": "e9a11100-7b2c-4bed-92b2-7c54ea30ed34",
+      "values": [
+        8
+      ]
+    },
+    "eval/tinygsm_exec": {
+      "metric_uid": "962cee01-9dfd-48d0-964c-6b650443e284",
+      "values": [
+        1.0
+      ]
+    },
+    "eval/tinygsm_exec_timeout": {
+      "metric_uid": "9eac14cb-4962-45fd-be7b-d69c1e50246b",
+      "values": [
+        5.0
+      ]
+    },
+    "eval/validate_before_train": {
+      "metric_uid": "589ed399-6889-43ff-b5b3-1c502e0c5e3b",
+      "values": [
+        1.0
+      ]
+    },
+    "gsm8k/bootstrap_size": {
+      "metric_uid": "25ec7779-b6a5-49c6-91b4-45e19901bd6b",
+      "values": [
+        1
+      ]
+    },
+    "gsm8k/timeout": {
+      "metric_uid": "97199e35-9124-4ef6-96b7-65b0851fdd96",
+      "values": [
+        5.0
+      ]
+    },
+    "loader/batch_size": {
+      "metric_uid": "d2d5cbbf-49a5-4430-9b10-2bd55977a135",
+      "values": [
+        32
+      ]
+    },
+    "loader/eval_batch_size": {
+      "metric_uid": "75863002-3a2b-48c4-82fe-0717684cdc42",
+      "values": [
+        64
+      ]
+    },
+    "loader/eval_global_batch_size": {
+      "metric_uid": "83a6b8d1-535a-4182-9770-d5ac03513f5c",
+      "values": [
+        512
+      ]
+    },
+    "loader/global_batch_size": {
+      "metric_uid": "a1b34b61-98d3-4768-b267-30157a903b22",
+      "values": [
+        512
+      ]
+    },
+    "loader/num_workers": {
+      "metric_uid": "55d17c1a-61b4-4b44-a0ed-a8dcb01b05bf",
+      "values": [
+        4
+      ]
+    },
+    "loader/pin_memory": {
+      "metric_uid": "a316f2a5-91f4-453e-aacf-c1008045f0bf",
+      "values": [
+        1.0
+      ]
+    },
+    "logger/force_new_run": {
+      "metric_uid": "1f84ea8b-9026-4a4f-a204-75b5f870167d",
+      "values": [
+        1.0
+      ]
+    },
+    "logger/resume": {
+      "metric_uid": "79aae69b-e62e-47c9-bbff-5dcc0e9f6d81",
+      "values": [
+        0.0
+      ]
+    },
+    "lr_scheduler/num_warmup_steps": {
+      "metric_uid": "4d661b79-ecf8-438c-8869-8c73f1416d24",
+      "values": [
+        2500
+      ]
+    },
+    "model/cond_dim": {
+      "metric_uid": "36a7f9eb-be8f-45dd-91db-7a023541e398",
+      "values": [
+        128
+      ]
+    },
+    "model/dropout": {
+      "metric_uid": "06ba8e87-8e1b-490f-af66-19059c794018",
+      "values": [
+        0.1
+      ]
+    },
+    "model/hidden_size": {
+      "metric_uid": "5a8c6728-049b-4b99-b2fe-e918dcaa4fb8",
+      "values": [
+        768
+      ]
+    },
+    "model/length": {
+      "metric_uid": "a0ca9d14-48e6-4078-9b6f-be676938674a",
+      "values": [
+        512
+      ]
+    },
+    "model/n_blocks": {
+      "metric_uid": "68c49a8a-e428-436e-9ec8-25270ece9bc1",
+      "values": [
+        12
+      ]
+    },
+    "model/n_heads": {
+      "metric_uid": "f5eebe58-4481-46ee-a324-9e154a35ce24",
+      "values": [
+        12
+      ]
+    },
+    "model/scale_by_sigma": {
+      "metric_uid": "857128ad-5df9-434f-a455-7b8a914bff42",
+      "values": [
+        1.0
+      ]
+    },
+    "model/tie_word_embeddings": {
+      "metric_uid": "20bbdcee-6cfe-4f9f-af0f-7e73ff255292",
+      "values": [
+        0.0
+      ]
+    },
+    "model/vocab_lookup": {
+      "metric_uid": "67d22d5a-e0f7-4dc4-b907-b12ed9dbf54a",
+      "values": [
+        1.0
+      ]
+    },
+    "noise/denoiser_latent_conditioning": {
+      "metric_uid": "baa109b7-d7fc-4e17-90dc-3428d61d0ae6",
+      "values": [
+        -1
+      ]
+    },
+    "noise/eps": {
+      "metric_uid": "22ffa5d5-6ba5-4ebb-b4df-61e884d2b5ef",
+      "values": [
+        0
+      ]
+    },
+    "noise/freeze_decoder": {
+      "metric_uid": "12ba76f3-c2bd-44bb-b48f-e58dca598bbe",
+      "values": [
+        0.0
+      ]
+    },
+    "noise/freeze_encoder": {
+      "metric_uid": "34e5420e-4e3a-4007-a66e-f3af43a623f5",
+      "values": [
+        0.0
+      ]
+    },
+    "optim/beta1": {
+      "metric_uid": "d4711414-4174-40ba-a443-c5ca9e8c317c",
+      "values": [
+        0.9
+      ]
+    },
+    "optim/beta2": {
+      "metric_uid": "28c63f12-ff14-4ebb-86d1-eba1106b9dab",
+      "values": [
+        0.999
+      ]
+    },
+    "optim/eps": {
+      "metric_uid": "d66a52c5-89dd-4a3d-8a08-bb73f37ec46e",
+      "values": [
+        1e-08
+      ]
+    },
+    "optim/fake_lr": {
+      "metric_uid": "50ebcaac-fce8-4c3c-a41b-06dc5cb7c5bb",
+      "values": [
+        1e-05
+      ]
+    },
+    "optim/lr": {
+      "metric_uid": "52446ba1-5ab6-4f4c-af04-9c2727e48c96",
+      "values": [
+        1e-05
+      ]
+    },
+    "optim/weight_decay": {
+      "metric_uid": "e13225d1-6b6d-4cff-900d-6eebd5b81d89",
+      "values": [
+        0
+      ]
+    },
+    "prior/latent_height": {
+      "metric_uid": "e6565e75-099c-4989-a3ea-49589858d89c",
+      "values": [
+        0
+      ]
+    },
+    "prior/latent_width": {
+      "metric_uid": "5f667f8f-18e4-406b-b063-e396c9e8d177",
+      "values": [
+        0
+      ]
+    },
+    "sampling/dynamic_threshold": {
+      "metric_uid": "85f69722-9bbb-4a4d-8334-8d9dca6504ff",
+      "values": [
+        0.9
+      ]
+    },
+    "sampling/num_sample_batches": {
+      "metric_uid": "be14a57a-04d8-4a0f-a968-af6642aac721",
+      "values": [
+        2
+      ]
+    },
+    "sampling/num_sample_log": {
+      "metric_uid": "151504d7-6d3b-4ec8-9c64-d3486fea8f5c",
+      "values": [
+        8
+      ]
+    },
+    "sampling/num_strides": {
+      "metric_uid": "653482c7-23c2-4313-94f8-5354e10bee49",
+      "values": [
+        1
+      ]
+    },
+    "sampling/p_nucleus": {
+      "metric_uid": "e60e7c28-62a4-4be0-8a1a-bbd3a50430ee",
+      "values": [
+        1.0
+      ]
+    },
+    "sampling/semi_ar": {
+      "metric_uid": "b7dc1771-5b77-4e8c-a456-54081c20a39d",
+      "values": [
+        0.0
+      ]
+    },
+    "sampling/steps": {
+      "metric_uid": "c1795372-f787-4770-9917-7b6afb4651db",
+      "values": [
+        64
+      ]
+    },
+    "sampling/stride_length": {
+      "metric_uid": "caa4921e-3f44-4b37-83aa-68d9a1fe57cb",
+      "values": [
+        1
+      ]
+    },
+    "sampling/temperature": {
+      "metric_uid": "6a0c150d-c8ac-409c-bd53-7995e93c36d9",
+      "values": [
+        1.0
+      ]
+    },
+    "sampling/use_float64": {
+      "metric_uid": "0e83943b-7dd9-44a4-a2fc-a2a916989677",
+      "values": [
+        1.0
+      ]
+    },
+    "seed": {
+      "metric_uid": "fca8318c-5144-40ec-854d-6b06289268ae",
+      "values": [
+        1
+      ]
+    },
+    "strategy/find_unused_parameters": {
+      "metric_uid": "c9936d4d-df78-42ee-84a7-c4f34147cdb8",
+      "values": [
+        1.0
+      ]
+    },
+    "trainer/accumulate_grad_batches": {
+      "metric_uid": "763ecc15-9154-4030-9956-17ddee664c03",
+      "values": [
+        1
+      ]
+    },
+    "trainer/devices": {
+      "metric_uid": "97b2a31d-536b-40f4-9618-58882572dffa",
+      "values": [
+        8
+      ]
+    },
+    "trainer/limit_train_batches": {
+      "metric_uid": "ad9fd140-09e7-43cf-88a5-ce8dc7b1aa2a",
+      "values": [
+        1.0
+      ]
+    },
+    "trainer/limit_val_batches": {
+      "metric_uid": "60cf2130-3bc2-461e-afae-8bfc42625354",
+      "values": [
+        500
+      ]
+    },
+    "trainer/log_every_n_steps": {
+      "metric_uid": "d072d97f-7e40-4653-8b50-67c86a46667e",
+      "values": [
+        100
+      ]
+    },
+    "trainer/max_steps": {
+      "metric_uid": "7f2e245c-8f32-4168-80ed-8d09520435e8",
+      "values": [
+        20000
+      ]
+    },
+    "trainer/num_nodes": {
+      "metric_uid": "c16bf0b2-517d-45ac-9a8d-93cbf52f450c",
+      "values": [
+        1
+      ]
+    },
+    "trainer/num_sanity_val_steps": {
+      "metric_uid": "b5258bfc-632f-4a50-a8cd-594062864682",
+      "values": [
+        2
+      ]
+    },
+    "trainer/val_check_interval": {
+      "metric_uid": "aa0352b9-b686-4f5d-b6fb-10859340b3e1",
+      "values": [
+        1000
+      ]
+    },
+    "training/antithetic_sampling": {
+      "metric_uid": "8214be46-556b-4a1b-83a1-aad965039f63",
+      "values": [
+        1.0
+      ]
+    },
+    "training/change_of_variables": {
+      "metric_uid": "e9a597b4-2e56-47ed-9793-2aec672770a0",
+      "values": [
+        0.0
+      ]
+    },
+    "training/continue_teacher": {
+      "metric_uid": "0db53384-297e-4df2-9544-55b24463b725",
+      "values": [
+        0.0
+      ]
+    },
+    "training/ema": {
+      "metric_uid": "a1413eec-f702-4c59-800d-7d201929f668",
+      "values": [
+        0.9999
+      ]
+    },
+    "training/importance_sampling": {
+      "metric_uid": "4b5c4b4b-b1f8-4776-9368-14a56e4d455d",
+      "values": [
+        0.0
+      ]
+    },
+    "training/sampling_eps": {
+      "metric_uid": "6933d0bc-c075-407e-a2d4-e3204639fd5f",
+      "values": [
+        0.001
+      ]
+    }
+  },
+  "batch_and_cadence": {
+    "reference_per_device_batch": 32,
+    "reference_devices": 8,
+    "examples_per_distributed_microbatch": 256,
+    "reference_lightning_accumulation": 1,
+    "reference_manual_accumulation": 2,
+    "reference_effective_global_batch": 512,
+    "new_lightning_accumulation": 2,
+    "new_effective_global_batch": 512,
+    "validation_interval_microbatches": 1000,
+    "validation_interval_optimizer_updates_at_default_batch": 500,
+    "original_logger_step_mapping": "Cached timing audit maps raw999 to500 student updates and raw13999 to7000; compare normalized optimizer updates, not raw logged steps.",
+    "checkpoint_difference": "New callback preserves full checkpoints every2000 optimizer updates and last.ckpt; reference periodic callback requested2000 train batches."
+  },
+  "separator": {
+    "python_repr": "'\\\\n'",
+    "codepoints": [
+      92,
+      110
+    ],
+    "evidence": "IDLM configs/data/tiny-gsm.yaml contains a YAML double-quoted escaped backslash followed by n; the launch overrides do not change separator.",
+    "scope_limit": "The exact historical string value is inferred from IDLM source because the numeric tracker cache does not record strings and frozen reference source retrieval failed."
+  },
+  "provenance_limits": [
+    "Exact reference frozen-source manifest reports404 for storagePath and directStoragePath; no exact historical source parity is asserted.",
+    "The numeric parameter cache directly records manual accum_batches=2 and global_batch_size=512, independently of the source retrieval failure.",
+    "The reference launch used a private mdlm_notok.ckpt; the default replacement is the public jdeschena/s-flm TinyGSM MDLM release. Supply the original checkpoint path for checkpoint-level matching.",
+    "The default SDTT70k student-update budget follows the selected official round schedule and exceeds the reference launch max_steps=20000. The optional20k preset is a shorter comparison preset and not the official10k-per-round schedule.",
+    "No GPU training, quality evaluation, speed benchmark, or pretrained parity claim was made during this code-only task."
+  ]
+}

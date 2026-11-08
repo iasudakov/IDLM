@@ -1,0 +1,16 @@
+name: sdtt
+backbone: dit
+parameterization: subs
+time_conditioning: False
+T: 0
+subs_masking: False
+causal_attention: False
+ignore_bos: False
+loss_type: elbo
+
+# Official SDTT defaults; experiment presets control the training budget.
+orig_num_sampling_steps: 1024
+num_distill_steps: 2
+min_num_sampling_steps: 8
+grow_dt_every: 10000
+use_ema_on_growth: False
