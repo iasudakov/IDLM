@@ -91,6 +91,15 @@ adversarial_distill:
   #                measures the reward in the student's own feature space.
   mmd_feature_source: ar
 
+  # Optional independent SDTT MDLM feature map; select source=sdtt_mdlm.
+  # The default revision is the undistilled Large teacher (863M, OWT/GPT2).
+  # A local path contains config.json + model.safetensors; no SDTT import,
+  # tokenizer remapping, student/teacher replacement, or objective rescaling.
+  mmd_sdtt_model: jdeschena/sdtt
+  mmd_sdtt_revision: teacher_400k_large_step_400000
+  mmd_sdtt_path: null
+  mmd_sdtt_local_files_only: false
+
   # HF hub id (or a local dir with the same config.json / pytorch_model.bin).
   # Loaded via the vendored `models/backbone_dit_legacy.py`, because the
   # published remote code imports transformers.models.qwen3, which this

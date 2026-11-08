@@ -1,3 +1,7 @@
+This branch restores the archived OWT MMD run `3daa3e6f` and adds an optional
+SDTT MDLM-L feature extractor. See [the feature option, provenance and launch
+recipe](docs/mdlm_large_features.md). The IDLM documentation below is inherited.
+
 # [IDLM: Inverse-distilled Diffusion Language Models](https://david-cripto.github.io/idlm-project-page/)
 
 <p align="center">

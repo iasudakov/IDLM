@@ -1043,9 +1043,25 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
           layer_weights=cfg.get('mmd_feature_layer_weights', None),
           noise_level=cfg.mmd_noise_level)
         what = f'diffusion teacher (noise={cfg.mmd_noise_level})'
+      elif source == 'sdtt_mdlm':
+        from mmd_sdtt_features import load_sdtt_feature_backbone
+        backbone = load_sdtt_feature_backbone(
+          cfg.get('mmd_sdtt_model', 'jdeschena/sdtt'), self.device,
+          tokenizer=self.tokenizer, mask_index=self.mask_index,
+          revision=cfg.get('mmd_sdtt_revision', 'teacher_400k_large_step_400000'),
+          local_path=cfg.get('mmd_sdtt_path', None),
+          local_files_only=cfg.get('mmd_sdtt_local_files_only', False),
+          feature_layer=cfg.mmd_feature_layer)
+        self._mmd_critic_cached = mmd_reward.FrozenBackboneFeatures(
+          backbone, self.mask_index,
+          layer_index=cfg.mmd_feature_layer,
+          layer_weights=cfg.get('mmd_feature_layer_weights', None),
+          noise_level=cfg.mmd_noise_level)
+        what = (f'SDTT MDLM features ({cfg.get("mmd_sdtt_revision", "teacher_400k_large_step_400000")}, '
+                f'noise={cfg.mmd_noise_level})')
       else:
         raise ValueError('adversarial_distill.mmd_feature_source must be '
-                         f'ar|diffusion, got {source!r}')
+                         f'ar|diffusion|sdtt_mdlm, got {source!r}')
       self._mmd_critic_cached.reward_type = kind
       self._mmd_critic_cached.kernel = kernel
       self._mmd_critic_cached.kernel_level = level
