@@ -1,0 +1,181 @@
+{
+  "run_uid": "3daa3e6f-1c54-4854-8bda-0b33dfd3257f",
+  "run_name": "5seed 2e-5 layer 3 unbiased batch2-rbf mmd owt-dm lr1e-4 g8 bf16",
+  "source": "Frozen Nirvana run-command/macro-command expressions from linked workflow launch.",
+  "scope": "Explicit launch overrides only. Missing fields are not inferred defaults; duplicate values indicate multiple assignments and require source review.",
+  "launches": [
+    {
+      "outer_workflow_instance_uid": "c58febd5-4a92-42bf-a5cd-f7b56202262d",
+      "block_guid": "f8e2e715-f182-443f-8399-e77fc662a0c9",
+      "block_code": "_vh__4c2e2df0-4dff-4cf8-b3ce-1f89bd62c9e8_729",
+      "command_text_sha256": [
+        "8cd881ceff051524ef4cad039b61f2ea9d77403ea15c71ff1ed665685f67440e",
+        "0f88b85c899bc4ac7d66b225c72fca5f5c15c62a6c00e112fc1ed4bfbc69dca6"
+      ],
+      "effective_launch_overrides": {
+        "model_weights_dir": [
+          "$SOURCE_CODE_PATH/code/cache_dir/owt_mmd_offline_bundle"
+        ],
+        "data": [
+          "openwebtext-split"
+        ],
+        "model": [
+          "small"
+        ],
+        "model.length": [
+          "1024"
+        ],
+        "algo": [
+          "mdlm"
+        ],
+        "algo.backbone": [
+          "hf_dit"
+        ],
+        "eval.checkpoint_path": [
+          "kuleshov-group/mdlm-owt"
+        ],
+        "strategy.find_unused_parameters": [
+          "True"
+        ],
+        "adversarial_distill.is_distill": [
+          "True"
+        ],
+        "adversarial_distill.dmd_weight": [
+          "0.0"
+        ],
+        "adversarial_distill.mmd_reward_weight": [
+          "1.0"
+        ],
+        "adversarial_distill.mmd_feature_source": [
+          "diffusion"
+        ],
+        "adversarial_distill.mmd_noise_level": [
+          "0.0"
+        ],
+        "adversarial_distill.mmd_group_size": [
+          "8"
+        ],
+        "optim.lr": [
+          "1e-4"
+        ],
+        "training.loss_precision": [
+          "bf16"
+        ],
+        "trainer.precision": [
+          "bf16"
+        ],
+        "loader.batch_size": [
+          "8"
+        ],
+        "loader.eval_batch_size": [
+          "8"
+        ],
+        "loader.global_batch_size": [
+          "512"
+        ],
+        "loader.num_workers": [
+          "4"
+        ],
+        "eval.generate_samples": [
+          "True"
+        ],
+        "eval.compute_generative_perplexity": [
+          "True"
+        ],
+        "eval.owt_pareto_temp_every_n_validations": [
+          "1"
+        ],
+        "eval.owt_pareto_steps": [
+          "[8,16,32]",
+          "[8,16,32]'"
+        ],
+        "eval.pareto_temperatures": [
+          "[0.75,0.80,0.85,0.875,0.90,0.925,0.95,0.975,1.00,1.05,1.10,1.20]"
+        ],
+        "callbacks.checkpoint_every_n_steps.every_n_train_steps": [
+          "200000"
+        ],
+        "callbacks.checkpoint_every_n_steps.save_top_k": [
+          "0"
+        ],
+        "checkpointing.use_periodic_train_batch_checkpoint": [
+          "True"
+        ],
+        "trainer.accumulate_grad_batches": [
+          "1"
+        ],
+        "trainer.gradient_clip_val": [
+          "null"
+        ],
+        "trainer.max_steps": [
+          "15000"
+        ],
+        "trainer.val_check_interval": [
+          "250"
+        ],
+        "eval.eval_step_range": [
+          "[0,20000]'"
+        ],
+        "trainer.limit_val_batches": [
+          "0.01"
+        ],
+        "sampling.steps": [
+          "32"
+        ],
+        "sampling.predictor": [
+          "ancestral_cache"
+        ],
+        "eval.owt_pareto_seeds": [
+          "5"
+        ],
+        "eval.owt_gm": [
+          "True"
+        ],
+        "adversarial_distill.mmd_kernel_source": [
+          "draws"
+        ],
+        "adversarial_distill.mmd_kernel_level": [
+          "token"
+        ],
+        "adversarial_distill.mmd_kernel_batch_size": [
+          "2"
+        ],
+        "adversarial_distill.mmd_rbf_exclude_same_sentence": [
+          "True"
+        ],
+        "adversarial_distill.mmd_rbf_exclude_same_position": [
+          "True"
+        ],
+        "adversarial_distill.mmd_kernel": [
+          "rbf"
+        ],
+        "adversarial_distill.mmd_rbf_alpha": [
+          "2e-5"
+        ],
+        "adversarial_distill.mmd_feature_layer": [
+          "3"
+        ],
+        "adversarial_distill.mmd_forward_batch_size": [
+          "8"
+        ]
+      },
+      "input_assets": [
+        {
+          "endpoint": "script",
+          "stored_data_id": null,
+          "storage_path": "https://nirvana.yandex-team.ru/api/resultItem/c58febd5-4a92-42bf-a5cd-f7b56202262d%2F9b4a7cde-566b-4bbe-b2e0-1c97e92edd3d/data"
+        },
+        {
+          "endpoint": "data",
+          "stored_data_id": "eb87cdcd-2ee5-45f5-9e3a-dfb3c64496e9",
+          "storage_path": "https://nirvana.yandex-team.ru/api/storedData/eb87cdcd-2ee5-45f5-9e3a-dfb3c64496e9/data"
+        },
+        {
+          "endpoint": "data",
+          "stored_data_id": "3321a245-5382-4d12-89a1-f470cd718427",
+          "storage_path": "https://nirvana.yandex-team.ru/api/storedData/3321a245-5382-4d12-89a1-f470cd718427/data"
+        }
+      ]
+    }
+  ]
+}

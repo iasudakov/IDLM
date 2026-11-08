@@ -1,4 +1,5 @@
-# TensorBoard logger (previous default). Select with `logger=tensorboard`.
+# The authors' original logger, kept as-is so `logger=tensorboard` reproduces
+# upstream behaviour exactly.
 _target_: lightning.pytorch.loggers.TensorBoardLogger
 save_dir: ${cwd:}/tb_logs
-name: ${algo.name}
+name: duo

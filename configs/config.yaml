@@ -10,125 +10,407 @@ defaults:
   - /algo: duo_base
   - /logger: underdeep
 
-mode: train  # train / ppl_eval / sample_eval / noise_diversity_eval
+mode: train  # train / ppl_eval / sample_eval
 debug: False
 seed: 1
 
+# Optional local model/tokenizer bundle. When set, model loads use only local
+# files and fail on missing assets. Native checkpoint paths can be bundle-relative.
+model_weights_dir: null
+
 adversarial_distill:
   is_distill: False
-  accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
-  fake_frequency: 1
-  generator_num_noised_samples: 1
-  # Gradient clipping inside the manual-optimization (min-max) loop. Lightning
-  # does not apply `trainer.gradient_clip_val` when automatic_optimization is
-  # off, so this is the only clipping the adversarial steps get. Disabled by
-  # default; set to True to clip to `gradient_clipping_val`. The pre-clip
-  # gradient norm is logged (grad_norm_student / grad_norm_fake) either way.
-  use_gradient_clipping: False
-  # Max gradient norm used when `use_gradient_clipping` is True. null or <= 0
-  # also disables clipping.
-  gradient_clipping_val: 1.0
-  # Critic family: 'ar' = autoregressive owt-ar teacher/fake; 'diffusion' =
-  # copies of the masked-diffusion student as teacher/fake (original IDLM).
-  critic_type: ar
-  # Whether to use the trainable fake critic. False disables the fake model
-  # entirely (not created, no fake steps) and trains the generator with only the
-  # teacher term, i.e. generator loss = teacher_loss (no min-max).
-  use_fake: True
-  # Autoregressive teacher (and fake-model initialisation) for MDLM_with_AR.
-  # A HF hub id or a local dir with the owt-ar config.json / pytorch_model.bin.
-  ar_model_path: kuleshov-group/owt-ar
-  # Learning rate for the fake critic. null => fall back to optim.lr (original
-  # IDLM: fake and student share optim.lr). Set e.g. 1e-4 to give the critic a
-  # larger, separate LR (two-time-scale).
-  fake_lr: null
-  # Target used to fit the fake critic to the student (D-MMD Sec. 3.2 / the
-  # "Optional use soft target" line of Algorithm 1). False => the one-hot hard
-  # sample x ~ Cat(x_hat_eta(z_t)) the critic latent was drawn from. True => the
-  # student's full soft distribution, i.e. the Rao-Blackwellisation of that
-  # target: same expectation, no per-position sampling noise, and for the AR
-  # critic exactly the quantity the generator step differentiates.
-  # null (default) => each critic keeps the default it was written with, so
-  # existing runs are unchanged: hard for critic_type=ar, soft for
-  # critic_type=diffusion. Set True/False explicitly to A/B it; the latent /
-  # context the critic sees is the hard sample either way, so at a fixed seed the
-  # two differ only in the target. Only the fake/auxiliary step is affected --
-  # the generator always uses the soft path.
-  # NOTE 1 (paper, same section): valid for *masked* diffusion only. Uniform
-  # diffusion (algo=duo*) must train its auxiliary model on hard samples.
-  # NOTE 2: with the diffusion critic the *logged* `fake_loss` is not comparable
-  # across the two settings. `_process_model_output` pins already-revealed
-  # positions to a one-hot (`neg_infinity` elsewhere), which the hard target
-  # zeroes out but the soft target multiplies its off-token mass against, adding
-  # a term ~1e5x the real signal. It is a constant assignment, so it contributes
-  # no gradient -- training is unaffected, but compare `student_loss` /
-  # `val/gen_ppl` rather than `fake_loss` between the modes.
-  fake_soft_target: null
-  # Weight of the auxiliary->teacher regularizer in the fake-model loss
-  # (D-MMD Eq. 12, second term): CE(teacher || fake) on the student's samples.
-  # Anchors the fake critic to the teacher, stabilizing the min-max without
-  # changing the fixed point. 0 => original IDLM fake loss (no anchor term).
-  fake_teacher_weight: 0.0
-  # Log `student_entropy` next to student_loss / fake_loss on every generator
-  # step: the mean entropy (nats) of the student's own prediction
-  # p_eta(x0 | z_t) at the positions it actually predicted, read off the same
-  # tensor the generator loss differentiates (no extra forward pass). Purely a
-  # diagnostic -- it is detached and never added to the objective. It
-  # separates the two ways student_loss can fall: matching the teacher, or
-  # sharpening onto a few modes the critic likes. The latter shows up here as
-  # entropy heading toward 0. The training-time counterpart of
-  # `eval.compute_pred_entropy` (which reads the sampling trajectory instead).
-  log_student_entropy: True
-  # Weight of the entropy bonus in the generator objective:
-  #   g_loss = teacher_loss - fake_loss - entropy_weight * H
-  # where H is the same student entropy `log_student_entropy` reports,
-  # reduced over positions exactly like the two critic terms, so the weight
-  # trades off against them directly and does not need rescaling with
-  # `model.length`. Positive => push entropy UP, which is what fights the
-  # collapse this objective can drift into (the student can lower
-  # teacher_loss - fake_loss either by matching the teacher or by narrowing
-  # onto the modes both critics like). Negative sharpens instead.
-  # 0 (default) reproduces the previous objective exactly and builds nothing
-  # differentiable -- the diagnostic stays on either way.
-  # Enabling it costs one extra p-sized tensor (~1.6 GB at batch_size=8,
-  # model.length=1024, float32) retained until backward.
-  # CALIBRATION: with valid_tokens=None (OWT) `_reduce_positions` *sums* over
-  # positions, so the reduced H is ~(masked positions) x (nats/position) --
-  # order 1e3 at model.length=1024 -- while student_loss is a *difference* of
-  # two large critic terms and is numerically far smaller. Expect a useful
-  # weight around 1e-3..1e-2, not O(1). Don't guess: `entropy_bonus` is logged
-  # next to student_loss whenever this is non-zero and is exactly what gets
-  # subtracted, so set the weight so the bonus is a few percent of
-  # |student_loss|, then watch student_entropy move.
-  # The bonus is unbounded above, so an over-large weight has a trivial
-  # optimum at the uniform distribution and will walk the model to noise.
-  entropy_weight: 0.0
-  # Diffusion time weighting `w` applied to every distillation cross-entropy
-  # (teacher term, fake term, aux->teacher anchor) for both algo=mdlm and
-  # algo=mdlm_dmmd. Only `critic_type=diffusion` is affected; the AR critic
-  # scores the clean sequence and carries no time weight.
-  # 'elbo' (default) => w = -alpha'/(1-alpha), the MDLM ELBO weight, which is
-  # both IDLM's lambda_t (its Eq. 1/7) and a valid choice of D-MMD's w(s)
-  # (Algorithm 1 leaves w free and never pins it down). Under the log-linear
-  # schedule this is 1/t at the critic time: 1 at t=1 up to ~1e3 at the
-  # training.sampling_eps floor, mean ~7.
-  # 'none' (or false) => w = 1, i.e. plain unweighted cross-entropy. The fixed
-  # point is unchanged (w scales the teacher and fake terms alike, and
-  # `teacher - fake` vanishes when the fake critic matches the teacher), so this
-  # is a pure optimization knob: it stops near-clean critic times (small s, where
-  # only a few positions are masked and 1/s explodes) from dominating the update,
-  # at the cost of ~7x smaller average gradients -- expect to raise optim.lr /
-  # fake_lr by roughly that factor for a like-for-like comparison. `null` keeps
-  # the default, as elsewhere in this config.
-  loss_weighting: elbo
-  # Generator input-noise conditioning (D-MMD Sec. 6.5). Dimensionality of the
-  # per-token Gaussian noise projected into the student's embedding residual so
-  # the masked generator can stay diverse instead of collapsing. 0 => disabled
-  # (original IDLM).
+
+  # --- Distillation objective -----------------------------------------------
+  # The generator loss is `dmd_weight * (teacher - fake) + mmd_reward_weight *
+  # REINFORCE(sample reward)`. Defaults reproduce the published objective
+  # exactly: DMD alone, the optional reward critic never built or downloaded.
+  dmd_weight: 1.0
+
+  # --- Paired AR feature reward (ported from the TinyGSM branch) -------------
+  # A frozen model used as a fixed *feature map* rather than a likelihood
+  # critic: run it over the clean row and over the student's sample, read one
+  # middle block's hidden states, and reward the student for closing the
+  # feature gap. Historical linear token/rows modes use pseudo-Huber;
+  # `mmd_kernel_source=draws` plus `mmd_kernel_level=sentence` uses the explicit
+  # linear-, RBF-, cosine-, or pseudo-Huber-kernel MMD documented below. Optimized by
+  # REINFORCE with a leave-one-out baseline over `mmd_group_size` candidates
+  # drawn at the same state. See `mmd_reward.py`.
+  #
+  # 0 disables it entirely -- the feature map is never even loaded.
+  mmd_reward_weight: 0.0
+
+  # What a sampled answer is scored ON. The group sampling, the leave-one-out
+  # baseline and REINFORCE machinery are shared; the reward function changes.
+  #   feature -- pooled-feature distance to x0 under a frozen model. A
+  #              similarity to one particular reference, which is why the
+  #              TinyGSM probe finds it close to a soft edit distance.
+  #   feature_mse -- negative MSE of real/generated features at matching masked
+  #              token positions, averaged over hidden coordinates and tokens.
+  #              Uses the same feature source/layers/noise; requires
+  #              mmd_score_positions: written. Ignores kernel/RBF/pooling
+  #              settings. With source=rows, scores each row independently
+  #              (ignores kernel_batch_size). With source=draws, averages K
+  #              per-draw MSE rewards; the surrogate does not divide by K again.
+  #   idlm    -- the ELBO log-density ratio nll_fake(x) - nll_teacher(x), the
+  #              same quantity DMD differentiates, reached by a score estimator
+  #              instead. Judges the sample on its own merits rather than
+  #              against a reference, and needs no feature map, so
+  #              mmd_feature_source / mmd_feature_layer / mmd_ar_model are all
+  #              ignored. It needs a TRAINED fake -- an untrained one is still a
+  #              copy of the teacher and the ratio collapses to ~0 for every
+  #              sample -- so the fake phase keeps running even at
+  #              dmd_weight=0, which for the feature reward switches it off.
+  #              `dmd_weight=0` with this reward therefore means: train the fake
+  #              as usual, but give the generator only the REINFORCE term.
+  #              Candidates in one leave-one-out group share the SAME sampled
+  #              diffusion time and corruption mask. Otherwise the advantage
+  #              mostly ranks corruption luck rather than generated quality.
+  mmd_reward_type: feature
+
+  # Optional physical forward limit for reward-only feature/feature_mse MDLM.
+  # Keep loader.batch_size/global_batch_size unchanged to preserve the objective.
+  # Checkpoints student forwards (extra backward recomputation), splits frozen
+  # feature forwards, then computes rewards/bandwidth/normalization over the
+  # original loader batch. Positive integer or null (legacy path). Not for DMD
+  # or IDLM-ratio/fake training; no guarantee of bitwise/RNG-identical runs.
+  mmd_forward_batch_size: null
+
+  # Maximum generated sequences per teacher/fake forward for the IDLM ratio
+  # reward. Bounds vocabulary-logit memory without changing loader.batch_size,
+  # mmd_group_size, shared corruption or the group baseline. Positive integer;
+  # smaller values use less memory and more critic forwards. Feature rewards
+  # and fake-critic training do not use this setting.
+  idlm_reward_batch_size: 8
+
+  # Which frozen model supplies the features.
+  #   ar        -- `kuleshov-group/owt-ar`, a causal DiT on the student's exact
+  #                corpus and vocabulary (50258 ids, matching mdlm-owt token for
+  #                token). Independent of the model being distilled.
+  #   diffusion -- the frozen teacher already in memory. Cheaper, but it
+  #                measures the reward in the student's own feature space.
+  mmd_feature_source: ar
+
+  # HF hub id (or a local dir with the same config.json / pytorch_model.bin).
+  # Loaded via the vendored `models/backbone_dit_legacy.py`, because the
+  # published remote code imports transformers.models.qwen3, which this
+  # environment's transformers 4.38.2 does not have.
+  mmd_ar_model: kuleshov-group/owt-ar
+
+  # Masking applied to BOTH rows before reading the diffusion teacher, which
+  # never saw a clean sequence. Ignored by `mmd_feature_source: ar` -- a causal
+  # LM did see clean text, so masking there would inject a difference into a
+  # comparison meant to isolate what the student wrote.
+  #
+  # Set 0.0 to feed the teacher whole, unmasked sentences instead: the masking
+  # is `rand < noise_level`, so nothing is dropped and the features are read off
+  # the clean rows. That is what the TinyGSM runs used, and it costs nothing
+  # extra here -- with `dmd_weight=0` the teacher is already resident and
+  # otherwise unused, where `mmd_feature_source: ar` loads a second model.
+  # Verified on OWT: the blocks resolve through the `hf_dit` wrapper and the
+  # reward stays monotone in corruption size.
+  mmd_noise_level: 0.1
+
+  # Which block's hidden states to read. `null` is the middle one: late layers
+  # specialize toward the next-token head and early ones barely differ from the
+  # embedding, so neither end says much about whether two sequences *mean* the
+  # same thing. Both owt-ar and mdlm-owt have 12 blocks, so null resolves to 6.
+  #
+  # `-1` selects the token EMBEDDINGS instead of a block -- a pure lookup with
+  # no attention and no mixing, so its pooled feature carries the token
+  # multiset and nothing about order. Verified: permuting a sequence leaves the
+  # pooled delta at 3e-08 for -1, against 17.9 for block 6. That makes it the
+  # floor any real block has to beat, not a reward to train on. It is admitted
+  # explicitly rather than falling through to Python's from-the-end indexing,
+  # which would have silently handed back the last block.
+  #
+  # A list asks for a summed reward, one reward term per block. Mind the
+  # scale spread: on the TinyGSM teacher the reward per corrupted token grew
+  # ~6x per four blocks, which makes an unweighted sum very nearly the deepest
+  # block alone. Use `mmd_feature_layer_weights` to put terms on equal footing.
+  mmd_feature_layer: null
+  mmd_feature_layer_weights: null
+
+  # How the two feature sets are compared.
+  #   linear -- rows mode and draws+token pool both sides and score the
+  #             difference with pseudo-Huber. `draws + sentence` instead uses
+  #             the actual normalized linear-kernel MMD: MSE between means,
+  #             with the fake-sample variance correction when K > 1.
+  #   linear_l2 -- negative MSE between real and generated mean feature vectors,
+  #             computed in fp32 after pooling. Supports rows/draws and both
+  #             token/sentence levels; draws are averaged before squaring.
+  #             Biased/V-statistic form, with no variance correction at K > 1.
+  #             Compares pooled means; feature_mse instead compares aligned
+  #             token features individually.
+  #             Requires mmd_reward_type: feature; supports AR and diffusion.
+  #   rbf    -- Gaussian-kernel MMD^2 over the token or sentence feature
+  #             distributions selected below. Sensitive to more than the mean,
+  #             which is the point given the probe's finding that the linear
+  #             reward behaves close to a soft edit distance.
+  #   cosine -- true dot-product MMD on individually L2-normalized features.
+  #             Token level normalizes each token; sentence level computes the
+  #             mean/last-token readout first, then normalizes that vector.
+  #             No pseudo-Huber, no extra 1/hidden_dim, and no RBF bandwidth.
+  #             Same off-diagonal estimator/activity rules as RBF, including
+  #             the fixed-real K=1 biased fallback for draws+sentence.
+  #             Matches mean unit features, not the full directional distribution.
+  #             Requires mmd_reward_type: feature; supports AR and diffusion.
+  #   pseudo_huber -- draws+sentence only. Distance-induced kernel built from
+  #             rho(x,y) = mean_d(sqrt((x_d-y_d)^2 + c^2) - c), c=0.001.
+  #             K=1 exactly preserves the historical pseudo-Huber reward.
+  #             K>1 uses mean_i rho(real,fake_i) minus half the mean over
+  #             distinct fake pairs; reward is the negative of that estimate.
+  #             This is a separate additive kernel, not Huber applied to a
+  #             linear/RBF MMD afterward. It need not distinguish distributions
+  #             differing only in dependencies between feature coordinates.
+  # RBF is computed by `mmd_rbf.py`, which reduces the three pair sums a tile at a
+  # time and never materialises the (batch, length, length) Gram matrix.
+  # MMD estimates are never clipped: negative estimates yield positive rewards.
+  mmd_kernel: linear
+  # What one kernel sample is, for whichever kernel is chosen.
+  #   token    -- every scored position of the kernel row (the default and the
+  #               historical behaviour). The distribution being matched is
+  #               over token features.
+  #   sentence -- read one feature vector per sequence using
+  #               `mmd_sentence_pooling`, then apply the kernel to those vectors.
+  #
+  # With mean pooling in `rows` mode, linear/linear_l2 token/sentence levels agree
+  # when every sequence in a row has the same scored count; otherwise token pooling
+  # weights a sequence by how much was scored while sentence pooling weights every
+  # sequence alike. Sentence-level RBF/cosine in rows mode need K >= 2 because
+  # both empirical sides contain K independently observed batch rows.
+  #
+  # In `draws` mode, sentence level produces one pooled REAL embedding and K
+  # independently pooled FAKE embeddings for each state. For linear, RBF,
+  # cosine and pseudo_huber, K > 1 removes fake self-pairs: it is unbiased over fake
+  # draws with the observed real embedding treated as fixed. K = 1 uses the
+  # biased empirical estimate because no off-diagonal fake pair exists.
+  # Unlike rows mode, sentence-level RBF/cosine are therefore valid at K = 1.
+  # linear_l2 always compares the real vector with the mean of K fake vectors
+  # using MSE, with no variance correction even at K > 1.
+  mmd_kernel_level: token
+  # Sentence representation (`mmd_kernel_level: sentence`):
+  #   mean       -- average over `mmd_score_positions` (historical default).
+  #   last_token -- AR hidden state at the last content token, even if that
+  #                 token was NOT masked/written. For packed OWT this is always
+  #                 position length-1, not the last masked token or first EOS.
+  #                 Requires mmd_feature_source: ar and mmd_reward_type: feature.
+  # This changes only the sequence readout, for both rows and draws and their
+  # existing kernels; estimators, layer weights and loss normalization stay
+  # unchanged. All tokens still go through the AR critic. A contextual block
+  # (`mmd_feature_layer >= 0`, or null for middle) sees the preceding tokens;
+  # layer -1 is only an input embedding and has no prefix context.
+  mmd_sentence_pooling: mean
+  # What FILLS the kernel batch, i.e. where the `mmd_kernel_batch_size` samples
+  # come from.
+  #   rows  -- adjacent sequences of the batch (the default and the historical
+  #            behaviour). They are different rows, so different `x0` and
+  #            different `x_t`, and the row's single reward is shared by all of
+  #            them -- which is what costs credit assignment 1/sqrt(N); see
+  #            `scripts/probe_kernel_batch_size.py`.
+  #   draws -- `mmd_kernel_batch_size` draws from the SAME `student_probs`, at
+  #            one state. Each REINFORCE candidate becomes that whole set
+  #            rather than a single sample. Token level compares n real token
+  #            features with K*n fake token features. Sentence level first
+  #            reads each sequence via `mmd_sentence_pooling`, then compares
+  #            one fixed real vector with K fake vectors. No reward is shared
+  #            between batch rows, so attribution stays intact.
+  #
+  # `draws` needs a critic with `multi_draw_reward`, which the feature critics
+  # have and `mmd_reward_type: idlm` does not. It costs `mmd_group_size *
+  # mmd_kernel_batch_size` critic forwards per micro-batch, so G=8 with K=4 is
+  # 4x the default's critic time.
+  mmd_kernel_source: rows
+  # Exponent scale: `null` uses 1 / (2 * median(D)) on REAL features per call.
+  # For squared Euclidean, this is alpha = 1 / (2 sigma^2). Fitting bandwidth
+  # to the student would let it drift as the student does.
+  mmd_rbf_alpha: null
+  # Distance inside exp(-alpha * D), used only by mmd_kernel: rbf.
+  #   squared_euclidean -- D = sum_d (x_d-y_d)^2 (historical default).
+  #   pseudo_huber -- D = sum_d (sqrt((x_d-y_d)^2 + delta^2) - delta).
+  # This is coordinatewise and summed, using the existing feature loss's
+  # smooth pseudo-Huber shape. It is distinct from mmd_kernel: pseudo_huber.
+  # With either distance, null alpha uses 1 / (2 * median(D)) on real features.
+  # Explicit alpha values tuned for squared Euclidean need recalibration.
+  # Pseudo-Huber uses fused Triton reductions on supported CUDA inputs,
+  # otherwise the portable tiled PyTorch implementation.
+  mmd_rbf_distance: squared_euclidean
+  # Positive transition scale in feature units, used only for pseudo_huber.
+  mmd_rbf_huber_delta: 0.001
+  # Tile edge for the blocked kernel; 0 sizes it from a 256MB scratch budget.
+  # Pseudo-Huber caps pair tiles to its own scratch budget; its portable
+  # fallback also chunks features. Fused CUDA keeps coordinate scratch local.
+  mmd_rbf_block_size: 0
+  # Omit only the reference-reference contribution and skip its kernel sums.
+  # Keep fake-fake/real-fake pairs, normalization, masks and bandwidth unchanged.
+  # Supports feature RBF with rows/draws, token/sentence, and either distance.
+  # Token mode supports K=1 with the existing minimum scored-token counts.
+  # Independent of exclude_same_sentence, which already omits real-real.
+  # Auto bandwidth still measures distances between real features.
+  mmd_rbf_omit_real_real: false
+  # Omit the entire fake-fake contribution and skip its kernel sums.
+  # Reward = 2*RF - RR, or 2*RF if real-real is also omitted.
+  # This changes the objective by removing the generated-sample repulsion.
+  # Same supported RBF modes/distances as omit_real_real; masks, bandwidth,
+  # RF normalization and K/G scaling are unchanged. Also skips cross-sentence
+  # FF when exclude_same_sentence=true (that mode still requires K>=2).
+  mmd_rbf_omit_fake_fake: false
+  # In draws+token RBF, exclude ALL fake-fake pairs from the same generated
+  # sentence. Different draws keep every token pair, including equal positions.
+  # With K draws and n scored positions, normalize fake-fake by K*(K-1)*n^2
+  # and real-fake by K*n^2. Omit the real-real term (one reference sentence).
+  # Reward = 2*mean(real-fake) - mean(cross-sentence fake-fake); its negation
+  # omits the reference constant, so it is not a complete MMD^2 value.
+  # Requires feature reward, kernel=rbf, source=draws, level=token and K>=2.
+  # Both squared_euclidean and pseudo_huber distances are supported.
+  # False preserves the historical token-diagonal-only estimator.
+  mmd_rbf_exclude_same_sentence: false
+  # Additionally exclude equal token positions (i=j) from cross-draw fake-fake
+  # pairs: keep only r!=s AND i!=j. Requires the cross-sentence mode above
+  # (feature + rbf + draws + token, exclude_same_sentence=true, K>=2).
+  # Fake-fake denominator is K*(K-1)*n*(n-1); rows with n<2 are inactive.
+  # Real-fake still uses ALL i,j and denominator K*n^2. No feature pooling.
+  # Both RBF distances and omit_fake_fake are supported; n>=2 still required.
+  # Automatic bandwidth still uses the existing real-token distance median.
+  mmd_rbf_exclude_same_position: false
+  # Kernel sample count K. Its meaning depends on `mmd_kernel_source`:
+  #   rows  -- K adjacent device-batch sequences are matched as a group and
+  #            share one reward. K must divide the per-device batch size.
+  #   draws -- K complete generated sequences are sampled at the SAME state
+  #            inside each REINFORCE candidate. It need not divide the batch.
+  #
+  # Rows mode can be satisfied by swapping content between its K sequences:
+  # the pooled mean and token multiset can stay unchanged, and sharing its
+  # reward coarsens credit assignment. Draws mode instead spends K times the
+  # critic compute to estimate one state's output distribution. Its candidate
+  # log-probability is the sum over those K draws and the loss divides by K, so
+  # changing K changes compute and estimator variance, not nominal weight.
+  mmd_kernel_batch_size: 1
+
+  # Which positions the reward is measured over. The student only ever WRITES
+  # the masked ones, and the REINFORCE surrogate always sums log-probabilities
+  # over exactly those -- this changes only what the critic looks at.
+  # For sentence pooling `last_token`, this does not choose the readout
+  # position: the endpoint comes from the full content span instead.
+  #   written -- the masked span alone (the default, and the historical
+  #              behaviour). Outside it the generated row IS the clean row, so
+  #              this is the span the two sequences actually differ on.
+  #   all     -- every content position. The extra positions hold identical
+  #              TOKENS in both rows, so they contribute only through the
+  #              feature map's context sensitivity: the hidden state at an
+  #              unwritten position still moves when the tokens around it
+  #              change. It therefore asks a different question -- how far the
+  #              student's writing perturbed the whole sequence's
+  #              representation, rather than how wrong the written span is.
+  #
+  # Measured on mdlm-owt features, against a known per-row corruption level.
+  # `all` does NOT discriminate better -- it rescales:
+  #
+  #   written/seq        51     153     307     512     921
+  #   corr  written    0.941   0.961   0.965   0.971   0.965
+  #   corr  all        0.908   0.948   0.963   0.971   0.966
+  #   |reward| written 1.038   1.050   1.149   1.293   1.538
+  #   |reward| all     0.152   0.410   0.720   1.059   1.509
+  #
+  # So the context term carries no extra ranking information, and the delta is
+  # diluted in proportion to the mask fraction -- 7x smaller at 5% masked,
+  # converging by 90%. Since `t ~ U(0,1)` spreads rows across that whole range,
+  # the practical effect is a REWEIGHTING of the schedule: rows that wrote
+  # little count for less. That is not obviously wrong -- few-step sampling
+  # starts from a fully masked sequence, so the heavily-masked rows are the
+  # regime that matters -- but it is a different knob from the one it looks
+  # like, and it costs correlation at the sparse end. Watch `mmd/reward` and
+  # `mmd/reward_spread`: both shrinking is the dilution, not a broader signal.
+  # feature_mse requires written: only the masked/content intersection counts.
+  mmd_score_positions: written
+
+  # Samples drawn per state, each costing one critic forward. At >= 2 the
+  # group's own leave-one-out mean is the baseline. 1 is allowed and is the
+  # cheap end -- a quarter the critic cost of 4 -- but it has no second sample
+  # at the same state, so the baseline has to come from somewhere else.
+  # The surrogate is averaged over this axis (`1 / group_size`, as in GRPO), so
+  # increasing it changes estimator variance and compute, not the nominal
+  # strength of `mmd_reward_weight`.
+  mmd_group_size: 4
+
+  # Which control variate removes the reward's offset.
+  #   auto  -- group when mmd_group_size >= 2, none when it is 1
+  #   group -- leave-one-out within the group; the lowest-variance option,
+  #            since every member was drawn at the same state
+  #   batch -- leave-one-out across the other sequences in the batch. Unbiased
+  #            and free, but noisier: those rows carry different x0 and
+  #            different masking, so their rewards measure different things.
+  #   none  -- subtract nothing; useful mainly as a control. Unclipped MMD
+  #            estimates can be negative and therefore produce positive reward.
+  mmd_baseline: auto
+
+  # Distillation-only sanity check for a one-forward generator. When true,
+  # the student's first prediction is made from the exact inference prior:
+  # every generated token is MASK, at t=1. The teacher/fake ELBO noise level
+  # remains independently sampled by the original IDLM schedule. This is
+  # intentionally separate from `sampling.steps`, which only controls eval.
+  generator_force_full_mask: False
+
+  # Optional few-NFE training mixture. Unless full-mask mode above is enabled,
+  # the ordinary distillation schedule draws a uniform diffusion time and thus
+  # an approximately uniform expected mask probability. When this is non-zero,
+  # that fraction of generator rows instead draws its expected mask probability
+  # uniformly from [high_mask_min, high_mask_max]. For example, 0.5 / 0.7 / 1.0
+  # devotes half of the rows to states with 70--100% of their tokens masked.
+  #
+  # This changes the corruption used to PRODUCE the student's sample. It is
+  # unrelated to mmd_noise_level, which only corrupts inputs to a diffusion
+  # feature critic. It applies consistently to MMD, DMD, and their combination
+  # because they share the same generator rollout. A zero fraction preserves
+  # the historical sampler exactly, including its RNG stream.
+  high_mask_fraction: 0.0
+  high_mask_min: 0.7
+  high_mask_max: 1.0
+
+  # BD3-LMs-style clipping of the generator's expected masking probability.
+  # original keeps the sampler/high-mask mixture above; clipped uses a fixed
+  # interval; adaptive selects an interval by held-out per-sequence denoising
+  # loss variance (a proxy, not MMD gradient variance). Only generator input
+  # corruption changes. Use high_mask_fraction=0 and generator_force_full_mask=False.
+  # Bounds are intersected with the log-linear noise support, so max=1 means
+  # 0.999 here. Actual mask counts remain Bernoulli draws, without rejection.
+  mask_schedule:
+    mode: original
+    min: 0.45
+    max: 0.95
+    # Extra student forwards per candidate on this many validation batches;
+    # ordinary validation NLL continues using the original full range.
+    search_batches: 4
+    search_intervals:
+      - [0.001, 1.0]
+      - [0.1, 0.6]
+      - [0.2, 0.7]
+      - [0.3, 0.8]
+      - [0.4, 0.9]
+      - [0.45, 0.95]
+      - [0.5, 1.0]
+
+  # --- Generator input-noise conditioning (D-MMD Sec. 6.5) -------------------
+  # A masked-diffusion generator is a DETERMINISTIC function of its masked
+  # input, and its tokens are drawn independently per position. That
+  # factorization is why a moment-matching objective can minimise itself by
+  # collapsing the output distribution -- which is exactly the failure this repo
+  # already documents, gen_ppl improving while entropy falls. These give the
+  # generator a real input noise source: a learned matrix projects per-token
+  # Gaussian noise into the student's token-embedding residual, so it can stay
+  # diverse across draws while each factorised output sharpens.
+  #
+  # Applied by wrapping the student backbone (`algo._NoiseConditionedBackbone`),
+  # so the noise is injected identically in training and in sampling. The
+  # teacher and fake critics are copied BEFORE the wrap and stay noise-free.
+  # Distillation only; a plain MDLM run is unaffected.
+  #
+  # Dimensionality of the injected Gaussian. 0 => disabled (original IDLM), and
+  # the forward pass is then bit-identical to a run without this feature.
   noise_dim: 0
-  # Granularity of the above noise conditioning. False (default) draws an
-  # independent Gaussian per token position; True broadcasts one per-sample
-  # vector across all token embeddings (same noise for every position).
+  # Granularity. False (default) draws an independent Gaussian per token
+  # position; True broadcasts one per-sample vector across all token embeddings
+  # (same noise for every position).
   noise_shared: False
   # INITIAL size of the injected noise vector, as a multiple of the student
   # embedding's own per-entry std -- i.e. the initial `noise/snr`. The projection
@@ -169,222 +451,31 @@ adversarial_distill:
   # Pin `rms(W)` to `noise_scale` for the whole run by normalising the projection
   # in the forward pass, leaving only its *direction* learnable. Stops the slow
   # erosion described above, so the snr you set is the snr you keep. Requires
-  # noise_scale > 0. False => the magnitude stays learnable (the historical
-  # behaviour) and `noise/snr` drifts wherever the objective takes it.
+  # noise_scale > 0. False => the magnitude stays learnable and `noise/snr`
+  # drifts wherever the objective takes it.
   noise_hold_rms: False
   # Separate learning rate for the learned noise-projection matrix. null => it
   # trains at optim.lr like the rest of the student. Only used when noise_dim>0.
   # Under the rescaled parameterization above, Adam moves `noise/snr` by roughly
   # this much per step (sign-consistent upper bound), so ~1e-3 reaches snr ~1 in
-  # a few thousand steps and 1e-4 takes ~1e4+. NOTE: not comparable to runs from
-  # before the rescaling, where the same value moved snr ~sqrt(noise_dim)/
-  # embed_std (~37x at noise_dim=128 on mdlm-owt) faster.
+  # a few thousand steps and 1e-4 takes ~1e4+.
   noise_lr: null
-  # Number of sampling steps k for the D-MMD posterior scheme (algo=mdlm_dmmd,
-  # MDLM_with_DMMD). The generation time t is drawn one step above the uniform
-  # critic time s via delta_t ~ U(0, 1/k), t = min(1, s + delta_t), so the critic
-  # latent z_s ~ q(z_s | z_t, x). Smaller k => a bigger gap between s and t (more
-  # positions revealed per step) and more mass on the t = 1 atom, where the
-  # generator sees the near-fully-masked input it starts sampling from.
-  # Ignored by the original IDLM re-noising path (algo=mdlm).
-  dmmd_num_steps: 32
-  # Mask-sampling scheme for algo=mdlm_dmmd (MDLM_DMMD). 'posterior' ('s'):
-  # D-MMD Algorithm 1, critic latent z_s ~ q(z_s | z_t, x) at t = min(1, s+delta).
-  # 'renoise' ('t'): original IDLM, re-noise student_probs to an independent
-  # time t. Lets the two schemes be A/B-tested with everything else fixed.
-  dmmd_mask_sampling: posterior
-  # Which positions get masked, in both dmmd_mask_sampling modes. 'random'
-  # (default, historical): each eligible position is masked independently, the
-  # same i.i.d. draw q_xt uses everywhere else. 'suffix' ('postfix'): the
-  # masked positions are a single contiguous block at the *end* of the
-  # sequence (or, with a prompt mask, the end of the valid_tokens==1 span) --
-  # the prefix stays unmasked/revealed at both z_t and the re-noised/posterior
-  # z_s. The boundary is set deterministically from alpha
-  # (round((1 - alpha) * n_eligible) masked positions), not drawn at random,
-  # so the z_s boundary is automatically <= the z_t one (alpha_s >= alpha_t)
-  # and the posterior only ever reveals the positions immediately left of the
-  # current mask -- no separate reveal step is needed the way 'random' needs
-  # one. For text this is prefix-conditioned generation/training -- a clean
-  # prompt, generated continuation as one contiguous block after it -- rather
-  # than the scattered masked-LM-style gaps 'random' produces throughout the
-  # sequence.
-  dmmd_mask_layout: random
-  # D-MMD Sec. 3.3 top-p (nucleus) teacher distillation (algo=mdlm_dmmd). The
-  # teacher target is restricted to the top-p nucleus so the student mode-seeks.
-  # >= 1 disables it (teacher target unchanged); the paper's best masked-text
-  # value is ~0.85. Applies in both dmmd_mask_sampling modes.
-  top_p: 1.0
-  # Constant Delta by which out-of-nucleus teacher logits are lowered instead of
-  # hard-masking (D-MMD Sec. 3.3, paper uses Delta=2). Avoids gradient spikes.
-  top_p_delta: 2.0
-  # Train/decode alignment: restrict the distillation losses to the positions a
-  # confidence-threshold sampler would actually commit at this noise level --
-  # among the positions the student predicted (masked in its own input), those
-  # whose top probability clears the threshold, and always at least `min_k` of
-  # them. Everything below the bar is discarded at sampling time and re-predicted
-  # later with more context, so supervising it trains the student on marginals no
-  # sample is ever drawn from -- and those are the hardest positions, so they
-  # dominate the gradient while contributing nothing to what is emitted.
-  # 'none' (default) => original behaviour, bit-for-bit.
-  # 'generator' => mask the student's objective only; the fake critic keeps
-  #   modelling every position, so it stays an accurate critic off-support.
-  # 'both' => mask the fake critic's objective too, so critic and generator are
-  #   fit on the same token set.
-  # NOTE this changes the loss *scale*: the reduction becomes a mean over the
-  # committed tokens (see `_reduce_positions`), where an OWT run with no
-  # `valid_tokens` previously summed over all `model.length` positions. Revisit
-  # optim.lr / fake_lr when switching it on.
-  confidence_loss_mask: none
-  # Threshold and k for the above. null => inherit sampling.confidence_threshold
-  # / sampling.min_reveal, so training filters on exactly the rule decoding uses.
-  # Set explicitly only to decouple the two.
-  confidence_loss_threshold: null
-  confidence_loss_min_k: null
 
-  # --- RL distillation (algo=mdlm_rl, algo.MDLM_RL) -------------------------
+  accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
+  fake_frequency: 1
+  # Learning rate for the fake critic. null => fall back to optim.lr (original
+  # IDLM: fake and student share one rate). The critic chases a moving student
+  # rather than converging to a fixed target, so it can want a larger, separate
+  # rate -- the two-time-scale setup.
   #
-  # Everything below is read only by `algo=mdlm_rl`. That algo optimizes the
-  # SAME reverse KL as D-MMD, but replaces D-MMD's *pathwise* gradient (which
-  # differentiates through the student's soft prediction while holding the AR
-  # critics' context fixed) with a REINFORCE / policy gradient on the hard
-  # samples the critics actually score. It requires critic_type=ar (the reward
-  # is a sequence log-density, which the diffusion critic cannot supply) and
-  # reuses top_p / top_p_delta / entropy_weight / fake_teacher_weight /
-  # fake_lr / fake_frequency / use_fake / use_gradient_clipping unchanged.
-  #
-  # Ignored by mdlm_rl: dmmd_* (the D-MMD mask-sampling scheme is specific to
-  # the diffusion critic), confidence_loss_*, loss_weighting and
-  # generator_num_noised_samples.
-  #
-  # SCALE: every generator-side RL term is reduced to per-token nats, whereas
-  # the D-MMD losses are a *sum* over ~model.length positions on OWT. So
-  # `student_loss` is ~1e3x smaller here and optim.lr=1e-6 does NOT transfer --
-  # expect to raise it. `fake_lr` does transfer (the critic objective keeps its
-  # original units). Compare `grad_norm_student`, which both algos log.
-  #
-  # WHICH samples the policy gradient is taken over:
-  # * 'trajectory' (default): roll the student's own multi-step ancestral
-  #   sampler out from the all-mask prior and score the finished sequence, so
-  #   `pi_eta` is genuinely the deployed k-step sampler's marginal. Costs
-  #   `rl_num_steps + 1` student forwards per micro-step. Reads rl_num_steps /
-  #   rl_grad_steps / rl_buffer_size / rl_rollout_reuse / rl_eps; the auxiliary
-  #   critic is retargeted to trajectory samples, so fake_soft_target does not
-  #   apply.
-  # * 'onestep': draw the sample exactly the way the non-RL runs do -- one
-  #   denoiser call on a data-derived latent `z_t ~ q(.|x0, t)`, then
-  #   `x ~ Cat(x_hat_eta(z_t))` -- and take the policy gradient of the same
-  #   reward over *that* distribution. Same sampling distribution as
-  #   algo=mdlm_dmmd / mdlm (critic_type=ar), only the estimator changes:
-  #   unbiased score-function instead of the pathwise term, which is biased
-  #   because it freezes the AR context while differentiating the
-  #   probabilities. Costs ONE student forward (the sample and the gradient
-  #   come from the same call) plus `rl_onestep_group_size` critic forwards --
-  #   substantially cheaper than 'trajectory'. Reads rl_onestep_group_size;
-  #   ignores rl_num_steps / rl_grad_steps / rl_buffer_size /
-  #   rl_rollout_reuse / rl_eps, and the auxiliary critic keeps the parent's
-  #   one-shot objective (so fake_soft_target applies as usual).
-  # Aliases: {'trajectory','traj','rollout','multistep'} /
-  #          {'onestep','one_step','one-step','single','dmmd'}.
-  rl_policy: trajectory
-  # G: i.i.d. hard samples drawn per latent in rl_policy='onestep', and the
-  # group the baseline is computed over. Grouping *per latent* is what makes
-  # the baseline valid here: unlike trajectory rollouts (which all start from
-  # the same all-mask prior and are therefore i.i.d.), one-step samples are
-  # conditioned on a different `x0` and `t` in every row, so a batch-level
-  # baseline mostly measures which latent was easy rather than which sample
-  # was good. With G samples from one `z_t` it is GRPO with the prompt being
-  # that latent. Costs G teacher + G fake forwards per micro-step (one at a
-  # time, so peak memory is unchanged); the student forward is shared.
-  # G=1 disables per-latent grouping and falls back to a batch-level baseline
-  # across latents -- still unbiased with rl_baseline='leave_one_out', but
-  # much noisier; a warning is printed.
-  rl_onestep_group_size: 4
-  #
-  # k: rollout length ('trajectory' only). The policy makes k+1 denoiser calls
-  # (the grid plus the terminal noise-removal step), exactly what
-  # generate_samples does, so this
-  # is also the step budget the student is being trained to decode at -- set
-  # sampling.steps to the same value to evaluate what was trained. Cost is
-  # linear in it: a generator micro-step is k+1 no-grad forwards plus
-  # rl_grad_steps with gradient.
-  rl_num_steps: 16
-  # M: how many of those k+1 steps are recomputed with gradient per update.
-  # Every position is revealed exactly once across the trajectory, so drawing M
-  # step indices uniformly without replacement and scaling by (k+1)/M is an
-  # unbiased estimate of the full sum -- M=1 is enough, and raising it trades
-  # forward/backward passes for variance.
-  #
-  # The LogLinear schedule reveals model.length/k positions per *grid* step in
-  # expectation, uniformly across the k of them, so the subsampling is much
-  # lower-variance than it looks. The exception is the terminal noise-removal
-  # step, which mops up whatever is still masked at t=eps: ~0.01 positions at
-  # model.length=1024. Drawing it (probability 1/(k+1), ~6% at k=16) therefore
-  # yields an exactly-zero gradient for that micro-step. That is unbiased, not
-  # a bug -- the step's true contribution really is ~0 -- and `rl/logp` logging
-  # exactly 0.0 is the tell. Raise M if losing ~6% of updates matters.
-  rl_grad_steps: 1
-  # Baseline subtracted from the reward, over the group of samples. In
-  # rl_policy='trajectory' the group is a set of rollouts, which all start from
-  # the same all-mask prior and so are i.i.d. -- GRPO with an empty prompt. In
-  # rl_policy='onestep' it is the rl_onestep_group_size draws from one latent
-  # -- GRPO with that latent as the prompt. Both settings below apply to
-  # either.
-  # 'leave_one_out' (default): mean of the *other* rewards, so the baseline is
-  #   independent of the row it is subtracted from and the estimator stays
-  #   unbiased. 'group_mean': plain GRPO. 'none': raw reward (unbiased, but
-  #   carries the reward's absolute scale into the gradient).
-  rl_baseline: leave_one_out
-  # 'std' divides the advantage by the group's reward std (GRPO), which makes
-  # the gradient scale independent of how peaked the critics are and hence of
-  # top_p / how far the fake critic has drifted. 'none' leaves it in nats.
-  rl_advantage_norm: std
-  # Trajectories per baseline group. 0 => the whole local rollout batch (i.e.
-  # loader.batch_size). A group of 1 has no baseline and contributes a zero
-  # advantage, so keep loader.batch_size >= 2.
-  # rl_policy='onestep' groups per latent instead (see rl_onestep_group_size)
-  # and only consults this when that is set to 1, i.e. for the batch-level
-  # fallback.
-  #
-  # With rl_advantage_norm='std' the advantage is a z-score, so its magnitude
-  # says nothing about how far apart the rewards actually were -- only how the
-  # group ranks. At a group of 2 that degenerates completely: the advantage is
-  # exactly +-sqrt(2) on every step (visible as a pinned `rl/advantage_abs`),
-  # i.e. only the sign of the reward difference survives. Groups of >= 8 keep
-  # some magnitude information; use rl_advantage_norm='none' if you want the
-  # reward gap itself to drive the step size.
-  rl_group_size: 0
-  # Mix the D-MMD *pathwise* generator term back in. 0 (default) => pure policy
-  # gradient and nothing extra is built. The pathwise gradient is low-variance
-  # but biased (it freezes the AR context), the policy gradient is unbiased but
-  # high-variance, so a small weight can stabilize early training. Costs two
-  # extra AR forwards.
-  # * rl_policy='trajectory': evaluated at one of the trajectory's own latents
-  #   with the rolled-out sequence as AR context.
-  # * rl_policy='onestep': evaluated at the same latent and on the same sample
-  #   the policy gradient uses, so it is *exactly* the algo=mdlm_dmmd AR
-  #   generator loss (in per-token nats). Weight 1.0 therefore adds the whole
-  #   non-RL objective on top of the RL one.
-  rl_pathwise_weight: 0.0
-  # ('trajectory' only.) FIFO of finished rollouts the auxiliary critic is fit
-  # on. Generator steps
-  # fill it, fake steps draw from it, so a fake step costs no rollout. Only the
-  # sequences are stored (rl_buffer_size * loader.batch_size * model.length
-  # int64s). Larger => the critic sees a slightly staler mixture.
-  rl_buffer_size: 8
-  # ('trajectory' only.) Reuse one rollout for this many consecutive generator
-  # micro-steps. Setting
-  # it to `accum_batches` is *exactly* on-policy -- neither the student nor the
-  # critic takes an optimizer step inside an accumulation window -- and divides
-  # the rollout cost by that factor; the price is correlated gradients within
-  # the window. Beyond accum_batches it becomes off-policy and, with no
-  # importance ratio implemented, biased.
-  rl_rollout_reuse: 1
-  # ('trajectory' only.) Terminal time of the rollout's sampling grid. null =>
-  # 1e-5, the default
-  # `TrainerBase.generate_samples` decodes with, so the trained policy is the
-  # evaluated one. NOTE this is deliberately not training.sampling_eps (1e-3),
-  # which floors the *training* time draw.
-  rl_eps: null
+  # It matters most with `mmd_reward_type=idlm`, where the reward IS
+  # `nll_fake - nll_teacher`: a critic that cannot keep up with the student
+  # stays a copy of the teacher, the ratio collapses to ~0 for every sample,
+  # and the run is a silent null rather than a crash. Watch `mmd/reward` and
+  # `mmd/reward_spread` -- both near zero means the critic, not the generator,
+  # is the thing that is stuck.
+  fake_lr: null
+  gradient_clipping_val: 1.0
 
 loader:
   global_batch_size: 512
@@ -396,69 +487,22 @@ loader:
   pin_memory: True
 
 sampling:
-  predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic, confidence, remask
-  # Which positions the 'ancestral'/'ancestral_cache' predictors reveal at
-  # each step, i.e. the sampling-time counterpart of
-  # `adversarial_distill.dmmd_mask_layout`. 'random' (default, historical):
-  # revealed positions are whichever the per-position categorical draw
-  # happens to land on -- unconstrained order. 'suffix': the revealed set is
-  # forced to be a growing *prefix* -- at each step, exactly the frontmost
-  # still-masked positions up to `AbsorbingState._suffix_mask_boundary(alpha_s,
-  # length)` are revealed (values still drawn from p_x0; only which positions
-  # get committed is deterministic), so the trajectory only ever visits
-  # states with a clean prefix / masked suffix -- prefix-conditioned
-  # generation for text. Only meaningful when evaluating a model trained with
-  # `dmmd_mask_layout=suffix` -- with the default 'random' training layout,
-  # forcing a prefix reveal order at sampling time feeds the model
-  # conditioning patterns (an arbitrary clean prefix, masked suffix) it never
-  # trained on, same as the reverse mismatch. Not implemented for 'analytic',
-  # 'confidence' or 'remask'.
-  mask_layout: random  # random, suffix
+  predictor: ancestral  # ancestral_cache (only for MDLM), ancestral, analytic
   steps: 1000
+  # Softmax temperature on the denoiser's x0 prediction, applied inside the
+  # ancestral update before the posterior is formed. 1.0 is exactly the
+  # published sampler -- the tempering is skipped outright, not computed with a
+  # scale of one -- so this defaults to a no-op.
+  #
+  # Deliberately NOT applied to the posterior `q(x_s | x_t)`. That distribution
+  # mixes the model's belief with the schedule's "stay masked" mass `1 - alpha_s`,
+  # and tempering the mixture would rescale the unmasking rate too, i.e. quietly
+  # change how many tokens each step commits. Tempering `p(x0 | x_t)` changes
+  # only what the model believes, leaving the schedule intact.
+  temperature: 1.0
   noise_removal: ancestral  # 'ancestral', 'greedy', 'none'
   use_float64: True
   p_nucleus: 1.0
-  # --- predictor: remask (consistency-style decode-then-renoise) ---
-  # The ancestral predictors freeze a position the moment they reveal it, so
-  # a token committed early from an almost fully masked context is final.
-  # This one decodes *every* position each step and then renoises, so a
-  # revealed token can go back to [MASK] and be re-decoded later under a
-  # richer context. `remask_strategy` sets `sigma_t`, the probability of
-  # remasking an already revealed token (see
-  # `trainer_base.AbsorbingState._remask_update` for the derivation):
-  #   consistency -- sigma_t = 1 - alpha_s. Both branches of the update
-  #                  coincide, so the step forgets x_t entirely: decode the
-  #                  whole sequence, renoise to level s. The masked-diffusion
-  #                  analogue of consistency-model multistep sampling.
-  #   scaled      -- sigma_t = remask_eta * (1 - alpha_s), a straight
-  #                  interpolation between the plain ancestral sampler
-  #                  (eta = 0) and 'consistency' (eta = 1).
-  #   cap         -- sigma_t = remask_eta, clipped to the largest admissible
-  #                  rate (ReMDM's max-cap schedule).
-  # Every setting keeps the expected masked fraction on the schedule's
-  # 1 - alpha_t, so `steps` means the same thing as it does for `ancestral`
-  # and the two are comparable at equal step count. Costs a denoiser call on
-  # every step (no p_x0 caching), and invalidates the ELBO -- likelihood
-  # numbers from `_loss` do not describe this sampler.
-  remask_strategy: consistency  # consistency, scaled, cap
-  remask_eta: 1.0               # only read by 'scaled' and 'cap'
-  # --- predictor: confidence (block-diffusion style decoding) ---
-  # Which positions to commit: every masked position whose predicted
-  # probability is >= `confidence_threshold`, at least `min_reveal` of
-  # them per step. `steps` is only a budget cap for this predictor, and
-  # a threshold > 1.0 gives plain top-`min_reveal`-per-step decoding.
-  confidence_threshold: 0.9
-  min_reveal: 1
-  block_size: 0  # 0 => decode the whole sequence at once (no semi-AR blocks)
-  # Which token to write there: softmax temperature on the proposed
-  # token only (the threshold above always sees the untempered
-  # probability). 0 => greedy argmax, as in every LLaDA / dInfer
-  # threshold decoder; 1.0 matches the ancestral sampler's categorical
-  # draw. NOTE at 0 an unconditional batch is deterministic, so all rows
-  # come out identical unless the student injects input noise
-  # (adversarial_distill.noise_dim > 0) -- use 1.0 to measure entropy /
-  # gen-ppl over a diverse batch.
-  temperature: 0.0
   num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
   num_sample_log: 2
   semi_ar: False
@@ -471,101 +515,152 @@ training:
   importance_sampling: False
   sampling_eps: 1e-3
   change_of_variables: False
-  loss_precision: 'bf16'  # bf16, float32, float64
+  # Match the released IDLM training recipe. Keep this aligned with
+  # `trainer.precision`: the MMD reward is a small loss difference and loses
+  # useful resolution when both the forward and loss arithmetic run in bf16.
+  loss_precision: 'float32'  # bf16, float32, float64
   finetune_path: ''
-  # Mask layout for the *plain* ELBO training loss (`Diffusion.nll`'s own
-  # `q_xt` call) -- the sampling-time and DMMD-distillation-time counterparts
-  # are `sampling.mask_layout` and `adversarial_distill.dmmd_mask_layout`.
-  # 'random' (default): i.i.d. per-position masking, as always. 'suffix': a
-  # warmup-training knob for `sampling.mask_layout=suffix` prefix-conditioned
-  # sampling -- that sampler reveals positions left-to-right (start of the
-  # sequence first), and a checkpoint pretrained under i.i.d. masking never
-  # saw a large *contiguous* masked block during its own pretraining (every
-  # masked token always had scattered real neighbours nearby), which is why
-  # it collapses to a degenerate constant prediction there instead of a
-  # plausible continuation. Setting this to 'suffix' fine-tunes on exactly
-  # that conditioning pattern directly, with the plain (non-adversarial) ELBO
-  # loss -- a far more stable objective to learn a new input distribution
-  # under than the D-MMD min-max loop, which is why this is a *separate*
-  # warmup phase and not folded into `dmmd_mask_layout` itself. Point a DMMD
-  # run's `eval.checkpoint_path` at the resulting checkpoint before switching
-  # `dmmd_mask_layout=suffix` on, so the student starts in-distribution for
-  # the corruption it will be distilled under, rather than learning both
-  # "what prefix conditioning looks like" and "how to match the critic" at
-  # once.
-  mask_layout: random
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
   disable_ema: False
   compute_generative_perplexity: False
   perplexity_batch_size: 8
-  # GPT-2 Gradient Moment (GM), D-MMD paper Eq. 13/14 -- the paper's headline
-  # metric (Table 5). Measures the distance between the sample and data
-  # distributions through a frozen reference LM's loss-gradient, so (unlike
-  # generative perplexity) it does not reward mode collapse: 0 = the reference
-  # model cannot tell the samples from the data, larger = further away.
-  # Reported in two places:
-  #   * training / `mode=ppl_eval`: logged as val/gm. Requires
-  #     `trainer.inference_mode=false` (GM needs gradients; Lightning validation
-  #     is inference-mode by default).
-  #   * `mode=sample_eval`: printed and written to `generated_samples_path` as
-  #     `gpt2_gm`, paired against validation batches (no trainer flag needed).
-  compute_gm: False
-  gm_eval_model_name_or_path: gpt2   # paper uses GPT-2 base for GM
-  # M paired (gen,data) batches; needs >= 2. The estimator averages the M(M-1)
-  # cross terms, so raise it to cut variance -- in `mode=sample_eval` the
-  # effective M is min(this, sampling.num_sample_batches) and is printed.
-  gm_num_batches: 10
   compute_perplexity_on_sanity: False
-  # Mean entropy (nats) of the denoiser's *own* predictive distribution
-  # p_theta(x0 | x_t), averaged over every (denoiser call, still-masked
-  # position) pair of the sampling trajectory -- so the early, mostly-masked
-  # steps carry the most weight. Logged as val/pred_entropy.
-  # Complements val/sample_entropy (unigram entropy of the finished tokens):
-  # this one reads per-position confidence, so it is what drops when
-  # distillation or nucleus truncation sharpens the conditionals. Bounded by
-  # log(vocab_size) ~= 10.82. Free of extra forward passes -- it reduces the
-  # p_x0 the sampler already computed -- but set False to skip the reduction.
-  compute_pred_entropy: True
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
   generate_samples: True
   generated_samples_path: ${cwd:}/samples.json
-  # --- Quality/diversity Pareto curve ---
-  # val/sample_entropy and val/gen_ppl plotted against each other rather than
-  # against the step: one point per validation, so the run traces the
-  # trade-off it is buying as it trains. Refreshed on exactly the schedule
-  # those two scalars are (every validation, same global step) and costs no
-  # extra sampling -- it reuses the numbers already computed. The point is
-  # appended to `pareto_path` and the re-rendered curve is logged as an image
-  # under `pareto_image_key` by loggers that support images (underdeep does;
-  # TensorBoard silently skips it). See `pareto_curve.py`, which also plots
-  # several runs' histories together offline:
-  #   python -m pareto_curve a/pareto_curve.jsonl b/pareto_curve.jsonl -o p.png
-  pareto_curve: True
-  # Under `checkpointing.save_dir`, not `${cwd:}`, so the history keeps
-  # accumulating across resumes of the same run -- same convention as the
-  # tracker's own `underdeep_metadata.pt`.
-  pareto_path: ${checkpointing.save_dir}/pareto_curve.jsonl
-  pareto_image_key: val/pareto
-  # --- Input-noise diversity probe (`mode=noise_diversity_eval`, or set this
-  # flag to also run it at every validation) ---
-  # Generates the same batch several times with the decoding randomness
-  # replayed and only the injected input noise (adversarial_distill.noise_dim)
-  # varied, and reports how much the samples move -- i.e. whether the noise
-  # channel the generator was given is actually buying diversity or is being
-  # ignored. Logged as val/noise_div/*; see
-  # `trainer_base.TrainerBase.noise_diversity_report` for what each number is.
-  # Costs `2 * num_noises + 1` extra sampling batches per validation.
-  noise_diversity: False
-  noise_diversity_num_noises: 4      # noise draws to compare (>= 2)
-  noise_diversity_num_samples: null  # null => loader.eval_batch_size
-  noise_diversity_seed: 0
-  # Also run the mirror-image control (one noise draw, several decoding seeds)
-  # so the noise contribution can be read against the sampler's own. Halve the
-  # cost by turning it off once you know what the sampler contributes.
-  noise_diversity_decode_control: True
-  noise_diversity_path: ${cwd:}/noise_diversity.json
+
+  # --- Where the expensive evaluation runs -----------------------------------
+  # `trainer.val_check_interval` fuses two very different cadences: the
+  # held-out NLL, which is seconds, and the generative evaluation -- sampling,
+  # gen_ppl, entropy, Gradient Moment, both Pareto sweeps -- which is minutes.
+  # Wanting the second one often therefore means buying it across the whole
+  # run.
+  #
+  # These two split them apart. The NLL keeps running at the trainer's cadence
+  # throughout; the generative half runs only where these admit it. That is
+  # what makes a dense `val_check_interval` affordable: set it to 50 and a
+  # window of interest gets an evaluation every 50 steps while the rest of the
+  # run pays for none.
+  #
+  # Both null (the default) is the old behaviour exactly, and neither applies
+  # outside `mode=train` -- `ppl_eval` and friends validate once at step 0.
+  #
+  # Mind the checkpoint monitor: `callbacks.checkpoint_monitor` watches
+  # `val/gen_ppl`, which a window stops logging outside itself, and Lightning
+  # raises the moment a monitored metric is missing. `main` refuses that
+  # combination at startup rather than mid-run; drop the callback with
+  # `'~callbacks.checkpoint_monitor'` or point it at `val/nll`.
+  #
+  # Both are in `global_step`, i.e. OPTIMIZER steps -- one per global batch,
+  # whatever `accumulate_grad_batches` and the device count make that. Same
+  # units as `trainer.max_steps`, as the checkpoint callback's
+  # `every_n_train_steps`, and as the x-axis of every metric the run logs.
+  # NOT micro-batches, which is the unit `trainer.val_check_interval` counts.
+  #
+  # Inclusive `[start, end]`; either bound may be null for an open end, so
+  # `[3000, null]` reads as "everything from step 3000 on".
+  eval_step_range: null           # e.g. [1000, 2000]
+  # Or name the steps outright, when the checkpoints of interest are already
+  # known. A step only fires if a validation lands on it, and validation lands
+  # every `val_check_interval / accumulate_grad_batches` optimizer steps -- so
+  # entries must be multiples of that. Ones that are not are reported at the
+  # first validation rather than silently never firing. Set together with
+  # `eval_step_range`, both have to admit the step.
+  eval_at_steps: null             # e.g. [1000, 2000, 4000]
+
+  # Legacy GM options remain accepted for command/checkpoint compatibility.
+  # Gradient Moment is disabled in code, including when owt_gm=True: no
+  # reference collection or GM scoring in validation or Pareto sweeps.
+  owt_gm: false
+  gm_eval_samples: 64
+  gm_eval_batch_size: 4
+
+  # --- Sampling-steps frontier (quality vs diversity) -----------------------
+  # Sample the checkpoint at each of these denoising-step budgets and record
+  # generative perplexity against sample entropy, drawing the frontier as
+  # `pareto/frontier`. Both axes are needed: perplexity alone falls when the
+  # model collapses onto generic text, and entropy falling with it is the tell.
+  #
+  # `null` disables the sweep. It is opt-in because it costs the SUM of the
+  # budgets in extra sampling -- [2,4,8,16,32,64] is 126 forward passes per
+  # batch, on top of the validation that already ran. Requires
+  # `eval.compute_generative_perplexity=True`; it is skipped with a message
+  # otherwise, since perplexity is one of the two axes.
+  owt_pareto_steps: null          # e.g. [2, 4, 8, 16, 32, 64]
+  # Run the sweep on every Nth validation, to keep a cheap validation cadence
+  # while still tracking the frontier.
+  owt_pareto_every_n_validations: 1
+  # Batches per budget; 0 means follow `sampling.num_sample_batches`. More
+  # batches steady the perplexity estimate, at linear cost.
+  owt_pareto_num_batches: 0
+  # Seeded repeats per budget, averaged, with the spread drawn as error bars.
+  # 1 keeps the old single-shot behaviour and seeds nothing.
+  #
+  # This is not just "sample more" -- raising `owt_pareto_num_batches` would
+  # also shrink the error bars. Fixing the seeds makes every checkpoint draw
+  # the SAME noise, so a shift in the frontier between checkpoints reflects the
+  # model changing rather than one validation getting luckier draws. Since the
+  # plot exists to show which way the frontier is MOVING, that paired
+  # comparison matters more than the raw variance.
+  #
+  # Cost is linear: 5 seeds is 5x the sweep. Pair it with
+  # `owt_pareto_every_n_validations` to keep the total in check.
+  owt_pareto_seeds: 1
+  # Optional JSON frontier drawn as a fixed dashed baseline, in the same point
+  # format ({steps, entropy, gen_ppl}). Missing file simply omits it.
+  owt_pareto_reference: null
+
+  # --- Temperature sweep (`mode=pareto_eval`) --------------------------------
+  # One finished checkpoint, swept over sampling temperatures instead of over
+  # training steps: each temperature draws its own (entropy, gen_ppl) frontier
+  # across `owt_pareto_steps`, and the figure puts them on one axes.
+  #
+  # Where the training-time sweep asks "is this run's frontier moving the right
+  # way", this asks the question you can only ask once training is done: at a
+  # fixed step budget, what does trading the sampler's sharpness buy. Low
+  # temperature sharpens `p(x0|x_t)` -- more fluent, less varied, down and to the
+  # LEFT; high temperature the other way. A student that beats its teacher only
+  # by being sharper is visible here as a curve that sits on the teacher's own
+  # temperature line rather than below it.
+  #
+  # Budgets, seeds and batches come from the `owt_pareto_*` knobs above, so a
+  # sweep is configured the same way in both places.
+  pareto_temperatures: [0.7, 0.8, 0.9, 1.0, 2.0]
+  # Run that same temperature sweep DURING training, on every Nth validation.
+  # 0 is off, which is the right default: it costs `len(pareto_temperatures)`
+  # times the budget sweep it runs on top of, so with the documented budget list
+  # one validation would spend 5 x 126 forward passes per batch on it.
+  #
+  # Two figures appear when it is on. `pareto/temperature_frontier` is the
+  # current checkpoint's fan -- the figure `mode=pareto_eval` draws -- and
+  # `pareto/temperature_by_checkpoint` stacks every checkpoint swept so far,
+  # one panel per budget and one line per checkpoint, which is where a run's
+  # progress actually reads. Scalars land as
+  # `val/gen_ppl_s{budget}_t{temperature}` and `val/entropy_...`, so there are
+  # `budgets x temperatures` of each: keep both lists short.
+  #
+  # Budgets, seeds and batches come from the `owt_pareto_*` knobs above, and
+  # the sample count per point matches the budget sweep's, so the T=1 curve is
+  # directly comparable to the frontier `pareto/frontier` draws.
+  owt_pareto_temp_every_n_validations: 0
+  # The trained student to evaluate: a Lightning `.ckpt` written by training.
+  # `eval.checkpoint_path` stays what it is during training -- the HF id the
+  # `hf_dit` backbone is BUILT from -- and this supplies the trained weights on
+  # top of it. Empty evaluates whatever `checkpoint_path` alone produces, i.e.
+  # the teacher, which is how you measure the baseline curve.
+  student_ckpt_path: ''
+  # Several checkpoints in one sweep, compared on the same axes. Takes
+  # precedence over `student_ckpt_path` when non-empty; an empty string as an
+  # ENTRY means "the model as built", i.e. the teacher, so it can sit in the
+  # list alongside the students it is the baseline for.
+  #
+  # Every checkpoint is driven through the same temperatures, budgets and
+  # seeds, in the same order, so the comparison is paired the way the
+  # temperatures already are: a gap between two checkpoints' curves is the
+  # weights differing, not one of them drawing luckier noise.
+  student_ckpt_paths: []
 
 optim:
   weight_decay: 0
@@ -581,7 +676,7 @@ trainer:
   devices: ${device_count:}
   accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   gradient_clip_val: 1.0
-  precision: 'bf16'
+  precision: 32
   num_sanity_val_steps: 2
   max_steps: 1_000_000
   log_every_n_steps: 100
@@ -602,9 +697,6 @@ trainer:
 #     - ${data.valid}
 #     - ${algo.name}
 
-# `logger` is composed from the /logger config group (see defaults above).
-# Default: underdeep experiment tracker. Use `logger=tensorboard` for TensorBoard.
-
 hydra:
   run:
     dir: ./outputs/${data.train}/${now:%Y.%m.%d}/${now:%H%M%S}
@@ -617,4 +709,20 @@ checkpointing:
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
+  # Persist `save_dir` across preemptions via Nirvana's snapshot store, the way
+  # yrDiT's training scripts do: restore once at startup, push after every
+  # checkpoint write. A preempted job comes back with an empty local disk, so
+  # without this `resume_ckpt_path` never exists and every restart silently
+  # begins from step 0.
+  #
+  # Safe to leave on everywhere: `yt_tools` only exists inside the Nirvana job
+  # image, and off it every call is a no-op. Failures on either side are
+  # reported and swallowed -- a snapshot problem should cost progress, not the
+  # run.
+  snapshot: true
   use_periodic_train_batch_checkpoint: false
+  # Keep one full checkpoint after each training validation (including NLL-only
+  # validations), from this inclusive optimizer/global step onward. Sanity
+  # checks and standalone evaluation do not save. Other savers are independent.
+  save_evaluated_checkpoints: false
+  save_evaluated_from_step: 0

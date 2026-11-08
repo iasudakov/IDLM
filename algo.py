@@ -1,6 +1,5 @@
 import os
 import collections
-import contextlib
 import copy
 import pickle
 
@@ -9,26 +8,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import metrics
 import trainer_base
+from mask_schedule import DistillMaskScheduleMixin
 import utils
 import hydra.utils
 import models
 from ipdb import set_trace as debug
-
-
-# Floor under `p` inside `log` when differentiating the entropy. `p` holds exact
-# zeros (`_process_model_output` sends the mask logit to `neg_infinity`), and
-# `torch.special.entr` -- correct in the forward -- has gradient `-log(p) - 1`,
-# which is `+inf` there and turns into NaN the moment it meets `exp`'s backward.
-# `-(p * clamp_min(p, eps).log())` has the same value and the same gradient
-# `-log(p) - 1` wherever `p > eps`, and a finite 0 below it. Well above float32's
-# smallest normal (~1.2e-38), and the values it alters contribute < 1e-28 nats.
-_ENTROPY_EPS = 1e-30
-# Rows per chunk in the entropy reduction, as an element budget. The full
-# (B, L, V) tensor is ~1.6 GB at B=8, L=1024, V=50257; the transient product is
-# what this bounds.
-_ENTROPY_CHUNK_ELEMS = 1 << 24
 
 
 def _maybe_save_periodic_checkpoint(module):
@@ -134,52 +119,143 @@ class AR(trainer_base.TrainerBase):
     del sigma
     return None
 
-def _load_owt_ar_backbone(model_id_or_path):
-  """Loads the causal (autoregressive) DiT backbone from the
-  `kuleshov-group/owt-ar` checkpoint (or a local directory holding the same
-  `config.json` / `pytorch_model.bin`).
 
-  The upstream repo ships its full `AutoModelForCausalLM` behind
-  `trust_remote_code`, but that code imports `transformers.models.qwen3`, which
-  is unavailable in this environment's transformers. We only need the causal
-  DiT backbone (vendored at `models/backbone_dit_legacy.py`) that maps a token
-  sequence to next-token logits, so we instantiate it directly and load just
-  its weights.
+class IdlmRatioReward:
+  """Score a hard sample by the IDLM teacher/fake log-density ratio.
+
+  A drop-in for the feature critic: same `paired_reward` signature, so
+  `mmd_reward.mmd_reinforce_loss` drives it with the same group sampling and
+  leave-one-out baseline. What changes is what a sample is scored *on*.
+
+  The feature reward asks "do the frozen AR's pooled features of this sample
+  match those of `x0`" -- a similarity to one particular reference answer. This
+  asks the question IDLM's own objective asks: under the ELBO, how much more
+  likely is this sample under the frozen teacher than under the fake model that
+  tracks the student. That is a judgement about the sample's own quality rather
+  than its distance to a reference, so it does not inherit the feature reward's
+  ceiling of behaving like a soft edit distance.
+
+  It is also the same quantity DMD differentiates, reached by a score estimator
+  instead. DMD pushes `student_probs` directly through the teacher and fake and
+  differentiates; this samples hard tokens, scores them, and lets REINFORCE
+  carry the gradient. Slower and noisier, but it scores what the student
+  actually emits rather than its soft relaxation -- which is the whole reason
+  the group machinery exists.
+
+  `clean_tokens` is accepted and ignored: unlike the paired feature reward this
+  is an absolute score, not a comparison against `x0`.
   """
-  import json
-  import huggingface_hub
-  from models import backbone_dit_legacy
 
-  if os.path.isdir(model_id_or_path):
-    config_path = os.path.join(model_id_or_path, 'config.json')
-    weights_path = os.path.join(model_id_or_path, 'pytorch_model.bin')
-  else:
-    config_path = huggingface_hub.hf_hub_download(
-      model_id_or_path, 'config.json')
-    weights_path = huggingface_hub.hf_hub_download(
-      model_id_or_path, 'pytorch_model.bin')
+  # `mmd_reinforce_loss` inspects this to decide whether to log a per-layer
+  # breakdown; there are no layers here.
+  resolved_layers = []
+  layer_description = 'idlm-ratio'
 
-  with open(config_path) as f:
-    hf_config = json.load(f)
-  backbone_config = dict(hf_config['backbone_config'])
-  backbone_config.pop('_target_', None)
-  # Never let the vendored backbone try to load weights itself; we load the
-  # published owt-ar weights explicitly below.
-  backbone_config['pretrained_model_name_or_path'] = None
-  model = backbone_dit_legacy.DITLegacy(**backbone_config)
+  def __init__(self, algo):
+    self.algo = algo
+    self.reward_batch_size = getattr(
+      algo.config.adversarial_distill, 'idlm_reward_batch_size', 8)
+    if (isinstance(self.reward_batch_size, bool)
+        or not isinstance(self.reward_batch_size, int)
+        or self.reward_batch_size < 1):
+      raise ValueError('adversarial_distill.idlm_reward_batch_size must be '
+                       'a positive integer')
 
-  state_dict = torch.load(
-    weights_path, map_location='cpu', weights_only=False)
-  if isinstance(state_dict, dict) and 'state_dict' in state_dict:
-    state_dict = state_dict['state_dict']
-  backbone_state = {
-    key[len('backbone.'):]: value
-    for key, value in state_dict.items()
-    if key.startswith('backbone.')}
-  missing, _ = model.load_state_dict(backbone_state, strict=False)
-  assert not missing, (
-    f'Missing weights when loading owt-ar backbone: {missing}')
-  return model
+  def _nll_for_tokens(self, model, xt, x, sigma, alpha_t, dalpha_t, valid):
+    # Keep the original outer autocast policy; backbones may use BF16 inside.
+    # Hard targets only need their token log-probabilities, promoted to FP32
+    # as the old float32 one-hot multiplication did. Avoid allocating int64
+    # and float32 targets of shape (batch, length, vocab).
+    with torch.cuda.amp.autocast(enabled=False):
+      log_probs = self.algo._process_model_output(
+        model_output=model(xt, sigma), xt=xt, sigma=sigma)
+    token_log_probs = log_probs.gather(-1, x.unsqueeze(-1)).squeeze(-1).float()
+    del log_probs
+    loss = token_log_probs * dalpha_t / (1 - alpha_t)
+    loss = loss * valid
+    return loss.sum(-1) / valid.sum(-1).clamp_min(1)
+
+  @torch.no_grad()
+  def grouped_reward(self, clean_tokens, generated_tokens, selected, eos_id):
+    """Score `(group, batch, length)` samples with common randomness.
+
+    Leave-one-out advantages rank candidates generated for the same state.
+    Giving each candidate its own diffusion time and mask would instead rank
+    how lucky its corruption was. Draw one `t` and one corruption mask per
+    underlying batch row, broadcast both across the group, and evaluate the
+    flattened group in bounded teacher/fake batches. Chunking changes only
+    scoring memory, not the sampled candidates, times, masks or group baseline.
+    """
+    del clean_tokens, eos_id  # absolute score; nothing to compare or remap
+    algo = self.algo
+    if generated_tokens.ndim != 3:
+      raise ValueError('IDLM grouped reward expects (group, batch, length), '
+                       f'got {tuple(generated_tokens.shape)}')
+    group, batch, length = generated_tokens.shape
+    if selected.shape != (batch, length):
+      raise ValueError('IDLM selected mask must be '
+                       f'{(batch, length)}, got {tuple(selected.shape)}')
+
+    # One time and mask for each underlying row, repeated in group-major order
+    # to match `generated_tokens.reshape(group * batch, length)`.
+    t = algo._sample_t(batch, 0)
+    dalpha_t, alpha_t = algo.noise(t)
+    alpha_t = alpha_t.unsqueeze(-1)
+    move = torch.rand(batch, length, device=generated_tokens.device) \
+      < 1 - alpha_t
+    move = move & selected.bool()
+    xt_grouped = torch.where(
+      move.unsqueeze(0), algo.mask_index, generated_tokens)
+    if algo.ignore_bos:
+      xt_grouped[:, :, 0] = generated_tokens[:, :, 0]
+
+    x = generated_tokens.reshape(group * batch, length)
+    xt = xt_grouped.reshape(group * batch, length)
+    valid = selected.unsqueeze(0).expand(group, -1, -1) \
+      .reshape(group * batch, length).to(x.dtype)
+    alpha_t = alpha_t.repeat(group, 1)
+    if torch.is_tensor(dalpha_t) and dalpha_t.ndim > 0:
+      dalpha_t = dalpha_t.reshape(batch, -1).repeat(group, 1)
+    sigma = algo._process_sigma(algo._sigma_from_alphat(alpha_t))
+
+    reward = torch.empty(group * batch, device=x.device, dtype=torch.float32)
+    for start in range(0, group * batch, self.reward_batch_size):
+      end = start + self.reward_batch_size
+      sigma_chunk = sigma[start:end] if sigma is not None else None
+      dalpha_chunk = dalpha_t
+      if torch.is_tensor(dalpha_t) and dalpha_t.ndim > 0:
+        dalpha_chunk = dalpha_t[start:end]
+      args = (xt[start:end], x[start:end], sigma_chunk, alpha_t[start:end],
+              dalpha_chunk, valid[start:end])
+      # Each helper returns only one scalar per sequence; its vocabulary
+      # logits are released before scoring the other critic or the next chunk.
+      nll_teacher = self._nll_for_tokens(algo.teacher, *args)
+      nll_fake = self._nll_for_tokens(algo.fake_model, *args)
+      reward[start:end] = nll_fake - nll_teacher
+
+    # Sign, since the helper's name invites getting this backwards: it computes
+    # `sum(x * log p) * dalpha_t / (1 - alpha_t)`, and `LogLinear` returns
+    # `dalpha_t = -(1 - eps)`, i.e. negative. The negative factor flips the
+    # log-likelihood, so what comes back is a positive NLL after all.
+    #
+    # The generator minimises `nll_teacher - nll_fake`, which makes a sample
+    # likelier under the teacher and unlikelier under the fake. The reward to
+    # MAXIMISE is therefore that quantity negated.
+    reward = reward.view(group, batch).transpose(0, 1)
+    active = selected.any(dim=1)
+    reward = torch.where(active.unsqueeze(-1), reward,
+                         torch.zeros_like(reward))
+    return reward, active
+
+  @torch.no_grad()
+  def paired_reward(self, clean_tokens, generated_tokens, selected, eos_id,
+                    return_per_layer=False):
+    reward, active = self.grouped_reward(
+      clean_tokens, generated_tokens.unsqueeze(0), selected, eos_id)
+    reward = reward[:, 0]
+    if return_per_layer:
+      return reward, active, {}
+    return reward, active
 
 
 def _embedding_std(embed_module):
@@ -187,7 +263,7 @@ def _embedding_std(embed_module):
 
   Used to calibrate the noise-conditioning init to the loaded checkpoint rather
   than to a freshly-initialised backbone. Returns the DiT init scale (0.02) if
-  no weight can be located, so the behaviour degrades to the previous constant.
+  no weight can be located, so the behaviour degrades to a constant.
   """
   for attr in ('embedding', 'weight'):
     w = getattr(embed_module, attr, None)
@@ -203,7 +279,7 @@ class _NoiseConditionedBackbone(torch.nn.Module):
   vector per sample is broadcast across all embeddings (same noise everywhere).
 
   A masked-diffusion generator is otherwise a deterministic function of its
-  (masked) input, so the moment-matching objective can only be minimised by
+  (masked) input, so a moment-matching objective can only be minimised by
   collapsing its output distribution -- which destroys sample diversity. An
   input noise source lets the generator stay diverse while sharpening its
   factorised output. Fresh noise is drawn on every forward pass and added to
@@ -278,8 +354,8 @@ class _NoiseConditionedBackbone(torch.nn.Module):
       'noise_hold_rms=True; got noise_scale=0, which schedules nothing. The '
       'zero *start* comes from the warmup gain, not from noise_scale.')
     # Step the ramp is evaluated at, set once per training batch by
-    # `MDLM_with_AR.on_train_batch_start`. None => no training loop has claimed
-    # this module (eval-only runs), and the schedule reads as complete so a
+    # `MDLM.on_train_batch_start`. None => no training loop has claimed this
+    # module (eval-only runs), and the schedule reads as complete so a
     # checkpoint is evaluated with the noise level it was trained with.
     self._noise_step = None
     self.noise_proj = torch.nn.Linear(noise_dim, hidden_size)
@@ -288,7 +364,6 @@ class _NoiseConditionedBackbone(torch.nn.Module):
     # of the token identity: `snr == rms(W)`. Fixed at construction (the
     # embedding drifts during training, and recomputing it per forward would
     # both cost a reduction over the whole matrix and feed back into itself).
-    # Falls back to the DiT init scale if the module exposes no weight.
     embed_std = _embedding_std(embed_module)
     # Non-persistent: recomputed from the embedding at every construction, so it
     # adds no state_dict key (an old noise-conditioned checkpoint would
@@ -312,33 +387,7 @@ class _NoiseConditionedBackbone(torch.nn.Module):
       torch.nn.init.zeros_(self.noise_proj.weight)
     torch.nn.init.zeros_(self.noise_proj.bias)
     self._noise = None
-    # When set (see `noise_stream`), the injected noise is drawn from this
-    # private RNG instead of the global one. Used by the noise-diversity probe
-    # to vary *only* the noise channel while every other source of sampling
-    # randomness replays identically.
-    self._noise_generator = None
     embed_module.register_forward_hook(self._add_noise)
-
-  @contextlib.contextmanager
-  def noise_stream(self, seed):
-    """Draw the injected noise from a private RNG seeded with `seed`.
-
-    Inside this context the noise is still redrawn on every forward pass, but
-    the whole *sequence* of draws is a deterministic function of `seed` and is
-    taken from a generator of its own, so it neither consumes nor is consumed
-    by the global RNG stream that drives the sampler's categorical draws.
-    That decoupling is what lets `TrainerBase.noise_diversity_report` hold the
-    decoding randomness fixed while varying the noise, and vice versa.
-    """
-    device = self.noise_proj.weight.device
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(seed))
-    previous = self._noise_generator
-    self._noise_generator = generator
-    try:
-      yield
-    finally:
-      self._noise_generator = previous
 
   def set_noise_step(self, step):
     """Point the warmup ramp at `step` (the trainer's global step)."""
@@ -391,8 +440,7 @@ class _NoiseConditionedBackbone(torch.nn.Module):
     length = 1 if self.shared_noise else xt.shape[1]
     self._noise = torch.randn(
       xt.shape[0], length, self.noise_dim,
-      device=xt.device, dtype=torch.float32,
-      generator=self._noise_generator)
+      device=xt.device, dtype=torch.float32)
     try:
       return self.backbone(xt, sigma, *args, **kwargs)
     finally:
@@ -423,86 +471,52 @@ def _wrap_backbone_with_noise(backbone, noise_dim, default_hidden,
     warmup_steps=warmup_steps, hold_rms=hold_rms)
 
 
-class MDLM_with_AR(trainer_base.AbsorbingState):
-  """MDLM student distilled with *autoregressive* teacher / fake critics.
-
-  This follows the IDLM adversarial-distillation recipe, but replaces the
-  diffusion teacher and fake models with autoregressive language models (the
-  `owt-ar` checkpoint). The frozen teacher supplies the data-distribution
-  signal and the trainable fake model tracks the student's own distribution;
-  the generator loss remains `teacher_loss - fake_loss`.
-
-  Both critics score the student's (clean) generated sequence by their
-  per-position next-token log-probabilities, and those log-probs are combined
-  with the differentiable student distribution `student_probs` exactly the way
-  the diffusion denoiser log-probs were, so the gradient to the student flows
-  through `student_probs` while the token context is treated as a constant.
-  """
-
+class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
   def __init__(self, config, tokenizer):
     super().__init__(config, tokenizer)
     self._validate_configuration()
     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
-    # Resolved lazily by `_student_embed_std` for the noise diagnostics.
-    self._embed_module_cache = None
-    # Time weighting for the distillation losses (see
-    # `nll_per_token_with_probs`). Set outside the distill branch so the method
-    # never sees a missing attribute; 'elbo' keeps the original behaviour.
-    self.loss_weighting = self._normalize_loss_weighting(
-      getattr(self.config.adversarial_distill, 'loss_weighting', 'elbo'))
     if self.is_adversarial_distill:
       self.automatic_optimization = False
-      # Critic type: 'ar' uses autoregressive (owt-ar) teacher/fake; 'diffusion'
-      # uses copies of the masked-diffusion student as critics (original IDLM).
-      self.critic_type = getattr(
-        self.config.adversarial_distill, 'critic_type', 'ar')
-      assert self.critic_type in ('ar', 'diffusion'), (
-        f'Unknown adversarial_distill.critic_type: {self.critic_type}')
-
-      # Whether to use the trainable fake critic at all. If False, the fake
-      # model is not created and the generator is trained with only the teacher
-      # term (no min-max, no fake steps).
-      self.use_fake = getattr(self.config.adversarial_distill, 'use_fake', True)
-
-      if self.critic_type == 'ar':
-        ar_model_path = getattr(
-          self.config.adversarial_distill, 'ar_model_path',
-          'kuleshov-group/owt-ar')
-        # Frozen AR teacher: the pretrained data-distribution model.
-        self.teacher = _load_owt_ar_backbone(ar_model_path)
-        # Trainable AR "fake" model, from the same owt-ar weights.
-        self.fake_model = (
-          _load_owt_ar_backbone(ar_model_path) if self.use_fake else None)
-      else:
-        # Original IDLM: teacher/fake are diffusion denoisers, copied from the
-        # (raw, un-noise-conditioned) student before it is wrapped below.
-        self.teacher = copy.deepcopy(self.backbone)
-        self.fake_model = (
-          copy.deepcopy(self.backbone) if self.use_fake else None)
+      self.teacher = copy.deepcopy(self.backbone)
       utils.freeze_model(self.teacher)
-      if self.use_fake:
-        utils.activate_model(self.fake_model)
+
+      self.fake_model = copy.deepcopy(self.backbone)
+      utils.activate_model(self.fake_model)
 
       # Optional generator input-noise conditioning (D-MMD Sec. 6.5): wrap the
       # student backbone so a learned Gaussian-noise projection is injected into
-      # the embedding residual. Done AFTER copying the diffusion critics (so they
-      # stay noise-free) and before (re)building the EMA/optimizer so the
-      # projection is tracked/trained like the rest of the backbone.
-      noise_dim = getattr(self.config.adversarial_distill, 'noise_dim', 0)
-      if noise_dim and noise_dim > 0:
-        noise_shared = getattr(
-          self.config.adversarial_distill, 'noise_shared', False)
-        noise_scale = getattr(
-          self.config.adversarial_distill, 'noise_scale', 1.0)
-        noise_warmup_steps = getattr(
-          self.config.adversarial_distill, 'noise_warmup_steps', 0)
-        noise_hold_rms = getattr(
-          self.config.adversarial_distill, 'noise_hold_rms', False)
+      # the embedding residual. The position in this block is load-bearing --
+      # AFTER the teacher/fake deepcopies above, so both critics stay noise-free
+      # and keep measuring the student against an unperturbed reference, and
+      # BEFORE the EMA rebuild below, so `noise_proj` is tracked and swapped in
+      # at eval like every other student parameter.
+      distill_cfg = self.config.adversarial_distill
+      noise_dim = int(distill_cfg.get('noise_dim', 0) or 0)
+      if noise_dim > 0:
         self.backbone = _wrap_backbone_with_noise(
           self.backbone, noise_dim, self.config.model.hidden_size,
-          shared_noise=noise_shared, noise_scale=noise_scale,
-          warmup_steps=noise_warmup_steps, hold_rms=noise_hold_rms)
+          shared_noise=bool(distill_cfg.get('noise_shared', False)),
+          noise_scale=float(distill_cfg.get('noise_scale', 0.0) or 0.0),
+          warmup_steps=int(distill_cfg.get('noise_warmup_steps', 0) or 0),
+          hold_rms=bool(distill_cfg.get('noise_hold_rms', False)))
+        shared = distill_cfg.get('noise_shared', False)
+        print(f'[noise] {noise_dim}-dim '
+              f"{'shared' if shared else 'per-token'} injection, "
+              f"scale={distill_cfg.get('noise_scale', 0.0)}, "
+              f"warmup={distill_cfg.get('noise_warmup_steps', 0)}, "
+              f"hold_rms={distill_cfg.get('noise_hold_rms', False)}", flush=True)
       utils.activate_model(self.backbone)
+      # Resolved lazily by `_student_embed_std`. A NAME, not the module: this is
+      # an `nn.Module`, so assigning a submodule to an attribute registers it,
+      # and the embedding would then be emitted a second time in `state_dict`
+      # under `_embed_module_cache.embedding` -- which resume rejects as an
+      # unexpected key.
+      self._embed_module_name = None
+      # Keep the attribute present even for deliberately tiny overfit runs
+      # with `training.ema=0`. EMA is useful for normal training, but it is not
+      # part of the IDLM objective and disabling it should not make manual
+      # adversarial optimization crash.
       self.ema_fake = None
       if self.ema is not None:
         del self.ema
@@ -510,150 +524,44 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
           self.backbone.parameters(),
           decay=self.config.training.ema)
 
-        if self.use_fake:
-          self.ema_fake = models.ema.ExponentialMovingAverage(
-            self.fake_model.parameters(),
-            decay=self.config.training.ema)
+        self.ema_fake = models.ema.ExponentialMovingAverage(
+          self.fake_model.parameters(),
+          decay=self.config.training.ema)
       self.training_step_counter = 0
-      self.accum_batches = self.config.adversarial_distill.accum_batches
+      self.accum_batches = self.config.adversarial_distill.accum_batches 
       self._fake_accum_counter = 0
       self._student_accum_counter = 0
       self.fake_frequency = self.config.adversarial_distill.fake_frequency
       self.fake_iter = 0
-      # With no fake critic, every step is a generator step.
-      self.is_generator_step = not self.use_fake
+      # Upstream starts on a fake step so the critic is warm before the
+      # generator first consults it. With dmd_weight=0 there is no critic to
+      # warm, and starting there would train one nothing reads.
+      self.is_generator_step = not self._needs_fake_phase()
       self.total_loss_student = 0
       self.total_loss_fake = 0
       self.f_loss_ar = []
-      # Running (sum, count) of the student's own predictive entropy over the
-      # generator micro-batches since the last logged step; see
-      # `_record_student_entropy`.
-      self.log_student_entropy = getattr(
-        self.config.adversarial_distill, 'log_student_entropy', True)
-      self._entropy_sum = None
-      self._entropy_count = 0
-      self._last_student_entropy = 0.0
-      # Weight of the entropy bonus in the generator objective; 0 => the
-      # entropy is a detached diagnostic only. See `generator_loss`.
-      self.entropy_weight = float(getattr(
-        self.config.adversarial_distill, 'entropy_weight', 0.0) or 0.0)
-      # Differentiable entropy of the *current* generator_loss call, summed
-      # over its `generator_num_noised_samples` draws.
-      self._entropy_term_sum = None
-      self._entropy_term_count = 0
-      # Detached running mean of the bonus actually subtracted, for the log.
-      self._entropy_bonus_sum = None
-      self._entropy_bonus_count = 0
-      self._last_entropy_bonus = 0.0
-      # Weight of the auxiliary->teacher regularizer in the fake loss (D-MMD
-      # Eq. 12). 0 => original fake loss (hard NLL on student samples only).
-      self.fake_teacher_weight = getattr(
-        self.config.adversarial_distill, 'fake_teacher_weight', 0.0)
-      # Fit the fake critic to the student's soft distribution instead of to the
-      # one-hot sampled tokens (D-MMD Sec. 3.2). Applies to both critic types:
-      # the AR critic switches between `_ar_cross_entropy` and `_ar_nll`, the
-      # diffusion critic between `student_probs` and one-hot `x_hard` (see
-      # `_fake_diffusion_target`). Only the *fake/auxiliary* step is affected;
-      # the generator always differentiates the soft path.
-      #
-      # `null` keeps each critic's own original default rather than imposing one
-      # on both, so no existing run changes behaviour: the AR critic was written
-      # with the hard next-token NLL, the diffusion critic with the soft target.
-      fake_soft_target = getattr(
-        self.config.adversarial_distill, 'fake_soft_target', None)
-      if fake_soft_target is None:
-        fake_soft_target = (self.critic_type == 'diffusion')
-      self.fake_soft_target = bool(fake_soft_target)
-      # Train/decode alignment: restrict the distillation losses to the
-      # positions a confidence-threshold sampler would actually commit
-      # (`sampling.predictor=confidence`). See `_confidence_loss_mask_for`.
-      # 'none' (default) keeps every existing run bit-for-bit.
-      self.confidence_loss_mask = self._normalize_confidence_loss_mask(
-        getattr(self.config.adversarial_distill,
-                'confidence_loss_mask', 'none'))
-      # Both default to the sampler's own knobs, so training filters on
-      # exactly the rule decoding will use; override to decouple them.
-      threshold = getattr(self.config.adversarial_distill,
-                          'confidence_loss_threshold', None)
-      self.confidence_loss_threshold = float(
-        self.config.sampling.get('confidence_threshold', 0.9)
-        if threshold is None else threshold)
-      min_k = getattr(self.config.adversarial_distill,
-                      'confidence_loss_min_k', None)
-      self.confidence_loss_min_k = int(
-        self.config.sampling.get('min_reveal', 1)
-        if min_k is None else min_k)
-      assert self.confidence_loss_min_k >= 1, (
-        'adversarial_distill.confidence_loss_min_k must be >= 1, '
-        'otherwise a step where nothing clears the threshold would '
-        'produce an all-zero loss.')
-      print(f'[adversarial_distill] critic_type={self.critic_type}, '
-            f'fake_soft_target={self.fake_soft_target}, '
-            f'loss_weighting={self.loss_weighting}, '
-            f'confidence_loss_mask={self.confidence_loss_mask}'
-            + ('' if self.confidence_loss_mask == 'none' else
-               f' (threshold={self.confidence_loss_threshold}, '
-               f'min_k={self.confidence_loss_min_k})'), flush=True)
-
-  @staticmethod
-  def _normalize_confidence_loss_mask(value):
-    """Normalize `adversarial_distill.confidence_loss_mask`.
-
-    'none' (default) / 'generator' (mask the student's objective only,
-    leaving the critic to model every position) / 'both' (mask the fake
-    critic's objective too, so critic and generator are fit on the same
-    token set).
-    """
-    if value is None or value is False:
-      return 'none'
-    if value is True:
-      return 'generator'
-    mode = str(value).lower()
-    if mode in ('none', 'off', 'false'):
-      return 'none'
-    if mode in ('generator', 'student'):
-      return 'generator'
-    if mode in ('both', 'all'):
-      return 'both'
-    raise ValueError(
-      f'Unknown adversarial_distill.confidence_loss_mask: {value!r} '
-      "(expected 'none', 'generator' or 'both').")
-
-  @staticmethod
-  def _normalize_loss_weighting(value):
-    """Normalize `adversarial_distill.loss_weighting` to 'elbo' / 'none'.
-
-    `null` keeps the default ('elbo'), matching the rest of the config; use the
-    explicit string 'none' (or `false`) to switch the weighting off.
-    """
-    if value is None or value is True:
-      return 'elbo'
-    if value is False:
-      return 'none'
-    mode = str(value).lower()
-    if mode in ('elbo', 'mdlm', 'default', 'lambda'):
-      return 'elbo'
-    if mode in ('none', 'off', 'uniform', 'false'):
-      return 'none'
-    raise ValueError(
-      f'Unknown adversarial_distill.loss_weighting: {value!r} '
-      "(expected 'elbo' or 'none').")
 
   def _student_param_groups(self):
-    """Student optimizer parameter groups. If the backbone is noise-conditioned
-    and `adversarial_distill.noise_lr` is set, the learned noise-projection
-    matrix gets its own learning rate; every other parameter uses optim.lr."""
+    """Student optimizer parameter groups.
+
+    If the backbone is noise-conditioned and `adversarial_distill.noise_lr` is
+    set, the learned noise-projection matrix gets its own learning rate; every
+    other parameter uses `optim.lr`. Worth its own knob because the two move on
+    different scales: under the output rescaling in
+    `_NoiseConditionedBackbone`, Adam moves `noise/snr` by roughly `noise_lr`
+    per step, while the student's weights want whatever `optim.lr` the
+    distillation needs -- often several orders of magnitude apart.
+    """
     base_lr = self.config.optim.lr
-    noise_lr = getattr(self.config.adversarial_distill, 'noise_lr', None)
+    noise_lr = self.config.adversarial_distill.get('noise_lr', None)
     if noise_lr is None or not hasattr(self.backbone, 'noise_proj'):
       return [{'params': list(self.backbone.parameters()), 'lr': base_lr}]
     noise_params = list(self.backbone.noise_proj.parameters())
     noise_ids = {id(p) for p in noise_params}
     other_params = [p for p in self.backbone.parameters()
                     if id(p) not in noise_ids]
-    return [
-      {'params': other_params, 'lr': base_lr},
-      {'params': noise_params, 'lr': noise_lr}]
+    return [{'params': other_params, 'lr': base_lr},
+            {'params': noise_params, 'lr': float(noise_lr)}]
 
   def configure_optimizers(self):
     if self.config.adversarial_distill.is_distill:
@@ -665,26 +573,26 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         eps=self.config.optim.eps,
         weight_decay=self.config.optim.weight_decay)
 
-      scheduler_student = hydra.utils.instantiate(
-        self.config.lr_scheduler, optimizer=optimizer_student)
-      scheduler_student_dict = {'scheduler': scheduler_student, 'name': 'trainer/lr'}
-
-      if not self.use_fake:
-        # No fake critic: a single student optimizer.
-        return [optimizer_student], [scheduler_student_dict]
-
-      # The fake critic adapts to the student's distribution and needs a real
-      # learning rate; it should not share the (often tiny) generator LR.
-      fake_lr = getattr(self.config.adversarial_distill, 'fake_lr', None)
+      # The critic chases a moving student, so it need not share the
+      # generator's (often tiny) learning rate -- the two-time-scale setup.
+      # `null` keeps the original IDLM behaviour of one shared `optim.lr`.
+      # It matters most with `mmd_reward_type=idlm`, where the reward IS
+      # `nll_fake - nll_teacher`: a critic that cannot keep up stays a copy of
+      # the teacher and the reward collapses to ~0 for every sample.
+      fake_lr = self.config.adversarial_distill.get('fake_lr', None)
       if fake_lr is None:
         fake_lr = self.config.optim.lr
       optimizer_fake = torch.optim.AdamW(
         self.fake_model.parameters(),
-        lr=fake_lr,
+        lr=float(fake_lr),
         betas=(self.config.optim.beta1,
               self.config.optim.beta2),
         eps=self.config.optim.eps,
         weight_decay=self.config.optim.weight_decay)
+
+      scheduler_student = hydra.utils.instantiate(
+        self.config.lr_scheduler, optimizer=optimizer_student)
+      scheduler_student_dict = {'scheduler': scheduler_student, 'name': 'trainer/lr'}
 
       scheduler_fake = hydra.utils.instantiate(
         self.config.lr_scheduler, optimizer=optimizer_fake)
@@ -695,14 +603,12 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
 
   def _validate_configuration(self):
     # ancestral sampling isn't desirable because it's slow
-    assert self.sampler in {
-      'ancestral_cache', 'confidence', 'remask'}
-    self._validate_remask_configuration()
+    assert self.sampler == 'ancestral_cache'
 
   def _process_model_output(self, model_output, xt, sigma):
     del sigma
     model_output[:, :, self.mask_index] += self.neg_infinity
-
+    
     # Normalize the model_output such that x.exp() is
     # a probability distribution over vocab_size.
     model_output = model_output - torch.logsumexp(
@@ -718,20 +624,23 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
 
   def on_train_start(self):
     if self.is_adversarial_distill:
-      if self.use_fake:
-        # Fake-first schedule: start on a fake step (student frozen).
+      if self.ema_fake is not None:
         self.ema_fake.move_shadow_params_to_device(self.device)
+      # Upstream opens on a fake step, so it hands the gradient to the critic
+      # and freezes the student. With dmd_weight=0 there is no fake phase and
+      # the very first step is the generator's, which would otherwise find its
+      # own parameters frozen and produce a loss with no grad_fn at all.
+      if self._needs_fake_phase():
         utils.activate_model(self.fake_model)
         utils.freeze_model(self.backbone)
       else:
-        # No fake critic: the student trains every step.
         utils.activate_model(self.backbone)
-        self.is_generator_step = True
+        utils.freeze_model(self.fake_model)
       self._sync_noise_schedule()
     super().on_train_start()
 
   def _sync_noise_schedule(self):
-    """Point the noise-injection warmup ramp at the current global step.
+    """Point the injection's warmup ramp at the current global step.
 
     A no-op unless the backbone is noise-conditioned with
     `adversarial_distill.noise_warmup_steps > 0`. Called from `on_train_start`
@@ -740,7 +649,7 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
     `on_train_batch_start` (so the ramp advances). Validation reuses whatever the
     last training batch set, which is the level the student was just trained at.
 
-    `self.global_step` counts optimizer steps, i.e. student *and* fake updates --
+    `self.global_step` counts optimizer steps -- student *and* fake updates --
     the same x-axis the `noise/*` diagnostics are logged against, so the logged
     `noise/gain` visibly reaches 1.0 at `noise_warmup_steps` on the plot.
     """
@@ -753,547 +662,26 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       self._sync_noise_schedule()
     return super().on_train_batch_start(batch, batch_idx)
 
-  def _sync_submodule_state(self, state_dict, prefix, module):
-    """Reconcile `state_dict` with `module`'s params under `prefix.`.
+  def _student_embed_std(self):
+    """Per-entry std of the (possibly noise-wrapped) student's embedding.
 
-    The AR teacher / fake model have a different architecture than the student
-    backbone, so a checkpoint may either lack their weights (e.g. distilling
-    from a plain MDLM student) or carry incompatible ones (e.g. an old
-    diffusion-critic checkpoint). We drop stray / shape-mismatched entries and
-    fill any missing keys from the freshly-loaded owt-ar module, so a strict
-    load succeeds without clobbering genuinely-resumed weights.
+    Re-read rather than cached as a number, because the embedding drifts during
+    training and `noise/embed_std` is the scale the injection is compared
+    against. Only the module's NAME is remembered -- caching the module itself
+    on `self` would register it as a submodule and duplicate its parameter in
+    `state_dict`.
     """
-    current = module.state_dict()
-    valid = {f'{prefix}.{name}': param for name, param in current.items()}
-    for key in list(state_dict.keys()):
-      if key.startswith(prefix + '.') and (
-          key not in valid or state_dict[key].shape != valid[key].shape):
-        del state_dict[key]
-    for key, param in valid.items():
-      state_dict.setdefault(key, param.detach().clone())
-
-  def on_load_checkpoint(self, checkpoint):
-    if self.is_adversarial_distill:
-      state_dict = collections.OrderedDict(checkpoint['state_dict'])
-      self._sync_submodule_state(state_dict, 'teacher', self.teacher)
-      if self.fake_model is not None:
-        self._sync_submodule_state(state_dict, 'fake_model', self.fake_model)
-      checkpoint['state_dict'] = state_dict
-    super().on_load_checkpoint(checkpoint)
-    if self.is_adversarial_distill and self.ema_fake is not None:
-      # Only restore a genuine fake-model EMA; never fall back to the student
-      # EMA, whose parameters have the (incompatible) student shapes.
-      ema_fake_state = checkpoint.get('ema_fake', None)
-      if ema_fake_state is not None:
-        self.ema_fake.load_state_dict(ema_fake_state)
-
-  def on_save_checkpoint(self, checkpoint):
-    if self.is_adversarial_distill and self.critic_type == 'ar':
-      # The frozen AR teacher is reloaded from owt-ar; don't persist it. The
-      # diffusion teacher is a frozen copy of the pretrained student (not
-      # reloadable from a fixed path), so it must stay in the checkpoint.
-      checkpoint['state_dict'] = collections.OrderedDict(
-        (k, v) for k, v in checkpoint['state_dict'].items()
-        if not k.startswith('teacher.'))
-    super().on_save_checkpoint(checkpoint)
-    if self.is_adversarial_distill and self.ema_fake is not None:
-      checkpoint['ema_fake'] = self.ema_fake.state_dict()
-
-  def _preserve_prompt_probs(self, probs, x0, valid_tokens):
-    if valid_tokens is None:
-      return probs
-    clean_probs = F.one_hot(x0, num_classes=probs.shape[-1]).to(probs.dtype)
-    return torch.where(valid_tokens[..., None].bool(), probs, clean_probs)
-
-  def _preserve_prompt_tokens(self, tokens, x0, valid_tokens):
-    if valid_tokens is None:
-      return tokens
-    return torch.where(valid_tokens.bool(), tokens, x0)
-
-  def multistep_generation(self, x0, valid_tokens,
-                           current_accumulation_step, return_xt=False):
-    """The student's one-shot prediction at a random noise level.
-
-    `return_xt` additionally hands back the masked latent the student
-    was conditioned on. Only `_confidence_loss_mask_for` needs it -- the
-    positions masked in `xt` are precisely the ones the student
-    predicted, and hence the only ones a sampler could commit.
-    """
-    t = self._sample_t(x0.shape[0], current_accumulation_step)
-    dalpha_t, alpha_t = self.noise(t)
-    alpha_t = alpha_t.unsqueeze(-1)
-    assert alpha_t.ndim == 2
-    sigma = self._sigma_from_alphat(alpha_t)
-
-    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
-
-    log_x_theta = self.forward(xt, sigma=sigma)
-    student_probs = log_x_theta.exp()
-    student_probs = self._preserve_prompt_probs(
-      student_probs, x0, valid_tokens)
-    if return_xt:
-      return student_probs, xt
-    return student_probs
-
-  def _confidence_loss_mask_for(self, student_probs, student_xt,
-                                valid_tokens, is_generator):
-    """Positions a confidence decoder would commit here, or `None`.
-
-    Exactly the rule `AbsorbingState._confidence_sampler` decodes with:
-    among the positions the student actually predicted (those masked in
-    its own input `student_xt`), keep the ones whose top probability
-    clears `confidence_loss_threshold`, and always at least
-    `confidence_loss_min_k` of them -- the top-k by probability -- so a
-    step where nothing clears the bar still trains on something.
-
-    The point is train/decode alignment. At sampling time these are the
-    only predictions that survive: everything below the bar is discarded
-    and re-predicted later at a less-masked latent, where the model sees
-    strictly more context. Supervising the discarded positions spends
-    the student on marginals no sample is ever drawn from -- and they
-    are the *hardest* positions, so they dominate the gradient while
-    contributing nothing to what the sampler actually emits.
-
-    Restricted to positions masked in `student_xt` for a concrete
-    reason, not just symmetry with the sampler: `_process_model_output`
-    pins already-revealed positions to a one-hot, so their probability
-    is exactly 1.0. They would clear any threshold and could fill the
-    top-k on their own, leaving a mask that selects almost nothing the
-    student can learn from (their `student_probs` is a constant and
-    carries no gradient).
-
-    Returns `None` when the option is off, so every reduction falls back
-    to its original behaviour bit-for-bit.
-    """
-    if self.confidence_loss_mask == 'none':
-      return None
-    if not is_generator and self.confidence_loss_mask != 'both':
-      return None
-    eligible = (student_xt == self.mask_index)
-    if valid_tokens is not None:
-      eligible = eligible & valid_tokens.bool()
-    # The student's confidence in its own top candidate, as at sampling
-    # time. Detached: this picks the loss support, it is not part of it.
-    prob = student_probs.detach().max(-1).values
-    prob = prob.masked_fill(~ eligible, - float('inf'))
-    num_keep = torch.clamp(
-      (prob >= self.confidence_loss_threshold).sum(-1),
-      min=self.confidence_loss_min_k).minimum(eligible.sum(-1))
-    ranks = prob.argsort(dim=-1, descending=True).argsort(dim=-1)
-    keep = (ranks < num_keep[:, None]) & eligible
-    return keep.to(student_probs.dtype)
-
-  def _ar_logprobs(self, ar_backbone, tokens):
-    """Per-position next-token log-probabilities from an AR backbone.
-
-    Args:
-      ar_backbone: a causal `DITLegacy` backbone (teacher or fake model).
-      tokens: int tensor (batch, length) of a full token sequence.
-
-    Returns:
-      log-probs of shape (batch, length - 1, vocab_size), where index `i`
-      holds `log p(tokens[i + 1] | tokens[<= i])`, aligned so that it can be
-      scored against `student_probs[:, 1:]`.
-    """
-    with torch.cuda.amp.autocast(dtype=torch.float32):
-      output = ar_backbone(input_ids=tokens[:, :-1])
-    logits = output.logits if hasattr(output, 'logits') else output[0]
-    log_probs = logits.float().log_softmax(-1)
-    # Align the AR vocabulary width to the student's vocabulary. The owt-ar
-    # checkpoint already matches (both 50258 over the GPT-2 tokenizer), but be
-    # defensive so a different checkpoint doesn't silently misalign.
-    vocab = self.vocab_size
-    if log_probs.shape[-1] > vocab:
-      log_probs = log_probs[..., :vocab]
-    elif log_probs.shape[-1] < vocab:
-      log_probs = F.pad(
-        log_probs, (0, vocab - log_probs.shape[-1]),
-        value=self.neg_infinity)
-    return log_probs
-
-  def _reduce_positions(self, per_token_loss, valid_tokens,
-                        loss_mask=None):
-    """Reduce a (batch, positions) per-token loss over positions.
-
-    With `loss_mask=None` this is exactly what every caller did inline
-    before: a masked token-mean when `valid_tokens` is given, and a plain
-    sum over positions when it is None (the OWT case --
-    `_conditional_valid_tokens` only returns a mask for tiny_gsm).
-
-    `loss_mask` (0/1, same shape) restricts the loss to a subset of
-    positions -- the tokens a confidence-threshold decoder would commit,
-    see `_confidence_loss_mask_for`. It also becomes the denominator, so the
-    result is the average loss *over the committed tokens* and its scale
-    does not swing with how many of them there are. That matters here:
-    the committed count varies by orders of magnitude between steps (one
-    token when nothing clears the threshold, most of the sequence when
-    the student is confident), and a raw sum would hand the optimizer a
-    correspondingly variable step size.
-
-    NOTE this means enabling `loss_mask` changes the loss scale for runs
-    whose `valid_tokens` is None -- a sum over ~`model.length`
-    positions becomes a mean over the committed ones -- so `optim.lr` /
-    `adversarial_distill.fake_lr` need revisiting when switching it on.
-    """
-    if loss_mask is None:
-      if valid_tokens is None:
-        return per_token_loss.sum(-1)
-      per_token_loss = per_token_loss * valid_tokens
-      return per_token_loss.sum(-1) / valid_tokens.sum(-1).clamp_min(1)
-    weights = (loss_mask if valid_tokens is None
-               else loss_mask * valid_tokens)
-    per_token_loss = per_token_loss * weights
-    return per_token_loss.sum(-1) / weights.sum(-1).clamp_min(1)
-
-  def _ar_cross_entropy(self, ar_logprobs, target_probs, valid_tokens,
-                        loss_mask=None):
-    """Token-averaged cross-entropy of the student distribution against an AR
-    critic's next-token log-probabilities.
-
-    `target_probs[:, i]` (the student distribution over token `i`) is scored by
-    `ar_logprobs[:, i - 1]` (`log p(token_i | token_{<i})`), so we drop the
-    first (contextless) position. Only one side carries gradient per call: in
-    the generator step the critic log-probs are constants and the gradient
-    reaches the student through `target_probs`; in the (soft-target) fake step
-    `target_probs` is detached and the gradient trains the critic.
-
-    `loss_mask` is a full-length (batch, length) mask and is sliced like
-    `valid_tokens`, so callers pass the same tensor to every reduction.
-    """
-    target = target_probs[:, 1:, :]
-    loss = -(target * ar_logprobs).sum(-1)  # (batch, length - 1)
-    return self._reduce_positions(
-      loss,
-      None if valid_tokens is None else valid_tokens[:, 1:],
-      None if loss_mask is None else loss_mask[:, 1:])
-
-  def _ar_nll(self, ar_logprobs, tokens, valid_tokens, loss_mask=None):
-    """Token-averaged NLL of the hard sampled sequence under an AR critic.
-
-    Standard next-token cross-entropy: `ar_logprobs[:, i]` scores the sampled
-    token `tokens[:, i + 1]`, so we gather against the tokens from position 1
-    onward (dropping the first, contextless position).
-    """
-    targets = tokens[:, 1:]
-    loss = -ar_logprobs.gather(
-      -1, targets[..., None]).squeeze(-1)  # (batch, length - 1)
-    return self._reduce_positions(
-      loss,
-      None if valid_tokens is None else valid_tokens[:, 1:],
-      None if loss_mask is None else loss_mask[:, 1:])
-
-  def q_xt_with_probs(self, student_probs, alpha_t, x0=None, valid_tokens=None):
-    """Diffuse a (soft) student distribution to noise level t for the diffusion
-    critic (masked diffusion). Verbatim from the original MDLM implementation."""
-    mask_probs = torch.zeros_like(student_probs)
-    mask_probs[:, :, self.mask_index] = 1
-    noise_probs = alpha_t[:, :, None] * student_probs + (1 - alpha_t[:, :, None])*(mask_probs)
-    if x0 is not None and valid_tokens is not None:
-      noise_probs = self._preserve_prompt_probs(noise_probs, x0, valid_tokens)
-    return noise_probs
-
-  def nll_per_token_with_probs(self, log_x_theta, xt, x0, alpha_t,
-                    dalpha_t, low_var=False, valid_tokens=None,
-                    loss_mask=None):
-    """Soft time-weighted cross-entropy for the diffusion critic (`x0` is the
-    target distribution). This is the single place the D-MMD / IDLM weighting
-    function `w` enters the distillation losses -- it is called for the teacher
-    term, the fake term and the aux->teacher anchor, in both `MDLM_with_AR` and
-    `MDLM_DMMD`, so `adversarial_distill.loss_weighting` switches all of them
-    together.
-
-    * 'elbo' (default): `w = -alpha'/(1-alpha)`, the MDLM ELBO weight, i.e.
-      IDLM's `lambda_t` and a valid choice of D-MMD's `w(s)`. Under the
-      log-linear schedule this is `1/t` (evaluated at the critic time), ranging
-      from 1 at t=1 to ~1e3 at the `sampling_eps` floor, mean ~7.
-    * 'none': `w = 1`. Note the sign: the unweighted branch negates instead of
-      dropping the factor, because `dalpha` is negative and it is what makes the
-      weighted loss positive. Same fixed point either way (`w` multiplies the
-      teacher and fake terms alike, and `teacher - fake` vanishes when the fake
-      critic matches the teacher), so this only changes the effective per-time
-      learning rate -- and lowers the average gradient scale by ~7x, so
-      `optim.lr` / `adversarial_distill.fake_lr` may need raising to compensate.
-
-    Only the diffusion critic is affected. `critic_type='ar'` scores the clean
-    sequence with `_ar_cross_entropy`, which carries no diffusion time weight.
-    """
-    del xt
-    loss = (x0 * log_x_theta).sum(-1)
-    if self.loss_weighting == 'none':
-      loss = -loss
-    else:
-      loss = loss * dalpha_t / (1 - alpha_t)
-    return self._reduce_positions(loss, valid_tokens, loss_mask)
-
-  def generator_loss(self, x0, valid_tokens, current_accumulation_step):
-    """Generator objective, plus the optional entropy bonus.
-
-    ``g_loss = teacher_loss - fake_loss - entropy_weight * H``
-
-    `H` is the student's own predictive entropy (`_record_student_entropy`),
-    reduced over positions the same way the two critic terms are, so the
-    weight is a plain trade-off between them rather than something that has
-    to be rescaled with `model.length`.
-
-    The sign is a *bonus*: the loss is minimized, so a positive
-    `entropy_weight` pushes entropy up. That is the direction that fights
-    the failure mode of this objective -- the student can lower
-    `teacher_loss - fake_loss` either by matching the teacher or by
-    collapsing onto the few modes both critics score well, and only the
-    second one takes entropy down with it. A negative weight sharpens
-    instead, which is occasionally what you want when distilling toward a
-    low-temperature sampler. At 0 (the default) this is exactly the previous
-    objective and nothing differentiable is built.
-
-    Start an order of magnitude below the scale of `student_loss`: the bonus
-    is unbounded above (entropy maxes out at `log V ~= 10.8` per position,
-    but a uniform student is worthless), so too large a weight has a trivial
-    optimum and will walk the model to noise. Watch `student_entropy`
-    against the teacher's own level rather than pushing it as high as it
-    will go.
-    """
-    self._entropy_term_sum = None
-    self._entropy_term_count = 0
-    if self.critic_type == 'diffusion':
-      loss = self._generator_loss_diffusion(
-        x0, valid_tokens, current_accumulation_step)
-    else:
-      loss = self._generator_loss_ar(
-        x0, valid_tokens, current_accumulation_step)
-    if self.entropy_weight != 0.0 and self._entropy_term_count:
-      # Mean over the `generator_num_noised_samples` draws, matching how the
-      # critic terms are averaged over them.
-      bonus = self.entropy_weight * (
-        self._entropy_term_sum / self._entropy_term_count)
-      loss = loss - bonus
-      applied = bonus.detach().mean()
-      self._entropy_bonus_sum = (
-        applied if self._entropy_bonus_sum is None
-        else self._entropy_bonus_sum + applied)
-      self._entropy_bonus_count += 1
-    self._entropy_term_sum = None
-    self._entropy_term_count = 0
-    return loss
-
-  def _generator_loss_ar(self, x0, valid_tokens, current_accumulation_step):
-    # Differentiable student distribution over the (clean) generated sequence.
-    student_probs, student_xt = self.multistep_generation(
-      x0, valid_tokens, current_accumulation_step, return_xt=True)
-    # Optionally supervise only the tokens a confidence decoder would
-    # commit; `None` (the default) leaves the reduction untouched.
-    loss_mask = self._confidence_loss_mask_for(
-      student_probs, student_xt, valid_tokens, is_generator=True)
-    self._record_student_entropy(
-      student_probs, student_xt, valid_tokens, loss_mask)
-
-    # Discrete sequence fed as context to the AR critics (non-differentiable).
-    x_gen = trainer_base.sample_categorical(student_probs.detach())
-    x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
-
-    # Both critics are frozen during the generator step; their outputs act as
-    # constants and gradients reach the student only through `student_probs`.
-    with torch.no_grad():
-      teacher_logprobs = self._ar_logprobs(self.teacher, x_gen)
-    teacher_loss = self._ar_cross_entropy(
-      teacher_logprobs, student_probs, valid_tokens, loss_mask=loss_mask)
-    if not self.use_fake:
-      return teacher_loss
-
-    with torch.no_grad():
-      fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
-    fake_loss = self._ar_cross_entropy(
-      fake_logprobs, student_probs, valid_tokens, loss_mask=loss_mask)
-    return teacher_loss - fake_loss
-
-  def _generator_loss_diffusion(self, x0, valid_tokens,
-                                current_accumulation_step):
-    # Original IDLM (diffusion critic). Verbatim from the `MDLM` implementation.
-    student_probs, student_xt = self.multistep_generation(
-      x0, valid_tokens, current_accumulation_step, return_xt=True)
-    loss_mask = self._confidence_loss_mask_for(
-      student_probs, student_xt, valid_tokens, is_generator=True)
-    self._record_student_entropy(
-      student_probs, student_xt, valid_tokens, loss_mask)
-
-    num_noised_samples = getattr(self.config.adversarial_distill, 'generator_num_noised_samples', 1)
-
-    teacher_loss_total = 0.0
-    fake_loss_total = 0.0
-
-    for _ in range(num_noised_samples):
-
-      print(_)
-
-      t = self._sample_t(x0.shape[0], current_accumulation_step)
-      dalpha_t, alpha_t = self.noise(t)
-      alpha_t = alpha_t.unsqueeze(-1)
-      assert alpha_t.ndim == 2
-      sigma = self._sigma_from_alphat(alpha_t)
-      sigma = self._process_sigma(sigma)
-
-      probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
-      xt = trainer_base.sample_categorical(probs_xt)
-      xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
-
-      with torch.cuda.amp.autocast(dtype=torch.float32):
-        model_output_teacher = self.teacher(xt, sigma)
-      logits_teacher = self._process_model_output(model_output=model_output_teacher, xt=xt, sigma=sigma)
-      teacher_loss = self.nll_per_token_with_probs(logits_teacher, xt, student_probs,
-                                  alpha_t=alpha_t, dalpha_t=dalpha_t,
-                                  valid_tokens=valid_tokens,
-                                  loss_mask=loss_mask)
-
-      teacher_loss_total = teacher_loss_total + teacher_loss
-
-      if self.use_fake:
-        with torch.cuda.amp.autocast(dtype=torch.float32):
-          model_output_fake = self.fake_model(xt, sigma)
-        logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
-        fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs,
-                                    alpha_t=alpha_t, dalpha_t=dalpha_t,
-                                    valid_tokens=valid_tokens,
-                                    loss_mask=loss_mask)
-
-        fake_loss_total = fake_loss_total + fake_loss
-
-    teacher_loss = teacher_loss_total / num_noised_samples
-    fake_loss = fake_loss_total / num_noised_samples
-      
-    if not self.use_fake:
-      return teacher_loss
-    
-    return teacher_loss - fake_loss
-
-  def _reduce_token_loss(self, per_token_loss, valid_tokens,
-                         loss_mask=None):
-    """Reduce a (batch, length - 1) per-token loss to (batch,).
-
-    Matches _ar_nll / _ar_cross_entropy: masked token-mean when valid_tokens is
-    given (using positions 1..L-1), otherwise a plain sum over positions.
-    """
-    return self._reduce_positions(
-      per_token_loss,
-      None if valid_tokens is None else valid_tokens[:, 1:],
-      None if loss_mask is None else loss_mask[:, 1:])
-
-  def fake_loss(self, x0, valid_tokens, current_accumulation_step):
-    if self.critic_type == 'diffusion':
-      return self._fake_loss_diffusion(
-        x0, valid_tokens, current_accumulation_step)
-    return self._fake_loss_ar(x0, valid_tokens, current_accumulation_step)
-
-  def _fake_loss_ar(self, x0, valid_tokens, current_accumulation_step):
-    # Auxiliary/fake objective (D-MMD Eq. 12). Fit the fake AR critic to the
-    # student's samples AND anchor it to the frozen teacher; the anchor
-    # stabilizes the min-max and keeps the critic from drifting into a
-    # degenerate state (it does not change the fixed point). The generator step
-    # still scores the fake against the soft `student_probs` (the differentiable
-    # DMD gradient path).
-    with torch.no_grad():
-      student_probs, student_xt = self.multistep_generation(
-        x0, valid_tokens, current_accumulation_step, return_xt=True)
-      x_gen = trainer_base.sample_categorical(student_probs)
-      x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
-    loss_mask = self._confidence_loss_mask_for(
-      student_probs, student_xt, valid_tokens, is_generator=False)
-
-    fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
-    # Term 1: fit the critic to the student's own distribution.
-    if self.fake_soft_target:
-      # CE(student_probs || fake): score *every* category by the student's
-      # probability rather than only the sampled one. Same expectation as the
-      # hard NLL below (x_gen ~ student_probs) but without the per-position
-      # sampling noise, and it is exactly the quantity the generator step
-      # differentiates -- so critic and generator optimize the same functional.
-      # The critic's context stays the hard sample `x_gen`, as it is in the
-      # generator step (an AR backbone consumes discrete ids).
-      loss = self._ar_cross_entropy(
-        fake_logprobs, student_probs, valid_tokens, loss_mask=loss_mask)
-    else:
-      # CE(x | fake) -- standard next-token NLL on the hard student sample.
-      loss = self._ar_nll(
-        fake_logprobs, x_gen, valid_tokens, loss_mask=loss_mask)
-    # Term 2: CE(teacher || fake) -- anchor the fake to the teacher's next-token
-    # distribution on the same context.
-    if self.fake_teacher_weight > 0:
-      with torch.no_grad():
-        teacher_probs = self._ar_logprobs(self.teacher, x_gen).exp()
-      teacher_ce = -(teacher_probs * fake_logprobs).sum(-1)  # (batch, length-1)
-      loss = loss + self.fake_teacher_weight * self._reduce_token_loss(
-        teacher_ce, valid_tokens, loss_mask=loss_mask)
-    return loss
-
-  def _fake_diffusion_target(self, student_probs, x_hard):
-    """Target the diffusion fake critic regresses onto (D-MMD Sec. 3.2).
-
-    `fake_soft_target=True` -> the student's soft prediction `x_hat_eta(z_t)`;
-    `False` -> the one-hot hard sample `x ~ Cat(x_hat_eta(z_t))` that the critic
-    latent was actually drawn from. For *masked* diffusion the paper states both
-    are valid ("it is therefore equally valid to use either the soft x_hat_eta or
-    the hard x"), because a masked `z_s` carries no information about `x` at the
-    masked positions; the soft target is just its Rao-Blackwellisation and has
-    lower variance. Note the caveat in the same section: for **uniform**
-    diffusion the auxiliary model must be trained on hard samples, so this switch
-    is masked-diffusion-only.
-
-    Returned as a distribution over the vocabulary either way, so both feed the
-    same weighted soft cross-entropy `nll_per_token_with_probs`.
-    """
-    if self.fake_soft_target:
-      return student_probs
-    return F.one_hot(
-      x_hard, num_classes=student_probs.shape[-1]).to(student_probs.dtype)
-
-  def _fake_loss_diffusion(self, x0, valid_tokens, current_accumulation_step):
-    # Original IDLM (diffusion critic), with the D-MMD Sec. 3.2 choice of hard
-    # vs. soft target exposed as `fake_soft_target`.
-    with torch.no_grad():
-      student_probs, student_xt = self.multistep_generation(
-        x0, valid_tokens, current_accumulation_step, return_xt=True)
-    loss_mask = self._confidence_loss_mask_for(
-      student_probs, student_xt, valid_tokens, is_generator=False)
-
-    t = self._sample_t(x0.shape[0], current_accumulation_step)
-    dalpha_t, alpha_t = self.noise(t)
-    alpha_t = alpha_t.unsqueeze(-1)
-    assert alpha_t.ndim == 2
-    sigma = self._sigma_from_alphat(alpha_t)
-    sigma = self._process_sigma(sigma)
-    # Draw the hard student sample, then mask it to the critic latent. This is
-    # marginally identical to the original one-shot draw from
-    # `q_xt_with_probs(student_probs, alpha_t)` -- both give P(mask) = 1 - alpha_t
-    # and P(c) = alpha_t * student_probs_c -- but it exposes the `x_hard` the
-    # latent is coupled to, which the hard target needs. Doing it the same way in
-    # both modes keeps the latent identical across a soft/hard A/B at fixed seed,
-    # so the comparison isolates the target.
-    x_hard = trainer_base.sample_categorical(student_probs)
-    x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
-    xt = self.q_xt(x_hard, alpha_t, valid_tokens=valid_tokens)
-    xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
-
-    with torch.cuda.amp.autocast(dtype=torch.float32):
-      model_output_fake = self.fake_model(xt, sigma)
-    logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
-    fake_loss = self.nll_per_token_with_probs(
-                                logits_fake, xt,
-                                self._fake_diffusion_target(
-                                  student_probs, x_hard),
-                                alpha_t=alpha_t, dalpha_t=dalpha_t,
-                                valid_tokens=valid_tokens,
-                                loss_mask=loss_mask)
-
-    # Optional aux->teacher anchor (D-MMD Eq. 12, second term). Disabled by
-    # default (fake_teacher_weight=0), so the above matches the original MDLM.
-    if self.fake_teacher_weight > 0:
-      with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float32):
-        teacher_probs = self._process_model_output(
-          model_output=self.teacher(xt, sigma), xt=xt, sigma=sigma).exp()
-      anchor = self.nll_per_token_with_probs(logits_fake, xt, teacher_probs,
-                                alpha_t=alpha_t, dalpha_t=dalpha_t,
-                                valid_tokens=valid_tokens,
-                                loss_mask=loss_mask)
-      fake_loss = fake_loss + self.fake_teacher_weight * anchor
-    return fake_loss
+    if getattr(self, '_embed_module_name', None) is None:
+      inner = getattr(self.backbone, 'backbone', self.backbone)
+      for name, module in inner.named_modules():
+        if name.endswith('vocab_embed'):
+          self._embed_module_name = name
+          break
+    name = getattr(self, '_embed_module_name', None)
+    if name is None:
+      return 0.02
+    inner = getattr(self.backbone, 'backbone', self.backbone)
+    return _embedding_std(inner.get_submodule(name))
 
   def _noise_conditioning_stats(self):
     """Diagnostics for the generator's input-noise conditioning, or `{}` when
@@ -1347,233 +735,590 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       'noise/embed_std': torch.as_tensor(embed_std, device=raw.device),
       'noise/snr': inject_std / max(embed_std, 1e-12)}
 
-  def _student_entropy_per_position(self, student_probs):
-    """`(batch, length)` Shannon entropy (nats) of the student's prediction,
-    differentiable w.r.t. `student_probs`.
+  def on_load_checkpoint(self, checkpoint):
+    if self.is_adversarial_distill:
+      state_dict = collections.OrderedDict(checkpoint['state_dict'])
+      # A plain MDLM checkpoint stores `backbone.<key>`, while a student with
+      # input-noise conditioning wraps that same model and therefore expects
+      # `backbone.backbone.<key>` plus a newly initialized noise projection.
+      # Convert only when starting distillation from such a plain checkpoint;
+      # normal resumes already carry `backbone.noise_proj.*` and bypass this
+      # block. Prefix depth is not a safe discriminator: the HF MDLM itself
+      # owns a `.backbone`, so its *plain* keys already begin with
+      # `backbone.backbone.` before our noise wrapper adds the third level.
+      if hasattr(self.backbone, 'noise_proj'):
+        wrapped_prefix = 'backbone.backbone.'
+        has_noise_state = any(
+          key.startswith('backbone.noise_proj.') for key in state_dict)
+        plain_keys = [
+          key for key in state_dict
+          if key.startswith('backbone.')]
+        if plain_keys and not has_noise_state:
+          for key in plain_keys:
+            suffix = key[len('backbone.'):]
+            state_dict[f'{wrapped_prefix}{suffix}'] = state_dict.pop(key)
+          for name, value in self.backbone.noise_proj.state_dict().items():
+            state_dict.setdefault(
+              f'backbone.noise_proj.{name}', value.detach().clone())
+      # The critics are seeded from the student when a checkpoint carries no
+      # weights of their own. Noise conditioning inserts a level in the student
+      # -- `backbone.backbone.blocks…` plus `backbone.noise_proj.*` -- while the
+      # teacher and fake stay UNWRAPPED, so mirroring the raw prefix would hand
+      # them `teacher.backbone.…` and a `teacher.noise_proj.weight` they have no
+      # parameter for, and Lightning's strict load would reject both. Strip the
+      # wrapper's level and drop the projection instead.
+      student_prefix = ('backbone.backbone.'
+                        if hasattr(self.backbone, 'noise_proj')
+                        else 'backbone.')
+      for key, value in list(state_dict.items()):
+        if key.startswith(student_prefix):
+          suffix = key[len(student_prefix):]
+          state_dict.setdefault(f'teacher.{suffix}', value)
+          state_dict.setdefault(f'fake_model.{suffix}', value)
+      checkpoint['state_dict'] = state_dict
+    super().on_load_checkpoint(checkpoint)
+    if (self.is_adversarial_distill
+        and getattr(self, 'ema_fake', None) is not None):
+      ema_fake_state = checkpoint.get('ema_fake', checkpoint.get('ema'))
+      if ema_fake_state is not None:
+        self.ema_fake.load_state_dict(ema_fake_state)
 
-    Written as ``-(p * clamp_min(p, eps).log()).sum(-1)`` rather than
-    `torch.special.entr` so the backward stays finite at the exact zeros the
-    distribution contains -- see `_ENTROPY_EPS`. Chunked over rows: `p` and
-    the log are each ~1.6 GB at the OWT shape, and this bounds the transient
-    product to `_ENTROPY_CHUNK_ELEMS`.
+  def on_save_checkpoint(self, checkpoint):
+    super().on_save_checkpoint(checkpoint)
+    if (self.is_adversarial_distill
+        and getattr(self, 'ema_fake', None) is not None):
+      checkpoint['ema_fake'] = self.ema_fake.state_dict()
 
-    NOTE the log *is* retained for backward (one extra `p`-sized tensor for
-    the whole step), which is why the caller only builds this when
-    `entropy_weight != 0`; the diagnostic path uses the no-grad
-    `metrics.entropy_sum`, which keeps nothing.
+  def _preserve_prompt_probs(self, probs, x0, valid_tokens):
+    if valid_tokens is None:
+      return probs
+    clean_probs = F.one_hot(x0, num_classes=probs.shape[-1]).to(probs.dtype)
+    return torch.where(valid_tokens[..., None].bool(), probs, clean_probs)
+
+  def _preserve_prompt_tokens(self, tokens, x0, valid_tokens):
+    if valid_tokens is None:
+      return tokens
+    return torch.where(valid_tokens.bool(), tokens, x0)
+
+  def _sample_distill_generator_t(self, n, current_accumulation_step):
+    """Sample generator corruption, optionally emphasizing high-mask rows.
+
+    The knobs describe expected mask probabilities instead of raw diffusion
+    times. For the log-linear schedule used here,
+    `mask_probability = (1 - noise.eps) * t`; expressing the option in mask
+    space makes its effect explicit and keeps it meaningful to few-NFE runs.
+
+    With a zero mixture fraction, return the original `_sample_t` tensor before
+    drawing any more randomness. This keeps disabled runs bit-compatible with
+    the historical schedule.
     """
-    vocab_size = student_probs.shape[-1]
-    flat = student_probs.reshape(-1, vocab_size)
-    rows_per_chunk = max(
-      1, _ENTROPY_CHUNK_ELEMS // max(vocab_size, 1))
-    parts = []
-    for lo in range(0, flat.shape[0], rows_per_chunk):
-      chunk = flat[lo: lo + rows_per_chunk]
-      parts.append(
-        - (chunk * chunk.clamp_min(_ENTROPY_EPS).log()).sum(-1))
-    return torch.cat(parts).view(student_probs.shape[:-1])
+    t = self._sample_t(n, current_accumulation_step)
+    schedule = getattr(self, '_mask_schedule', None)
+    if schedule is not None and schedule.mode != 'original':
+      return schedule.sample(t)
+    cfg = self.config.adversarial_distill
+    fraction = float(cfg.get('high_mask_fraction', 0.0))
+    minimum = float(cfg.get('high_mask_min', 0.7))
+    maximum = float(cfg.get('high_mask_max', 1.0))
+    if not 0.0 <= fraction <= 1.0:
+      raise ValueError('adversarial_distill.high_mask_fraction must be in '
+                       f'[0, 1], got {fraction}')
+    if not 0.0 <= minimum <= maximum <= 1.0:
+      raise ValueError('adversarial_distill high-mask interval must satisfy '
+                       '0 <= high_mask_min <= high_mask_max <= 1, got '
+                       f'[{minimum}, {maximum}]')
+    if fraction == 0.0:
+      return t
 
-  def _record_student_entropy(self, student_probs, student_xt,
-                              valid_tokens=None, loss_mask=None):
-    """Accumulate the entropy of the student's *own* prediction on this
-    micro-batch, for `student_entropy` in the step log.
+    high_mask_probability = minimum + (maximum - minimum) * torch.rand_like(t)
+    # LogLinear gives `1 - alpha_t = (1 - noise.eps) * t`, so this is
+    # the exact inverse in the mask-probability parameterization above.
+    high_t = (high_mask_probability / (1.0 - self.noise.eps)).clamp(
+      self.sampling_eps, 1.0)
+    choose_high = torch.rand_like(t) < fraction
+    return torch.where(choose_high, high_t.to(t.dtype), t)
 
-    ``H = -sum_v p_eta(v | z_t) log p_eta(v | z_t)`` in nats, averaged over
-    the positions the student actually predicted. It is read off the very
-    tensor the generator loss differentiates, so it is the training-time
-    counterpart of `val/pred_entropy` (which reads the sampling trajectory)
-    and needs no extra forward pass.
-
-    What it buys as a diagnostic is a direct view of the collapse the
-    min-max game can drift into -- `student_loss` falls both when the
-    student matches the teacher and when it sharpens onto a few modes the
-    critic happens to like, and those two look identical on the loss curve.
-    This separates them: sharpening shows up here as entropy heading toward
-    0 while `student_loss` still improves. Expect the frozen `mdlm-owt`
-    teacher's level at init and watch the gap, since the absolute value is
-    dominated by the noise level `t` the batch drew.
-
-    With `adversarial_distill.entropy_weight != 0` the same quantity is also
-    accumulated *with* its graph, reduced exactly like the critic losses
-    (`_reduce_positions` with this call's `valid_tokens` / `loss_mask`, so
-    the two are on one scale), and handed to `generator_loss` as a bonus
-    term. At weight 0 -- the default -- nothing differentiable is built and
-    this stays a detached readout.
-
-    Only positions masked in `student_xt` count: elsewhere
-    `_process_model_output` (and `_preserve_prompt_probs`) pin the
-    distribution to a one-hot whose entropy is 0 by construction, so
-    including them would track the sampled `t` rather than the model. Prompt
-    positions are already excluded -- `q_xt` masks nothing outside
-    `valid_tokens`.
-    """
-    want_term = self.entropy_weight != 0.0
-    if not (self.log_student_entropy or want_term):
-      return
-    predicted = (student_xt == self.mask_index)
-    if want_term:
-      per_position = self._student_entropy_per_position(student_probs)
-      per_position = per_position * predicted.to(per_position.dtype)
-      # Same reduction as the teacher / fake terms this is added to, so
-      # `entropy_weight` is in units of "nats of entropy per nat of critic
-      # cross-entropy" instead of depending on the sequence length.
-      term = self._reduce_positions(
-        per_position, valid_tokens, loss_mask=loss_mask)
-      self._entropy_term_sum = (
-        term if self._entropy_term_sum is None
-        else self._entropy_term_sum + term)
-      self._entropy_term_count += 1
-      total = per_position.detach().sum()
-      count = int(predicted.sum())
+  def _distill_generator_state(self, x0, valid_tokens,
+                                current_accumulation_step):
+    """Prepare corruption once for the complete logical batch."""
+    force_full_mask = bool(self.config.adversarial_distill.get(
+      'generator_force_full_mask', False))
+    if force_full_mask:
+      # `q_xt(x0, alpha(1))` still leaves about eps*length clean tokens on
+      # average. Inference starts from the literal all-MASK prior, so construct
+      # that state explicitly. Prompt positions, when present, stay visible.
+      t = torch.ones(x0.shape[0], device=x0.device)
+      _, alpha_t = self.noise(t)
+      alpha_t = alpha_t.unsqueeze(-1)
+      sigma = self._sigma_from_alphat(alpha_t)
+      xt = torch.full_like(x0, self.mask_index)
+      xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
     else:
-      total, count = metrics.entropy_sum(
-        student_probs, mask=predicted)
-    if not count:
-      return
-    self._entropy_sum = (
-      total if self._entropy_sum is None else self._entropy_sum + total)
-    self._entropy_count += count
+      t = self._sample_distill_generator_t(
+        x0.shape[0], current_accumulation_step)
+      _, alpha_t = self.noise(t)
+      alpha_t = alpha_t.unsqueeze(-1)
+      assert alpha_t.ndim == 2
+      sigma = self._sigma_from_alphat(alpha_t)
+      xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    return xt, sigma
 
-  def _student_entropy_stats(self):
-    """Pop the accumulated `student_entropy` for the step log, or `{}` when
-    the flag is off.
+  def multistep_generation(self, x0, valid_tokens, current_accumulation_step,
+                           return_xt=False):
+    xt, sigma = self._distill_generator_state(
+      x0, valid_tokens, current_accumulation_step)
+    log_x_theta = self.forward(xt, sigma=sigma)
+    student_probs = log_x_theta.exp()
+    student_probs = self._preserve_prompt_probs(student_probs, x0, valid_tokens)
+    # `return_xt` exists for the MMD reward: the positions masked in `xt` are
+    # exactly the ones the student wrote, and so the only ones worth scoring.
+    if return_xt:
+      return student_probs, xt
+    return student_probs
 
-    Position-weighted mean over every generator micro-batch (and every
-    `generator_num_noised_samples` draw) since the last logged step, so it
-    lines up with the `student_loss` printed beside it.
+  def q_xt_with_probs(self, student_probs, alpha_t, x0=None, valid_tokens=None):
+    mask_probs = torch.zeros_like(student_probs)
+    mask_probs[:, :, self.mask_index] = 1
+    noise_probs = alpha_t[:, :, None] * student_probs + (1 - alpha_t[:, :, None])*(mask_probs)
+    if x0 is not None and valid_tokens is not None:
+      noise_probs = self._preserve_prompt_probs(noise_probs, x0, valid_tokens)
+    return noise_probs
 
-    Whether the key is present depends only on the config flag, never on the
-    data: `log_dict` under DDP hangs if the ranks disagree on the key set,
-    and a window in which no rank ever saw a masked position -- possible in
-    principle, since `t` is random -- would otherwise be a rare deadlock
-    rather than a rare wrong number. In that case the previous value is
-    repeated.
+  def nll_per_token_with_probs(self, log_x_theta, xt, x0, alpha_t,
+                    dalpha_t, low_var=False, valid_tokens=None):
+    del xt
+    loss = (x0 * log_x_theta).sum(-1)
+    loss = loss * dalpha_t / (1 - alpha_t)
+    if valid_tokens is not None:
+      loss = loss * valid_tokens
+      denom = valid_tokens.sum(-1).clamp_min(1)
+      return loss.sum(-1) / denom
+    return loss.sum(-1)
+
+  def _needs_fake_phase(self):
+    """Whether the fake critic still has to be trained.
+
+    `dmd_weight=0` normally means nothing reads the fake, so its phase is
+    skipped. `mmd_reward_type=idlm` breaks that inference: the reward *is*
+    `nll_fake - nll_teacher`, so an untrained fake stays a copy of the teacher
+    and the reward collapses to ~0 for every sample -- a silent null run rather
+    than a crash. Both gates consult this instead of `dmd_weight` directly so
+    they cannot disagree.
     """
-    stats = {}
-    if self.entropy_weight != 0.0:
-      # `entropy_weight * H` as actually subtracted from g_loss, batch-mean.
-      # The one number that says whether the weight is doing anything:
-      # compare it against `student_loss` printed beside it.
-      if self._entropy_bonus_count:
-        self._last_entropy_bonus = (
-          self._entropy_bonus_sum / self._entropy_bonus_count)
-        self._entropy_bonus_sum = None
-        self._entropy_bonus_count = 0
-      stats['entropy_bonus'] = self._last_entropy_bonus
-    if not self.log_student_entropy:
-      return stats
-    if self._entropy_count:
-      self._last_student_entropy = self._entropy_sum / self._entropy_count
-      self._entropy_sum = None
-      self._entropy_count = 0
-    stats['student_entropy'] = self._last_student_entropy
-    return stats
+    cfg = self.config.adversarial_distill
+    if bool(getattr(cfg, 'dmd_weight', 1.0)):
+      return True
+    return (str(getattr(cfg, 'mmd_reward_type', 'feature')) == 'idlm'
+            and bool(getattr(cfg, 'mmd_reward_weight', 0.0)))
 
-  def _extra_train_stats(self):
-    """Extra key/value pairs to fold into the generator step's `log_dict`.
+  @property
+  def _mmd_critic(self):
+    """The frozen feature map, built on first use.
 
-    Empty here, so every existing run logs exactly what it logged before.
-    Subclasses that carry their own diagnostics (see `MDLM_RL`) override it.
-
-    The contract a subclass must honour is the one `_student_entropy_stats`
-    already documents: the *key set* may depend on the config but never on
-    the data, because `log_dict` under DDP hangs if the ranks disagree on
-    which keys they are reducing.
+    Constructed lazily so a run with `mmd_reward_weight=0` never downloads or
+    holds it, and the published objective stays exactly as upstream wrote it.
     """
-    return {}
+    if getattr(self, '_mmd_critic_cached', None) is None:
+      import mmd_reward
+      cfg = self.config.adversarial_distill
+      kind = str(getattr(cfg, 'mmd_reward_type', 'feature'))
+      if kind not in ('feature', 'feature_mse', 'idlm'):
+        raise ValueError('adversarial_distill.mmd_reward_type must be '
+                         f'feature|feature_mse|idlm, got {kind!r}')
+      feature_mse = kind == 'feature_mse'
+      if feature_mse and str(cfg.get('mmd_score_positions', 'written')) != 'written':
+        raise ValueError('adversarial_distill.mmd_reward_type=feature_mse '
+                         'requires mmd_score_positions=written')
+      # Aligned MSE has no kernel, bandwidth or sentence readout. Normalize
+      # unused settings so an existing MMD command can switch only reward type.
+      kernel = 'linear' if feature_mse else str(cfg.get('mmd_kernel', 'linear'))
+      if kernel not in ('linear', 'linear_l2', 'rbf', 'cosine', 'pseudo_huber'):
+        raise ValueError('adversarial_distill.mmd_kernel must be '
+                         f'linear|linear_l2|rbf|cosine|pseudo_huber, got {kernel!r}')
+      if kernel == 'linear_l2' and kind != 'feature':
+        raise ValueError('adversarial_distill.mmd_kernel=linear_l2 requires '
+                         'mmd_reward_type=feature')
+      if kernel == 'cosine' and kind != 'feature':
+        raise ValueError('adversarial_distill.mmd_kernel=cosine requires '
+                         'mmd_reward_type=feature')
+      rbf_distance = str(cfg.get('mmd_rbf_distance', 'squared_euclidean'))
+      rbf_huber_delta = cfg.get('mmd_rbf_huber_delta', 0.001)
+      rbf_exclude_same_sentence = (not feature_mse and bool(
+        cfg.get('mmd_rbf_exclude_same_sentence', False)))
+      rbf_exclude_same_position = (not feature_mse and bool(
+        cfg.get('mmd_rbf_exclude_same_position', False)))
+      rbf_omit_real_real = (not feature_mse and bool(
+        cfg.get('mmd_rbf_omit_real_real', False)))
+      if rbf_omit_real_real and (kind != 'feature' or kernel != 'rbf'):
+        raise ValueError('adversarial_distill.mmd_rbf_omit_real_real requires '
+                         'mmd_reward_type=feature and mmd_kernel=rbf')
+      rbf_omit_fake_fake = (not feature_mse and bool(
+        cfg.get('mmd_rbf_omit_fake_fake', False)))
+      if rbf_omit_fake_fake and (kind != 'feature' or kernel != 'rbf'):
+        raise ValueError('adversarial_distill.mmd_rbf_omit_fake_fake requires '
+                         'mmd_reward_type=feature and mmd_kernel=rbf')
+      if kernel == 'rbf' and kind == 'feature':
+        mmd_reward.mmd_rbf.validate_distance(rbf_distance, rbf_huber_delta)
+      rbf_description = (
+        f'distance={rbf_distance}, huber_delta={rbf_huber_delta}, '
+        f'exclude_same_sentence={rbf_exclude_same_sentence}, '
+        f'exclude_same_position={rbf_exclude_same_position}, '
+        f'omit_real_real={rbf_omit_real_real}, '
+        f'omit_fake_fake={rbf_omit_fake_fake}, '
+        if kernel == 'rbf' else '')
+      level = 'token' if feature_mse else str(cfg.get('mmd_kernel_level', 'token'))
+      if level not in ('token', 'sentence'):
+        raise ValueError('adversarial_distill.mmd_kernel_level must be '
+                         f'token|sentence, got {level!r}')
+      kernel_source = str(cfg.get('mmd_kernel_source', 'rows'))
+      if kernel_source not in ('rows', 'draws'):
+        raise ValueError('adversarial_distill.mmd_kernel_source must be '
+                         f'rows|draws, got {kernel_source!r}')
+      if rbf_exclude_same_position:
+        if (kind != 'feature' or kernel != 'rbf' or kernel_source != 'draws'
+            or level != 'token' or not rbf_exclude_same_sentence
+            or int(cfg.get('mmd_kernel_batch_size', 1) or 1) < 2):
+          raise ValueError('adversarial_distill.mmd_rbf_exclude_same_position requires '
+                           'mmd_reward_type=feature, mmd_kernel=rbf, '
+                           'mmd_kernel_source=draws, mmd_kernel_level=token, '
+                           'mmd_kernel_batch_size >= 2 and '
+                           'mmd_rbf_exclude_same_sentence=True')
+      if rbf_exclude_same_sentence:
+        if (kind != 'feature' or kernel != 'rbf' or kernel_source != 'draws'
+            or level != 'token'):
+          raise ValueError('adversarial_distill.mmd_rbf_exclude_same_sentence '
+                           'requires mmd_reward_type=feature, mmd_kernel=rbf, '
+                           'mmd_kernel_source=draws and mmd_kernel_level=token')
+        if int(cfg.get('mmd_kernel_batch_size', 1) or 1) < 2:
+          raise ValueError('adversarial_distill.mmd_rbf_exclude_same_sentence '
+                           'requires mmd_kernel_batch_size >= 2')
+      if kernel == 'pseudo_huber' and (
+          kernel_source != 'draws' or level != 'sentence' or kind != 'feature'):
+        raise ValueError('adversarial_distill.mmd_kernel=pseudo_huber requires '
+                         'mmd_kernel_source=draws, mmd_kernel_level=sentence '
+                         'and mmd_reward_type=feature')
+      source = getattr(cfg, 'mmd_feature_source', 'ar')
+      sentence_pooling = ('mean' if feature_mse else
+                          str(cfg.get('mmd_sentence_pooling', 'mean')))
+      if sentence_pooling not in ('mean', 'last_token'):
+        raise ValueError('adversarial_distill.mmd_sentence_pooling must be '
+                         f'mean|last_token, got {sentence_pooling!r}')
+      if sentence_pooling == 'last_token' and (
+          kind != 'feature' or source != 'ar' or level != 'sentence'):
+        raise ValueError('adversarial_distill.mmd_sentence_pooling=last_token '
+                         'requires mmd_reward_type=feature, '
+                         'mmd_feature_source=ar and mmd_kernel_level=sentence')
+      if kind == 'idlm':
+        # Scores samples by the teacher/fake ratio instead of by feature
+        # distance to x0, so no feature map is built at all.
+        self._mmd_critic_cached = IdlmRatioReward(self)
+        print(f'[mmd] IDLM teacher/fake log-density ratio, per-sequence '
+              f'reward, group={cfg.mmd_group_size}, '
+              f'critic_batch={self._mmd_critic_cached.reward_batch_size}, '
+              f'weight={cfg.mmd_reward_weight}', flush=True)
+        return self._mmd_critic_cached
+      if source == 'ar':
+        # `kuleshov-group/owt-ar`: a causal DiT trained on the student's exact
+        # corpus and vocabulary. Independent of the model being distilled,
+        # unlike the diffusion teacher, and it *did* see clean sequences --
+        # hence noise_level=0, since masking would inject a difference into a
+        # comparison meant to isolate what the student wrote.
+        backbone = mmd_reward.load_owt_ar_backbone(
+          str(cfg.mmd_ar_model), self.device,
+          weights_dir=getattr(self.config, 'model_weights_dir', None))
+        self._mmd_critic_cached = mmd_reward.FrozenBackboneFeatures(
+          backbone, self.mask_index,
+          layer_index=cfg.mmd_feature_layer,
+          layer_weights=cfg.get('mmd_feature_layer_weights', None),
+          noise_level=0.0)
+        what = f'owt-ar {cfg.mmd_ar_model} (clean, no masking)'
+      elif source == 'diffusion':
+        # The teacher is a frozen copy of the student taken before training:
+        # already in memory, same vocabulary, and its features are about this
+        # corpus rather than about text at large. A denoiser never saw a clean
+        # sequence, so both rows are lightly masked first.
+        self._mmd_critic_cached = mmd_reward.FrozenBackboneFeatures(
+          self.teacher, self.mask_index,
+          layer_index=cfg.mmd_feature_layer,
+          layer_weights=cfg.get('mmd_feature_layer_weights', None),
+          noise_level=cfg.mmd_noise_level)
+        what = f'diffusion teacher (noise={cfg.mmd_noise_level})'
+      else:
+        raise ValueError('adversarial_distill.mmd_feature_source must be '
+                         f'ar|diffusion, got {source!r}')
+      self._mmd_critic_cached.reward_type = kind
+      self._mmd_critic_cached.kernel = kernel
+      self._mmd_critic_cached.kernel_level = level
+      self._mmd_critic_cached.sentence_pooling = sentence_pooling
+      self._mmd_critic_cached.rbf_alpha = cfg.get('mmd_rbf_alpha', None)
+      self._mmd_critic_cached.rbf_distance = rbf_distance
+      self._mmd_critic_cached.rbf_huber_delta = rbf_huber_delta
+      self._mmd_critic_cached.rbf_exclude_same_sentence = rbf_exclude_same_sentence
+      self._mmd_critic_cached.rbf_exclude_same_position = rbf_exclude_same_position
+      self._mmd_critic_cached.rbf_omit_real_real = rbf_omit_real_real
+      self._mmd_critic_cached.rbf_omit_fake_fake = rbf_omit_fake_fake
+      self._mmd_critic_cached.rbf_block_size = int(
+        cfg.get('mmd_rbf_block_size', 0) or 0)
+      self._mmd_critic_cached.kernel_batch_size = max(
+        1, int(cfg.get('mmd_kernel_batch_size', 1) or 1))
+      if feature_mse and kernel_source == 'rows':
+        # Position-aligned targets belong to their own sequence, never to a
+        # neighbouring prompt/row selected by MMD's kernel batching.
+        self._mmd_critic_cached.kernel_batch_size = 1
+      kernel_batch = (
+        f'{self._mmd_critic_cached.kernel_batch_size} draws/candidate'
+        if kernel_source == 'draws'
+        else f'rows of {self._mmd_critic_cached.kernel_batch_size}')
+      reward_description = (
+        'negative aligned masked-token MSE, ' if feature_mse else
+        f'{kernel} kernel over {level}s, {rbf_description}'
+        f'sentence_pooling={sentence_pooling}, ')
+      print(f'[mmd] {what}, block '
+            f'{self._mmd_critic_cached.layer_description}, '
+            f'{reward_description}'
+            f'{kernel_batch}, '
+            f'group={cfg.mmd_group_size}, '
+            f'weight={cfg.mmd_reward_weight}', flush=True)
+    return self._mmd_critic_cached
 
-  def _student_embed_std(self):
-    """Per-entry std of the (possibly noise-wrapped) student's embedding."""
-    if self._embed_module_cache is None:
-      inner = getattr(self.backbone, 'backbone', self.backbone)
-      for name, module in inner.named_modules():
-        if name.endswith('vocab_embed'):
-          self._embed_module_cache = module
-          break
-    if self._embed_module_cache is None:
-      return 0.02
-    return _embedding_std(self._embed_module_cache)
+  def _mmd_content_mask(self, x0, valid_tokens):
+    """Which positions carry real content worth pooling features over.
 
-  def _clip_gradients(self, parameters, name):
-    """Optionally clip gradients in the manual-optimization loop; log the norm.
-
-    With ``automatic_optimization=False`` Lightning does NOT apply
-    ``trainer.gradient_clip_val``, so this is the only clipping the adversarial
-    steps get. Unclipped steps combined with the diffusion weight
-    ``w(s) = dalpha_s / (1 - alpha_s)`` (huge near ``s -> eps``) can make the
-    generator/critic losses diverge (student_loss -> -inf, fake_loss -> +inf,
-    entropy -> 0), so watch the logged norm when clipping is off. That spike is
-    exactly what ``adversarial_distill.loss_weighting='none'`` removes, so the
-    two knobs overlap: with the weighting off, clipping matters much less.
-
-    Clipping is opt-in via ``adversarial_distill.use_gradient_clipping``
-    (default False); when enabled the accumulated gradient is clipped to
-    ``adversarial_distill.gradient_clipping_val`` (None or <= 0 also disables)
-    right before ``optimizer.step()``. The pre-clip norm is logged in both
-    cases, so disabling clipping does not cost the diagnostic.
+    Unconditional OpenWebText (`valid_tokens is None`) is packed text: `wrap`
+    concatenates documents and cuts the stream into fixed rows, so every
+    position is content and there is no padding. In particular EOS is a
+    *document separator* that recurs inside a row rather than a terminator --
+    the conditional branch below stops at the first one, which on OWT would
+    throw away most of every sequence.
     """
-    parameters = [p for p in parameters if p.grad is not None]
-    if not parameters:
-      return
-    ad = self.config.adversarial_distill
-    clip_val = getattr(ad, 'gradient_clipping_val', None)
-    if (getattr(ad, 'use_gradient_clipping', False)
-        and clip_val is not None and clip_val > 0):
-      norm = torch.nn.utils.clip_grad_norm_(parameters, clip_val)
+    if valid_tokens is None:
+      return torch.ones_like(x0, dtype=torch.bool)
+
+    # Conditional data (TinyGSM): real answer content only -- not padding, and
+    # not past the answer's end. EOS doubles as BOS in that tokenizer, so the
+    # search for the end is confined to `valid_tokens`, which is already zero
+    # across the prompt. The terminator itself is kept; knowing where to stop
+    # is part of the answer.
+    content = valid_tokens.bool()
+    pad_id = self.tokenizer.pad_token_id
+    if pad_id is not None:
+      content = content & x0.ne(pad_id)
+    eos_id = self.tokenizer.eos_token_id
+    if eos_id is not None:
+      is_eos = x0.eq(eos_id) & content
+      seen = F.pad(is_eos.cumsum(dim=1)[:, :-1], (1, 0))
+      content = content & seen.eq(0)
+    return content
+
+  def _mmd_forward_batch_size(self):
+    """Physical forward limit; the loader batch still defines the objective."""
+    cfg = self.config.adversarial_distill
+    value = cfg.get('mmd_forward_batch_size', None)
+    if value is None:
+      return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+      raise ValueError('adversarial_distill.mmd_forward_batch_size must be '
+                       'a positive integer or null')
+    if (cfg.get('dmd_weight', 1.0) != 0
+        or not cfg.get('mmd_reward_weight', 0.0)
+        or cfg.get('mmd_reward_type', 'feature') not in
+           ('feature', 'feature_mse')):
+      raise ValueError('adversarial_distill.mmd_forward_batch_size requires '
+                       'dmd_weight=0, nonzero mmd_reward_weight and '
+                       'mmd_reward_type=feature|feature_mse')
+    return value
+
+  def _mmd_microbatch_loss(self, x0, valid_tokens,
+                           current_accumulation_step, batch_size):
+    """Keep logical-batch rewards while checkpointing smaller student forwards.
+
+    Only sampled IDs and their log probabilities survive each forward. Full
+    vocabulary outputs and model activations are recomputed during backward.
+    Kernels, automatic bandwidth, baselines and the token denominator still
+    see the complete loader batch, including groups that cross forward chunks.
+    """
+    from torch.utils.checkpoint import checkpoint
+    cfg = self.config.adversarial_distill
+    xt, sigma = self._distill_generator_state(
+      x0, valid_tokens, current_accumulation_step)
+    selected = (xt == self.mask_index) & self._mmd_content_mask(x0, valid_tokens)
+    group_size = int(cfg.mmd_group_size)
+    if group_size < 1:
+      raise ValueError('mmd_group_size must be >= 1')
+    source = str(cfg.get('mmd_kernel_source', 'rows'))
+    if source not in ('rows', 'draws'):
+      raise ValueError('mmd_kernel_source must be rows|draws')
+    draws = group_size * (max(1, int(cfg.get('mmd_kernel_batch_size', 1) or 1))
+                          if source == 'draws' else 1)
+
+    def sample_chunk(noisy, noise, clean, valid, written):
+      probs = self.forward(noisy, sigma=noise).exp()
+      probs = self._preserve_prompt_probs(probs, clean, valid)
+      with torch.no_grad():
+        ids = torch.multinomial(
+          probs.detach().reshape(-1, probs.shape[-1]).float(),
+          draws, replacement=True)
+        ids = ids.T.reshape(draws, *clean.shape)
+        ids = torch.where(written.unsqueeze(0), ids, clean.unsqueeze(0))
+      logp = probs.clamp_min(1e-12).log()
+      sampled_logp = logp.gather(2, ids.permute(1, 2, 0)).permute(2, 0, 1)
+      return sampled_logp, ids
+
+    logp_chunks, sample_chunks = [], []
+    for start in range(0, x0.shape[0], batch_size):
+      stop = start + batch_size
+      valid = None if valid_tokens is None else valid_tokens[start:stop]
+      sampled_logp, ids = checkpoint(
+        sample_chunk, xt[start:stop], sigma[start:stop], x0[start:stop],
+        valid, selected[start:stop], use_reentrant=False,
+        preserve_rng_state=True)
+      logp_chunks.append(sampled_logp)
+      sample_chunks.append(ids)
+    sampled_logp = torch.cat(logp_chunks, dim=1)
+    samples = torch.cat(sample_chunks, dim=1)
+    if bool(selected.any()):
+      # Feature extraction is frozen: split its forwards without checkpointing.
+      # Captured features are rejoined before computing the logical-batch reward.
+      self._mmd_critic.forward_batch_size = batch_size
+    return self._mmd_term(x0, valid_tokens, None, xt,
+                          samples=samples, sampled_logp=sampled_logp)
+
+  def _mmd_term(self, x0, valid_tokens, student_probs, xt, *,
+                samples=None, sampled_logp=None):
+    """The configured hard-sample reward as a REINFORCE term, or zero."""
+    import mmd_reward
+    cfg = self.config.adversarial_distill
+    output = student_probs if samples is None else sampled_logp
+    content = self._mmd_content_mask(x0, valid_tokens)
+    # The WRITTEN span: what the student filled in, hence what the REINFORCE
+    # surrogate sums log-probabilities over. Never widened.
+    selected = (xt == self.mask_index) & content
+    if not bool(selected.any()):
+      return (output.new_zeros(()) if samples is None
+              else output.sum() * 0.0)
+    # The SCORED span, which `mmd_score_positions` may widen to every content
+    # position. Outside the written span the two token sequences are identical,
+    # so this adds signal only through the feature map's context sensitivity.
+    where = str(cfg.get('mmd_score_positions', 'written'))
+    if where == 'written':
+      scored = selected
+    elif where == 'all':
+      scored = content
     else:
-      # Monitoring only: the same total norm `clip_grad_norm_` would report,
-      # with the gradients left untouched.
-      norm = torch.norm(torch.stack(
-        [p.grad.detach().norm(2) for p in parameters]), 2)
-    self.log(name, norm, on_step=True, on_epoch=False,
-             prog_bar=False, sync_dist=True)
+      raise ValueError('adversarial_distill.mmd_score_positions must be '
+                       f'written|all, got {where!r}')
+    if samples is None:
+      loss_fn = mmd_reward.mmd_reinforce_loss
+      args = (student_probs, x0, selected, self._mmd_critic)
+    else:
+      loss_fn = mmd_reward.mmd_reinforce_loss_from_samples
+      args = (sampled_logp, x0, selected, samples, self._mmd_critic)
+    loss, stats = loss_fn(
+      *args,
+      group_size=cfg.mmd_group_size,
+      eos_id=self.tokenizer.eos_token_id,
+      reward_weight=cfg.mmd_reward_weight,
+      baseline=str(cfg.get('mmd_baseline', 'auto')),
+      scored=scored,
+      kernel_source=str(cfg.get('mmd_kernel_source', 'rows')),
+      kernel_draws=max(1, int(cfg.get('mmd_kernel_batch_size', 1) or 1)),
+      # Keep the endpoint independent of the written/scored span. Packed OWT
+      # includes every position, even document-separator EOS tokens.
+      sequence_mask=(content if
+                     cfg.get('mmd_reward_type', 'feature') == 'feature' and
+                     cfg.get('mmd_sentence_pooling', 'mean') == 'last_token'
+                     else None))
+    stats['mmd/generator_mask_fraction'] = (
+      selected.sum().to(output.dtype)
+      / content.sum().clamp_min(1).to(output.dtype)).detach()
+    self.log_dict(stats, on_step=True, on_epoch=False, sync_dist=True)
+    return loss
 
-  def _generator_only_step(self, input_tokens, valid_tokens,
-                           current_accumulation_step):
-    # No fake critic: every step trains the student on the (teacher-only)
-    # generator loss.
-    optimizer_student = self.optimizers()
-    scheduler_student = self.lr_schedulers()
-    self.toggle_optimizer(optimizer_student)
-    g_loss = self.generator_loss(
-      input_tokens, valid_tokens, current_accumulation_step)
-    g_loss = g_loss.mean() / self.accum_batches
-    self.manual_backward(g_loss)
-    self.untoggle_optimizer(optimizer_student)
+  def generator_loss(self, x0, valid_tokens, current_accumulation_step):
+    cfg = self.config.adversarial_distill
+    mmd_weight = getattr(cfg, 'mmd_reward_weight', 0.0)
+    dmd_weight = getattr(cfg, 'dmd_weight', 1.0)
+    assert mmd_weight or dmd_weight, (
+      'adversarial_distill.dmd_weight and mmd_reward_weight are both 0, which '
+      'leaves the generator with no objective at all.')
+    forward_batch_size = self._mmd_forward_batch_size()
+    if forward_batch_size is not None:
+      return self._mmd_microbatch_loss(
+        x0, valid_tokens, current_accumulation_step, forward_batch_size)
+    if mmd_weight:
+      student_probs, mmd_xt = self.multistep_generation(
+        x0, valid_tokens, current_accumulation_step, return_xt=True)
+    else:
+      student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
 
-    self._student_accum_counter += 1
-    self.total_loss_student += g_loss.detach()
-    if self._student_accum_counter == self.accum_batches:
-      self._student_accum_counter = 0
-      self._clip_gradients(self.backbone.parameters(), 'grad_norm_student')
-      optimizer_student.step()
-      self.ema.update(self.backbone.parameters())
-      optimizer_student.zero_grad()
-      _maybe_save_periodic_checkpoint(self)
-      self.log_dict(
-        {"student_loss": self.total_loss_student,
-         **self._student_entropy_stats(),
-         **self._extra_train_stats(),
-         **self._noise_conditioning_stats()},
-        prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
-      scheduler_student.step()
-      self.total_loss_student = 0
+    if not dmd_weight:
+      # Reward-only: skip the differentiable DMD teacher/fake pair. The IDLM
+      # ratio reward still consults both critics internally on hard samples;
+      # the paired feature reward does not.
+      return self._mmd_term(x0, valid_tokens, student_probs, mmd_xt)
+
+    t = self._sample_t(x0.shape[0], current_accumulation_step)
+    dalpha_t, alpha_t = self.noise(t)
+    alpha_t = alpha_t.unsqueeze(-1)
+    assert alpha_t.ndim == 2
+    sigma = self._sigma_from_alphat(alpha_t)
+    sigma = self._process_sigma(sigma)
+
+    probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
+    xt = trainer_base.sample_categorical(probs_xt)
+    xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
+    
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+      model_output_teacher = self.teacher(xt, sigma)
+    logits_teacher = self._process_model_output(model_output=model_output_teacher, xt=xt, sigma=sigma)
+    teacher_loss = self.nll_per_token_with_probs(logits_teacher, xt, student_probs, 
+                                alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                valid_tokens=valid_tokens)
+
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+      model_output_fake = self.fake_model(xt, sigma)
+    logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
+    fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs,
+                                alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                valid_tokens=valid_tokens)
+    loss = dmd_weight * (teacher_loss - fake_loss)
+    if mmd_weight:
+      loss = loss + self._mmd_term(x0, valid_tokens, student_probs, mmd_xt)
+    return loss
+
+  def fake_loss(self, x0, valid_tokens, current_accumulation_step):
+    with torch.no_grad():
+      student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
+
+    t = self._sample_t(x0.shape[0], current_accumulation_step)
+    dalpha_t, alpha_t = self.noise(t)
+    alpha_t = alpha_t.unsqueeze(-1)
+    assert alpha_t.ndim == 2
+    sigma = self._sigma_from_alphat(alpha_t)
+    sigma = self._process_sigma(sigma)
+    probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
+    xt = trainer_base.sample_categorical(probs_xt)
+    xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
+
+    with torch.cuda.amp.autocast(dtype=torch.float32):
+      model_output_fake = self.fake_model(xt, sigma)
+    logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
+    fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs, 
+                                alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                valid_tokens=valid_tokens)
+
+    return fake_loss
 
   def training_step(self, batch, batch_idx):
     if self.config.adversarial_distill.is_distill:
-      current_accumulation_step = (batch_idx % self.accum_batches)
-
-      (input_tokens, output_tokens, valid_tokens) = self._process_model_input(batch['input_ids'],
-                                                                              batch['attention_mask'])
-      valid_tokens = _conditional_valid_tokens(self.config, valid_tokens)
-
-      if not self.use_fake:
-        return self._generator_only_step(
-          input_tokens, valid_tokens, current_accumulation_step)
-
       optimizer_student, optimizer_fake = self.optimizers()
       scheduler_student, scheduler_fake = self.lr_schedulers()
+      current_accumulation_step = (batch_idx % self.accum_batches)
       finish_iter = False
+
+      (input_tokens, output_tokens, valid_tokens) = self._process_model_input(batch['input_ids'], 
+                                                                              batch['attention_mask'])
+      valid_tokens = _conditional_valid_tokens(self.config, valid_tokens)
       if self.is_generator_step:
         self.toggle_optimizer(optimizer_student)
         g_loss = self.generator_loss(input_tokens, valid_tokens, current_accumulation_step)
@@ -1586,10 +1331,10 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self._student_accum_counter += 1
         self.total_loss_student += g_loss.detach()
         if self._student_accum_counter == self.accum_batches:
-          self._student_accum_counter = 0
-          self._clip_gradients(self.backbone.parameters(), 'grad_norm_student')
+          self._student_accum_counter = 0 
           optimizer_student.step()
-          self.ema.update(self.backbone.parameters())
+          if self.ema is not None:
+            self.ema.update(self.backbone.parameters())
           optimizer_student.zero_grad()
           finish_iter = True
       else:
@@ -1603,10 +1348,10 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         self._fake_accum_counter += 1
         self.total_loss_fake += f_loss.detach()
         if self._fake_accum_counter == self.accum_batches:
-          self._fake_accum_counter = 0
-          self._clip_gradients(self.fake_model.parameters(), 'grad_norm_fake')
+          self._fake_accum_counter = 0 
           optimizer_fake.step()
-          self.ema_fake.update(self.fake_model.parameters())
+          if self.ema_fake is not None:
+            self.ema_fake.update(self.fake_model.parameters())
           optimizer_fake.zero_grad()
           finish_iter = True
 
@@ -1614,16 +1359,25 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
         _maybe_save_periodic_checkpoint(self)
 
       if finish_iter and self.is_generator_step:
-        self.is_generator_step = False
-        utils.activate_model(self.fake_model)
-        utils.freeze_model(self.backbone)
-        optimizer_fake.zero_grad()
+        # With dmd_weight=0 nothing reads the fake critic, so handing it half
+        # the steps would burn compute training a model the loss ignores. Stay
+        # in generator mode instead.
+        train_fake = self._needs_fake_phase()
+        self.is_generator_step = not train_fake
+        if train_fake:
+          utils.activate_model(self.fake_model)
+          utils.freeze_model(self.backbone)
+          optimizer_fake.zero_grad()
+        # `f_loss_ar` stays empty when there is no fake phase, and
+        # `torch.stack([])` raises rather than logging nothing.
+        stats = {"student_loss": self.total_loss_student}
+        if self.f_loss_ar:
+          stats["fake_loss"] = torch.stack(self.f_loss_ar).mean()
+        # Rank-identical (read off the parameters, not the batch), so the
+        # `sync_dist=True` below averages equal values.
+        stats.update(self._noise_conditioning_stats())
         self.log_dict(
-            {"student_loss": self.total_loss_student,
-             "fake_loss": torch.stack(self.f_loss_ar).mean(),
-             **self._student_entropy_stats(),
-             **self._extra_train_stats(),
-             **self._noise_conditioning_stats()},
+            stats,
             prog_bar=True,
             on_step=True,
             on_epoch=False,
@@ -1699,1725 +1453,6 @@ class MDLM_with_AR(trainer_base.AbsorbingState):
       masked_score * masked_indices
       + unmasked_score * (1 - masked_indices))
     return model_output.exp()
-
-
-class MDLM_DMMD(MDLM_with_AR):
-  """MDLM distilled with the Discrete Moment-Matching (D-MMD) recipe of
-  Hoogeboom et al., "Beyond Single Tokens" (arXiv:2603.20155).
-
-  This subclasses `MDLM_with_AR` and inherits *all* of its machinery unchanged
-  (optimizers, EMA, checkpointing, the fake/generator min-max schedule, the AR
-  critic, generator input-noise conditioning, samplers, ...). It only replaces
-  the diffusion-critic loss to add three features, each independently
-  toggleable so their effect on training can be compared:
-
-  1. Mask sampling scheme -- `adversarial_distill.dmmd_mask_sampling`:
-     * 'posterior' ("s", D-MMD Algorithm 1, default): couple two times `s < t`,
-       generate the student prediction `x_hat_eta(z_t)` at the *noisier* latent
-       `z_t`, sample a hard `x ~ Cat(x_hat_eta(z_t))`, and draw the *less-noisy*
-       critic latent from the masked-diffusion posterior `z_s ~ q(z_s | z_t, x)`
-       (revealing some masked positions toward `x`). The critic is scored at `z_s`
-       with weight `w(s)`. The step count `k` is `adversarial_distill.
-       dmmd_num_steps`; the two times are coupled as in Algorithm 1 --
-       `s ~ U(0, 1)`, `delta_t ~ U(0, 1/k)`, `t = min(1, s + delta_t)`.
-     * 'renoise' ("t", original IDLM `MDLM_with_AR`): generate `student_probs`,
-       then *re-noise* it back to an independent time `t` (`q_xt_with_probs`) and
-       score the critic at `t`. This is the parent's exact scheme (identical when
-       `generator_num_noised_samples == 1`), kept here so the two mask-sampling
-       strategies can be A/B-tested with everything else held fixed.
-     Aliases accepted: {'posterior','s','dmmd'} / {'renoise','t','idlm'}.
-
-  2. Top-p (nucleus) teacher distillation (D-MMD Sec. 3.3), applied in *both*
-     modes. To make the student mode-seek like a top-p sampler, the teacher
-     target is restricted to the top-p nucleus. Hard-masking out-of-nucleus
-     logits to a large negative value spikes the gradient reaching the student
-     (the paper reports divergence), so instead their logits are *lowered by a
-     constant* `Delta` (paper: `Delta = 2`):
-     `s_theta <- s_theta - (1 - mask_top-p) * Delta`. Set via
-     `adversarial_distill.top_p` (>= 1 disables) and `.top_p_delta`. Top-p also
-     applies to the AR critic's teacher; the posterior mask sampling is specific
-     to the diffusion critic.
-
-  3. Mask layout -- `adversarial_distill.dmmd_mask_layout`, orthogonal to
-     `dmmd_mask_sampling` above and honoured by both of its modes. 'random'
-     (default): every `z_t`/`z_s` masked position is drawn i.i.d., same as
-     `q_xt`. 'suffix': the masked positions are a single contiguous block at
-     the end of the sequence -- the prefix is always unmasked, at both `z_t`
-     and `z_s` -- with the boundary set deterministically from alpha rather
-     than by a per-position coin flip. For text this is prefix-conditioned
-     ("continue this text") generation/training: a clean prompt at the start,
-     generated continuation as a single contiguous block after it, instead of
-     scattered masked-LM-style gaps throughout. See `_suffix_mask_boundary`.
-  """
-
-  def __init__(self, config, tokenizer):
-    super().__init__(config, tokenizer)
-    ad = self.config.adversarial_distill
-    # Nucleus threshold for D-MMD Sec. 3.3 teacher-target top-p distillation.
-    # None or >= 1 disables it (teacher target left unchanged).
-    self.top_p = getattr(ad, 'top_p', 1.0)
-    if self.top_p is None:
-      self.top_p = 1.0
-    # Constant by which out-of-nucleus teacher logits are lowered (paper Delta=2).
-    self.top_p_delta = getattr(ad, 'top_p_delta', 2.0)
-    # Number of D-MMD sampling steps k; the generation time t is drawn one step
-    # above the uniform critic time s via delta_t ~ U(0, 1/k) (posterior only).
-    self.dmmd_num_steps = getattr(ad, 'dmmd_num_steps', 32)
-    # Mask-sampling scheme: 'posterior' (D-MMD, critic at s) or 'renoise' (IDLM,
-    # critic at re-noised t). Normalized so 's'/'dmmd' and 't'/'idlm' also work.
-    mode = str(getattr(ad, 'dmmd_mask_sampling', 'posterior')).lower()
-    if mode in ('posterior', 's', 'dmmd'):
-      self.dmmd_mask_sampling = 'posterior'
-    elif mode in ('renoise', 't', 'idlm'):
-      self.dmmd_mask_sampling = 'renoise'
-    else:
-      raise ValueError(
-        f'Unknown adversarial_distill.dmmd_mask_sampling: {mode!r} '
-        "(expected one of 'posterior'/'s' or 'renoise'/'t').")
-    # Spatial layout of which positions get masked. 'random' (default): the
-    # i.i.d. per-position draw q_xt uses. 'suffix': a contiguous block at the
-    # end of the sequence, boundary set deterministically from alpha. See the
-    # config key.
-    layout = str(getattr(ad, 'dmmd_mask_layout', 'random')).lower()
-    if layout in ('random', 'iid'):
-      self.dmmd_mask_layout = 'random'
-    elif layout in ('suffix', 'postfix', 'block'):
-      self.dmmd_mask_layout = 'suffix'
-    else:
-      raise ValueError(
-        f'Unknown adversarial_distill.dmmd_mask_layout: {layout!r} '
-        "(expected one of 'random' or 'suffix'/'postfix').")
-
-  def _dmmd_sample_t(self, s):
-    """Generation time `t` one D-MMD step above the critic time `s`.
-
-    Algorithm 1's coupling: `delta_t ~ U(0, 1/k)` (k = `dmmd_num_steps`),
-    `t = min(1, s + delta_t)`. `t >= s`, so `alpha_t <= alpha_s` -- `z_s` is a
-    *less* noisy latent than `z_t`, matching the reverse (denoising) direction
-    of the posterior.
-
-    The paper draws the *critic* time uniformly and derives `t` from it, which
-    is the opposite of an earlier version of this method (uniform `t`, then
-    `s = t - delta_t`). It matters in two ways: the loss weight `w(s)` and the
-    critic's mask density are now driven by a genuinely uniform `s`, and the
-    clamp puts an atom of mass `1/(2k)` (~1.6% at k=32) on `t = 1`, i.e. the
-    generator is sometimes trained on the near-fully-masked input it starts
-    sampling from. Runs from before this change are therefore not exactly
-    comparable.
-    """
-    delta = torch.rand_like(s) / self.dmmd_num_steps
-    return (s + delta).clamp(max=1.0)
-
-  def _dmmd_q_xt(self, x, alpha, valid_tokens=None):
-    """`q_xt`, or its `dmmd_mask_layout='suffix'` counterpart -- whichever
-    `self.dmmd_mask_layout` selects. Same call sites, same semantics, so every
-    `q_xt` caller in `_dmmd_generate` can route through this instead.
-    `_suffix_mask_boundary`/`_suffix_mask_indices` live on
-    `trainer_base.AbsorbingState` (inherited), shared with
-    `_ancestral_update`'s `sampling.mask_layout='suffix'` so training and
-    sampling use exactly the same boundary formula.
-    """
-    if self.dmmd_mask_layout == 'random':
-      return self.q_xt(x, alpha, valid_tokens=valid_tokens)
-    move = self._suffix_mask_indices(alpha, x, valid_tokens=valid_tokens)
-    xt = torch.where(move, self.mask_index, x)
-    if self.ignore_bos:
-      xt[:, 0] = x[:, 0]
-    return xt
-
-  def _dmmd_posterior(self, z_t, x_hard, alpha_t, alpha_s, valid_tokens=None):
-    """Masked-diffusion posterior sample `z_s ~ q(z_s | z_t, x_hard)`.
-
-    Mirrors `AbsorbingState._ancestral_update` (a reverse step from `t` to `s`)
-    but conditions on the *hard* student sample `x_hard` instead of a soft model
-    prediction: positions already revealed in `z_t` are kept, and each still-
-    masked position is revealed to `x_hard`.
-
-    `dmmd_mask_layout='random'` (default): reveal each still-masked position
-    independently with probability `(alpha_s - alpha_t) / (1 - alpha_t)`.
-    `='suffix'`: no per-position draw -- `_suffix_mask_boundary(alpha_s)` gives
-    the `z_s` mask directly (nested inside `z_t`'s by construction, since
-    `alpha_s >= alpha_t`), and the positions that leave the mask between `z_t`
-    and `z_s` are exactly the ones revealed to `x_hard`.
-    """
-    if self.dmmd_mask_layout == 'suffix':
-      mask_s = self._suffix_mask_indices(alpha_s, z_t, valid_tokens=valid_tokens)
-      if self.ignore_bos:
-        mask_s = mask_s.clone()
-        mask_s[:, 0] = False
-      newly_revealed = (z_t == self.mask_index) & ~mask_s
-      masked = torch.full_like(z_t, self.mask_index)
-      return torch.where(mask_s, masked, torch.where(newly_revealed, x_hard, z_t))
-    reveal_prob = ((alpha_s - alpha_t) / (1 - alpha_t)).clamp(0.0, 1.0)
-    reveal = torch.rand(z_t.shape, device=z_t.device) < reveal_prob
-    newly_revealed = (z_t == self.mask_index) & reveal
-    return torch.where(newly_revealed, x_hard, z_t)
-
-  def _dmmd_generate(self, x0, valid_tokens, current_accumulation_step,
-                     detach_student):
-    """One critic draw: `(student_probs, crit_x, alpha, dalpha, x_hard,
-    student_xt)`.
-
-    `student_probs` is the differentiable student prediction; `crit_x` is the
-    discrete latent fed to the teacher/fake critic, scored with weight from
-    `(alpha, dalpha)`; `x_hard ~ Cat(student_probs)` is the hard sample the
-    latent is coupled to (Algorithm 1's `x`), needed by the hard fake target;
-    `student_xt` is the latent the *student* was conditioned on (`z_t`, not the
-    critic's `z_s`), which `_confidence_loss_mask_for` needs to know which
-    positions the student actually predicted.
-    The latent is produced by the D-MMD posterior ('posterior' mode) or by IDLM
-    re-noising ('renoise' mode). When `detach_student` the student forward pass
-    is run under `no_grad` (fake / auxiliary step).
-    """
-    if self.dmmd_mask_sampling == 'renoise':
-      # IDLM: generate student_probs, then re-noise to an independent time t.
-      if detach_student:
-        with torch.no_grad():
-          student_probs, student_xt = self.multistep_generation(
-            x0, valid_tokens, current_accumulation_step, return_xt=True)
-      else:
-        student_probs, student_xt = self.multistep_generation(
-          x0, valid_tokens, current_accumulation_step, return_xt=True)
-      t = self._sample_t(x0.shape[0], current_accumulation_step)
-      dalpha_t, alpha_t = self.noise(t)
-      alpha_t = alpha_t.unsqueeze(-1)
-      assert alpha_t.ndim == 2
-      # Hard sample then mask, rather than one draw from the mixture: same
-      # marginal, but exposes `x_hard` for the hard fake target (see
-      # `MDLM_with_AR._fake_loss_diffusion`).
-      x_hard = trainer_base.sample_categorical(student_probs.detach())
-      x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
-      xt = self._dmmd_q_xt(x_hard, alpha_t, valid_tokens=valid_tokens)
-      xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
-      return student_probs, xt, alpha_t, dalpha_t, x_hard, student_xt
-
-    # D-MMD posterior (Algorithm 1): couple s < t and sample z_s from q(z_s|z_t,x).
-    # `s ~ U(eps, 1)` is the critic time (`_sample_t` is just the repo's uniform
-    # draw, with antithetic sampling / global-batch chunking); `t` is one step
-    # above it. The `eps` floor is what keeps the `w(s) = -alpha'_s/(1-alpha_s)`
-    # weight bounded (~1e3 at s=eps).
-    s = self._sample_t(x0.shape[0], current_accumulation_step)
-    t = self._dmmd_sample_t(s)
-    _, alpha_t = self.noise(t)
-    dalpha_s, alpha_s = self.noise(s)
-    alpha_t = alpha_t.unsqueeze(-1)
-    alpha_s = alpha_s.unsqueeze(-1)
-    assert alpha_t.ndim == 2 and alpha_s.ndim == 2
-
-    # Generate the student prediction at the (noisier) generation latent z_t.
-    z_t = self._dmmd_q_xt(x0, alpha_t, valid_tokens=valid_tokens)
-    sigma_t = self._sigma_from_alphat(alpha_t)
-    if detach_student:
-      with torch.no_grad():
-        student_probs = self.forward(z_t, sigma=sigma_t).exp()
-    else:
-      student_probs = self.forward(z_t, sigma=sigma_t).exp()
-    student_probs = self._preserve_prompt_probs(student_probs, x0, valid_tokens)
-
-    # Hard student sample -> posterior "sampling of masks" to the critic latent.
-    x_hard = trainer_base.sample_categorical(student_probs.detach())
-    x_hard = self._preserve_prompt_tokens(x_hard, x0, valid_tokens)
-    z_s = self._dmmd_posterior(z_t, x_hard, alpha_t, alpha_s,
-                               valid_tokens=valid_tokens)
-    z_s = self._preserve_prompt_tokens(z_s, x0, valid_tokens)
-    return student_probs, z_s, alpha_s, dalpha_s, x_hard, z_t
-
-  def _apply_top_p_to_teacher(self, teacher_log_probs):
-    """D-MMD Sec. 3.3 top-p distillation of the teacher target.
-
-    Lowers the log-probability of out-of-nucleus categories by `top_p_delta`
-    instead of hard-masking them to a large negative value (which would spike the
-    gradient reaching the student through its softmax Jacobian). No-op when
-    `top_p >= 1`. The nucleus is the smallest set whose cumulative probability
-    first exceeds `top_p` (top-1 always kept), matching the shift-by-one
-    semantics of `utils.top_k_top_p_filtering`. Following the paper we do not
-    renormalize; a per-position constant would not change the student gradient.
-    Safe on the one-hot revealed positions produced by `_process_model_output`
-    (their nucleus is the single revealed token, so they stay one-hot).
-    """
-    if self.top_p is None or self.top_p >= 1.0:
-      return teacher_log_probs
-    with torch.no_grad():
-      probs = teacher_log_probs.exp()
-      sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
-      cum_probs = torch.cumsum(sorted_probs, dim=-1)
-      sorted_remove = cum_probs > self.top_p
-      # Keep the boundary category that first crosses top_p; always keep top-1.
-      sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
-      sorted_remove[..., 0] = False
-      remove = torch.zeros_like(sorted_remove).scatter(
-        -1, sorted_idx, sorted_remove)
-    return teacher_log_probs - remove.to(teacher_log_probs.dtype) * self.top_p_delta
-
-  def _generator_loss_diffusion(self, x0, valid_tokens,
-                                current_accumulation_step):
-    # D-MMD generator loss (diffusion critic). Same weighted soft cross-entropy
-    # as the parent, but the critic latent comes from the selected mask-sampling
-    # scheme (D-MMD posterior or IDLM re-noising) and the teacher target is
-    # optionally top-p distilled.
-    num_noised_samples = getattr(
-      self.config.adversarial_distill, 'generator_num_noised_samples', 1)
-
-    teacher_loss_total = 0.0
-    fake_loss_total = 0.0
-
-    for _ in range(num_noised_samples):
-      student_probs, crit_x, alpha, dalpha, _, student_xt = (
-        self._dmmd_generate(x0, valid_tokens, current_accumulation_step,
-                            detach_student=False))
-      loss_mask = self._confidence_loss_mask_for(
-        student_probs, student_xt, valid_tokens, is_generator=True)
-      self._record_student_entropy(
-        student_probs, student_xt, valid_tokens, loss_mask)
-      sigma = self._sigma_from_alphat(alpha)
-      sigma = self._process_sigma(sigma)
-
-      with torch.cuda.amp.autocast(dtype=torch.float32):
-        model_output_teacher = self.teacher(crit_x, sigma)
-      logits_teacher = self._process_model_output(
-        model_output=model_output_teacher, xt=crit_x, sigma=sigma)
-      logits_teacher = self._apply_top_p_to_teacher(logits_teacher)
-      teacher_loss = self.nll_per_token_with_probs(
-        logits_teacher, crit_x, student_probs,
-        alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens,
-        loss_mask=loss_mask)
-      teacher_loss_total = teacher_loss_total + teacher_loss
-
-      if self.use_fake:
-        with torch.cuda.amp.autocast(dtype=torch.float32):
-          model_output_fake = self.fake_model(crit_x, sigma)
-        logits_fake = self._process_model_output(
-          model_output=model_output_fake, xt=crit_x, sigma=sigma)
-        fake_loss = self.nll_per_token_with_probs(
-          logits_fake, crit_x, student_probs,
-          alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens,
-          loss_mask=loss_mask)
-        fake_loss_total = fake_loss_total + fake_loss
-
-    teacher_loss = teacher_loss_total / num_noised_samples
-    if not self.use_fake:
-      return teacher_loss
-    fake_loss = fake_loss_total / num_noised_samples
-    return teacher_loss - fake_loss
-
-  def _fake_loss_diffusion(self, x0, valid_tokens, current_accumulation_step):
-    # D-MMD auxiliary/fake loss (diffusion critic). Fits the fake critic at the
-    # critic latent to either the student's soft prediction or the hard sample it
-    # was drawn from, per `fake_soft_target` (D-MMD Sec. 3.2 -- Algorithm 1's
-    # "Optional use soft target x <- x_hat_eta(z_t)"). Keeps the optional
-    # aux->teacher anchor (fake_teacher_weight, D-MMD Eq. 12, second term).
-    student_probs, crit_x, alpha, dalpha, x_hard, student_xt = (
-      self._dmmd_generate(x0, valid_tokens, current_accumulation_step,
-                          detach_student=True))
-    loss_mask = self._confidence_loss_mask_for(
-      student_probs, student_xt, valid_tokens, is_generator=False)
-    sigma = self._sigma_from_alphat(alpha)
-    sigma = self._process_sigma(sigma)
-
-    with torch.cuda.amp.autocast(dtype=torch.float32):
-      model_output_fake = self.fake_model(crit_x, sigma)
-    logits_fake = self._process_model_output(
-      model_output=model_output_fake, xt=crit_x, sigma=sigma)
-    fake_loss = self.nll_per_token_with_probs(
-      logits_fake, crit_x,
-      self._fake_diffusion_target(student_probs, x_hard),
-      alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens,
-      loss_mask=loss_mask)
-
-    if self.fake_teacher_weight > 0:
-      with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float32):
-        teacher_probs = self._process_model_output(
-          model_output=self.teacher(crit_x, sigma), xt=crit_x, sigma=sigma).exp()
-      anchor = self.nll_per_token_with_probs(
-        logits_fake, crit_x, teacher_probs,
-        alpha_t=alpha, dalpha_t=dalpha, valid_tokens=valid_tokens,
-        loss_mask=loss_mask)
-      fake_loss = fake_loss + self.fake_teacher_weight * anchor
-    return fake_loss
-
-  def _generator_loss_ar(self, x0, valid_tokens, current_accumulation_step):
-    # AR critic: identical to the parent, plus D-MMD Sec. 3.3 top-p distillation
-    # of the teacher's next-token log-probs. (The posterior mask sampling is
-    # diffusion-specific and does not apply to a full-sequence AR critic.)
-    student_probs, student_xt = self.multistep_generation(
-      x0, valid_tokens, current_accumulation_step, return_xt=True)
-    loss_mask = self._confidence_loss_mask_for(
-      student_probs, student_xt, valid_tokens, is_generator=True)
-    self._record_student_entropy(
-      student_probs, student_xt, valid_tokens, loss_mask)
-
-    x_gen = trainer_base.sample_categorical(student_probs.detach())
-    x_gen = self._preserve_prompt_tokens(x_gen, x0, valid_tokens)
-
-    with torch.no_grad():
-      teacher_logprobs = self._ar_logprobs(self.teacher, x_gen)
-    teacher_logprobs = self._apply_top_p_to_teacher(teacher_logprobs)
-    teacher_loss = self._ar_cross_entropy(
-      teacher_logprobs, student_probs, valid_tokens, loss_mask=loss_mask)
-    if not self.use_fake:
-      return teacher_loss
-
-    with torch.no_grad():
-      fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
-    fake_loss = self._ar_cross_entropy(
-      fake_logprobs, student_probs, valid_tokens, loss_mask=loss_mask)
-    return teacher_loss - fake_loss
-
-
-# Backwards-compatible alias for the algo=mdlm_dmmd wiring in main.py.
-MDLM_with_DMMD = MDLM_DMMD
-
-
-# Keys `MDLM_RL._extra_train_stats` always emits. Fixed at import time and
-# never data-dependent: `log_dict` under DDP reduces across ranks and hangs
-# if two ranks disagree about which keys they are reducing.
-_RL_STAT_KEYS = ('rl/reward', 'rl/reward_std', 'rl/teacher_nll',
-                 'rl/fake_nll', 'rl/logp', 'rl/advantage_abs')
-
-
-# One sampler rollout, with everything the policy-gradient recompute needs.
-#
-#   x        (B, L)      the finished, fully-unmasked sequence
-#   latents  (K, B, L)   the latent the denoiser was conditioned on at step j
-#   reveals  (K, B, L)   bool; positions step j moved from [MASK] to a token
-#   sigmas   (K, B, 1)   the sigma fed to the backbone at step j
-#   seeds    list[int]   per-step seed of the injected input noise (see
-#                        `_NoiseConditionedBackbone.noise_stream`); replayed at
-#                        recompute so the differentiated forward is the same
-#                        function that produced the action
-#   valid_tokens         the mask this rollout was produced under, carried so a
-#                        buffered rollout reduces the same way it was generated
-#
-# `K = rl_num_steps + 1`: the k grid steps plus the final noise-removal step,
-# exactly the call sequence `TrainerBase.generate_samples` makes.
-_RLRollout = collections.namedtuple(
-  '_RLRollout', ['x', 'latents', 'reveals', 'sigmas', 'seeds', 'valid_tokens'])
-
-
-class MDLM_RL(MDLM_DMMD):
-  """MDLM distilled by **policy gradient on the sampler's own trajectories**.
-
-  D-MMD (`MDLM_DMMD`) and IDLM (`MDLM_with_AR`) both minimize the reverse KL
-  `KL(pi_eta || p_teacher)` with the paper's *pathwise* estimator (D-MMD
-  Eq. 11): a **single** denoiser call produces the soft prediction
-  `x_hat_eta(z_t)`, the critics score it, and the sampling path is
-  stop-gradiented. With `critic_type='ar'` the sequence the owt-ar teacher
-  scores is therefore a one-shot draw from one *data-derived* latent at a
-  random `t` -- never a sequence the student would actually emit. The student
-  is optimized against a distribution it does not sample from, nothing credits
-  it for how its early commitments shape the states its later steps see, and
-  the KL being minimized is that of a one-step conditional rather than of the
-  deployed k-step sampler.
-
-  This class closes that gap. It rolls out the student's **actual** multi-step
-  ancestral sampler from the all-mask prior, scores the finished sequence with
-  the AR critics, and trains with REINFORCE. Same objective, but `pi_eta` is
-  now genuinely the sampler's marginal.
-
-  Two policies (`adversarial_distill.rl_policy`)
-  ----------------------------------------------
-  The gap above has two halves -- *which distribution* the samples come from,
-  and *which estimator* the gradient uses -- and the config splits them so
-  they can be attributed separately:
-
-  * `'trajectory'` (default): changes both. The rest of this docstring
-    describes it.
-  * `'onestep'`: changes only the estimator. Samples are drawn exactly as
-    `MDLM_DMMD`/`MDLM_with_AR` draw them -- one denoiser call on a
-    data-derived latent, `x ~ Cat(x_hat_eta(z_t))` -- and the same reward is
-    optimized with the score function instead of the pathwise term, with the
-    baseline group being `rl_onestep_group_size` draws from the *same* latent.
-    Costs one student forward per micro-step instead of `k+1`. See
-    `_rl_onestep_generator_loss`; the sections below marked with the
-    trajectory machinery (`_rl_rollout`, the buffer, `rl_grad_steps`) do not
-    apply to it.
-
-  The estimator
-  -------------
-  A trajectory is `tau = (z_0 = [MASK]^L, ..., z_K, x)`::
-
-      R(x)       = log p_teacher(x) - log p_fake(x)             # detached
-      log pi(tau) = sum_j sum_{i in reveal_j} log p_eta(x_i | z_j)
-      grad E[R]  = E_tau [ A * grad log pi(tau) ],  A = (R - b) / sigma
-
-  Three properties of masked diffusion make this cheap *and* exact:
-
-  * The ancestral reveal **probability** `(alpha_s - alpha_t)/(1 - alpha_t)`
-    does not depend on `eta`, so it drops out of the score function and only
-    the token term survives.
-  * A revealed position is never rewritten (`copy_flag` in
-    `AbsorbingState._ancestral_update`), so the token committed at step `j`,
-    position `i` is simply `x[i]` of the finished sequence. The rollout stores
-    latents and reveal masks only -- no per-step token buffer.
-  * Every position is revealed exactly once, so `log pi(tau)` is a sum of `L`
-    terms spread over `K` latents. Drawing `M` step indices uniformly and
-    scaling by `K/M` is **unbiased** for the whole sum, so one extra
-    forward/backward (`rl_grad_steps=1`) suffices per update.
-
-  Generator objective actually built (per-token nats, see "Scale")::
-
-      g_loss = -(1/L) * A * (K/M) * sum_{j in S} sum_{i in reveal_j}
-                                        log p_eta(x_i | z_j)
-               - entropy_weight * H                    (inherited knob)
-               + rl_pathwise_weight * (D-MMD soft CE at the same latent)
-
-  The fixed point is unchanged from D-MMD: at `pi_eta = p_teacher` with the
-  auxiliary model caught up (`p_fake = pi_eta`), `R == 0` and hence `A == 0`.
-
-  The auxiliary ("fake") critic is retargeted to match: it is now fit to
-  *trajectory* samples drawn from a small FIFO of recent rollouts, not to
-  one-shot draws, because `log p_fake` in the reward has to be the density of
-  the distribution the student actually samples from. It costs no extra
-  forwards -- the generator's rollouts are reused.
-
-  Cost
-  ----
-  One generator micro-step is `K` no-grad forwards plus `M` with gradient,
-  i.e. roughly 6-8x an `mdlm_dmmd` step at `rl_num_steps=16`. Set
-  `rl_rollout_reuse = accum_batches` to amortize the rollout over an
-  accumulation window: neither model updates inside one, so this stays
-  *exactly* on-policy; the price is correlated gradients within the window.
-
-  Scale
-  -----
-  Every RL term is reduced to **per-token nats**, whereas the inherited AR
-  losses are a plain *sum* over ~`model.length` positions when `valid_tokens`
-  is None (`_reduce_positions`, the OWT case). So `student_loss` here is ~1e3x
-  smaller in magnitude than `mdlm_dmmd`'s and `optim.lr=1e-6` will not
-  transfer -- expect to raise it. `grad_norm_student` is logged by both and is
-  the number to compare.
-
-  Deliberately not implemented
-  ----------------------------
-  * PPO ratio/clipping and multi-epoch reuse of a rollout: every update here
-    is on-policy, so the importance ratio is identically 1 and the clip is
-    dead code. The natural next step if rollout cost dominates.
-  * Per-token dense reward, data-anchored partial rollouts, and
-    diffusion-critic rewards (which would need an ELBO proxy for `log p`).
-  * The `confidence` predictor as the RL policy: at `sampling.temperature=0`
-    it is deterministic and so has no score function. The rollout here is
-    always ancestral; evaluate with `sampling.predictor=ancestral_cache` at
-    `sampling.steps = rl_num_steps` to measure what was trained.
-  """
-
-  def __init__(self, config, tokenizer):
-    super().__init__(config, tokenizer)
-    ad = self.config.adversarial_distill
-    # Which distribution the policy gradient is taken over: the multi-step
-    # sampler's marginal ('trajectory', the class docstring above) or the
-    # one-shot conditional the non-RL algos already sample from ('onestep',
-    # see `_rl_onestep_generator_loss`).
-    self.rl_policy = self._normalize_rl_policy(
-      getattr(ad, 'rl_policy', 'trajectory'))
-    # G: i.i.d. draws per latent in 'onestep' mode, and the baseline group.
-    group = getattr(ad, 'rl_onestep_group_size', 4)
-    self.rl_onestep_group_size = 4 if group is None else int(group)
-    # k: rollout length. The policy makes k+1 denoiser calls (the grid plus
-    # the final noise-removal step), matching `generate_samples`.
-    self.rl_num_steps = int(getattr(ad, 'rl_num_steps', 16) or 16)
-    # M: how many of those steps are recomputed with gradient per update.
-    self.rl_grad_steps = int(getattr(ad, 'rl_grad_steps', 1) or 1)
-    self.rl_baseline = self._normalize_rl_baseline(
-      getattr(ad, 'rl_baseline', 'leave_one_out'))
-    self.rl_advantage_norm = self._normalize_rl_advantage_norm(
-      getattr(ad, 'rl_advantage_norm', 'std'))
-    # 0 => the whole local rollout batch is one group.
-    self.rl_group_size = int(getattr(ad, 'rl_group_size', 0) or 0)
-    self.rl_pathwise_weight = float(
-      getattr(ad, 'rl_pathwise_weight', 0.0) or 0.0)
-    self.rl_buffer_size = int(getattr(ad, 'rl_buffer_size', 8) or 8)
-    self.rl_rollout_reuse = int(getattr(ad, 'rl_rollout_reuse', 1) or 1)
-    # Terminal time of the sampling grid. `null` => `generate_samples`'s own
-    # default (1e-5), i.e. the rollout is the sampler validation decodes with.
-    # Note this is NOT `training.sampling_eps` (1e-3), which floors the
-    # *training* time draw; using it here would train a policy one grid off
-    # the one that is evaluated.
-    rl_eps = getattr(ad, 'rl_eps', None)
-    self.rl_eps = 1e-5 if rl_eps is None else float(rl_eps)
-    assert self.rl_num_steps >= 1, (
-      'adversarial_distill.rl_num_steps must be >= 1.')
-    assert 1 <= self.rl_grad_steps <= self.rl_num_steps + 1, (
-      'adversarial_distill.rl_grad_steps must be in [1, rl_num_steps + 1]; '
-      f'got {self.rl_grad_steps} with rl_num_steps={self.rl_num_steps}.')
-    assert self.rl_rollout_reuse >= 1, (
-      'adversarial_distill.rl_rollout_reuse must be >= 1.')
-    assert self.rl_onestep_group_size >= 1, (
-      'adversarial_distill.rl_onestep_group_size must be >= 1.')
-
-    # FIFO of finished rollouts the auxiliary critic is fit on. Generator
-    # steps fill it; fake steps drain it without paying for a rollout.
-    self._rl_buffer = collections.deque(
-      maxlen=max(1, self.rl_buffer_size))
-    self._rl_cached_rollout = None
-    self._rl_reuse_left = 0
-    # Running (sum, count) of the diagnostics, popped by `_extra_train_stats`.
-    self._rl_stat_sums = {}
-    self._rl_stat_count = 0
-    self._rl_last_stats = {key: 0.0 for key in _RL_STAT_KEYS}
-
-    if self.is_adversarial_distill:
-      assert self.critic_type == 'ar', (
-        "algo=mdlm_rl requires adversarial_distill.critic_type='ar'. The "
-        'reward is `log p_teacher(x) - log p_fake(x)` on a finished '
-        'sequence, and the diffusion critic has no tractable sequence '
-        'log-likelihood to supply it (only an ELBO bound, which is not '
-        'implemented here). Use algo=mdlm_dmmd for the diffusion critic.')
-      if self.rl_policy == 'onestep':
-        # 'onestep' shares the parent's sampling distribution, so the only
-        # trajectory-mode knobs it reads are the reward/advantage ones.
-        if self.rl_onestep_group_size < 2:
-          print('[rl] adversarial_distill.rl_onestep_group_size=1: the '
-                'baseline falls back to a batch-level group, but the rows '
-                'of a batch are one-step samples from *different* latents '
-                '(different x0 and t), so most of the reward spread is the '
-                'latent rather than the sample. Still unbiased with '
-                "rl_baseline='leave_one_out', just much noisier -- prefer "
-                '>= 2 so the group is a set of draws from one latent.',
-                flush=True)
-        print(f'[rl] policy=onestep group_size={self.rl_onestep_group_size} '
-              f'baseline={self.rl_baseline} '
-              f'advantage_norm={self.rl_advantage_norm} '
-              f'pathwise_weight={self.rl_pathwise_weight}', flush=True)
-        return
-      if self.fake_soft_target:
-        print('[rl] adversarial_distill.fake_soft_target is ignored by '
-              "algo=mdlm_rl with rl_policy='trajectory': the auxiliary "
-              'critic is fit to the hard trajectory samples, because its '
-              'log-density is what the reward subtracts.', flush=True)
-      if self.sampler == 'confidence':
-        print('[rl] sampling.predictor=\'confidence\' decodes by confidence '
-              'rank, but the RL rollout is always ancestral -- a cached or '
-              'reordered p_x0 comes from a different latent and would make '
-              'the recorded log-prob wrong. The policy is therefore trained '
-              'under a different decoder than it is evaluated with; use '
-              "sampling.predictor='ancestral_cache' to keep them aligned.",
-              flush=True)
-      if self.sampler == 'remask':
-        print("[rl] sampling.predictor='remask' can send an already "
-              'revealed token back to [MASK], but the RL rollout is always '
-              'ancestral and scores a monotone trajectory, so the policy is '
-              'trained under a decoder that never revises itself and '
-              'evaluated under one that does; use '
-              "sampling.predictor='ancestral_cache' to keep them aligned.",
-              flush=True)
-      # 'ancestral_cache' needs no warning: it only reuses `p_x0` on a step
-      # where *no* position changed anywhere in the batch, and each grid step
-      # reveals ~model.length/k positions, so at realistic lengths the cache
-      # never engages and the decoder is bit-for-bit the rollout's.
-      print(f'[rl] policy=trajectory num_steps={self.rl_num_steps} '
-            f'grad_steps={self.rl_grad_steps} '
-            f'baseline={self.rl_baseline} '
-            f'advantage_norm={self.rl_advantage_norm} '
-            f'group_size={self.rl_group_size or "batch"} '
-            f'pathwise_weight={self.rl_pathwise_weight} '
-            f'buffer={self.rl_buffer_size} '
-            f'rollout_reuse={self.rl_rollout_reuse} '
-            f'eps={self.rl_eps}', flush=True)
-
-  @staticmethod
-  def _normalize_rl_policy(value):
-    """Normalize `adversarial_distill.rl_policy` to 'trajectory' / 'onestep'.
-
-    'trajectory' (default) takes the policy gradient over the multi-step
-    sampler's marginal; 'onestep' takes it over the one-shot conditional
-    `Cat(x_hat_eta(z_t))` that the non-RL algos already sample from.
-    """
-    if value is None:
-      return 'trajectory'
-    mode = str(value).lower()
-    if mode in ('trajectory', 'traj', 'rollout', 'multistep', 'multi_step'):
-      return 'trajectory'
-    if mode in ('onestep', 'one_step', 'one-step', 'single', 'dmmd'):
-      return 'onestep'
-    raise ValueError(
-      f'Unknown adversarial_distill.rl_policy: {value!r} '
-      "(expected 'trajectory' or 'onestep').")
-
-  @staticmethod
-  def _normalize_rl_baseline(value):
-    """Normalize `adversarial_distill.rl_baseline`.
-
-    'leave_one_out' (default) subtracts the mean of the *other* rewards in
-    the group, which keeps the estimator unbiased because the baseline is
-    then independent of the sample it is subtracted from. 'group_mean' is
-    the plain GRPO baseline: cheaper to reason about, very slightly biased
-    at small group sizes. 'none' leaves the raw reward, which is unbiased
-    but has the variance of the reward's absolute scale.
-    """
-    if value is None:
-      return 'leave_one_out'
-    mode = str(value).lower()
-    if mode in ('leave_one_out', 'loo', 'rloo'):
-      return 'leave_one_out'
-    if mode in ('group_mean', 'mean', 'grpo'):
-      return 'group_mean'
-    if mode in ('none', 'off', 'false'):
-      return 'none'
-    raise ValueError(
-      f'Unknown adversarial_distill.rl_baseline: {value!r} '
-      "(expected 'leave_one_out', 'group_mean' or 'none').")
-
-  @staticmethod
-  def _normalize_rl_advantage_norm(value):
-    """Normalize `adversarial_distill.rl_advantage_norm` to 'std' / 'none'."""
-    if value is None or value is True:
-      return 'std'
-    if value is False:
-      return 'none'
-    mode = str(value).lower()
-    if mode in ('std', 'grpo', 'zscore'):
-      return 'std'
-    if mode in ('none', 'off', 'false'):
-      return 'none'
-    raise ValueError(
-      f'Unknown adversarial_distill.rl_advantage_norm: {value!r} '
-      "(expected 'std' or 'none').")
-
-  # --- policy plumbing -------------------------------------------------
-
-  @contextlib.contextmanager
-  def _rl_policy_mode(self):
-    """Run the backbone in `eval()` mode, restoring whatever it was in.
-
-    The estimator is only valid if the function that *produced* the action is
-    the function that is *differentiated*. With `model.dropout=0.1` and the
-    backbone left in `train()` (which `utils.activate_model` puts it in on
-    every generator step), the rollout forward and the recompute forward
-    would draw different dropout masks -- so the recorded `log p_eta(x_i|z_j)`
-    would be a log-prob under a network the student never used, and the
-    gradient would be systematically wrong rather than merely noisy.
-
-    Deliberately NOT `TrainerBase._eval_mode`, which swaps the EMA shadow
-    parameters in: the rollout has to be on-policy with the *live* weights.
-    """
-    was_training = self.backbone.training
-    self.backbone.eval()
-    try:
-      yield
-    finally:
-      self.backbone.train(was_training)
-
-  def _rl_sum_norm(self, valid_tokens, length):
-    """Divisor turning a raw sum-over-positions into per-token nats.
-
-    For quantities this class sums itself (the trajectory log-prob, the
-    entropy term). Scalar on OWT, `(batch,)` when a prompt mask restricts
-    which positions count.
-    """
-    if valid_tokens is None:
-      return float(max(length, 1))
-    return valid_tokens.sum(-1).clamp_min(1).to(torch.float32)
-
-  @staticmethod
-  def _rl_reduced_to_per_token(value, valid_tokens, length):
-    """Same conversion for a value that came out of `_reduce_positions`.
-
-    That helper already returns a token-*mean* when `valid_tokens` is given
-    and a plain *sum* when it is None, so only the second case needs
-    dividing -- applying `_rl_sum_norm` to both would double-normalize the
-    tiny_gsm path.
-    """
-    if valid_tokens is None:
-      return value / float(max(length, 1))
-    return value
-
-  @torch.no_grad()
-  def _rl_rollout(self, x0, valid_tokens):
-    """Sample one batch of trajectories from the student's own sampler.
-
-    Reimplements the `ancestral` branch of `TrainerBase.generate_samples`
-    rather than calling it, for three reasons:
-
-    * it must record the per-step latent and reveal mask that the score
-      function is built from;
-    * it must not take the `ancestral_cache` shortcut -- a cached `p_x0`
-      comes from an *earlier* latent, so the log-prob recomputed at `z_j`
-      would not be the distribution the token was actually drawn from;
-    * each step's forward is wrapped in `self._noise_stream(seed_j)`, a
-      no-op unless `adversarial_distill.noise_dim > 0`, so the injected
-      Gaussian draw can be replayed bit-for-bit at recompute time. (This is
-      why the differentiable pass uses one step index shared across the
-      whole batch: a per-row seed cannot be replayed in a single batched
-      forward. Unbiasedness is unaffected -- it only correlates the
-      estimator's step choice across rows.)
-
-    Prompt positions (`valid_tokens == 0`) start out holding `x0`'s tokens,
-    so `copy_flag` freezes them for the whole trajectory and they never
-    appear in any `reveals` mask -- they are outside the policy and carry no
-    score. Runs with `valid_tokens is None` (OWT) have no prompt at all.
-    """
-    batch_size, length = x0.shape
-    device = x0.device
-    k = self.rl_num_steps
-    eps = self.rl_eps
-    x = self.prior_sample(batch_size, length)
-    x = self._preserve_prompt_tokens(x, x0, valid_tokens)
-    timesteps = torch.linspace(1, eps, k + 1, device=device)
-    dt = (1 - eps) / k
-
-    num_calls = k + 1  # k grid steps + the terminal noise-removal step
-    latents = torch.empty((num_calls, batch_size, length),
-                          dtype=x.dtype, device=device)
-    reveals = torch.zeros((num_calls, batch_size, length),
-                          dtype=torch.bool, device=device)
-    sigmas = torch.empty((num_calls, batch_size, 1),
-                         dtype=torch.float32, device=device)
-    # Drawn on the CPU generator so reading them back costs no device sync.
-    seeds = torch.randint(0, 2 ** 31 - 1, (num_calls,)).tolist()
-
-    ones = torch.ones(batch_size, 1, device=device)
-    with self._rl_policy_mode():
-      for i in range(num_calls):
-        noise_removal = (i == k)
-        # For i == k this is `timesteps[-1]`, exactly `generate_samples`' t0.
-        t = timesteps[min(i, k)] * ones
-        _, alpha_t = self.noise(t)
-        latents[i] = x
-        sigmas[i] = self._sigma_from_alphat(alpha_t)
-        with self._noise_stream(seeds[i]):
-          _, x_next = self._ancestral_update(
-            x=x, t=t, dt=None if noise_removal else dt, p_x0=None,
-            noise_removal_step=noise_removal)
-        x_next = self._preserve_prompt_tokens(x_next, x0, valid_tokens)
-        reveals[i] = (x == self.mask_index) & (x_next != self.mask_index)
-        x = x_next
-
-    # The terminal step has alpha_s = 1, so every surviving mask is revealed
-    # with probability 1. If one got through, some position would be scored
-    # by the critics as a [MASK] token and would carry no policy log-prob.
-    assert not bool((x == self.mask_index).any()), (
-      'RL rollout left masked positions after the noise-removal step.')
-    return _RLRollout(
-      x=x, latents=latents, reveals=reveals, sigmas=sigmas, seeds=seeds,
-      valid_tokens=valid_tokens)
-
-  def _rl_get_rollout(self, x0, valid_tokens):
-    """The rollout this generator micro-step trains on, plus bookkeeping.
-
-    Reused for `rl_rollout_reuse` consecutive generator micro-steps. Set it
-    to `accum_batches` and the reuse is *exactly* on-policy: neither the
-    student nor the critic takes an optimizer step inside an accumulation
-    window, so the cached trajectories are still draws from the current
-    policy. Beyond that it becomes off-policy and, with no importance ratio
-    here, biased.
-    """
-    if self._rl_cached_rollout is not None and self._rl_reuse_left > 0:
-      cached = self._rl_cached_rollout
-      if (cached.x.shape == x0.shape
-          and (cached.valid_tokens is None) == (valid_tokens is None)):
-        self._rl_reuse_left -= 1
-        return cached
-    rollout = self._rl_rollout(x0, valid_tokens)
-    self._rl_cached_rollout = rollout
-    self._rl_reuse_left = self.rl_rollout_reuse - 1
-    self._rl_push_buffer(rollout)
-    return rollout
-
-  def _rl_push_buffer(self, rollout):
-    """Hand the finished sequences to the auxiliary critic's FIFO.
-
-    Only `x` and its `valid_tokens` are kept -- the critic fits a sequence
-    log-density and needs nothing about the trajectory that produced it --
-    so the buffer costs `rl_buffer_size * batch * length` int64s.
-    """
-    if not self.use_fake:
-      return
-    self._rl_buffer.append(
-      (rollout.x.detach().clone(),
-       None if rollout.valid_tokens is None
-       else rollout.valid_tokens.detach().clone()))
-
-  # --- reward / advantage ----------------------------------------------
-
-  def _rl_per_token_nll(self, ar_logprobs, tokens, valid_tokens):
-    """`_ar_nll` forced into per-token nats.
-
-    `_reduce_positions` sums over positions when `valid_tokens is None`, so
-    the raw value would be ~1e3x larger on OWT than on tiny_gsm and the
-    advantage's scale (and every `rl/*` diagnostic) would silently depend on
-    `model.length`. Dividing by the scored-position count fixes both.
-    """
-    return self._rl_reduced_to_per_token(
-      self._ar_nll(ar_logprobs, tokens, valid_tokens),
-      valid_tokens, tokens.shape[1] - 1)
-
-  @torch.no_grad()
-  def _rl_reward(self, x, valid_tokens):
-    """`(reward, teacher_nll, fake_nll)`, each `(batch,)` in per-token nats.
-
-    `reward = log p_teacher(x) - log p_fake(x) = fake_nll - teacher_nll`.
-
-    This is the same DMD/D-MMD substitution the pathwise losses make: the
-    student's own `log pi_eta(x)` is intractable for a k-step masked-
-    diffusion sampler, so the trainable auxiliary model stands in for it.
-    That is exactly what makes the reward a *reverse-KL* signal rather than
-    plain teacher-likelihood maximization, and it is why the auxiliary
-    critic has to be fit on trajectory samples (`_fake_loss_ar` below).
-
-    `top_p` / `top_p_delta` carry over unchanged via
-    `_apply_top_p_to_teacher`: out-of-nucleus tokens have their teacher
-    log-prob lowered by `Delta`, so a sequence that uses them is rewarded
-    less. With `use_fake=False` the reward degenerates to `log p_teacher`,
-    which is still a usable (if mode-seeking) objective; `fake_nll` is then
-    reported as 0.
-    """
-    teacher_logprobs = self._apply_top_p_to_teacher(
-      self._ar_logprobs(self.teacher, x))
-    teacher_nll = self._rl_per_token_nll(teacher_logprobs, x, valid_tokens)
-    del teacher_logprobs
-    if not self.use_fake:
-      fake_nll = torch.zeros_like(teacher_nll)
-      return -teacher_nll, teacher_nll, fake_nll
-    fake_logprobs = self._ar_logprobs(self.fake_model, x)
-    fake_nll = self._rl_per_token_nll(fake_logprobs, x, valid_tokens)
-    del fake_logprobs
-    return fake_nll - teacher_nll, teacher_nll, fake_nll
-
-  def _rl_advantage(self, reward):
-    """Group-baselined advantage, `(batch,)`, detached.
-
-    The group is the local rollout batch (`rl_group_size=0`) or fixed-size
-    chunks of it. Because every trajectory in a group starts from the same
-    all-mask prior, they are i.i.d. draws from one distribution and the
-    group mean is a valid baseline -- this is GRPO's setting exactly, with
-    the prompt being empty.
-
-    Degenerate groups (one member, or zero reward spread) return zeros
-    rather than NaNs: a group that produced identical rewards carries no
-    information about which trajectory was better, so contributing nothing
-    is the correct answer, not an accident to be papered over.
-    """
-    reward = reward.detach()
-    group = self.rl_group_size or reward.shape[0]
-    group = max(1, min(group, reward.shape[0]))
-    parts = []
-    for chunk in torch.split(reward, group):
-      n = chunk.shape[0]
-      if self.rl_baseline == 'none':
-        adv = chunk
-      elif n < 2:
-        parts.append(torch.zeros_like(chunk))
-        continue
-      elif self.rl_baseline == 'leave_one_out':
-        # Baseline for row i is the mean of the other n-1 rewards, so it is
-        # independent of row i and the estimator stays unbiased.
-        adv = chunk - (chunk.sum() - chunk) / (n - 1)
-      else:
-        adv = chunk - chunk.mean()
-      if self.rl_advantage_norm == 'std' and n >= 2:
-        std = chunk.std()
-        # Tensor-valued guard rather than a Python `if`, so no host sync.
-        adv = torch.where(std > 1e-6, adv / std.clamp_min(1e-6),
-                          torch.zeros_like(adv))
-      parts.append(adv)
-    return torch.cat(parts)
-
-  # --- surrogate --------------------------------------------------------
-
-  def _rl_step_indices(self, num_calls):
-    """`M` distinct step indices, uniform without replacement.
-
-    Uniform-without-replacement scaled by `K/M` is unbiased for the full sum
-    over steps (each index appears with probability `M/K`), which is the
-    whole reason one forward/backward per update is enough. Drawn on the CPU
-    RNG: under DDP the ranks pick different steps, which is just extra
-    independent sampling -- no collective depends on the choice.
-    """
-    m = max(1, min(self.rl_grad_steps, num_calls))
-    return torch.randperm(num_calls)[:m].tolist(), m
-
-  def _rl_surrogate(self, rollout, advantage, valid_tokens):
-    """`(loss, logp)`: the policy-gradient surrogate and its diagnostic.
-
-    `loss` is `(batch,)` and differentiable; its gradient is the REINFORCE
-    estimator `-A * grad log pi_eta(tau)`, in per-token nats. `logp` is the
-    detached per-token trajectory log-probability, for the step log.
-
-    Only positions in `reveals[j]` are scored. That is not merely an
-    optimization: `_process_model_output` pins already-revealed positions to
-    a one-hot, so their log-prob is the constant 0 and carries no gradient,
-    and positions still masked *after* step `j` were not acted on at `j`.
-    """
-    num_calls = rollout.latents.shape[0]
-    indices, m = self._rl_step_indices(num_calls)
-    norm = self._rl_sum_norm(valid_tokens, rollout.x.shape[1])
-    targets = rollout.x[..., None]
-
-    logp_total = 0.0
-    with self._rl_policy_mode():
-      for pos, j in enumerate(indices):
-        with self._noise_stream(rollout.seeds[j]):
-          log_probs = self.forward(rollout.latents[j], sigma=rollout.sigmas[j])
-        weight = rollout.reveals[j].to(log_probs.dtype)
-        if valid_tokens is not None:
-          weight = weight * valid_tokens
-        logp = log_probs.gather(-1, targets).squeeze(-1)
-        logp_total = logp_total + (logp * weight).sum(-1)
-        if pos == 0:
-          # One latent's worth of entropy, so `student_entropy` and
-          # `entropy_weight` keep working. Restricted to the first selected
-          # step because materializing `exp()` with its graph is the single
-          # largest tensor in this loss.
-          self._rl_record_entropy(log_probs, rollout.latents[j], valid_tokens)
-        del log_probs
-
-    scale = num_calls / m
-    surrogate = -(advantage.detach() * scale * logp_total) / norm
-    return surrogate, (logp_total.detach() * scale) / norm
-
-  def _rl_record_entropy(self, log_probs, latent, valid_tokens):
-    """`student_entropy` / the `entropy_weight` bonus, at one trajectory latent.
-
-    Does what `_record_student_entropy` does -- same quantity, same
-    positions (only those still masked in `latent`, since
-    `_process_model_output` pins the rest to a zero-entropy one-hot) -- but
-    reduces the differentiable term to **per-token nats** instead of
-    deferring to `_reduce_positions`, which sums when `valid_tokens is
-    None`. Without that, the bonus would be ~`model.length` times the scale
-    of the surrogate it is added to and `entropy_weight` would mean
-    something completely different here than in `mdlm_dmmd`.
-
-    Also takes the log-probabilities directly: the diagnostic path reads
-    them with `log_input=True` and never materializes `exp()`, which at OWT
-    shapes is a 1.6 GB tensor.
-    """
-    want_term = self.entropy_weight != 0.0
-    if not (self.log_student_entropy or want_term):
-      return
-    predicted = (latent == self.mask_index)
-    if want_term:
-      per_position = self._student_entropy_per_position(log_probs.exp())
-      per_position = per_position * predicted.to(per_position.dtype)
-      term = per_position.sum(-1) / self._rl_sum_norm(
-        valid_tokens, latent.shape[1])
-      self._entropy_term_sum = (
-        term if self._entropy_term_sum is None
-        else self._entropy_term_sum + term)
-      self._entropy_term_count += 1
-      total = per_position.detach().sum()
-      count = int(predicted.sum())
-    else:
-      total, count = metrics.entropy_sum(
-        log_probs.detach(), mask=predicted, log_input=True)
-    if not count:
-      return
-    self._entropy_sum = (
-      total if self._entropy_sum is None else self._entropy_sum + total)
-    self._entropy_count += count
-
-  def _rl_pathwise_term(self, rollout, valid_tokens):
-    """The D-MMD pathwise term, evaluated on the trajectory (`(batch,)`).
-
-    Off by default (`rl_pathwise_weight=0`) and not built at all then. When
-    on, this is the inherited AR generator loss `CE(teacher || x_hat_eta) -
-    CE(fake || x_hat_eta)` (`MDLM_DMMD._generator_loss_ar`), except that the
-    latent is one of the trajectory's own `z_j` and the AR context is the
-    rolled-out sequence instead of a data-derived one-shot draw.
-
-    Worth having as a hybrid: the pathwise gradient is low-variance but
-    biased toward the one-step conditional, the policy gradient is unbiased
-    for the sampler's marginal but high-variance, and a small weight buys
-    some of the former's stability early in training. Only positions still
-    masked in `z_j` contribute -- elsewhere `x_hat_eta` is pinned to a
-    one-hot and carries no gradient.
-
-    Costs two extra AR critic forwards (the reward's are not retained; at
-    OWT shapes a `(B, L, V)` float32 log-prob tensor is ~1.6 GB, which is
-    not worth holding across the surrogate's backward for an off-by-default
-    option).
-    """
-    j, _ = self._rl_step_indices(rollout.latents.shape[0])
-    j = j[0]
-    with self._rl_policy_mode(), self._noise_stream(rollout.seeds[j]):
-      student_probs = self.forward(
-        rollout.latents[j], sigma=rollout.sigmas[j]).exp()
-    length = rollout.x.shape[1] - 1
-    with torch.no_grad():
-      teacher_logprobs = self._apply_top_p_to_teacher(
-        self._ar_logprobs(self.teacher, rollout.x))
-    loss = self._rl_reduced_to_per_token(
-      self._ar_cross_entropy(teacher_logprobs, student_probs, valid_tokens),
-      valid_tokens, length)
-    del teacher_logprobs
-    if self.use_fake:
-      with torch.no_grad():
-        fake_logprobs = self._ar_logprobs(self.fake_model, rollout.x)
-      loss = loss - self._rl_reduced_to_per_token(
-        self._ar_cross_entropy(fake_logprobs, student_probs, valid_tokens),
-        valid_tokens, length)
-    return loss
-
-  # --- one-step policy ('onestep') --------------------------------------
-
-  def _rl_onestep_advantage(self, reward):
-    """Group-baselined advantage for a `(batch, G)` reward, detached.
-
-    The same estimator as `_rl_advantage`, taken along the *group* axis: the
-    G columns of a row are i.i.d. draws from `Cat(x_hat_eta(z_t))` at one
-    latent, so their mean is a valid baseline for that row (GRPO / RLOO with
-    the latent as the prompt).
-
-    The batch axis is deliberately left alone. Unlike trajectory rollouts,
-    which all start from the same all-mask prior, each row here is a sample
-    from a *different* `(x0, t)`: a batch-level baseline would mostly
-    subtract off how easy the latent was rather than how good the sample
-    was, and the leftover advantage would rank latents instead of actions.
-
-    `G == 1` has no per-latent group, so it falls back to the batch-level
-    `_rl_advantage` (warned about at init).
-    """
-    reward = reward.detach()
-    n = reward.shape[1]
-    if n < 2:
-      return self._rl_advantage(reward.squeeze(1))[:, None]
-    if self.rl_baseline == 'none':
-      adv = reward
-    elif self.rl_baseline == 'leave_one_out':
-      # Baseline for column g is the mean of the other G-1 rewards of the
-      # same row, hence independent of column g: the estimator stays unbiased.
-      adv = reward - (reward.sum(1, keepdim=True) - reward) / (n - 1)
-    else:
-      adv = reward - reward.mean(1, keepdim=True)
-    if self.rl_advantage_norm == 'std':
-      std = reward.std(1, keepdim=True)
-      # Tensor-valued guard rather than a Python `if`, so no host sync. A row
-      # whose G samples all scored the same carries no information about
-      # which was better, so it contributes exactly nothing.
-      adv = torch.where(std > 1e-6, adv / std.clamp_min(1e-6),
-                        torch.zeros_like(adv))
-    return adv
-
-  def _rl_onestep_generator_loss(self, x0, valid_tokens,
-                                 current_accumulation_step):
-    """REINFORCE over the **one-shot** samples the non-RL algos already draw.
-
-    Sampling distribution: identical to `MDLM_DMMD._generator_loss_ar` (and
-    to `MDLM_with_AR`'s). One denoiser call on a data-derived latent
-    `z_t ~ q(. | x0, t)`, `t` from the usual `_sample_t` draw, then
-    `x ~ Cat(x_hat_eta(z_t))`. Only the *estimator* changes::
-
-        pathwise (D-MMD):  grad sum_i sum_v p_eta(v|z_t)_i * (log p_teacher
-                             - log p_fake)(v | x_<i)      # x_<i held fixed
-        score function:    E_x [ A(x) * grad sum_i log p_eta(x_i | z_t) ]
-
-    The pathwise term differentiates the student's probabilities while
-    holding the *context* the AR critics condition on fixed, so it misses
-    every way a token changes how the rest of the sequence is scored -- it is
-    the gradient of a per-position surrogate, not of the sequence-level
-    reward. The score function is unbiased for the real thing, at the price
-    of variance (which is what the group baseline and `rl_advantage_norm`
-    are for). `rl_pathwise_weight` mixes the two.
-
-    Compared to `rl_policy='trajectory'` this trains the one-step conditional
-    rather than the deployed k-step sampler's marginal, which is the same
-    limitation the non-RL objectives have. What it buys is cost: **one**
-    student forward instead of `rl_num_steps + 1`.
-
-    Three simplifications follow from the sample and the gradient coming out
-    of the *same* forward call, rather than a no-grad rollout that is later
-    recomputed:
-
-    * No `_rl_policy_mode`. There is no second forward to keep consistent
-      with the first, so dropout and injected input noise are shared by
-      construction and the backbone stays in whatever mode
-      `utils.activate_model` left it -- exactly as in the non-RL path.
-    * No `_noise_stream` seed bookkeeping, for the same reason.
-    * No rollout buffer: the auxiliary critic draws its own one-shot samples
-      as cheaply as the generator does (see `_fake_loss_ar`).
-
-    Scale: the surrogate is divided by `model.length` (via `_rl_sum_norm`),
-    not by the number of masked positions, so it stays an unbiased estimate
-    of a fixed multiple of the true gradient. Dividing by the mask count
-    instead would silently reweight the objective by `1/(1 - alpha_t)`, which
-    blows up as `t -> 0`. The practical consequence is that `student_loss`
-    here is smaller than the trajectory mode's by roughly the average mask
-    rate -- only masked positions are actions.
-    """
-    # `multistep_generation`'s body, inline: the surrogate needs the *log*
-    # probabilities, and going through its `student_probs` would mean taking
-    # a log of an exp and reading -inf out of the prompt-preserved one-hots.
-    t = self._sample_t(x0.shape[0], current_accumulation_step)
-    _, alpha_t = self.noise(t)
-    alpha_t = alpha_t.unsqueeze(-1)
-    assert alpha_t.ndim == 2
-    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
-    log_x_theta = self.forward(xt, sigma=self._sigma_from_alphat(alpha_t))
-
-    # Positions the student actually acted on. The rest are prompt tokens or
-    # positions `q_xt` left revealed, which `_process_model_output` pins to a
-    # one-hot -- their log-prob is the constant 0 and carries no gradient, so
-    # this is a clarification rather than a change of value.
-    acted = (xt == self.mask_index)
-    if valid_tokens is not None:
-      acted = acted & valid_tokens.bool()
-    weight = acted.to(log_x_theta.dtype)
-
-    # G i.i.d. hard samples from the one prediction. Drawn (and the `(B,L,V)`
-    # `exp()` freed) before any critic forward, so only one tensor that size
-    # is alive at a time.
-    group = max(1, self.rl_onestep_group_size)
-    with torch.no_grad():
-      probs = log_x_theta.detach().exp()
-      samples = [
-        self._preserve_prompt_tokens(
-          trainer_base.sample_categorical(probs), x0, valid_tokens)
-        for _ in range(group)]
-      del probs
-
-    # `reward` scores the whole sequence, so the positions `z_t` left
-    # revealed (real data) are in it too. They are not constant across the
-    # group -- they are AR-conditioned on the sampled tokens -- and what is
-    # shared between the G draws is exactly what the per-latent baseline
-    # subtracts off.
-    rewards, teacher_nlls, fake_nlls = [], [], []
-    for x_gen in samples:
-      reward, teacher_nll, fake_nll = self._rl_reward(x_gen, valid_tokens)
-      rewards.append(reward)
-      teacher_nlls.append(teacher_nll)
-      fake_nlls.append(fake_nll)
-    reward = torch.stack(rewards, dim=1)            # (batch, G)
-    advantage = self._rl_onestep_advantage(reward)  # (batch, G)
-
-    norm = self._rl_sum_norm(valid_tokens, xt.shape[1])
-    loss = 0.0
-    logp_total = 0.0
-    for g, x_gen in enumerate(samples):
-      logp = (log_x_theta.gather(-1, x_gen[..., None]).squeeze(-1)
-              * weight).sum(-1)
-      loss = loss - advantage[:, g] * logp
-      logp_total = logp_total + logp.detach()
-    # Mean over the group: each draw is an independent estimate of the same
-    # expectation, so averaging keeps the step size independent of G.
-    loss = loss / (group * norm)
-
-    self._rl_record_entropy(log_x_theta, xt, valid_tokens)
-    self._rl_record_stats(
-      reward.reshape(-1),
-      torch.stack(teacher_nlls, dim=1).reshape(-1),
-      torch.stack(fake_nlls, dim=1).reshape(-1),
-      logp_total / (group * norm),
-      advantage.reshape(-1),
-      # The spread that survives the baseline is the *within-latent* one;
-      # across rows it is dominated by which `(x0, t)` was drawn.
-      reward_std=reward.std(1).mean() if group > 1 else None)
-    if self.rl_pathwise_weight != 0.0:
-      loss = loss + self.rl_pathwise_weight * self._rl_onestep_pathwise(
-        log_x_theta, samples[0], x0, valid_tokens)
-    return loss
-
-  def _rl_onestep_pathwise(self, log_x_theta, x_gen, x0, valid_tokens):
-    """The D-MMD pathwise generator term at this latent, `(batch,)`.
-
-    Exactly `MDLM_DMMD._generator_loss_ar` -- `CE(teacher || x_hat_eta) -
-    CE(fake || x_hat_eta)` with the hard sample as AR context -- but reduced
-    to per-token nats so `rl_pathwise_weight` trades against the surrogate at
-    a comparable scale. `rl_pathwise_weight=1` therefore adds the entire
-    non-RL objective on top of the policy gradient.
-
-    Reuses the surrogate's own forward and its first sample, so the only
-    extra cost is two AR critic forwards. Those are re-run rather than kept
-    from `_rl_reward`: at OWT shapes one `(B, L, V)` float32 log-prob tensor
-    is ~1.6 GB, which is not worth holding across an off-by-default term.
-    """
-    student_probs = self._preserve_prompt_probs(
-      log_x_theta.exp(), x0, valid_tokens)
-    length = x_gen.shape[1] - 1
-    with torch.no_grad():
-      teacher_logprobs = self._apply_top_p_to_teacher(
-        self._ar_logprobs(self.teacher, x_gen))
-    loss = self._rl_reduced_to_per_token(
-      self._ar_cross_entropy(teacher_logprobs, student_probs, valid_tokens),
-      valid_tokens, length)
-    del teacher_logprobs
-    if self.use_fake:
-      with torch.no_grad():
-        fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
-      loss = loss - self._rl_reduced_to_per_token(
-        self._ar_cross_entropy(fake_logprobs, student_probs, valid_tokens),
-        valid_tokens, length)
-    return loss
-
-  # --- losses -----------------------------------------------------------
-
-  def _generator_loss_ar(self, x0, valid_tokens, current_accumulation_step):
-    """Policy-gradient generator loss.
-
-    Overrides `_generator_loss_ar` rather than `generator_loss` so the
-    inherited entropy-bonus plumbing (`generator_loss` ->
-    `_entropy_term_sum` -> `entropy_weight * H`) applies here untouched.
-    """
-    if self.rl_policy == 'onestep':
-      return self._rl_onestep_generator_loss(
-        x0, valid_tokens, current_accumulation_step)
-    del current_accumulation_step  # the rollout starts from the prior, not x0
-    rollout = self._rl_get_rollout(x0, valid_tokens)
-    reward, teacher_nll, fake_nll = self._rl_reward(rollout.x, valid_tokens)
-    advantage = self._rl_advantage(reward)
-    loss, logp = self._rl_surrogate(rollout, advantage, valid_tokens)
-    self._rl_record_stats(reward, teacher_nll, fake_nll, logp, advantage)
-    if self.rl_pathwise_weight != 0.0:
-      loss = loss + self.rl_pathwise_weight * self._rl_pathwise_term(
-        rollout, valid_tokens)
-    return loss
-
-  def _fake_loss_ar(self, x0, valid_tokens, current_accumulation_step):
-    """Auxiliary/fake objective, fit to **trajectory** samples.
-
-    (`rl_policy='onestep'` defers to the parent instead -- see the branch
-    below.)
-
-    This is the change that keeps the min-max consistent. `log p_fake`
-    appears in the reward as the stand-in for the student's own intractable
-    `log pi_eta`, so the critic has to model the distribution the reward is
-    computed on -- the sampler's marginal -- not the one-shot conditional
-    the parent fits it to. Fitting it to one-shot draws would leave the
-    reward measuring the gap between the teacher and a model of something
-    the student never emits, and the `R == 0` fixed point would be lost.
-
-    Sequences come from the generator's rollout FIFO, so a fake step costs
-    exactly what it cost before (one AR forward, plus the optional teacher
-    anchor). The buffer is empty only on the very first fake step of a run
-    -- the schedule is fake-first -- and that one step pays for a rollout.
-
-    `fake_soft_target` does not apply: a trajectory sample is a sequence of
-    hard tokens, and there is no single soft `x_hat_eta` it was drawn from.
-    `fake_teacher_weight` (D-MMD Eq. 12's anchor) is unchanged.
-
-    Left in the inherited `_reduce_positions` units (a sum over positions on
-    OWT), unlike the generator terms: only the *data* the critic is fit on
-    changed, so `adversarial_distill.fake_lr` transfers from `mdlm_dmmd`
-    unmodified. Only `optim.lr` needs revisiting.
-    """
-    if self.rl_policy == 'onestep':
-      # `log p_fake` must be the density of the distribution the reward is
-      # computed on. In 'onestep' that is the one-shot conditional the parent
-      # already fits its critic to, so the inherited objective is exactly the
-      # right one -- and `fake_soft_target` applies with its usual meaning.
-      # It also draws its own samples (one student forward), so the rollout
-      # FIFO is not needed and stays empty.
-      return super()._fake_loss_ar(
-        x0, valid_tokens, current_accumulation_step)
-    del current_accumulation_step
-    x_gen, buffered_valid = self._rl_draw_buffer(x0, valid_tokens)
-    fake_logprobs = self._ar_logprobs(self.fake_model, x_gen)
-    loss = self._ar_nll(fake_logprobs, x_gen, buffered_valid)
-    if self.fake_teacher_weight > 0:
-      with torch.no_grad():
-        teacher_probs = self._ar_logprobs(self.teacher, x_gen).exp()
-      teacher_ce = -(teacher_probs * fake_logprobs).sum(-1)
-      loss = loss + self.fake_teacher_weight * self._reduce_token_loss(
-        teacher_ce, buffered_valid)
-    return loss
-
-  def _rl_draw_buffer(self, x0, valid_tokens):
-    """One batch of trajectory samples for the critic, `(x, valid_tokens)`.
-
-    Drawn uniformly from the FIFO rather than popped, so a rollout can train
-    the critic more than once (the critic takes `fake_frequency` steps per
-    generator step, and the generator produces at most one rollout per
-    accumulation window). Rolls out on demand when the buffer is empty.
-    """
-    if not self._rl_buffer:
-      rollout = self._rl_rollout(x0, valid_tokens)
-      self._rl_push_buffer(rollout)
-      return rollout.x, rollout.valid_tokens
-    idx = int(torch.randint(len(self._rl_buffer), (1,)))
-    return self._rl_buffer[idx]
-
-  # --- logging ----------------------------------------------------------
-
-  def _rl_record_stats(self, reward, teacher_nll, fake_nll, logp, advantage,
-                       reward_std=None):
-    """Accumulate the `rl/*` diagnostics over this step's micro-batches.
-
-    `reward_std` overrides the default spread with the one the baseline
-    actually leaves behind, for callers whose group is not the batch
-    (`_rl_onestep_generator_loss` passes the within-latent std).
-    """
-    values = {
-      'rl/reward': reward.mean(),
-      # Spread of the reward *within* the baseline group. This is the signal
-      # the baseline leaves behind: at 0 every sample looked equally good and
-      # the advantage (hence the whole gradient) is 0.
-      'rl/reward_std': (
-        reward_std if reward_std is not None
-        else (reward.std() if reward.shape[0] > 1
-              else torch.zeros_like(reward.mean()))),
-      'rl/teacher_nll': teacher_nll.mean(),
-      'rl/fake_nll': fake_nll.mean(),
-      'rl/logp': logp.mean(),
-      'rl/advantage_abs': advantage.abs().mean()}
-    for key, value in values.items():
-      value = value.detach()
-      self._rl_stat_sums[key] = (
-        value if key not in self._rl_stat_sums
-        else self._rl_stat_sums[key] + value)
-    self._rl_stat_count += 1
-
-  def _extra_train_stats(self):
-    """Pop the `rl/*` diagnostics for the step log.
-
-    Fixed key set with a last-value fallback, for the reason
-    `_student_entropy_stats` spells out: `log_dict` under DDP reduces across
-    ranks and deadlocks if their key sets differ, so "no generator
-    micro-batch contributed since the last log" has to repeat the previous
-    value rather than drop the key.
-
-    What to watch:
-      * `rl/reward` rising and `rl/teacher_nll` falling -- the student's
-        samples are getting more likely under the teacher.
-      * `rl/reward_std` collapsing to 0 -- every trajectory scores the same,
-        so there is no learning signal left (either converged, or the
-        sampler has collapsed onto one output).
-      * `rl/fake_nll - rl/teacher_nll` shrinking -- the reverse KL proxy
-        itself; this is what the objective drives to 0.
-      * `rl/logp` heading toward 0 -- the policy is becoming deterministic.
-        Cross-check `student_entropy`.
-    """
-    if self._rl_stat_count:
-      for key in _RL_STAT_KEYS:
-        if key in self._rl_stat_sums:
-          self._rl_last_stats[key] = (
-            self._rl_stat_sums[key] / self._rl_stat_count)
-      self._rl_stat_sums = {}
-      self._rl_stat_count = 0
-    return dict(self._rl_last_stats)
-
-
-# class MDLM(trainer_base.AbsorbingState):
-#   def __init__(self, config, tokenizer):
-#     super().__init__(config, tokenizer)
-#     self._validate_configuration()
-#     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
-#     if self.is_adversarial_distill:
-#       self.automatic_optimization = False
-#       self.teacher = copy.deepcopy(self.backbone)
-#       utils.freeze_model(self.teacher)
-      
-#       self.fake_model = copy.deepcopy(self.backbone)
-#       utils.activate_model(self.fake_model)
-#       utils.activate_model(self.backbone)
-#       if self.ema is not None:
-#         del self.ema
-#         self.ema = models.ema.ExponentialMovingAverage(
-#           self.backbone.parameters(),
-#           decay=self.config.training.ema)
-
-#         self.ema_fake = models.ema.ExponentialMovingAverage(
-#           self.fake_model.parameters(),
-#           decay=self.config.training.ema)
-#       self.training_step_counter = 0
-#       self.accum_batches = self.config.adversarial_distill.accum_batches 
-#       self._fake_accum_counter = 0
-#       self._student_accum_counter = 0
-#       self.fake_frequency = self.config.adversarial_distill.fake_frequency
-#       self.fake_iter = 0 
-#       self.is_generator_step = False
-#       self.total_loss_student = 0
-#       self.total_loss_fake = 0
-#       self.f_loss_ar = []
-  
-#   def configure_optimizers(self):
-#     if self.config.adversarial_distill.is_distill:
-#       optimizer_student = torch.optim.AdamW(
-#         self.backbone.parameters(),
-#         lr=self.config.optim.lr,
-#         betas=(self.config.optim.beta1,
-#               self.config.optim.beta2),
-#         eps=self.config.optim.eps,
-#         weight_decay=self.config.optim.weight_decay)
-      
-#       optimizer_fake = torch.optim.AdamW(
-#         self.fake_model.parameters(),
-#         lr=self.config.optim.lr,
-#         betas=(self.config.optim.beta1,
-#               self.config.optim.beta2),
-#         eps=self.config.optim.eps,
-#         weight_decay=self.config.optim.weight_decay)
-
-#       scheduler_student = hydra.utils.instantiate(
-#         self.config.lr_scheduler, optimizer=optimizer_student)
-#       scheduler_student_dict = {'scheduler': scheduler_student, 'name': 'trainer/lr'}
-
-#       scheduler_fake = hydra.utils.instantiate(
-#         self.config.lr_scheduler, optimizer=optimizer_fake)
-#       scheduler_fake_dict = {'scheduler': scheduler_fake, 'name': 'trainer/lr_fake'}
-#       return [optimizer_student, optimizer_fake], [scheduler_student_dict, scheduler_fake_dict]
-#     else:
-#       return super().configure_optimizers()
-
-#   def _validate_configuration(self):
-#     # ancestral sampling isn't desirable because it's slow
-#     assert self.sampler == 'ancestral_cache'
-
-#   def _process_model_output(self, model_output, xt, sigma):
-#     del sigma
-#     model_output[:, :, self.mask_index] += self.neg_infinity
-    
-#     # Normalize the model_output such that x.exp() is
-#     # a probability distribution over vocab_size.
-#     model_output = model_output - torch.logsumexp(
-#       model_output, dim=-1, keepdim=True)
-#     # Apply updates directly in the logits matrix.
-#     # For the logits of the unmasked tokens, set all values
-#     # to -infinity except for the indices corresponding to
-#     # the unmasked tokens.
-#     unmasked_indices = (xt != self.mask_index)
-#     model_output[unmasked_indices] = self.neg_infinity
-#     model_output[unmasked_indices, xt[unmasked_indices]] = 0
-#     return model_output
-
-#   def on_train_start(self):
-#     if self.is_adversarial_distill:
-#       self.ema_fake.move_shadow_params_to_device(self.device)
-#       utils.activate_model(self.fake_model)
-#       utils.freeze_model(self.backbone)
-#     super().on_train_start()
-
-#   def on_load_checkpoint(self, checkpoint):
-#     if self.is_adversarial_distill:
-#       state_dict = collections.OrderedDict(checkpoint['state_dict'])
-#       for key, value in list(state_dict.items()):
-#         if key.startswith('backbone.'):
-#           suffix = key[len('backbone.'):]
-#           state_dict.setdefault(f'teacher.{suffix}', value)
-#           state_dict.setdefault(f'fake_model.{suffix}', value)
-#       checkpoint['state_dict'] = state_dict
-#     super().on_load_checkpoint(checkpoint)
-#     if self.is_adversarial_distill and self.ema_fake is not None:
-#       ema_fake_state = checkpoint.get('ema_fake', checkpoint.get('ema'))
-#       if ema_fake_state is not None:
-#         self.ema_fake.load_state_dict(ema_fake_state)
-
-#   def on_save_checkpoint(self, checkpoint):
-#     super().on_save_checkpoint(checkpoint)
-#     if self.is_adversarial_distill and self.ema_fake is not None:
-#       checkpoint['ema_fake'] = self.ema_fake.state_dict()
-
-#   def _preserve_prompt_probs(self, probs, x0, valid_tokens):
-#     if valid_tokens is None:
-#       return probs
-#     clean_probs = F.one_hot(x0, num_classes=probs.shape[-1]).to(probs.dtype)
-#     return torch.where(valid_tokens[..., None].bool(), probs, clean_probs)
-
-#   def _preserve_prompt_tokens(self, tokens, x0, valid_tokens):
-#     if valid_tokens is None:
-#       return tokens
-#     return torch.where(valid_tokens.bool(), tokens, x0)
-
-#   def multistep_generation(self, x0, valid_tokens, current_accumulation_step):
-#     t = self._sample_t(x0.shape[0], current_accumulation_step)
-#     dalpha_t, alpha_t = self.noise(t)
-#     alpha_t = alpha_t.unsqueeze(-1)
-#     assert alpha_t.ndim == 2
-#     sigma = self._sigma_from_alphat(alpha_t)
-
-#     xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
-
-#     log_x_theta = self.forward(xt, sigma=sigma)
-#     student_probs = log_x_theta.exp()
-#     return self._preserve_prompt_probs(student_probs, x0, valid_tokens)
-
-#   def q_xt_with_probs(self, student_probs, alpha_t, x0=None, valid_tokens=None):
-#     mask_probs = torch.zeros_like(student_probs)
-#     mask_probs[:, :, self.mask_index] = 1
-#     noise_probs = alpha_t[:, :, None] * student_probs + (1 - alpha_t[:, :, None])*(mask_probs)
-#     if x0 is not None and valid_tokens is not None:
-#       noise_probs = self._preserve_prompt_probs(noise_probs, x0, valid_tokens)
-#     return noise_probs
-
-#   def nll_per_token_with_probs(self, log_x_theta, xt, x0, alpha_t,
-#                     dalpha_t, low_var=False, valid_tokens=None):
-#     del xt
-#     loss = (x0 * log_x_theta).sum(-1)
-#     loss = loss * dalpha_t / (1 - alpha_t)
-#     if valid_tokens is not None:
-#       loss = loss * valid_tokens
-#       denom = valid_tokens.sum(-1).clamp_min(1)
-#       return loss.sum(-1) / denom
-#     return loss.sum(-1)
-
-#   def generator_loss(self, x0, valid_tokens, current_accumulation_step):
-#     student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
-    
-#     t = self._sample_t(x0.shape[0], current_accumulation_step)
-#     dalpha_t, alpha_t = self.noise(t)
-#     alpha_t = alpha_t.unsqueeze(-1)
-#     assert alpha_t.ndim == 2
-#     sigma = self._sigma_from_alphat(alpha_t)
-#     sigma = self._process_sigma(sigma)
-
-#     probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
-#     xt = trainer_base.sample_categorical(probs_xt)
-#     xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
-    
-#     with torch.cuda.amp.autocast(dtype=torch.float32):
-#       model_output_teacher = self.teacher(xt, sigma)
-#     logits_teacher = self._process_model_output(model_output=model_output_teacher, xt=xt, sigma=sigma)
-#     teacher_loss = self.nll_per_token_with_probs(logits_teacher, xt, student_probs, 
-#                                 alpha_t=alpha_t, dalpha_t=dalpha_t,
-#                                 valid_tokens=valid_tokens)
-
-#     with torch.cuda.amp.autocast(dtype=torch.float32):
-#       model_output_fake = self.fake_model(xt, sigma)
-#     logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
-#     fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs, 
-#                                 alpha_t=alpha_t, dalpha_t=dalpha_t,
-#                                 valid_tokens=valid_tokens)
-#     return teacher_loss - fake_loss
-
-#   def fake_loss(self, x0, valid_tokens, current_accumulation_step):
-#     with torch.no_grad():
-#       student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
-
-#     t = self._sample_t(x0.shape[0], current_accumulation_step)
-#     dalpha_t, alpha_t = self.noise(t)
-#     alpha_t = alpha_t.unsqueeze(-1)
-#     assert alpha_t.ndim == 2
-#     sigma = self._sigma_from_alphat(alpha_t)
-#     sigma = self._process_sigma(sigma)
-#     probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
-#     xt = trainer_base.sample_categorical(probs_xt)
-#     xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
-
-#     with torch.cuda.amp.autocast(dtype=torch.float32):
-#       model_output_fake = self.fake_model(xt, sigma)
-#     logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
-#     fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs, 
-#                                 alpha_t=alpha_t, dalpha_t=dalpha_t,
-#                                 valid_tokens=valid_tokens)
-
-#     return fake_loss
-
-#   def training_step(self, batch, batch_idx):
-#     if self.config.adversarial_distill.is_distill:
-#       optimizer_student, optimizer_fake = self.optimizers()
-#       scheduler_student, scheduler_fake = self.lr_schedulers()
-#       current_accumulation_step = (batch_idx % self.accum_batches)
-#       finish_iter = False
-
-#       (input_tokens, output_tokens, valid_tokens) = self._process_model_input(batch['input_ids'], 
-#                                                                               batch['attention_mask'])
-#       valid_tokens = _conditional_valid_tokens(self.config, valid_tokens)
-#       if self.is_generator_step:
-#         self.toggle_optimizer(optimizer_student)
-#         g_loss = self.generator_loss(input_tokens, valid_tokens, current_accumulation_step)
-#         g_loss = g_loss.mean()
-#         g_loss = g_loss / self.accum_batches
-#         self.manual_backward(g_loss)
-
-#         self.untoggle_optimizer(optimizer_student)
-
-#         self._student_accum_counter += 1
-#         self.total_loss_student += g_loss.detach()
-#         if self._student_accum_counter == self.accum_batches:
-#           self._student_accum_counter = 0 
-#           optimizer_student.step()
-#           self.ema.update(self.backbone.parameters())
-#           optimizer_student.zero_grad()
-#           finish_iter = True
-#       else:
-#         self.toggle_optimizer(optimizer_fake)
-#         f_loss = self.fake_loss(input_tokens, valid_tokens, current_accumulation_step)
-#         f_loss = f_loss.mean()
-#         f_loss = f_loss / self.accum_batches
-#         self.manual_backward(f_loss)
-
-#         self.untoggle_optimizer(optimizer_fake)
-#         self._fake_accum_counter += 1
-#         self.total_loss_fake += f_loss.detach()
-#         if self._fake_accum_counter == self.accum_batches:
-#           self._fake_accum_counter = 0 
-#           optimizer_fake.step()
-#           self.ema_fake.update(self.fake_model.parameters())
-#           optimizer_fake.zero_grad()
-#           finish_iter = True
-
-#       if finish_iter:
-#         _maybe_save_periodic_checkpoint(self)
-
-#       if finish_iter and self.is_generator_step:
-#         self.is_generator_step = False
-#         utils.activate_model(self.fake_model)
-#         utils.freeze_model(self.backbone)
-#         optimizer_fake.zero_grad()
-#         self.log_dict(
-#             {"student_loss": self.total_loss_student, "fake_loss": torch.stack(self.f_loss_ar).mean()},
-#             prog_bar=True,
-#             on_step=True,
-#             on_epoch=False,
-#             sync_dist=True,
-#         )
-#         scheduler_student.step()
-#         scheduler_fake.step()
-#         self.total_loss_student = 0
-#         self.f_loss_ar.clear()
-#       elif finish_iter:
-#         self.fake_iter += 1
-#         self.f_loss_ar.append(self.total_loss_fake)
-#         self.total_loss_fake = 0
-#         if self.fake_iter == self.fake_frequency:
-#           self.is_generator_step = True
-#           self.fake_iter = 0
-#           utils.activate_model(self.backbone)
-#           utils.freeze_model(self.fake_model)
-#           optimizer_student.zero_grad()
-
-#     else:
-#       return super().training_step(batch, batch_idx)
-
-#   def nll_per_token(self, log_x_theta, xt, x0, alpha_t,
-#                     dalpha_t, low_var=False):
-#     del xt
-#     log_p_theta = torch.gather(
-#       input=log_x_theta,
-#       dim=-1,
-#       index=x0[:, :, None]).squeeze(-1)
-#     return log_p_theta * dalpha_t / (1 - alpha_t)
-
-#   def _get_score(self, x, sigma):
-#     model_output = self.forward(x, sigma)
-#     # score(x, t) = p_t(y) / p_t(x)
-#     # => log score(x, t) = log p_t(y) - log p_t(x)
-    
-#     # case 1: x = masked
-#     #   (i) y = unmasked
-#     #     log score(x, t) = log p_\theta(x)|_y + log k
-#     #     where k = exp(- sigma) / (1 - exp(- sigma))
-#     #   (ii) y = masked
-#     #     log score(x, t) = 0
-
-#     # case 2: x = unmasked
-#     #   (i) y != masked, y != x
-#     #     log score(x_i, t) = - inf
-#     #   (ii) y = x 
-#     #     log score(x_i, t) = 0
-#     #   (iii) y = masked token
-#     #     log score(x_i, t) = - log k
-#     #     where k = exp(- sigma) / (1 - exp(- sigma))
-    
-#     log_k = - torch.log(torch.expm1(sigma)).squeeze(-1)
-#     assert log_k.ndim == 1
-    
-#     masked_score = model_output + log_k[:, None, None]
-#     masked_score[:, :, self.mask_index] = 0
-
-#     unmasked_score = self.neg_infinity * torch.ones_like(
-#       model_output)
-#     unmasked_score = torch.scatter(
-#       unmasked_score,
-#       -1,
-#       x[..., None],
-#       torch.zeros_like(unmasked_score[..., :1]))
-#     unmasked_score[:, :, self.mask_index] = - (
-#       log_k[:, None] * torch.ones_like(x))
-    
-#     masked_indices = (x == self.mask_index).to(
-#       model_output.dtype)[:, :, None]
-#     model_output = (
-#       masked_score * masked_indices
-#       + unmasked_score * (1 - masked_indices))
-#     return model_output.exp()
 
 
 class D3PMAbsorb(trainer_base.AbsorbingState):
@@ -3648,7 +1683,7 @@ class DUO_BASE(trainer_base.UniformState):
     assert alpha_t.ndim == 2
     
     q_xs = self._compute_posterior(
-      x=self.forward(x, sigma_t).exp(),
+      x=self._temper(self.forward(x, sigma_t)).exp(),
       xt=x,
       alpha_s=alpha_s,
       alpha_t=alpha_t)
@@ -3956,16 +1991,6 @@ class DUO(DUO_BASE):
     fake_loss = self.nll_per_token_with_probs(logits_fake, xt_usdm, student_probs, 
                                 alpha_t=usdm_alpha_t, dalpha_t=usdm_dalpha_t)
     return self._masked_mean(fake_loss, valid_tokens)
-
-  def _apply_checkpoint_ema_to_backbone_state(self, state_dict, checkpoint):
-    ema_state = checkpoint.get('ema', None)
-    if not (ema_state and 'shadow_params' in ema_state):
-      return
-    for (name, _), shadow in zip(
-        self.backbone.named_parameters(), ema_state['shadow_params']):
-      key = f'backbone.{name}'
-      if key in state_dict:
-        state_dict[key] = shadow.detach().clone().to(state_dict[key].dtype)
 
   def _backbone_shadow_params_from_state(self, state_dict):
     shadow_params = []

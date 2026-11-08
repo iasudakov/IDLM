@@ -7,59 +7,13 @@ import torch.nn.functional as F
 import torchmetrics
 import transformers
 
+from model_assets import pretrained_kwargs
+
 LOG2 = math.log(2)
 
-
-@torch.no_grad()
-def entropy_sum(dist, mask=None, log_input=False,
-                max_chunk_elems=1 << 24):
-  """Summed Shannon entropy (nats) of a batch of categorical distributions.
-
-  Returns ``(total, count)``: the sum of ``-sum_v p(v) log p(v)`` over the
-  counted positions as a 0-dim tensor on `dist`'s device (None when nothing
-  was counted), and how many positions that was. Kept as a sum rather than a
-  mean so callers can pool across calls with different position counts.
-
-  Args:
-    dist: ``(..., V)`` categorical distribution(s) from the model.
-    mask: optional bool tensor broadcastable to ``dist.shape[:-1]``; only
-      those positions are counted. For masked diffusion pass
-      ``xt == mask_index`` -- `_process_model_output` pins the already-
-      revealed positions to a one-hot, whose entropy is 0 by construction,
-      so including them measures how full the sequence is rather than how
-      confident the model is.
-    log_input: `dist` holds log-probabilities rather than probabilities.
-    max_chunk_elems: cap on the temporary allocated per chunk. The full
-      ``(B, L, V)`` tensor is ~1.6 GB at B=8, L=1024, V=50257, so the
-      reduction walks it in row blocks instead of materializing a
-      same-shape temporary. Masked-out rows are dropped before the math,
-      so a half-masked latent costs about half as much.
-  """
-  vocab_size = dist.shape[-1]
-  flat = dist.reshape(-1, vocab_size)
-  keep = None if mask is None else mask.reshape(-1)
-  rows_per_chunk = max(1, int(max_chunk_elems) // max(vocab_size, 1))
-  total = None
-  count = 0
-  for lo in range(0, flat.shape[0], rows_per_chunk):
-    chunk = flat[lo: lo + rows_per_chunk]
-    if keep is not None:
-      keep_chunk = keep[lo: lo + rows_per_chunk]
-      if not bool(keep_chunk.any()):
-        continue
-      chunk = chunk[keep_chunk]
-    chunk = chunk.detach().to(torch.float32)
-    if log_input:
-      # -sum p log p read off log-probs directly. `_process_model_output`
-      # writes a large finite `neg_infinity` rather than -inf, but clamp
-      # anyway so a true -inf gives 0 * -inf = 0 instead of NaN.
-      h = - (chunk.exp() * chunk.clamp_min(-1e30)).sum(-1)
-    else:
-      h = torch.special.entr(chunk).sum(-1)
-    chunk_total = h.sum()
-    total = chunk_total if total is None else total + chunk_total
-    count += h.numel()
-  return total, count
+# GM is disabled even when legacy commands request eval.owt_gm=True.
+# Gate both evaluation collection/call sites and direct metric calls.
+GRADIENT_MOMENT_ENABLED = False
 
 
 class NLL(torchmetrics.aggregation.MeanMetric):
@@ -116,133 +70,9 @@ class Perplexity(NLL):
     return torch.exp(self.mean_value / self.weight)
 
 
-class GradientMoment:
-  """GPT-2 Gradient Moment (GM), D-MMD paper Eq. 13/14.
-
-  ``GM = || E_g[grad_theta log p_LLM(x)] - E_q[grad_theta log p_LLM(x)] ||^2``,
-  a distribution-distance metric where ``g`` = generated samples, ``q`` = data
-  and ``p_LLM`` is a frozen reference LM (GPT-2). GM = 0 iff the two sample sets
-  are indistinguishable to the reference model's loss-gradient; larger means
-  further from the data. Unlike generative perplexity it is not gamed by mode
-  collapse (a collapsed generator scores *low* ppl but *high* GM).
-
-  Unbiased U-statistic estimator over M paired (gen, data) batches. With
-  ``d_m = grad(gen_m) - grad(data_m)`` (reference-model parameter gradients of
-  the mean-per-sequence log-likelihood):
-
-      GM ~= ( ||sum_m d_m||^2 - sum_m ||d_m||^2 ) / ( M (M-1) )   (needs M >= 2)
-
-  because ``E[d_i . d_j] = ||E_g - E_q||^2`` for independent i != j. Only the
-  running sum ``S = sum_m d_m`` (one gradient-shaped structure) and the scalar
-  ``Q = sum_m ||d_m||^2`` are kept. The sign of the gradient cancels in ``d_m``.
-  """
-
-  def __init__(self, model_name_or_path='gpt2') -> None:
-    self.model_name_or_path = model_name_or_path
-    self.model = transformers.AutoModelForCausalLM.from_pretrained(
-      model_name_or_path)
-    self.model.eval()  # disable dropout; parameters still require grad
-    for p in self.model.parameters():
-      p.requires_grad_(True)
-    self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-      model_name_or_path)
-    if self.tokenizer.pad_token is None:
-      self.tokenizer.pad_token = self.tokenizer.eos_token
-      self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-    self.device = 'cpu'
-    self._S = None   # dict: param name -> running sum of d_m
-    self._Q = 0.0    # scalar: sum_m ||d_m||^2
-    self._M = 0      # number of accumulated batches
-
-  def to(self, *args, **kwargs):
-    self.model = self.model.to(*args, **kwargs)
-    for a in args:
-      if isinstance(a, (str, torch.device)):
-        self.device = a
-    if 'device' in kwargs and kwargs['device'] is not None:
-      self.device = kwargs['device']
-    return self
-
-  def reset(self) -> None:
-    self._S = None
-    self._Q = 0.0
-    self._M = 0
-
-  def _tokenize(self, texts, max_length, device):
-    enc = self.tokenizer(
-      texts, return_tensors='pt', return_token_type_ids=False,
-      return_attention_mask=True, truncation=True, padding=True,
-      max_length=max_length)
-    return enc['input_ids'].to(device), enc['attention_mask'].to(device)
-
-  def _grad(self, texts, max_length, device):
-    """Reference-model parameter gradient of the mean-per-sequence
-    log-likelihood on ``texts``. Returns ``{param_name: grad tensor}``."""
-    input_ids, attn_mask = self._tokenize(texts, max_length, device)
-    self.model.zero_grad(set_to_none=True)
-    logits = self.model(input_ids, attention_mask=attn_mask).logits
-    logits = logits[:, :-1, :]
-    targets = input_ids[:, 1:]
-    tok_mask = attn_mask[:, 1:].to(logits.dtype)
-    nll = F.cross_entropy(
-      logits.reshape(-1, logits.shape[-1]), targets.reshape(-1),
-      reduction='none').reshape(targets.shape)
-    # gradient of the mean-per-token NLL (the standard LM loss; length-robust so
-    # a generated batch with early EOS isn't scored differently just for being
-    # shorter). Sign is irrelevant -- it cancels in d_m = grad(gen) - grad(data).
-    loss = (nll * tok_mask).sum() / tok_mask.sum().clamp_min(1.0)
-    loss.backward()
-    return {n: p.grad.detach().clone()
-            for n, p in self.model.named_parameters()
-            if p.grad is not None}
-
-  @torch.enable_grad()
-  def accumulate(self, gen_texts, data_texts, max_length, device) -> None:
-    """Add one paired (generated, data) batch to the GM estimate."""
-    self.to(device)
-    try:
-      a = self._grad(gen_texts, max_length, device)
-      b = self._grad(data_texts, max_length, device)
-    except RuntimeError as e:
-      m = str(e).lower()
-      # Under Lightning validation's default inference_mode, the loss has no
-      # grad_fn so backward fails with a "does not require grad" / inference
-      # message. Surface an actionable hint instead of the cryptic error.
-      if ('inference' in m or 'does not require grad' in m
-          or 'grad_fn' in m):
-        raise RuntimeError(
-          'GradientMoment needs gradients but the reference-model forward could '
-          'not build an autograd graph -- Lightning validation runs under '
-          'inference_mode by default. Re-run with `trainer.inference_mode=false` '
-          '(required whenever eval.compute_gm=true).') from e
-      raise
-    q_m = 0.0
-    if self._S is None:
-      self._S = {}
-      for n in a:
-        d = a[n] - b[n]
-        self._S[n] = d
-        q_m += (d * d).sum().item()
-    else:
-      for n in a:
-        d = a[n] - b[n]
-        self._S[n] += d
-        q_m += (d * d).sum().item()
-    self._Q += q_m
-    self._M += 1
-
-  def compute(self) -> float:
-    if self._M < 2:
-      return 0.0
-    s_norm_sq = sum((v * v).sum().item() for v in self._S.values())
-    return (s_norm_sq - self._Q) / (self._M * (self._M - 1))
-
-
 class Metrics:
   def __init__(self, gen_ppl_eval_model_name_or_path=None,
-               eval_ppl_batch_size=None,
-               compute_gm=False,
-               gm_eval_model_name_or_path='gpt2') -> None:
+               eval_ppl_batch_size=None, model_weights_dir=None) -> None:
     metrics = torchmetrics.MetricCollection({
         'nll': NLL(), 'bpd': BPD(), 'ppl': Perplexity()})
     metrics.set_dtype(torch.float64)
@@ -252,13 +82,12 @@ class Metrics:
     self.valid_aux = BPD()
     self.gen_ppl = Perplexity()
     self.sample_entropy = torchmetrics.aggregation.MeanMetric()
-    self.pred_entropy = torchmetrics.aggregation.MeanMetric()
     self.eval_ppl_batch_size = eval_ppl_batch_size
-    self.gm = (GradientMoment(gm_eval_model_name_or_path)
-               if compute_gm else None)
     self.gen_ppl_eval_model_name_or_path = gen_ppl_eval_model_name_or_path
+    self.model_weights_dir = model_weights_dir
     self.tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(gen_ppl_eval_model_name_or_path)
+      from_pretrained(**pretrained_kwargs(
+        gen_ppl_eval_model_name_or_path, model_weights_dir, kind='tokenizer'))
     if self.tokenizer.pad_token is None:
       self.tokenizer.pad_token = self.tokenizer.eos_token
       self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -266,24 +95,18 @@ class Metrics:
   def to(self, *args, **kwargs):
     self.gen_ppl = self.gen_ppl.to(*args, **kwargs)
     self.sample_entropy = self.sample_entropy.to(*args, **kwargs)
-    self.pred_entropy = self.pred_entropy.to(*args, **kwargs)
     self.train_nlls = self.train_nlls.to(*args, **kwargs)
     self.train_aux = self.train_aux.to(*args, **kwargs)
     self.valid_nlls = self.valid_nlls.to(*args, **kwargs)
     self.valid_aux = self.valid_aux.to(*args, **kwargs)
-    if self.gm is not None:
-      self.gm.to(*args, **kwargs)
 
   def reset(self):
     self.gen_ppl.reset()
     self.sample_entropy.reset()
-    self.pred_entropy.reset()
     self.train_nlls.reset()
     self.train_aux.reset()
     self.valid_nlls.reset()
     self.valid_aux.reset()
-    if self.gm is not None:
-      self.gm.reset()
 
   def update_train(self, nll, aux_loss, num_tokens):
     self.train_nlls.update(nll, num_tokens)
@@ -346,40 +169,88 @@ class Metrics:
       self.sample_entropy.update(entropy)
 
   @torch.no_grad()
-  def record_pred_entropy(self, dist, mask=None, log_input=False,
-                          max_chunk_elems=1 << 24):
-    """Mean Shannon entropy (nats) of the *model's own* predictive
-    distribution: ``-sum_v p_theta(v) log p_theta(v)``, averaged over
-    positions. Successive calls accumulate a *position-weighted* mean, so
-    over a sampling trajectory the early, mostly-masked steps -- where the
-    model has the most positions to predict -- dominate.
+  def _ensure_eval_model(self, device='cuda'):
+    """The reference LM, loaded once and kept.
 
-    This is the sibling of `record_entropy`, which measures the unigram
-    entropy of the token *counts* in a finished sample. That one can look
-    healthy while every individual conditional has collapsed to a spike;
-    this one reads the spike directly, so it is the number that moves when
-    distillation / nucleus truncation sharpens the denoiser. Range is
-    ``[0, log V]`` (``log 50257 ~= 10.82`` for GPT-2 BPE); low = confident /
-    near-deterministic conditionals, high = diffuse.
-
-    Args:
-      dist: ``(..., V)`` categorical distribution from the model.
-      mask: optional bool tensor broadcastable to ``dist.shape[:-1]``;
-        only those positions are counted. For masked diffusion pass
-        ``xt == mask_index`` -- `_process_model_output` pins the
-        already-revealed positions to a one-hot, whose entropy is 0 by
-        construction and would otherwise dominate the average as the
-        sampler fills the sequence in.
-      log_input: `dist` holds log-probabilities rather than probabilities.
-      max_chunk_elems: see `entropy_sum`.
+    `record_generative_perplexity` reloads it per call, which is merely slow
+    there. Gradient Moment backprops through it, so reloading 774M parameters
+    per evaluation would dominate the metric's cost outright.
     """
-    total, count = entropy_sum(
-      dist, mask=mask, log_input=log_input,
-      max_chunk_elems=max_chunk_elems)
-    if count:
-      self.pred_entropy.update(total / count, count)
+    if getattr(self, '_eval_model', None) is None:
+      model = transformers.AutoModelForCausalLM.from_pretrained(
+        **pretrained_kwargs(self.gen_ppl_eval_model_name_or_path,
+                            self.model_weights_dir)).eval()
+      # llama2 is left where `from_pretrained` put it, matching what
+      # `record_generative_perplexity` has always done for that path.
+      if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
+        model = model.to(device)
+      self._eval_model = model
+    return self._eval_model
 
-  @torch.no_grad()
+  def record_gradient_moment(self, samples_texts, data_texts, max_length,
+                             batch_size=4, device='cuda'):
+    """Gradient Moment (arXiv:2603.20155): `||E_samples[grad L] - E_data[grad L]||^2`.
+
+    Currently disabled: returns None before any import, model load or scoring.
+
+    Ported from yrELF's `metrics_utils.Metrics.record_gradient_moment`, so the
+    numbers are comparable with that project's.
+
+    The reason to pay for it: it backprops through the reference LM, so unlike
+    generative perplexity it is not gamed by low-entropy or mode-collapsed
+    sampling. That failure is not hypothetical here -- an OWT run of this repo
+    drove gen_ppl from 68 to 11.9 while sample entropy fell and held-out NLL
+    rose, i.e. gen_ppl improved precisely because the model was collapsing.
+
+    One GM pair is `2 * batch_size` rows per side, each split in half
+    internally; the halves' inner product is what makes the squared norm
+    unbiased. Returns None when there are too few rows to form one pair, or
+    when the `gradient_moment` package is not installed -- it is an optional
+    sibling repo, and a missing one must not take the run down.
+    """
+    if not GRADIENT_MOMENT_ENABLED:
+      return None
+    try:
+      from gradient_moment import evaluate, make_generative_llm_metrics
+      from gradient_moment.huggingface import text_causal_lm_forward
+    except ImportError as e:
+      # `gradient_moment/` is vendored at the repo root, so this should not
+      # fire; it stays as a guard for a truncated checkout rather than as a
+      # prompt to install anything.
+      print(f'[gm] skipped: gradient_moment not importable ({e}). '
+            'It is vendored at the repo root -- check the checkout.', flush=True)
+      return None
+
+    model = self._ensure_eval_model(device)
+    pair_rows = 2 * batch_size
+    n = (min(len(samples_texts), len(data_texts)) // pair_rows) * pair_rows
+    if n == 0:
+      print(f'[gm] need >= {pair_rows} sample/data rows, skipping', flush=True)
+      return None
+    samples_texts, data_texts = samples_texts[:n], data_texts[:n]
+
+    def _tok(texts):
+      enc = self.tokenizer(
+        texts, return_tensors='pt', return_token_type_ids=False,
+        truncation=True, padding=True, max_length=max_length)
+      return {'input_ids': enc['input_ids'].to(device).long(),
+              'attention_mask': enc['attention_mask'].to(device).float()}
+
+    batches = [(_tok(samples_texts[i:i + pair_rows]),
+                _tok(data_texts[i:i + pair_rows]))
+               for i in range(0, n, pair_rows)]
+    forward_fn = text_causal_lm_forward(model, self.tokenizer.eos_token_id)
+    metric = make_generative_llm_metrics(forward_fn, model)
+    # `torch.enable_grad` because this runs inside validation, where Lightning
+    # has already switched gradients off -- and the whole metric is a gradient.
+    with torch.enable_grad():
+      results = evaluate([metric], batches)
+    gm = results[metric.name]
+    return {'centered_gm': gm['centered_gm']['mean'],
+            'uncentered_gm_samples': gm['uncentered_gm_samples']['mean'],
+            'uncentered_gm_data': gm['uncentered_gm_data']['mean'],
+            'n_pairs': gm['centered_gm']['n']}
+
   def record_generative_perplexity(
     self,
     text_samples: typing.List[str],
@@ -388,10 +259,13 @@ class Metrics:
     device='cuda') -> None:
     
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    eval_model = transformers.AutoModelForCausalLM.from_pretrained(
-      self.gen_ppl_eval_model_name_or_path).eval()
-    if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
-      eval_model = eval_model.to(device)
+    # Cached rather than reloaded per call. This used to run `from_pretrained`
+    # on every invocation -- 18.6s of disk for gpt2-large, once per sample
+    # batch, every validation. The Pareto sweep multiplies that by budgets and
+    # seeds: [2,4,8,16,32,64] x 2 batches x 5 seeds is 60 reloads, ~19 minutes
+    # of pure model loading per validation. The model is frozen and in eval
+    # mode, so reusing it is numerically identical.
+    eval_model = self._ensure_eval_model(device)
     # Re-tokenize using eval model's tokenizer
     if retokenize:
       (samples, attn_mask,

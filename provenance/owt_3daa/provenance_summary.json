@@ -1,0 +1,62 @@
+{
+  "authoritative_run_uid": "3daa3e6f-1c54-4854-8bda-0b33dfd3257f",
+  "run_url": "https://deep.yandex-team.ru/projects/generative-models/experiments/owt/run/3daa3e6f-1c54-4854-8bda-0b33dfd3257f",
+  "run_name": "5seed 2e-5 layer 3 unbiased batch2-rbf mmd owt-dm lr1e-4 g8 bf16",
+  "figure_identity": "Figure 2 top row (MDLM-MMD on OWT), also Table 2 mean gPPL values",
+  "matched_checkpoint_label": 3218,
+  "matched_raw_iteration": 25749,
+  "curve_match": {
+    "points_compared": 36,
+    "rmse_log_ppl": 1.1066603842529688e-07,
+    "max_abs_ppl_error": 8.925066140363924e-06,
+    "max_abs_entropy_error_from_milli_entropy_logging": 0.0004920318332874984
+  },
+  "paper_nominal_steps": 3250,
+  "nominal_steps_note": "The logged label 3218 equals floor((25749+1)/8), consistent numerically with accum_batches=8. This is a log-counter mapping, not an independently verified exact optimizer-update count. The nominal 3250 in the paper corresponds to raw iteration 25999 under this mapping and does not match the plotted figure.",
+  "paper_group_size": 4,
+  "actual_run_group_size": 8,
+  "source_archive_url": "https://nirvana.yandex-team.ru/api/resultItem/c58febd5-4a92-42bf-a5cd-f7b56202262d%2F9b4a7cde-566b-4bbe-b2e0-1c97e92edd3d/data",
+  "source_tree": "/home/iasudakov/underdeep_comparison/mdlm_large_features_20261108/provenance/source_3daa",
+  "source_retrieval": {
+    "http_status": 200,
+    "stop_reason": "archive_end",
+    "saved_files": 122,
+    "saved_bytes": 1079070,
+    "streamed_archive_bytes": 10905600,
+    "raw_archive_saved": false
+  },
+  "frozen_launch_file": "/home/iasudakov/underdeep_comparison/mdlm_large_features_20261108/provenance/launch_config_3daa3e6f-1c54-4854-8bda-0b33dfd3257f.json",
+  "recipe": {
+    "policy_gradient_group_size": 8,
+    "mmd_batch_size": 2,
+    "rbf_alpha": 2e-05,
+    "effective_sigma_if_exp_minus_distance_over_2sigma2": 158.11388300841895,
+    "feature_layer_zero_based": 3,
+    "global_batch_size": 512,
+    "per_device_batch_size": 8,
+    "custom_accum_batches": 8,
+    "trainer_accumulate_grad_batches": 1,
+    "devices": 8,
+    "learning_rate": 0.0001,
+    "evaluation_seeds": 5,
+    "validation_interval_logged_iterations": 250
+  },
+  "feature_source": "diffusion",
+  "feature_noise_level": 0.0,
+  "student_initial_checkpoint": "kuleshov-group/mdlm-owt",
+  "data": "openwebtext-split",
+  "sequence_length": 1024,
+  "kernel": "token RBF over draws",
+  "exclude_same_sentence": true,
+  "exclude_same_position": true,
+  "public_reproduction_run_uid": "bcb83467-f71e-4c55-b937-449ed3fceaaf",
+  "public_reproduction_note": "Public recipe reproduction, one evaluation seed and nine temperatures; not the exact source of paper figure2.",
+  "not_included": [
+    "model weights",
+    "OWT dataset/cache",
+    "raw shell launch commands/environment",
+    "hidden files",
+    "binary assets"
+  ],
+  "full_safe_source_archive_complete": true
+}

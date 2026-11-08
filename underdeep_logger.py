@@ -56,6 +56,12 @@ class UnderdeepLogger(Logger):
     self._run = None
     self._initialized = False
     self._finished = False
+    # Lightning calls `finalize` at the end of *every* trainer entry point,
+    # `trainer.validate` included -- so any validation phase driven before
+    # `trainer.fit` closes the run before training logs a single scalar, and
+    # every later write then fails with "Can't log data to finished run".
+    # A caller that runs such a phase sets this to defer the close.
+    self.defer_finalize = False
 
   # -- Lightning Logger interface -------------------------------------- #
 
@@ -115,6 +121,37 @@ class UnderdeepLogger(Logger):
       print('[underdeep] scalar log failed: {}'.format(e), flush=True)
 
   @rank_zero_only
+  def log_table(self, key, columns, data, step=None):
+    """Log one table (e.g. a batch of generated samples) to the run.
+
+    Lightning has no table hook, so `trainer_base` reaches this the way
+    it reaches `log_image`: behind a `hasattr(logger, 'log_table')`
+    guard, which a logger without table support (e.g.
+    ``TensorBoardLogger``) simply fails, skipping the call. Until this
+    existed the underdeep logger was one of those -- every sample table
+    the validation loop built was silently dropped.
+
+    Args:
+      key: table title. As with `log_image`, repeated calls under the
+        same title become a step-indexed series, so pass a *stable* key
+        and let `step` carry the training step rather than baking the
+        step into the title -- otherwise each validation lands as its
+        own unrelated table.
+      columns: column names.
+      data: rows, each an iterable as long as `columns`.
+      step: training step the table belongs to.
+    """
+    run = self.experiment
+    if run is None or not data:
+      return
+    try:
+      from underdeep.runs.data_types import UTable
+      rows = [dict(zip(columns, row)) for row in data]
+      run.log({key: UTable(value=rows)}, step=step)
+    except Exception as e:  # pragma: no cover - tracker best-effort
+      print('[underdeep] table log failed: {}'.format(e), flush=True)
+
+  @rank_zero_only
   def log_image(self, key, image, step=None):
     """Log one image to the run, versioned by `step` like a scalar.
 
@@ -144,6 +181,8 @@ class UnderdeepLogger(Logger):
 
   @rank_zero_only
   def finalize(self, status):
+    if self.defer_finalize:
+      return
     if self._run is None or self._finished:
       return
     self._finished = True

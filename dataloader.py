@@ -18,6 +18,7 @@ import tokenizers
 import torch
 import transformers
 
+from model_assets import pretrained_kwargs
 import utils
 
 LOGGER = utils.get_logger(__name__)
@@ -597,29 +598,9 @@ def get_dataset(dataset_name,
     filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped{eos_tag}.dat'
   _path = os.path.join(cache_dir, filename)
   
-  _abs_path = os.path.abspath(_path)
-  _exists = utils.fsspec_exists(_path)
-  print(
-    f'[get_dataset] looking for cached data:\n'
-    f'    dataset_name = {dataset_name!r}, mode = {mode!r}\n'
-    f'    cache_dir    = {cache_dir!r}\n'
-    f'    filename     = {filename!r}\n'
-    f'    full path    = {_path}\n'
-    f'    resolved     = {_abs_path}\n'
-    f'    cwd          = {os.getcwd()}\n'
-    f'    FOUND        = {_exists}',
-    flush=True,
-  )
-  if _exists:
-    print(f'[get_dataset] FOUND cached data -> loading from disk: {_abs_path}',
-          flush=True)
+  if utils.fsspec_exists(_path):
     LOGGER.info(f'Loading data from: {_path}')
     return datasets.load_from_disk(_path).with_format('torch')
-  print(
-    f'[get_dataset] ABSENT: no cached data at {_abs_path}\n'
-    f'              -> will DOWNLOAD + RE-TOKENIZE from scratch (slow, needs net + disk).',
-    flush=True,
-  )
   LOGGER.info(f'Generating new data at: {_path}')
   LOGGER.info(f'{streaming=}')  
 
@@ -861,16 +842,24 @@ class VocabSizeTokenizerWrapper:
 
 
 def get_tokenizer(config):
+  tokenizer_name = config.data.tokenizer_name_or_path
+  weights_dir = getattr(config, 'model_weights_dir', None)
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
   elif config.data.tokenizer_name_or_path == 'bert-base-uncased':
     tokenizer = transformers.BertTokenizer.\
-      from_pretrained('bert-base-uncased')
+      from_pretrained(**pretrained_kwargs(
+        tokenizer_name, weights_dir, kind='tokenizer'))
   elif config.data.tokenizer_name_or_path == 'synthetic':
     tokenizer = SyntheticTokenizer(vocab_size=256)
   else:
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-      config.data.tokenizer_name_or_path)
+      **pretrained_kwargs(tokenizer_name, weights_dir, kind='tokenizer'))
+
+  # Keep the logical tokenizer identity for cached datasets and integral files;
+  # the bundle directory changes where assets are read, not their identity.
+  if weights_dir and tokenizer_name not in ('text8', 'synthetic'):
+    tokenizer.name_or_path = tokenizer_name
 
   if (isinstance(tokenizer, transformers.GPT2TokenizerFast)
       or isinstance(tokenizer, transformers.GPT2Tokenizer)):

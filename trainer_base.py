@@ -1,6 +1,7 @@
-import contextlib
+import collections
 import itertools
-import typing
+import json
+import os
 from dataclasses import dataclass
 
 import hydra.utils
@@ -13,9 +14,28 @@ import transformers
 import dataloader
 import metrics
 import models
-import pareto_curve
+from model_assets import pretrained_kwargs
 import utils
 from ipdb import set_trace as debug
+
+
+# `pareto/owt_step_*` plots perplexity against entropy, but the tracker indexes
+# a series by an integer step. Entropy is carried at this fixed scale, so an x
+# of 5062 reads as entropy 5.062.
+_ENTROPY_X_SCALE = 1000
+
+
+def _mean(values):
+  return float(sum(values) / len(values)) if values else 0.0
+
+
+def _std(values):
+  """Sample standard deviation; 0 for fewer than two values."""
+  if len(values) < 2:
+    return 0.0
+  mean = _mean(values)
+  return float((sum((v - mean) ** 2 for v in values)
+                / (len(values) - 1)) ** 0.5)
 
 
 @dataclass
@@ -51,63 +71,6 @@ def _unsqueeze(x, reference):
     * ((1,) * (len(reference.shape) - len(x.shape))))
 
 
-@dataclass
-class NoiseDiversity:
-  """Result of `TrainerBase.noise_diversity_report`."""
-  metrics: typing.Dict[str, float]
-  # Decoded samples, `variants[k][b]` = row `b` under noise draw `k`, or None
-  # if they were not requested.
-  variants: typing.Optional[typing.List[typing.List[str]]]
-
-
-def _matched_agreement(stack):
-  """Mean positional token agreement between *matched rows* of different
-  replicates: mean over `k < j`, row `b` and position `l` of
-  `stack[k, b, l] == stack[j, b, l]`. 1.0 => the replicates are identical."""
-  num_replicates = stack.shape[0]
-  total, num_pairs = 0.0, 0
-  for i in range(num_replicates):
-    for j in range(i + 1, num_replicates):
-      total += (stack[i] == stack[j]).float().mean().item()
-      num_pairs += 1
-  return total / max(num_pairs, 1)
-
-
-def _independent_agreement(stack):
-  """Mean positional agreement between two *different rows* of the same
-  replicate, i.e. between fully independent samples. This is the chance-level
-  floor the matched-row agreements above should be read against: two unrelated
-  unconditional samples still agree wherever both emit a common token."""
-  batch_size = stack.shape[1]
-  if batch_size < 2:
-    return None
-  equal = (stack[:, :, None, :] == stack[:, None, :, :]).float().mean(-1)
-  rows, cols = torch.triu_indices(
-    batch_size, batch_size, offset=1, device=stack.device)
-  return equal[:, rows, cols].mean().item()
-
-
-def _distinct_per_position(stack):
-  """Mean number of distinct tokens a single position takes across the
-  replicates. 1.0 => every replicate wrote the same token everywhere;
-  `num_replicates` => a different token every time."""
-  ordered, _ = torch.sort(stack, dim=0)
-  return (1 + (ordered[1:] != ordered[:-1]).sum(0)).float().mean().item()
-
-
-def _unique_sequence_frac(stack):
-  """Fraction of the replicates of a row that are distinct sequences, averaged
-  over rows. 1/K => all replicates collapsed to one sequence; 1.0 => every
-  replicate produced a sequence not seen under any other noise draw."""
-  num_replicates = stack.shape[0]
-  equal = (stack[:, None] == stack[None, :]).all(-1)  # (K, K, B)
-  is_new = torch.ones(equal.shape[0], equal.shape[-1],
-                      dtype=torch.bool, device=stack.device)
-  for k in range(1, num_replicates):
-    is_new[k] = ~ equal[:k, k].any(0)
-  return (is_new.float().sum(0) / num_replicates).mean().item()
-
-
 class TrainerBase(L.LightningModule):
   def __init__(
     self,
@@ -117,6 +80,11 @@ class TrainerBase(L.LightningModule):
     super().__init__()
     self.save_hyperparameters()
     self.config = config
+    mask_schedule_cfg = config.adversarial_distill.get('mask_schedule', {}) or {}
+    if (hasattr(mask_schedule_cfg, 'get')
+        and mask_schedule_cfg.get('mode', 'original') != 'original'
+        and config.algo.name != 'mdlm'):
+      raise ValueError('adversarial_distill.mask_schedule requires algo=mdlm')
     if hasattr(self.config.algo, 'ignore_bos'):
       self.ignore_bos = config.algo.ignore_bos
     else:
@@ -129,33 +97,6 @@ class TrainerBase(L.LightningModule):
     else:
       self.vocab_size = vocab_size
     self.sampler = self.config.sampling.predictor
-    # Sampling-time mask layout for 'ancestral'/'ancestral_cache' -- see the
-    # config key. Not read by any other predictor.
-    layout = str(self.config.sampling.get('mask_layout', 'random')).lower()
-    if layout in ('random', 'iid'):
-      self.sampling_mask_layout = 'random'
-    elif layout in ('suffix', 'postfix', 'block'):
-      self.sampling_mask_layout = 'suffix'
-      assert self.sampler in ('ancestral', 'ancestral_cache'), (
-        "sampling.mask_layout='suffix' is only implemented for "
-        f"sampling.predictor in ('ancestral', 'ancestral_cache'), got "
-        f'{self.sampler!r}.')
-    else:
-      raise ValueError(
-        f'Unknown sampling.mask_layout: {layout!r} '
-        "(expected one of 'random' or 'suffix'/'postfix').")
-    # Plain-ELBO training-time mask layout -- the warmup counterpart of
-    # `sampling.mask_layout`, read by `Diffusion.nll` only. See the config key.
-    train_layout = str(
-      self.config.training.get('mask_layout', 'random')).lower()
-    if train_layout in ('random', 'iid'):
-      self.training_mask_layout = 'random'
-    elif train_layout in ('suffix', 'postfix', 'block'):
-      self.training_mask_layout = 'suffix'
-    else:
-      raise ValueError(
-        f'Unknown training.mask_layout: {train_layout!r} '
-        "(expected one of 'random' or 'suffix'/'postfix').")
     self.antithetic_sampling = self.config.training.antithetic_sampling
     self.parameterization = self.config.algo.parameterization
     if self.config.algo.backbone == 'dit':
@@ -168,12 +109,17 @@ class TrainerBase(L.LightningModule):
         pad_token_id=self.tokenizer.pad_token_id)
     elif self.config.algo.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
-        config.eval.checkpoint_path, trust_remote_code=True)
+        **pretrained_kwargs(
+          config.eval.checkpoint_path,
+          getattr(config, 'model_weights_dir', None)),
+        trust_remote_code=True)
 
     self.T = self.config.algo.T
     self.num_tokens = self.config.model.length
     self.softplus = torch.nn.Softplus()
     self.p_nucleus = self.config.sampling.p_nucleus
+    self.sampling_temperature = float(
+      self.config.sampling.get('temperature', 1.0) or 1.0)
     # Noise Schedule
     self.noise = LogLinear()
 
@@ -182,9 +128,7 @@ class TrainerBase(L.LightningModule):
         self.config.eval.gen_ppl_eval_model_name_or_path,
       eval_ppl_batch_size=\
         self.config.eval.perplexity_batch_size,
-      compute_gm=self.config.eval.get('compute_gm', False),
-      gm_eval_model_name_or_path=self.config.eval.get(
-        'gm_eval_model_name_or_path', 'gpt2'))
+      model_weights_dir=getattr(config, 'model_weights_dir', None))
 
     if self.config.training.ema > 0:
       self.ema = models.ema.ExponentialMovingAverage(
@@ -235,6 +179,24 @@ class TrainerBase(L.LightningModule):
       self.ema.restore(self._get_parameters())
     self.backbone.train()
     self.noise.train()
+
+  def _apply_checkpoint_ema_to_backbone_state(self, state_dict, checkpoint):
+    """Overwrite the raw backbone weights in `state_dict` with the EMA ones.
+
+    A checkpoint carries both: `state_dict` holds the live parameters and
+    `ema.shadow_params` a parallel list in `backbone.named_parameters()` order.
+    Every number a run reports is measured on the EMA copy (`_eval_mode`
+    swaps it in), so an eval that reads `state_dict` alone quietly scores a
+    different model from the one the curves describe.
+    """
+    ema_state = checkpoint.get('ema', None)
+    if not (ema_state and 'shadow_params' in ema_state):
+      return
+    for (name, _), shadow in zip(
+        self.backbone.named_parameters(), ema_state['shadow_params']):
+      key = f'backbone.{name}'
+      if key in state_dict:
+        state_dict[key] = shadow.detach().clone().to(state_dict[key].dtype)
 
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
@@ -328,27 +290,30 @@ class TrainerBase(L.LightningModule):
     if self.ema:
       self.ema.update(self._get_parameters())
 
+  def _temper(self, log_p_x0):
+    """Sharpen or flatten the denoiser's x0 prediction.
+
+    Takes and returns LOG-probabilities, renormalised, so callers can keep
+    treating the result as `p(x0 | x_t)`. At temperature 1 the tensor is handed
+    straight back: the published sampler must stay bit-identical when the knob
+    is untouched.
+
+    Safe on the absorbing parameterisation's hard rows. `MDLM
+    ._process_model_output` pins already-unmasked positions to `0` for the
+    observed token and `neg_infinity` elsewhere; dividing that by any
+    temperature in a sane range leaves it one-hot after renormalisation, so a
+    committed token cannot be un-committed by tempering. The same holds for the
+    mask token's suppressed column.
+    """
+    if self.sampling_temperature == 1.0:
+      return log_p_x0
+    return (log_p_x0 / self.sampling_temperature).log_softmax(dim=-1)
+
   def _process_sigma(self, sigma):
     raise NotImplementedError
 
   def _process_model_output(self, model_output, xt, sigma):
     raise NotImplementedError
-
-  def _pred_entropy_mask(self, xt):
-    """Positions of `xt` whose predictive distribution is a genuine model
-    prediction (see `metrics.Metrics.record_pred_entropy`). None => all."""
-    del xt
-    return None
-
-  def _record_pred_entropy(self, dist, xt, log_input=False):
-    """Fold one denoiser call's predictive distribution into
-    `val/pred_entropy`. Called only from the samplers, so it costs a
-    reduction over an already-materialized tensor and no extra forward."""
-    if dist is None or not self.config.eval.get(
-        'compute_pred_entropy', True):
-      return
-    self.metrics.record_pred_entropy(
-      dist, mask=self._pred_entropy_mask(xt), log_input=log_input)
 
   def forward(self, xt, sigma):
     sigma = self._process_sigma(sigma)
@@ -385,21 +350,21 @@ class TrainerBase(L.LightningModule):
 
   def on_validation_epoch_start(self):
     self.metrics.reset()
+    # Gradient Moment compares the reference LM's gradient on our samples
+    # against its gradient on REAL text, so a fresh batch of held-out rows has
+    # to be collected alongside the usual validation.
+    self._gm_ref_texts = []
     self._eval_mode()
-    # Buffer for GM data batches (decoded to text; see on_validation_epoch_end).
-    self._gm_data_texts = []
+    # Decided once per validation rather than per call: `global_step` does not
+    # move during the loop, and re-deciding would print the skip line once per
+    # validation batch.
+    self._gen_eval_active = self._generative_eval_active()
     assert self.metrics.valid_nlls.nll.mean_value == 0
     assert self.metrics.valid_nlls.nll.weight == 0
 
   def validation_step(self, batch, batch_idx):
     del batch_idx
-    # GPT-2 Gradient Moment needs *data* samples to pair with generated ones.
-    # Buffer the first `gm_num_batches` val batches as text (not tensors, which
-    # would be inference tensors and unusable in the autograd pass GM needs).
-    if self.metrics.gm is not None and len(
-        self._gm_data_texts) < self.config.eval.get('gm_num_batches', 4):
-      self._gm_data_texts.append(
-        self.tokenizer.batch_decode(batch['input_ids']))
+    self._collect_gm_reference(batch)
     losses = self._loss(batch['input_ids'],
                         batch['attention_mask'])
     self.metrics.update_valid(losses.nlls, losses.prior_loss,
@@ -410,132 +375,679 @@ class TrainerBase(L.LightningModule):
     for k, v in self.metrics.valid_nlls.items():
       self.log(name=k,  value=v.compute(), on_step=False,
                on_epoch=True, sync_dist=True)
+    # The held-out NLL above is cheap and it is the loss curve, so it runs at
+    # the trainer's cadence throughout. Everything below is the expensive half
+    # -- sampling, gen_ppl, Gradient Moment, both Pareto sweeps -- and that is
+    # what `eval.eval_step_range` / `eval.eval_at_steps` gate.
+    if not getattr(self, '_gen_eval_active', True):
+      self._train_mode()
+      return
     if ((self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)
          and self.config.eval.generate_samples):
       samples, text_samples = None, None
-      for _sb in range(
+      # Gradient Moment scores a POOL of samples against a pool of real rows,
+      # so unlike the per-batch metrics it needs them kept rather than
+      # overwritten each iteration.
+      gm_samples = []
+      for _ in range(
         self.config.sampling.num_sample_batches):
         samples = self.generate_samples(
           num_samples=self.config.loader.eval_batch_size)
-
+        
         self.metrics.record_entropy(samples)
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
+        if (metrics.GRADIENT_MOMENT_ENABLED
+            and self.config.eval.get('owt_gm', False)):
+          gm_samples.extend(text_samples)
         if self.config.eval.compute_generative_perplexity:
           self.metrics.record_generative_perplexity(
             text_samples, self.num_tokens, self.device)
-        # GPT-2 Gradient Moment: pair this generated batch with a buffered data
-        # batch (needs trainer.inference_mode=false so autograd is available).
-        if (self.metrics.gm is not None
-            and _sb < len(self._gm_data_texts)):
-          self.metrics.gm.accumulate(
-            text_samples, self._gm_data_texts[_sb],
-            self.num_tokens, self.device)
       if text_samples is not None:
         if self.trainer.global_rank == 0 and hasattr(
           self.trainer.logger, 'log_table'):
           # Log the last generated samples
           text_samples = text_samples[
             : self.config.sampling.num_sample_log]
+          # Stable key + explicit `step`: a tracker turns repeated calls
+          # under one title into a step-indexed series, so baking the step
+          # into the title instead lands every validation as its own
+          # unrelated table.
           self.trainer.logger.log_table(
-            key=f'samples@global_step{self.global_step}',
+            key='val/samples',
             columns=['Generated Samples'],
-            data=[[s] for s in text_samples])
+            data=[[s] for s in text_samples],
+            step=self.global_step)
         if self.config.eval.compute_generative_perplexity:
-          # Held in locals so the Pareto curve below reuses these values
-          # instead of calling `compute()` again -- under DDP that is a
-          # collective, and it has to run on every rank or not at all.
-          gen_ppl = self.metrics.gen_ppl.compute()
-          sample_entropy = self.metrics.sample_entropy.compute()
           self.log('val/gen_ppl',
-                   gen_ppl,
+                   self.metrics.gen_ppl.compute(),
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)
           self.log('val/sample_entropy',
-                   sample_entropy,
+                   self.metrics.sample_entropy.compute(),
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)
-          self._log_pareto_curve(sample_entropy, gen_ppl)
-        # Mean entropy of the denoiser's own conditionals over the sampling
-        # trajectory (nats; see metrics.record_pred_entropy). Accumulated by
-        # the samplers above, so it is only defined for samplers that expose
-        # `p_x0` -- `analytic` and DUO's ancestral update do not.
-        if float(self.metrics.pred_entropy.weight) > 0:
-          self.log('val/pred_entropy',
-                   self.metrics.pred_entropy.compute(),
-                   on_epoch=True,
-                   on_step=False,
-                   sync_dist=True)
-        if self.metrics.gm is not None:
-          self.log('val/gm',
-                   torch.tensor(self.metrics.gm.compute(),
-                                device=self.device),
-                   on_epoch=True,
-                   on_step=False,
-                   sync_dist=True)
-    # How much of that diversity was the injected input noise? Independent of
-    # the block above (it generates its own, seed-controlled batches).
-    if ((self.config.eval.compute_perplexity_on_sanity
-         or not self.trainer.sanity_checking)
-        and self.config.eval.get('noise_diversity', False)):
-      diversity = self.noise_diversity_report(return_variants=True)
-      for name, value in diversity.metrics.items():
-        self.log(f'val/{name}',
-                 torch.tensor(value, device=self.device),
-                 on_epoch=True,
-                 on_step=False,
-                 sync_dist=True)
-      if (self.trainer.global_rank == 0
-          and hasattr(self.trainer.logger, 'log_table')):
-        # One row per noise draw, same decoding seed: the qualitative version
-        # of `noise_div/agree_noise`.
-        self.trainer.logger.log_table(
-          key=f'noise_variants@global_step{self.global_step}',
-          columns=['noise draw', 'sample'],
-          data=[[k, replicate[0]]
-                for k, replicate in enumerate(diversity.variants)])
+      # Before the Pareto sweep, which resets `self.metrics` per budget.
+      self._log_gradient_moment(gm_samples)
+    # Deliberately last: the sweep reuses `self.metrics` and resets it per
+    # budget, so it must not run before `val/gen_ppl` and `val/sample_entropy`
+    # above have been read off. `on_validation_epoch_start` resets again, so
+    # leaving it dirty here is harmless.
+    try:
+      self._log_owt_pareto()
+    except Exception as e:
+      # A diagnostic must never take the run down with it. The sweep samples at
+      # budgets the main loop never uses (2 steps, say), so it can fail where
+      # ordinary validation does not -- and it sits inside the validation of
+      # runs measured in days.
+      print(f'[owt-pareto] sweep failed, continuing: {e}', flush=True)
+    try:
+      self._log_owt_pareto_temperature()
+    except Exception as e:
+      print(f'[owt-pareto-temp] sweep failed, continuing: {e}', flush=True)
     self._train_mode()
 
-  def _log_pareto_curve(self, sample_entropy, gen_ppl):
-    """Extend the run's quality/diversity Pareto curve by one point.
+  def _generative_eval_active(self):
+    """Whether this validation should pay for the generative evaluation.
 
-    Called from `on_validation_epoch_end` right after `val/gen_ppl` and
-    `val/sample_entropy` go out, with the very same two numbers, so the curve
-    is refreshed on exactly the schedule those scalars are -- once per
-    validation, at the same global step. The point is appended to
-    `eval.pareto_path` (a JSONL under `checkpointing.save_dir`, so it survives
-    resuming), the whole history is re-read and re-rendered, and the image is
-    logged under `eval.pareto_image_key`, which makes it a step-indexed series
-    in the tracker: scrubbing it replays the run walking its trade-off.
+    Sampling, generative perplexity, Gradient Moment and both Pareto sweeps
+    cost minutes per validation; the held-out NLL costs seconds. So the
+    trainer's `val_check_interval` is really two cadences fused into one, and a
+    run that wants the expensive half often has to buy it everywhere.
 
-    Free in GPU terms -- both numbers are already computed. Rank zero only, and
-    never fatal: a tracker or plotting failure must not take a training run
-    down with it, so everything here is caught and reported.
+    These two knobs separate them. When the interesting part of a run is
+    already known -- which checkpoints matter, or which stretch of training --
+    restricting the expensive half to it is what makes a dense
+    `val_check_interval` affordable: an evaluation every 50 steps inside the
+    window, and none outside it.
+
+      * `eval.eval_step_range`: `[start, end]`, inclusive, in training steps.
+        Either bound may be null for an open end.
+      * `eval.eval_at_steps`: the exact steps to evaluate at. A step only fires
+        if a validation actually lands on it, i.e. entries have to be multiples
+        of `val_check_interval / accumulate_grad_batches`; ones that are not
+        are reported once rather than silently never firing.
+
+    Both read `self.global_step`, which counts OPTIMIZER steps -- one per
+    global batch, whatever `accumulate_grad_batches` and the device count make
+    that -- so they are in the same units as `trainer.max_steps`, as
+    `ModelCheckpoint.every_n_train_steps`, and as the x-axis of every metric
+    the run logs. They are NOT in micro-batches, which is what
+    `val_check_interval` counts.
+
+    Both are null by default and both being null is the old behaviour exactly.
+    Set together they must BOTH admit the step. Never applied outside `fit`:
+    `mode=ppl_eval` and friends run one validation at step 0, and a window
+    written for a training run would silently turn them into no-ops.
     """
-    if not self.config.eval.get('pareto_curve', False):
+    config = self.config.eval
+    window = config.get('eval_step_range', None)
+    at_steps = config.get('eval_at_steps', None)
+    if window is None and at_steps is None:
+      return True
+    state_fn = getattr(getattr(self.trainer, 'state', None), 'fn', None)
+    if str(getattr(state_fn, 'value', state_fn)) != 'fit':
+      return True
+
+    step = int(self.global_step)
+    reason = None
+    if window is not None:
+      window = list(window)
+      assert len(window) == 2, (
+        f'eval.eval_step_range must be [start, end], got {window!r}')
+      start, end = window
+      if start is not None and step < int(start):
+        reason = f'step {step} is before eval.eval_step_range start {start}'
+      elif end is not None and step > int(end):
+        reason = f'step {step} is past eval.eval_step_range end {end}'
+    if reason is None and at_steps is not None:
+      wanted = sorted({int(s) for s in at_steps})
+      self._warn_unreachable_eval_steps(wanted)
+      if step not in wanted:
+        reason = f'step {step} is not in eval.eval_at_steps'
+    if reason is None:
+      return True
+    if self.trainer.global_rank == 0:
+      print(f'[eval-window] skipping generative eval: {reason}', flush=True)
+    return False
+
+  def _warn_unreachable_eval_steps(self, wanted):
+    """Say so, once, when an `eval.eval_at_steps` entry can never fire.
+
+    Validation only lands on some steps, so a step that is not one of them is
+    never a step this method is called at -- and the failure mode is silence,
+    which reads exactly like "the sweep is broken".
+
+    Which steps those are needs one conversion. `eval_at_steps` is in
+    `global_step`, i.e. OPTIMIZER steps -- one per global batch, the same axis
+    as `trainer.max_steps` and as every logged metric. `val_check_interval` is
+    not: Lightning compares it against `batch_idx`, which counts MICRO-batches
+    (`_should_check_val_fx`). The two coincide only at
+    `accumulate_grad_batches=1`; at 2, `val_check_interval=250` is a validation
+    every 125 optimizer steps.
+    """
+    if getattr(self, '_eval_at_steps_checked', False):
       return
-    if self.trainer.global_rank != 0 or self.trainer.sanity_checking:
+    self._eval_at_steps_checked = True
+    interval = getattr(self.trainer, 'val_check_interval', None)
+    # A float is a fraction of an epoch, which says nothing about which steps
+    # validation lands on; only the integer form is checkable.
+    if not isinstance(interval, int) or interval <= 0:
+      return
+    accum = int(getattr(self.trainer, 'accumulate_grad_batches', 1) or 1)
+    if accum > 1 and interval % accum:
+      # Validation then lands on optimizer steps that are not evenly spaced,
+      # and guessing which would be worse than saying nothing.
+      return
+    cadence = max(1, interval // max(1, accum))
+    stranded = [s for s in wanted if s % cadence]
+    if stranded and self.trainer.global_rank == 0:
+      print(f'[eval-window] eval.eval_at_steps {stranded} are not multiples '
+            f'of the validation cadence ({cadence} optimizer steps = '
+            f'val_check_interval {interval} / accumulate_grad_batches {accum})'
+            ' and will never fire', flush=True)
+
+  def _collect_gm_reference(self, batch):
+    """Keep a capped sample of real validation text for Gradient Moment.
+
+    Decoding is not free, so this stops as soon as `gm_eval_samples` rows are
+    held and does nothing at all when the metric is off.
+    """
+    if (not metrics.GRADIENT_MOMENT_ENABLED
+        or not self.config.eval.get('owt_gm', False)):
+      return
+    # The rows only feed Gradient Moment, which the window may have switched
+    # off for this validation; decoding them anyway would be pure waste.
+    if not getattr(self, '_gen_eval_active', True):
+      return
+    wanted = int(self.config.eval.get('gm_eval_samples', 64))
+    held = getattr(self, '_gm_ref_texts', None)
+    if held is None:
+      self._gm_ref_texts = held = []
+    if len(held) >= wanted:
+      return
+    ids = batch['input_ids'][: wanted - len(held)]
+    held.extend(self.tokenizer.batch_decode(ids))
+
+  def _log_gradient_moment(self, sample_texts):
+    """Score the samples against real data by Gradient Moment, and log it.
+
+    Kept separate from generative perplexity because it answers the question
+    perplexity cannot: gen_ppl rewards text the reference LM finds predictable,
+    which a collapsing model produces *more* of, so it can improve while the
+    model degrades. GM compares gradients against real data, so collapse moves
+    it the right way.
+    """
+    if (not metrics.GRADIENT_MOMENT_ENABLED
+        or not self.config.eval.get('owt_gm', False)):
+      return
+    refs = getattr(self, '_gm_ref_texts', None) or []
+    if not sample_texts or not refs:
+      print('[gm] no samples or no reference rows, skipping', flush=True)
       return
     try:
-      path = self.config.eval.get('pareto_path', None)
-      pareto_curve.append(
-        path,
-        step=self.global_step,
-        sample_entropy=float(sample_entropy),
-        gen_ppl=float(gen_ppl))
-      if not hasattr(self.trainer.logger, 'log_image'):
-        return
-      image = pareto_curve.render_history(
-        path, label=getattr(self.trainer.logger, 'name', None) or 'this run')
-      self.trainer.logger.log_image(
-        key=self.config.eval.get('pareto_image_key', 'val/pareto'),
-        image=image,
+      results = self.metrics.record_gradient_moment(
+        sample_texts, refs, max_length=self.num_tokens,
+        batch_size=int(self.config.eval.get('gm_eval_batch_size', 4)),
+        device=self.device)
+    except Exception as e:
+      # A diagnostic must not take down a run measured in days.
+      print(f'[gm] failed, continuing: {e}', flush=True)
+      return
+    if results is None:
+      return
+    print(f"[gm] step {self.global_step}: centered {results['centered_gm']:+.4e} "
+          f"(n_pairs={results['n_pairs']})", flush=True)
+    for key, name in (('centered_gm', 'val/gm'),
+                      ('uncentered_gm_samples', 'val/gm_uncentered_samples'),
+                      ('uncentered_gm_data', 'val/gm_uncentered_data')):
+      self.log(name, torch.tensor(float(results[key]), device=self.device),
+               on_epoch=True, on_step=False, sync_dist=False,
+               rank_zero_only=True)
+
+  def _log_owt_pareto(self):
+    """Sample at several step budgets and record the fluency/diversity curve.
+
+    One denoising-step count gives one (entropy, perplexity) point; the set of
+    them is the frontier this checkpoint sits on. Opt-in via
+    `eval.owt_pareto_steps`, because the sweep costs the sum of its budgets in
+    extra sampling -- [2,4,8,16,32,64] is 126 forward passes per batch on top of
+    the validation that already ran.
+    """
+    config = self.config.eval
+    budgets = config.get('owt_pareto_steps', None)
+    if not budgets or self.trainer.sanity_checking:
+      return
+    every = int(config.get('owt_pareto_every_n_validations', 1) or 1)
+    self._owt_pareto_count = getattr(self, '_owt_pareto_count', 0) + 1
+    if (self._owt_pareto_count - 1) % every:
+      return
+    if not self.config.eval.compute_generative_perplexity:
+      print('[owt-pareto] skipped: needs eval.compute_generative_perplexity',
+            flush=True)
+      return
+
+    budgets = sorted({int(b) for b in budgets})
+    num_batches = int(config.get('owt_pareto_num_batches', 0) or
+                      self.config.sampling.num_sample_batches)
+    seeds = max(1, int(config.get('owt_pareto_seeds', 1) or 1))
+
+    # Repeats are *seeded*, not merely repeated. Averaging more samples would
+    # shrink the error bars either way, but fixing the seeds also makes every
+    # checkpoint draw the SAME noise, which turns the frontier's movement
+    # between checkpoints into a paired comparison: a shift then reflects the
+    # model changing rather than one validation getting luckier draws. That
+    # matters more than the raw variance here, since the question the plot
+    # answers is which direction the frontier is moving.
+    #
+    # The seed carries the rank, so data-parallel ranks still draw different
+    # samples -- seeding them identically would make the extra ranks redundant
+    # rather than additional evidence.
+    base_seed = int(getattr(self.config, 'seed', 0) or 0)
+    rank = self.trainer.global_rank
+
+    # Sampling here must not perturb the training RNG stream, or enabling the
+    # sweep would silently change the trajectory of the run it is measuring.
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = (torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available() else None)
+    try:
+      # Gradient Moment per budget, when it is on and there is real text to
+      # compare against. Worth the cost precisely here: gen_ppl is the frontier
+      # axis most vulnerable to collapse -- a degenerate sampler scores *better*
+      # on it -- and GM is the one number in this sweep that moves the right way
+      # when that happens. Cheap budgets are where collapse shows up first.
+      gm_on = (metrics.GRADIENT_MOMENT_ENABLED
+               and bool(self.config.eval.get('owt_gm', False)))
+      gm_refs = getattr(self, '_gm_ref_texts', None) or []
+      if gm_on and not gm_refs:
+        print('[owt-pareto] GM requested but no reference rows; '
+              'skipping GM per budget', flush=True)
+      curve = []
+      for budget in budgets:
+        entropies, perplexities, moments = [], [], []
+        for repeat in range(seeds):
+          if seeds > 1:
+            # 9973 is prime, so budgets and repeats cannot collide onto a
+            # shared seed the way `base + repeat + budget` would.
+            torch.manual_seed(base_seed + 9973 * (repeat + 1) + rank)
+          # Fresh accumulators per repeat: torchmetrics aggregate until reset,
+          # so without this each point would carry the previous budgets' and
+          # repeats' samples too and the curve would flatten into a running
+          # average.
+          self.metrics.reset()
+          texts = []
+          for _ in range(num_batches):
+            samples = self.generate_samples(
+              num_samples=self.config.loader.eval_batch_size,
+              num_steps=budget)
+            self.metrics.record_entropy(samples)
+            decoded = self.tokenizer.batch_decode(samples)
+            if gm_on and gm_refs:
+              texts.extend(decoded)
+            self.metrics.record_generative_perplexity(
+              decoded, self.num_tokens, self.device)
+          entropies.append(float(self.metrics.sample_entropy.compute()))
+          perplexities.append(float(self.metrics.gen_ppl.compute()))
+          if gm_on and gm_refs:
+            # Scored per seed rather than on the pooled samples, so GM is
+            # averaged the same way entropy and perplexity are and its spread
+            # means the same thing as theirs.
+            try:
+              gm = self.metrics.record_gradient_moment(
+                texts, gm_refs, max_length=self.num_tokens,
+                batch_size=int(self.config.eval.get('gm_eval_batch_size', 4)),
+                device=self.device)
+            except Exception as e:
+              print(f'[owt-pareto] GM failed at budget {budget}: {e}',
+                    flush=True)
+              gm = None
+            if gm is not None:
+              moments.append(float(gm['centered_gm']))
+        point = {'steps': budget,
+                 'entropy': _mean(entropies),
+                 'gen_ppl': _mean(perplexities),
+                 'entropy_std': _std(entropies),
+                 'gen_ppl_std': _std(perplexities),
+                 'seeds': seeds}
+        if moments:
+          point['gm'] = _mean(moments)
+          point['gm_std'] = _std(moments)
+        curve.append(point)
+        spread = ('' if seeds < 2 else
+                  f" +/- {point['gen_ppl_std']:.2f} / "
+                  f"{point['entropy_std']:.4f} over {seeds} seeds")
+        gm_txt = '' if 'gm' not in point else f" gm {point['gm']:+.4e}"
+        print(f"[owt-pareto] step {self.global_step} budget {budget}: "
+              f"gen_ppl {point['gen_ppl']:.2f} entropy {point['entropy']:.4f}"
+              f"{gm_txt}{spread}", flush=True)
+    finally:
+      torch.set_rng_state(cpu_rng)
+      if cuda_rng is not None:
+        torch.cuda.set_rng_state_all(cuda_rng)
+    self._publish_owt_pareto(curve)
+
+  def _publish_owt_pareto(self, curve):
+    """Log one checkpoint's frontier: scalar series, trends, and the figure."""
+    def _scalar(name, value):
+      self.log(name, torch.tensor(float(value), device=self.device),
+               on_epoch=True, on_step=False, sync_dist=False,
+               rank_zero_only=True)
+
+    for point in curve:
+      # Per-budget trends against the *training* step, so each budget also reads
+      # as an ordinary curve over the run.
+      tag = f"{point['steps']:g}"
+      _scalar(f'val/gen_ppl_s{tag}', point['gen_ppl'])
+      _scalar(f'val/entropy_s{tag}', point['entropy'])
+      # The spread across seeds, as its own series. The figure already draws it
+      # as error bars, but those cannot be read off a tracker's scalar view --
+      # and the spread is what decides whether a move in the mean is real. It
+      # is also worth watching in its own right: a spread that grows over
+      # training says the sampler is becoming erratic, which the mean hides.
+      #
+      # Logged only when several seeds actually ran. At one seed `_std` is
+      # identically 0, and a flat zero line invites being read as "no
+      # variance measured" rather than "variance not measured". Since
+      # `owt_pareto_seeds` is fixed for a run, the set of series stays stable
+      # within it rather than appearing and vanishing between validations.
+      if int(point.get('seeds', 1)) > 1:
+        _scalar(f'val/gen_ppl_s{tag}_std', point.get('gen_ppl_std', 0.0))
+        _scalar(f'val/entropy_s{tag}_std', point.get('entropy_std', 0.0))
+      if 'gm' in point:
+        _scalar(f'val/gm_s{tag}', point['gm'])
+        if int(point.get('seeds', 1)) > 1:
+          _scalar(f'val/gm_s{tag}_std', point.get('gm_std', 0.0))
+
+    if self.trainer.global_rank != 0:
+      return
+    logger = self.trainer.logger
+    if logger is None:
+      return
+    # The frontier itself, as a series whose x-axis is sample entropy rather
+    # than the training step -- the same pair of axes the figure draws, so the
+    # native scalar graph and `pareto/frontier` tell the same story. `self.log`
+    # cannot express that (it always stamps the trainer's step), so go through
+    # the logger's own `log_metrics`, which passes `step` straight through. One
+    # series per checkpoint, since a single graph cannot hold two curves.
+    #
+    # The tracker indexes points by an integer step, and entropy is a float
+    # around 5, so it is carried at fixed scale: an x of 5062 means entropy
+    # 5.062. Three decimals separates budgets that sit ~0.05 apart with room to
+    # spare, and keeps the axis monotone in entropy.
+    series = f'pareto/owt_step_{self.global_step}'
+    for point in curve:
+      try:
+        logger.log_metrics({series: point['gen_ppl']},
+                           step=int(round(point['entropy']
+                                          * _ENTROPY_X_SCALE)))
+      except Exception as e:  # pragma: no cover - tracker best-effort
+        print(f'[owt-pareto] scalar log failed: {e}', flush=True)
+        break
+
+    history_path = os.path.join(self.config.checkpointing.save_dir,
+                                'owt_pareto_history.json')
+    run_uid = getattr(logger, 'version', '') or ''
+    if getattr(self, '_owt_pareto_history', None) is None:
+      # A *resumed* run resumes the same tracker run, so the figure has to pick
+      # up the curves the earlier process drew. A fresh run reusing the same
+      # save_dir must not -- it would graft the previous run's frontiers onto
+      # this one's plot. The run uid tells the two cases apart.
+      self._owt_pareto_history = {}
+      if os.path.exists(history_path):
+        try:
+          with open(history_path) as f:
+            stored = json.load(f)
+          if stored.get('run_uid') == run_uid:
+            self._owt_pareto_history = {int(k): v
+                                        for k, v in stored['curves'].items()}
+          else:
+            print('[owt-pareto] ignoring history from a different run '
+                  f"({stored.get('run_uid')!r} != {run_uid!r})", flush=True)
+        except Exception as e:  # pragma: no cover
+          print(f'[owt-pareto] history read failed: {e}', flush=True)
+    self._owt_pareto_history[int(self.global_step)] = curve
+    try:
+      os.makedirs(self.config.checkpointing.save_dir, exist_ok=True)
+      with open(history_path, 'w') as f:
+        json.dump({'run_uid': run_uid, 'curves': self._owt_pareto_history},
+                  f, indent=2)
+    except Exception as e:  # pragma: no cover
+      print(f'[owt-pareto] history write failed: {e}', flush=True)
+
+    if not hasattr(logger, 'log_image'):
+      return
+    try:
+      import owt_pareto_plot
+      image = owt_pareto_plot.render(
+        self._owt_pareto_history,
+        reference=owt_pareto_plot.load_reference(
+          self.config.eval.get('owt_pareto_reference', None)))
+      logger.log_image('pareto/frontier', image, step=self.global_step)
+    except Exception as e:  # pragma: no cover - plotting is best-effort
+      print(f'[owt-pareto] figure failed: {e}', flush=True)
+
+  def _log_owt_pareto_temperature(self):
+    """Sweep the sampler's temperature at this checkpoint.
+
+    `_log_owt_pareto` varies the CHECKPOINT at a fixed sampler and answers "is
+    the frontier moving the right way". This varies the SAMPLER at a fixed
+    checkpoint, and having both is what lets a move be attributed: a frontier
+    that drops may only mean the model got sharper, and the tell is whether the
+    new point sits below the checkpoint's own temperature curve or merely
+    somewhere along it. The budget sweep cannot answer that at any number of
+    checkpoints, because it never draws the curve the point would sit on.
+
+    Off unless `eval.owt_pareto_temp_every_n_validations` is set, and it should
+    stay off for most runs: the cost is `len(eval.pareto_temperatures)` times
+    the budget sweep this runs on top of -- 5 x 126 forward passes per batch for
+    the documented budget list, which is not a diagnostic to run every
+    validation. The temperatures themselves come from `eval.pareto_temperatures`
+    rather than a knob of their own, so a sweep is configured the same way here
+    and in `mode=pareto_eval`.
+    """
+    config = self.config.eval
+    every = int(config.get('owt_pareto_temp_every_n_validations', 0) or 0)
+    temperatures = config.get('pareto_temperatures', None)
+    budgets = config.get('owt_pareto_steps', None)
+    if not every or not temperatures or not budgets:
+      return
+    if self.trainer.sanity_checking:
+      return
+    # Its own counter, not the budget sweep's: the two cadences are set
+    # independently and sharing a counter would couple them.
+    self._owt_pareto_temp_count = getattr(
+      self, '_owt_pareto_temp_count', 0) + 1
+    if (self._owt_pareto_temp_count - 1) % every:
+      return
+    if not config.compute_generative_perplexity:
+      print('[owt-pareto-temp] skipped: needs '
+            'eval.compute_generative_perplexity', flush=True)
+      return
+
+    # `sweep` SPLITS its sample count across ranks; `_log_owt_pareto` has every
+    # rank draw `num_batches` and pools them. Scaling by the world size is what
+    # makes the two protocols agree, so the T=1 point measured here is the same
+    # measurement as the budget sweep's point at that budget rather than a
+    # smaller one that merely sits near it.
+    world_size = max(1, int(getattr(self.trainer, 'world_size', 1) or 1))
+    num_batches = int(config.get('owt_pareto_num_batches', 0) or
+                      self.config.sampling.num_sample_batches) * world_size
+    seeds = max(1, int(config.get('owt_pareto_seeds', 1) or 1))
+
+    # Sampling here must not perturb the training RNG stream, or enabling the
+    # sweep would silently change the trajectory of the run it is measuring.
+    # `sweep` seeds per (repeat, budget, rank) and never per checkpoint, so
+    # every validation draws the SAME noise -- which is what makes the movement
+    # across checkpoints a paired comparison rather than a lucky draw.
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = (torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available() else None)
+    try:
+      import pareto_temperature
+      curves, _ = pareto_temperature.sweep(
+        self,
+        temperatures=list(temperatures),
+        budgets=sorted({int(b) for b in budgets}),
+        seeds=seeds,
+        num_batches=num_batches,
+        batch_size=self.config.loader.eval_batch_size,
+        max_length=self.num_tokens,
+        # No text kept: the training tracker already carries samples from
+        # ordinary validation, and a table per validation would bury them.
+        keep_samples=0)
+    finally:
+      torch.set_rng_state(cpu_rng)
+      if cuda_rng is not None:
+        torch.cuda.set_rng_state_all(cuda_rng)
+    self._publish_owt_pareto_temperature(curves)
+
+  def _publish_owt_pareto_temperature(self, curves):
+    """Log this checkpoint's temperature fan, and its history over the run.
+
+    Two figures, because the sweep has three dimensions and no single axes holds
+    them: `pareto/temperature_frontier` is this checkpoint alone, one curve per
+    budget, and `pareto/temperature_by_checkpoint` is one panel per budget with
+    one line per checkpoint, which is where the run's progress actually reads.
+    """
+    def _scalar(name, value):
+      self.log(name, torch.tensor(float(value), device=self.device),
+               on_epoch=True, on_step=False, sync_dist=False,
+               rank_zero_only=True)
+
+    # One series per (budget, temperature) against the TRAINING step. The
+    # eval-mode sweep indexes the same numbers by temperature instead, which
+    # cannot work here: every validation would write the same handful of x
+    # values, and the graph would be a pile of overwrites rather than a trend.
+    for temperature, curve in curves.items():
+      for point in curve:
+        tag = f"s{point['steps']:g}_t{float(temperature):g}"
+        _scalar(f'val/gen_ppl_{tag}', point['gen_ppl'])
+        _scalar(f'val/entropy_{tag}', point['entropy'])
+
+    if self.trainer.global_rank != 0:
+      return
+    logger = self.trainer.logger
+    if logger is None:
+      return
+
+    history_path = os.path.join(self.config.checkpointing.save_dir,
+                                'owt_pareto_temp_history.json')
+    run_uid = getattr(logger, 'version', '') or ''
+    if getattr(self, '_owt_pareto_temp_history', None) is None:
+      # Same rule as the budget sweep's history: a RESUMED run continues the
+      # same tracker run and must pick up the curves the earlier process drew,
+      # while a fresh run reusing the save_dir must not graft them onto its own
+      # figure. The run uid is what tells the two apart.
+      self._owt_pareto_temp_history = {}
+      if os.path.exists(history_path):
+        try:
+          with open(history_path) as f:
+            stored = json.load(f)
+          if stored.get('run_uid') == run_uid:
+            self._owt_pareto_temp_history = {
+              int(k): v for k, v in stored['curves'].items()}
+          else:
+            print('[owt-pareto-temp] ignoring history from a different run '
+                  f"({stored.get('run_uid')!r} != {run_uid!r})", flush=True)
+        except Exception as e:  # pragma: no cover
+          print(f'[owt-pareto-temp] history read failed: {e}', flush=True)
+    # Keyed by `%g`, because JSON keys are strings and `str(0.7000000001)` is
+    # not a temperature anyone set. `_by_budget` parses the key back either way.
+    self._owt_pareto_temp_history[int(self.global_step)] = {
+      f'{float(t):g}': curve for t, curve in curves.items()}
+    try:
+      os.makedirs(self.config.checkpointing.save_dir, exist_ok=True)
+      with open(history_path, 'w') as f:
+        json.dump({'run_uid': run_uid,
+                   'curves': self._owt_pareto_temp_history}, f, indent=2)
+    except Exception as e:  # pragma: no cover
+      print(f'[owt-pareto-temp] history write failed: {e}', flush=True)
+
+    # Everything below publishes the sweep as *numbers* as well as pictures.
+    # `pareto/temperature_frontier` is an image, and an image cannot answer
+    # "what was gen_ppl at T=0.9, 16 steps, at training step 3000" -- it has to
+    # be read off a pixel. The per-(budget, temperature) scalars above answer
+    # that one series at a time; these two answer it in a form that parses.
+    by_budget = collections.defaultdict(list)
+    for temperature, curve in curves.items():
+      for point in curve:
+        by_budget[int(point['steps'])].append(
+          dict(point, temperature=float(temperature)))
+
+    # The frontier itself, as scalars, exactly as `_publish_owt_pareto` logs
+    # the budget frontier: x is entropy at fixed scale (5062 means 5.062), y is
+    # gen_ppl, one series per budget per checkpoint. `self.log` cannot express
+    # it -- it always stamps the trainer's step -- so this goes through the
+    # logger's own `log_metrics`, which passes `step` straight through. Named
+    # per checkpoint because a single series cannot hold two curves: reusing
+    # one would have every validation overwrite the same handful of x values.
+    for budget, points in sorted(by_budget.items()):
+      series = f'pareto/temp_step_{self.global_step}_s{budget}'
+      for point in sorted(points, key=lambda p: p['entropy']):
+        try:
+          logger.log_metrics({series: point['gen_ppl']},
+                             step=int(round(point['entropy']
+                                            * _ENTROPY_X_SCALE)))
+        except Exception as e:  # pragma: no cover - tracker best-effort
+          print(f'[owt-pareto-temp] frontier log failed: {e}', flush=True)
+          break
+
+    # And the whole sweep as one table per validation: the exact values at
+    # full precision, including the spreads and the seed count that the scalar
+    # series drop, in a single place that a script can pull down and parse.
+    # Stable key + explicit `step`, so the tracker keeps them as one
+    # step-indexed series rather than a pile of unrelated tables.
+    if hasattr(logger, 'log_table'):
+      rows = []
+      for temperature, curve in sorted(curves.items(),
+                                       key=lambda kv: float(kv[0])):
+        for point in sorted(curve, key=lambda p: int(p['steps'])):
+          rows.append([int(self.global_step), float(temperature),
+                       int(point['steps']), float(point['entropy']),
+                       float(point['gen_ppl']),
+                       float(point.get('entropy_std', 0.0)),
+                       float(point.get('gen_ppl_std', 0.0)),
+                       int(point.get('seeds', 1))])
+      try:
+        logger.log_table(
+          key='pareto/temperature_values',
+          columns=['train_step', 'temperature', 'steps', 'entropy',
+                   'gen_ppl', 'entropy_std', 'gen_ppl_std', 'seeds'],
+          data=rows, step=self.global_step)
+      except Exception as e:  # pragma: no cover - tracker best-effort
+        print(f'[owt-pareto-temp] value table failed: {e}', flush=True)
+
+    if not hasattr(logger, 'log_image'):
+      return
+    try:
+      import owt_pareto_plot
+      reference = owt_pareto_plot.load_reference(
+        self.config.eval.get('owt_pareto_reference', None))
+      logger.log_image(
+        'pareto/temperature_frontier',
+        owt_pareto_plot.render_temperature(
+          curves, reference=reference,
+          subtitle=f'training step {self.global_step}'),
         step=self.global_step)
-    except Exception as e:  # pragma: no cover - diagnostics are best-effort
-      print('[pareto] curve update failed: {}'.format(e), flush=True)
+      history = sorted(self._owt_pareto_temp_history.items())
+      # One checkpoint is not a progression, and the grid would say nothing the
+      # fan above has not already said.
+      if len(history) > 1:
+        logger.log_image(
+          'pareto/temperature_by_checkpoint',
+          owt_pareto_plot.render_checkpoints(
+            [{'short': f'{step / 1000:g}k',
+              'label': f'training step {step}',
+              'curves': stored} for step, stored in history],
+            reference=reference,
+            title='Fluency vs diversity: temperature at each checkpoint'),
+          step=self.global_step)
+    except Exception as e:  # pragma: no cover - plotting is best-effort
+      print(f'[owt-pareto-temp] figure failed: {e}', flush=True)
 
   def configure_optimizers(self):
     optimizer = torch.optim.AdamW(
@@ -567,170 +1079,6 @@ class TrainerBase(L.LightningModule):
       eps=eps)
     self._train_mode()
     return samples
-
-  # --- Input-noise diversity probe -------------------------------------
-
-  @property
-  def has_noise_conditioning(self):
-    """Whether the backbone injects input noise (`noise_dim > 0`)."""
-    return hasattr(self.backbone, 'noise_stream')
-
-  @contextlib.contextmanager
-  def _noise_stream(self, seed):
-    """Pin the backbone's *input-noise* draws to a private RNG seeded with
-    `seed`. A no-op for backbones without noise conditioning, so the probe
-    below still runs there -- and correctly reports that varying the noise
-    changes nothing."""
-    stream = getattr(self.backbone, 'noise_stream', None)
-    if stream is None:
-      yield
-    else:
-      with stream(seed):
-        yield
-
-  @torch.no_grad()
-  def _sample_with_seeds(self, num_samples, decode_seed, noise_seed,
-                         num_steps=None):
-    """One batch of samples with *both* randomness sources pinned: the global
-    RNG (the sampler's categorical / Gumbel draws) to `decode_seed`, and the
-    injected input noise to `noise_seed`."""
-    torch.manual_seed(decode_seed)
-    if torch.cuda.is_available():
-      torch.cuda.manual_seed_all(decode_seed)
-    with self._noise_stream(noise_seed):
-      return self.generate_samples(num_samples=num_samples,
-                                   num_steps=num_steps)
-
-  @torch.no_grad()
-  def noise_diversity_report(self, num_samples=None, num_noises=None,
-                             num_steps=None, seed=None,
-                             decode_control=None, return_variants=False):
-    """How much of the model's sample diversity comes from the *input noise*?
-
-    A masked-diffusion generator has two sources of randomness: the sampler's
-    own categorical draws, and -- when `adversarial_distill.noise_dim > 0` --
-    the Gaussian noise injected into the embedding residual (D-MMD Sec. 6.5),
-    which exists precisely so the generator can stay diverse under a
-    moment-matching objective instead of collapsing. This probe separates the
-    two by generating the same batch several times with one source replayed
-    and the other varied:
-
-    * **noise arm** -- `num_noises` batches sharing one decoding seed, each
-      with a different noise seed. Matched rows differ *only* because of the
-      noise, so `agree_noise` (their mean positional token agreement) is 1.0
-      exactly when the noise channel is unused and falls as it starts to
-      matter.
-    * **decode arm** (control, `decode_control`) -- the mirror image:
-      `num_noises` batches sharing one noise seed with different decoding
-      seeds. `agree_decode` says how much diversity the sampler contributes on
-      its own. With `sampling.temperature=0` and the confidence predictor
-      decoding is deterministic, so this is 1.0 and *all* diversity is noise.
-    * **floor** -- different rows of one batch are fully independent samples,
-      and `agree_indep` is what their agreement happens to be (nonzero: two
-      unrelated texts share ' the', ',', ...). Both arms are reported against
-      it as `sensitivity = (1 - agree) / (1 - agree_indep)`: 0 => that source
-      contributes nothing, 1 => varying it alone decorrelates samples as much
-      as drawing an unrelated sample does.
-    * **replay check** -- one extra batch with *both* seeds equal to the noise
-      arm's first replicate. `agree_replay` must be ~1.0; anything lower means
-      generation is not bit-reproducible on this device and the other numbers
-      are correspondingly blurred, not evidence about the noise.
-
-    Also reported: `distinct_per_pos`, the mean number of distinct tokens a
-    position takes across the noise arm (1.0 .. `num_noises`), and
-    `uniq_seq_frac`, the fraction of a row's noise replicates that are
-    distinct sequences (`1/num_noises` .. 1.0) -- the coarse, readable version
-    of the same question.
-
-    Replaying a stream is exact for the ancestral predictors: they draw once
-    per step from the global RNG no matter what the noise did, so the noise
-    arm's decoding draws line up step for step. Two predictors can let a
-    replayed stream drift, which is worth knowing before reading a borderline
-    number: the confidence predictor takes a data-dependent number of steps,
-    so at `sampling.temperature > 0` the noise arm's Gumbel draws can
-    desynchronise, and `ancestral_cache` skips the denoiser call on a step
-    that reveals nothing, so the decode arm's *noise* draws can. Drift blurs
-    an arm towards the floor -- it inflates the measured contribution rather
-    than hiding one.
-
-    Costs `2 * num_noises + 1` sampling batches (`num_noises + 2` without the
-    control). The global RNG state is saved and restored, so calling this
-    during validation does not perturb the training stream.
-    """
-    eval_config = self.config.eval
-    if num_samples is None:
-      num_samples = (eval_config.get('noise_diversity_num_samples', None)
-                     or self.config.loader.eval_batch_size)
-    if num_noises is None:
-      num_noises = int(eval_config.get('noise_diversity_num_noises', 4))
-    if decode_control is None:
-      decode_control = bool(
-        eval_config.get('noise_diversity_decode_control', True))
-    if seed is None:
-      seed = int(eval_config.get('noise_diversity_seed', 0))
-    assert num_noises >= 2, (
-      f'eval.noise_diversity_num_noises must be >= 2 to compare noise '
-      f'draws against each other, got {num_noises}.')
-    # Each rank probes a different set of seeds, so the DDP-averaged numbers
-    # cover more draws instead of recomputing the same ones.
-    seed = int(seed) + 100003 * self.global_rank
-
-    # Validation runs inside inference mode by default, where a captured RNG
-    # state would itself be an inference tensor; take/restore it outside.
-    with torch.inference_mode(False):
-      cpu_rng_state = torch.random.get_rng_state().clone()
-      cuda_rng_states = (torch.cuda.get_rng_state_all()
-                         if torch.cuda.is_available() else None)
-    try:
-      # Same decoding seed everywhere, one noise seed per replicate.
-      noise_arm = torch.stack([
-        self._sample_with_seeds(
-          num_samples, decode_seed=seed, noise_seed=seed + 1 + k,
-          num_steps=num_steps)
-        for k in range(num_noises)])
-      # Both seeds repeated: must reproduce `noise_arm[0]` token for token.
-      replay = self._sample_with_seeds(
-        num_samples, decode_seed=seed, noise_seed=seed + 1,
-        num_steps=num_steps)
-      decode_arm = None
-      if decode_control:
-        # Mirror image: one noise seed, a different decoding seed each time.
-        decode_arm = torch.stack([
-          self._sample_with_seeds(
-            num_samples, decode_seed=seed + 1 + k, noise_seed=seed + 1,
-            num_steps=num_steps)
-          for k in range(num_noises)])
-    finally:
-      with torch.inference_mode(False):
-        torch.random.set_rng_state(cpu_rng_state)
-        if cuda_rng_states is not None:
-          torch.cuda.set_rng_state_all(cuda_rng_states)
-
-    agree_noise = _matched_agreement(noise_arm)
-    agree_indep = _independent_agreement(noise_arm)
-    report = {
-      'noise_div/agree_noise': agree_noise,
-      'noise_div/agree_replay': (replay == noise_arm[0]).float().mean().item(),
-      'noise_div/distinct_per_pos': _distinct_per_position(noise_arm),
-      'noise_div/uniq_seq_frac': _unique_sequence_frac(noise_arm),
-      'noise_div/num_noises': float(num_noises)}
-    # A single-row batch has no independent pair to normalise against; the raw
-    # agreements are still meaningful, the ratios are simply unavailable.
-    span = None if agree_indep is None else max(1.0 - agree_indep, 1e-8)
-    if span is not None:
-      report['noise_div/agree_indep'] = agree_indep
-      report['noise_div/sensitivity'] = (1.0 - agree_noise) / span
-    if decode_arm is not None:
-      agree_decode = _matched_agreement(decode_arm)
-      report['noise_div/agree_decode'] = agree_decode
-      if span is not None:
-        report['noise_div/decode_sensitivity'] = (1.0 - agree_decode) / span
-
-    variants = None
-    if return_variants:
-      variants = [self.tokenizer.batch_decode(replicate)
-                  for replicate in noise_arm]
-    return NoiseDiversity(metrics=report, variants=variants)
 
   def _process_model_input(self, x0, valid_tokens):
     raise NotImplementedError
@@ -843,7 +1191,7 @@ class Diffusion(TrainerBase):
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
 
-    xt = self._layout_q_xt(x0, alpha_t, valid_tokens=valid_tokens)
+    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
     log_x_theta = self.forward(xt, sigma=sigma)
     utils.print_nans(log_x_theta, 'model_output')
     return self.nll_per_token(
@@ -867,18 +1215,6 @@ class Diffusion(TrainerBase):
   def _ancestral_update(self, x, t, dt, p_x0, noise_removal_step):
     raise NotImplementedError
 
-  def _remask_update(self, x, t, dt, noise_removal_step=False):
-    raise NotImplementedError(
-      'Remasking (consistency-style) sampling is only defined for '
-      'absorbing-state (masked) diffusion; set sampling.predictor to '
-      'a sampler supported by this algo.')
-
-  def _confidence_sampler(self, num_samples, num_steps, eps):
-    raise NotImplementedError(
-      'Confidence sampling is only defined for absorbing-state '
-      '(masked) diffusion; set sampling.predictor to a sampler '
-      'supported by this algo.')
-
   @torch.no_grad()
   def generate_samples(self, num_samples, num_steps=None,
                        eps=1e-5):
@@ -886,9 +1222,6 @@ class Diffusion(TrainerBase):
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
-    if self.sampler == 'confidence':
-      return self._confidence_sampler(
-        num_samples, num_steps=num_steps, eps=eps)
     x = self.prior_sample(num_samples, self.num_tokens)
     timesteps = torch.linspace(
       1, eps, num_steps + 1, device=self.device)
@@ -899,30 +1232,15 @@ class Diffusion(TrainerBase):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ancestral':
-        p_x0, x_next = self._ancestral_update(
+        _, x = self._ancestral_update(
           x=x, t=t, dt=dt, p_x0=None)
-        self._record_pred_entropy(p_x0, x)
-        x = x_next
       elif self.sampler == 'ancestral_cache':
-        # Only a cache miss actually runs the denoiser; on a hit `p_x0` is
-        # last step's distribution and folding it in again would just
-        # reweight the average by how long each call happened to be reused.
-        is_fresh = p_x0_cache is None
         p_x0_cache, x_next = self._ancestral_update(
           x=x, t=t, dt=dt, p_x0=p_x0_cache)
-        if is_fresh:
-          self._record_pred_entropy(p_x0_cache, x)
         if (not torch.allclose(x_next, x)
             or self.time_conditioning):
           # Disable caching
           p_x0_cache = None
-        x = x_next
-      elif self.sampler == 'remask':
-        # No caching here: this update rewrites *every* position, so `x`
-        # changes on essentially every step and a cached `p_x0` would be
-        # conditioned on a latent that no longer exists.
-        p_x0, x_next = self._remask_update(x=x, t=t, dt=dt)
-        self._record_pred_entropy(p_x0, x)
         x = x_next
       else:
         x = self._analytic_update(x=x,t=t, dt=dt)
@@ -933,22 +1251,12 @@ class Diffusion(TrainerBase):
       if self.sampler == 'analytic':
         x = self._denoiser_update(x=x, t=t0)
       else:
-        # Shared with `remask`: at `alpha_s = 1` its remask rate is pinned to
-        # 0 by the admissibility bound, so its update degenerates to exactly
-        # this one -- fill every remaining mask, keep what is already there.
-        # (`p_x0_cache` is None for that predictor, so the call is fresh.)
-        is_fresh = p_x0_cache is None
-        p_x0, x_next = self._ancestral_update(x=x, t=t0, dt=None,
+        _, x = self._ancestral_update(x=x, t=t0, dt=None,
                                  p_x0=p_x0_cache,
                                  noise_removal_step=True)
-        if is_fresh:
-          self._record_pred_entropy(p_x0, x)
-        x = x_next
     elif self.config.sampling.noise_removal == 'greedy':
       sigma = self._sigma_from_alphat(self.noise(t0)[1])
-      log_p_x0 = self.forward(xt=x, sigma=sigma)
-      self._record_pred_entropy(log_p_x0, x, log_input=True)
-      x = log_p_x0.argmax(dim=-1)
+      x = self.forward(xt=x, sigma=sigma).argmax(dim=-1)
     return x
 
   @torch.no_grad
@@ -1037,27 +1345,6 @@ class AbsorbingState(Diffusion):
       assert self.parameterization in {'mean', 'subs'}
     if self.subs_masking:
       assert self.parameterization == 'mean'
-    self._validate_remask_configuration()
-
-  def _validate_remask_configuration(self):
-    """Checks for `sampling.predictor='remask'`. Split out so subclasses
-    that do not chain to `_validate_configuration` (e.g. `MDLM_with_AR`)
-    can still run them -- otherwise a typo in `remask_strategy` would only
-    surface at the first validation sampling, thousands of steps in."""
-    if self.sampler != 'remask':
-      return
-    strategy = self.config.sampling.get('remask_strategy', 'consistency')
-    assert strategy in {'consistency', 'scaled', 'cap'}, (
-      f'Unknown sampling.remask_strategy={strategy!r}; expected one of '
-      "'consistency', 'scaled', 'cap'.")
-    if strategy in {'scaled', 'cap'}:
-      eta = float(self.config.sampling.get('remask_eta', 1.0))
-      assert 0.0 <= eta <= 1.0, (
-        f'sampling.remask_eta must be in [0, 1], got {eta}.')
-    assert self.config.sampling.noise_removal != 'none', (
-      "sampling.predictor='remask' remasks tokens right up to the last "
-      'step, so it needs a final full decode; set '
-      "sampling.noise_removal to 'ancestral' or 'greedy'.")
 
   def q_xt(self, x, alpha_t, valid_tokens=None):
     """Computes the noisy sample xt.
@@ -1076,74 +1363,9 @@ class AbsorbingState(Diffusion):
       xt[:, 0] = x[:, 0]
     return xt
 
-  def _layout_q_xt(self, x, alpha, valid_tokens=None):
-    """`q_xt`, or its `training.mask_layout='suffix'` counterpart -- whichever
-    `self.training_mask_layout` selects. Used by the plain ELBO loss
-    (`Diffusion.nll`) only; `algo.MDLM_DMMD._dmmd_q_xt` is the equivalent for
-    the D-MMD distillation loss, keyed on the separate
-    `adversarial_distill.dmmd_mask_layout`.
-    """
-    if self.training_mask_layout == 'random':
-      return self.q_xt(x, alpha, valid_tokens=valid_tokens)
-    move = self._suffix_mask_indices(alpha, x, valid_tokens=valid_tokens)
-    xt = torch.where(move, self.mask_index, x)
-    if self.ignore_bos:
-      xt[:, 0] = x[:, 0]
-    return xt
-
-  def _suffix_mask_boundary(self, alpha, length, valid_tokens=None):
-    """Per-example rank (float, shape `(batch, 1)`) such that eligible
-    positions ranked `>= boundary` are the contiguous-suffix masked block a
-    'suffix' mask layout uses -- shared by `algo.MDLM_DMMD`'s
-    `dmmd_mask_layout` (training), `Diffusion.nll`'s `training.mask_layout`
-    (plain-ELBO warmup training) and `_ancestral_update`'s
-    `sampling.mask_layout` (sampling), so all three stay exactly consistent.
-    Eligible positions are every position when `valid_tokens is None`, else
-    the `valid_tokens==1` subset counted in sequence order -- a prompt-masked
-    prefix then yields a suffix over the *answer* span, not over raw sequence
-    indices.
-
-    Deterministic in `alpha`: no randomness, so calling this at `alpha_t` and
-    `alpha_s` (`alpha_t <= alpha_s`) gives nested masks -- the `alpha_s` block
-    is a subset of the `alpha_t` one -- with no separate reveal step needed.
-
-    For text (`data=openwebtext-split` and similar), a 'suffix' layout means
-    the masked block is the *end* of the token sequence and the clean part is
-    the *start* -- i.e. this is prefix-conditioned ("continue this text")
-    generation/training, not the usual token-order-agnostic masked-LM setup.
-    """
-    if valid_tokens is None:
-      n_eligible = torch.full_like(alpha, float(length))
-    else:
-      n_eligible = valid_tokens.sum(-1, keepdim=True).to(alpha.dtype)
-    num_masked = ((1.0 - alpha) * n_eligible).round()
-    return n_eligible - num_masked
-
-  def _suffix_mask_indices(self, alpha, x, valid_tokens=None):
-    """Boolean `(batch, length)`, True at the 'suffix'-layout positions to
-    mask -- see `_suffix_mask_boundary`.
-    """
-    length = x.shape[-1]
-    if valid_tokens is None:
-      rank = torch.arange(length, device=x.device, dtype=alpha.dtype)
-      rank = rank.unsqueeze(0).expand(x.shape[0], -1)
-    else:
-      rank = (valid_tokens.cumsum(-1) - 1).to(alpha.dtype)
-    boundary = self._suffix_mask_boundary(alpha, length, valid_tokens)
-    move = rank >= boundary
-    if valid_tokens is not None:
-      move = move & valid_tokens.bool()
-    return move
-
   def prior_sample(self, *batch_dims):
     return self.mask_index * torch.ones(
       * batch_dims, dtype=torch.int64, device=self.device)
-
-  def _pred_entropy_mask(self, xt):
-    # Revealed positions are pinned to a one-hot by `_process_model_output`,
-    # so their entropy is 0 by construction; only the masked positions carry
-    # an actual prediction.
-    return xt == self.mask_index
 
   def _ancestral_update(self, x, t, dt, p_x0=None,
                    noise_removal_step=False):
@@ -1154,295 +1376,15 @@ class AbsorbingState(Diffusion):
       _, alpha_s = self.noise(t - dt)
     assert alpha_t.ndim == 2
     if p_x0 is None:
-      p_x0 = self.forward(
-        x, self._sigma_from_alphat(alpha_t)).exp()
-
-    if self.sampling_mask_layout == 'suffix':
-      # Deterministic reveal: extend the clean prefix to
-      # `_suffix_mask_boundary(alpha_s)`, drawing the newly committed
-      # positions' values from p_x0 -- everything from `boundary_s` on stays
-      # `[MASK]` regardless of what the model would have proposed there.
-      # Mirrors `algo.MDLM_DMMD._dmmd_posterior`'s 'suffix' branch exactly,
-      # with p_x0 standing in for the training-time hard student sample.
-      length = x.shape[-1]
-      boundary_s = self._suffix_mask_boundary(alpha_s, length)
-      rank = torch.arange(
-        length, device=x.device, dtype=alpha_s.dtype).unsqueeze(0).expand(
-        x.shape[0], -1)
-      keep_masked = rank >= boundary_s
-      x_hat = sample_categorical(p_x0)
-      target = torch.where(
-        keep_masked, torch.full_like(x, self.mask_index), x_hat)
-    else:
-      q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
-      q_xs[:, :, self.mask_index] = 1 - alpha_s
-      target = sample_categorical(q_xs)
-
+      p_x0 = self._temper(self.forward(
+        x, self._sigma_from_alphat(alpha_t))).exp()
+    
+    q_xs = p_x0 * (alpha_s - alpha_t)[:, :, None]
+    q_xs[:, :, self.mask_index] = 1 - alpha_s
+    _x = sample_categorical(q_xs)
+    
     copy_flag = (x != self.mask_index).to(x.dtype)
-    return p_x0, copy_flag * x + (1 - copy_flag) * target
-
-  def _remask_rate(self, alpha_t, alpha_s):
-    """`sigma_t`: the probability that `_remask_update` sends an already
-    revealed token back to `[MASK]` on this step. Shape follows `alpha_t`,
-    i.e. `(batch, 1)`.
-
-    Clipped to the largest admissible value `(1 - alpha_s) / alpha_t`, above
-    which the masked branch's stay-probability would go negative -- there is
-    simply not enough mask mass at `s` left to absorb the remasked tokens.
-    """
-    strategy = self.config.sampling.get('remask_strategy', 'consistency')
-    eta = float(self.config.sampling.get('remask_eta', 1.0))
-    sigma_max = ((1 - alpha_s)
-                 / alpha_t.clamp_min(1e-9)).clamp(0.0, 1.0)
-    if strategy == 'consistency':
-      # sigma_t = 1 - alpha_s makes both branches of `_remask_update` equal,
-      # i.e. the step forgets `x_t` entirely. Always <= sigma_max.
-      sigma = 1 - alpha_s
-    elif strategy == 'scaled':
-      # Straight interpolation between the ancestral sampler (eta=0) and
-      # 'consistency' (eta=1).
-      sigma = eta * (1 - alpha_s)
-    elif strategy == 'cap':
-      # ReMDM's max-cap schedule: a constant rate, clipped where the bound
-      # bites (which it does at both ends of the trajectory).
-      sigma = torch.full_like(alpha_t, eta)
-    else:
-      raise ValueError(
-        f'Unknown sampling.remask_strategy={strategy!r}; expected one of '
-        "'consistency', 'scaled', 'cap'.")
-    return torch.minimum(sigma.clamp_min(0.0), sigma_max)
-
-  def _remask_update(self, x, t, dt, noise_removal_step=False):
-    """One step of remasking ("consistency-style") reverse sampling.
-
-    `_ancestral_update` only ever *adds* tokens: `copy_flag` freezes a
-    position the moment it is revealed, so a token committed at step 3 on
-    the strength of an almost fully masked context can never be revisited,
-    and every such mistake is carried into the final sample. That is the
-    dominant error at low step counts, where each step commits many
-    positions at once from a weak context.
-
-    This update instead decodes *every* position to a proposal `x0_hat` and
-    then renoises, so a revealed token can go back to `[MASK]` and be
-    re-decoded later under a much richer context. Per position, going from
-    `t` to `s < t`:
-
-      * revealed in `x_t`  -> `[MASK]` with probability `sigma_t`,
-                              otherwise kept (`x0_hat` reproduces it, since
-                              `_process_model_output` pins revealed
-                              positions to a one-hot);
-      * masked in `x_t`    -> `[MASK]` with probability
-                              `beta = (1 - alpha_s - alpha_t sigma_t)
-                                      / (1 - alpha_t)`,
-                              otherwise a categorical draw from `p_x0`.
-
-    `beta` is what keeps the expected masked fraction at `1 - alpha_s`
-    exactly as the schedule prescribes (`alpha_t sigma_t
-    + (1 - alpha_t) beta = 1 - alpha_s`), so `sampling.steps` means the
-    same thing here as for the ancestral predictors and the two are
-    directly comparable at equal step count. Two special values are worth
-    naming (`sampling.remask_strategy`, see `_remask_rate`):
-
-      * `sigma_t = 0` gives back `_ancestral_update` term for term;
-      * `sigma_t = 1 - alpha_s` makes both branches identical, i.e. the step
-        stops depending on `x_t` at all: decode the whole sequence, then
-        renoise it to level `s`. This is the masked-diffusion analogue of
-        multistep sampling in a continuous consistency model
-        (`x0 = f(x_t, t)`, then `x_s = x0 + sigma_s eps`), and is the
-        default.
-
-    The catch, and the reason the rate is a knob rather than a constant:
-    remasking is only worth it if the re-decode is better than what it
-    threw away. It costs a full denoiser call per step with no `p_x0`
-    caching, and under an aggressive rate a short trajectory can spend all
-    its steps churning instead of converging. It also breaks the ELBO's
-    derivation -- likelihood bounds computed with `_loss` do not describe
-    this sampler.
-    """
-    _, alpha_t = self.noise(t)
-    if noise_removal_step:
-      alpha_s = torch.ones_like(alpha_t)
-    else:
-      _, alpha_s = self.noise(t - dt)
-    assert alpha_t.ndim == 2
-
-    p_x0 = self.forward(
-      x, self._sigma_from_alphat(alpha_t)).exp()
-    if self.p_nucleus < 1:
-      # Truncate only the draw; the returned `p_x0` (and so `val/pred_
-      # entropy`) keeps reading the model's own distribution.
-      sample_probs = utils.top_k_top_p_filtering(
-        p_x0.log(), top_p=self.p_nucleus).softmax(-1)
-    else:
-      sample_probs = p_x0
-    x0_hat = sample_categorical(sample_probs)
-
-    sigma_t = self._remask_rate(alpha_t, alpha_s)
-    beta = ((1 - alpha_s - alpha_t * sigma_t)
-            / (1 - alpha_t).clamp_min(1e-9)).clamp(0.0, 1.0)
-    # (batch, 1) rates broadcast against the (batch, length) predicate.
-    mask_prob = torch.where(x == self.mask_index, beta, sigma_t)
-    remask = torch.rand(
-      x.shape, device=x.device) < mask_prob
-    x_next = torch.where(remask, self.mask_index, x0_hat)
-    if self.ignore_bos:
-      x_next[:, 0] = x[:, 0]
-    return p_x0, x_next
-
-  def _denoise_x0(self, x):
-    """One denoiser call on the current partially-masked `x`.
-
-    Returns `(x0, prob)`: the proposed clean token at every position and
-    the probability the denoiser assigns to it. The time fed to the
-    network is read off `x` itself -- the fraction of positions still
-    masked is exactly `1 - alpha_t` under the absorbing forward process
-    -- rather than taken from a fixed grid, because confidence decoding
-    reveals a data-dependent number of tokens per step (and, with
-    blocks, leaves later blocks fully masked). For a model with
-    `algo.time_conditioning=False` (e.g. MDLM) `_process_sigma` zeroes
-    this out anyway.
-
-    The token is greedy by default (`sampling.temperature = 0`), as in
-    the LLaDA / dInfer threshold decoders: the confidence the threshold
-    tests is then `max_v p(v)`, a clean statement that this position's
-    conditional is already nearly deterministic, which is exactly what
-    licenses committing several positions in the same step. Sampling the
-    token instead can propose an off-mode candidate whose probability
-    then fails the threshold, so the position is deferred and re-drawn
-    -- temperature and the threshold work against each other.
-
-    A positive `sampling.temperature` switches to Gumbel-max, which is
-    the usual softmax temperature (`argmax(log p + T g)` has the same
-    argmax as `argmax(log p / T + g)`, i.e. a draw from
-    `softmax(log p_x0 / T)`); 1.0 is an exact categorical draw from
-    `p_x0`, the draw `sample_categorical` makes in the ancestral
-    sampler. That is worth paying for in *unconditional* generation:
-    with T=0 there is no prompt, `prior_sample` gives every row the same
-    all-mask input and the rest of this sampler is deterministic, so a
-    batch collapses to one identical sequence -- unless the student
-    injects input noise (`adversarial_distill.noise_dim > 0`), which
-    supplies the diversity itself.
-
-    `sampling.p_nucleus` additionally restricts the draw to the nucleus.
-    Both knobs affect only *which* token is proposed: the returned
-    probability is always read off the unmodified `p_x0`, so the
-    threshold in `_confidence_sampler` sees the model's real probability
-    and raising the temperature does not loosen it.
-    """
-    t = (x == self.mask_index).to(torch.float32).mean(
-      -1, keepdim=True).clamp(min=self.sampling_eps, max=1.0)
-    _, alpha_t = self.noise(t)
-    log_p_x0 = self.forward(x, self._sigma_from_alphat(alpha_t))
-    self._record_pred_entropy(log_p_x0, x, log_input=True)
-    logits = log_p_x0
-    if self.p_nucleus < 1:
-      # `top_k_top_p_filtering` writes in place; keep `log_p_x0` intact.
-      logits = utils.top_k_top_p_filtering(
-        logits.clone(), top_p=self.p_nucleus)
-    temperature = float(
-      self.config.sampling.get('temperature', 0.0))
-    if temperature > 0:
-      noise = torch.rand_like(logits)
-      gumbel = - torch.log(- torch.log(noise + 1e-10) + 1e-10)
-      x0 = (logits + temperature * gumbel).argmax(-1)
-    else:
-      x0 = logits.argmax(-1)
-    prob = log_p_x0.gather(-1, x0[..., None]).squeeze(-1).exp()
-    return x0, prob
-
-  @torch.no_grad()
-  def _confidence_sampler(self, num_samples, num_steps=None,
-                          eps=1e-5):
-    """Confidence-threshold decoding, as used by block-diffusion models.
-
-    The ancestral sampler (`_ancestral_update`) unmasks a *random*
-    subset of positions per step -- each masked position flips with
-    probability `(alpha_s - alpha_t) / (1 - alpha_t)` regardless of what
-    the denoiser thinks -- and it is the sampler the ELBO is derived
-    for. This one instead commits positions by the denoiser's own
-    probability, the MaskGIT / LLaDA / Fast-dLLM rule. It is not the
-    reverse of the forward masking process, so likelihood bounds no
-    longer apply, but it removes most of the factorised-independence
-    error at low step counts: the positions committed together are the
-    ones whose conditionals are already nearly deterministic, which is
-    exactly when treating them as independent is harmless.
-
-    Reveal rule, per row and per step: unmask **every** still-masked
-    position whose probability `p_x0[i, x0_i]` is `>=
-    sampling.confidence_threshold`, but **at least
-    `sampling.min_reveal` (k)** of them -- the top-k by probability --
-    so a step where nothing clears the bar still makes progress and the
-    loop cannot stall. The number of denoiser calls is therefore
-    data-dependent, not fixed: an easy sequence finishes in a handful
-    while a hard one falls back to ~`L / k` steps. A threshold above 1
-    gives pure top-k-per-step decoding; `min_reveal` = the block length
-    gives one-shot decoding.
-
-    Two knobs shape the schedule:
-
-    * `sampling.block_size` (0 => the whole sequence, i.e. no blocking)
-      decodes left-to-right one block at a time, finishing a block
-      before touching the next. That is the semi-autoregressive schedule
-      of block diffusion; with `block_size=1` it degenerates to pure
-      left-to-right AR decoding, and with the default it is LLaDA-style
-      whole-sequence confidence decoding.
-    * `num_steps` (`sampling.steps`) is only a **budget cap** here,
-      spread evenly over the blocks. Threshold decoding sets its own
-      pace, so the cap normally does not bind; if a block does hit it,
-      its remaining masks are revealed in one shot rather than leaving
-      mask tokens in the output.
-
-    Already-revealed tokens are never revisited, exactly as in the
-    ancestral sampler.
-    """
-    del eps
-    if num_steps is None:
-      num_steps = self.config.sampling.steps
-    block_size = int(
-      self.config.sampling.get('block_size', 0) or self.num_tokens)
-    assert self.num_tokens % block_size == 0, (
-      f'sampling.block_size={block_size} must divide the sequence '
-      f'length {self.num_tokens}.')
-    num_blocks = self.num_tokens // block_size
-    threshold = float(
-      self.config.sampling.get('confidence_threshold', 0.9))
-    min_reveal = int(self.config.sampling.get('min_reveal', 1))
-    assert min_reveal >= 1, (
-      'sampling.min_reveal must be >= 1, otherwise a step that clears '
-      'no position would leave the sampler stuck.')
-    # Budget cap per block; >= 1 so every block gets at least one call.
-    max_steps = max(1, num_steps // num_blocks)
-
-    x = self.prior_sample(num_samples, self.num_tokens)
-    for block in range(num_blocks):
-      lo, hi = block * block_size, (block + 1) * block_size
-      for step in range(max_steps):
-        block_masked = (x[:, lo:hi] == self.mask_index)
-        num_masked = block_masked.sum(-1)
-        if not bool(num_masked.any()):
-          break
-
-        x0, prob = self._denoise_x0(x)
-        # Only still-masked positions inside the active block compete.
-        eligible = torch.zeros_like(x, dtype=torch.bool)
-        eligible[:, lo:hi] = block_masked
-        prob = prob.masked_fill(~ eligible, - float('inf'))
-
-        # Everything over the bar, but never fewer than k and never
-        # more than what is actually left masked in this block.
-        num_reveal = torch.clamp(
-          (prob >= threshold).sum(-1),
-          min=min_reveal).minimum(num_masked)
-        if step == max_steps - 1:
-          # Budget exhausted: finish the block in one shot.
-          num_reveal = num_masked
-        # Per-row top-`num_reveal` via ranks (the count varies by row).
-        # Thresholding keeps exactly the highest-probability positions,
-        # so one ranked selection covers both branches of the rule.
-        ranks = prob.argsort(dim=-1, descending=True).argsort(dim=-1)
-        reveal = (ranks < num_reveal[:, None]) & eligible
-        x = torch.where(reveal, x0, x)
-    return x
+    return p_x0, copy_flag * x + (1 - copy_flag) * _x
 
   def _staggered_score(self, score, dsigma):
     score = score.clone()

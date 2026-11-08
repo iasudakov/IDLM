@@ -1,3 +1,4 @@
+import collections
 import json
 import os
 
@@ -11,8 +12,12 @@ import torch
 
 import algo
 import dataloader
+from evaluated_checkpoint import EvaluatedCheckpoint
+import model_assets
+import nirvana_snapshot
+import owt_pareto_plot
+import pareto_temperature
 import utils
-import underdeep_logger  # noqa: F401  (registers `underdeep_logger.*` Hydra _target_)
 from ipdb import set_trace as debug
 
 torch.autograd.set_detect_anomaly(True)
@@ -27,14 +32,73 @@ omegaconf.OmegaConf.register_new_resolver(
   'div_up', lambda x, y: (x + y - 1) // y)
 
 
+def _warn_if_resume_unreachable(config, logger):
+  """Say so when resume is configured but nothing will write the file it wants.
+
+  `resume_ckpt_path` defaults to `checkpoints/last.ckpt`, which only the
+  `checkpoint_every_n_steps` callback writes, and only when `save_last` is on.
+  Turn `save_last` off -- the shipped TinyGSM scripts do, and it is an easy
+  thing to copy -- and resume degrades in the worst possible way: the job
+  restores its snapshot, finds no checkpoint, starts from step 0, and reports
+  nothing wrong. Numbered `step=*.ckpt` files may be sitting right beside the
+  path it looked for.
+
+  A warning rather than an error: wanting checkpoints without wanting resume is
+  a legitimate configuration, and this runs on every start including the ones
+  that never get preempted.
+  """
+  if not config.checkpointing.get('resume_from_ckpt', False):
+    return
+  wanted = config.checkpointing.get('resume_ckpt_path', None)
+  if not wanted or not str(wanted).endswith('last.ckpt'):
+    return
+  callbacks = config.get('callbacks', None) or {}
+  every_n = callbacks.get('checkpoint_every_n_steps', None) or {}
+  monitor = callbacks.get('checkpoint_monitor', None) or {}
+  if every_n.get('save_last', False) or monitor.get('save_last', False):
+    return
+  logger.warning(
+    f'resume_from_ckpt is on and resume_ckpt_path is {wanted}, but no '
+    'checkpoint callback has save_last=True, so that file will never be '
+    'written and every restart will silently begin from step 0. Set '
+    'callbacks.checkpoint_every_n_steps.save_last=True, or point '
+    'checkpointing.resume_ckpt_path at a file something does write.')
+
+
+class SnapshotSync(L.Callback):
+  """Push the run directory to the snapshot store after validation.
+
+  `PeriodicStepCheckpoint` pushes its own writes, but Lightning's
+  `ModelCheckpoint` callbacks save on validation and know nothing about
+  snapshots. `on_validation_end` runs after they have written, which is the
+  first hook where the new file is actually on disk -- `on_save_checkpoint`
+  fires *before* the write and would push the previous state.
+  """
+
+  def __init__(self, snapshot_dir, enabled=True):
+    self.snapshot_dir = os.fspath(snapshot_dir)
+    self.enabled = bool(enabled)
+
+  def on_validation_end(self, trainer, pl_module):
+    if trainer.sanity_checking or not trainer.is_global_zero:
+      return
+    nirvana_snapshot.save(self.snapshot_dir, enabled=self.enabled,
+                          reason=f'validation step={trainer.global_step}')
+
+
 class PeriodicStepCheckpoint(L.Callback):
   """Save deterministic checkpoints every N completed train batches."""
 
-  def __init__(self, dirpath, every_n_train_steps):
+  def __init__(self, dirpath, every_n_train_steps, snapshot_dir=None,
+               snapshot=False):
     self.dirpath = os.fspath(dirpath)
     self.every_n_train_steps = int(every_n_train_steps)
     self._completed_train_batches = 0
     self._last_saved_step = 0
+    # The snapshot covers the whole run directory, not just `dirpath`, so that
+    # a restored job also gets its logs and tracker metadata back.
+    self.snapshot_dir = os.fspath(snapshot_dir or dirpath)
+    self.snapshot = bool(snapshot)
 
   def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
     if self.every_n_train_steps <= 0:
@@ -57,6 +121,49 @@ class PeriodicStepCheckpoint(L.Callback):
       print(
         f'Saved periodic checkpoint at train_batch={save_step}: {ckpt_path}',
         flush=True)
+      nirvana_snapshot.save(self.snapshot_dir, enabled=self.snapshot,
+                            reason=f'periodic step={save_step}')
+
+
+# Logged at every validation, whatever `eval.eval_step_range` says: they come
+# from the held-out NLL, which the window deliberately leaves running.
+_ALWAYS_LOGGED_VAL_METRICS = ('val/nll', 'val/bpd', 'val/ppl')
+
+
+def _check_eval_window_monitors(config, callbacks):
+  """Refuse a checkpoint monitor the eval window will starve.
+
+  `eval.eval_step_range` / `eval.eval_at_steps` skip the generative half of
+  validation outside the window, so `val/gen_ppl`, `val/sample_entropy` and
+  everything the Pareto sweeps log simply do not exist at those validations.
+  A `ModelCheckpoint` monitoring one of them then raises
+  `MisconfigurationException` at the FIRST validation outside the window --
+  a crash from a diagnostic knob, hours into a run, with a message that points
+  at the checkpoint callback rather than at the window that caused it.
+
+  Caught here instead, before a single training step is taken.
+  """
+  window = config.eval.get('eval_step_range', None)
+  at_steps = config.eval.get('eval_at_steps', None)
+  if window is None and at_steps is None:
+    return
+  offenders = []
+  for callback in callbacks:
+    if not isinstance(callback, L.pytorch.callbacks.ModelCheckpoint):
+      continue
+    monitor = getattr(callback, 'monitor', None)
+    if monitor and monitor not in _ALWAYS_LOGGED_VAL_METRICS:
+      offenders.append(monitor)
+  if not offenders:
+    return
+  which = ', '.join(f'{m!r}' for m in sorted(set(offenders)))
+  raise ValueError(
+    f'ModelCheckpoint monitors {which}, but eval.eval_step_range / '
+    'eval.eval_at_steps skip the generative evaluation outside the window, so '
+    'that metric is not logged at every validation and Lightning raises the '
+    'moment one is missed. Either drop the monitoring callback '
+    "('~callbacks.checkpoint_monitor'), point it at a metric the window never "
+    f'gates ({", ".join(_ALWAYS_LOGGED_VAL_METRICS)}), or clear the window.')
 
 
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
@@ -65,7 +172,8 @@ def _load_from_checkpoint(diffusion_model, config, tokenizer):
     return model
   
   return diffusion_model.load_from_checkpoint(
-    config.eval.checkpoint_path,
+    model_assets.resolve_checkpoint(
+      config.eval.checkpoint_path, config.get('model_weights_dir')),
     tokenizer=tokenizer,
     config=config,
     weights_only=False)
@@ -121,70 +229,6 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     print('ids:', last)
 
 
-def _prepare_gm_data(model, config, logger, tokenizer):
-  """Validation batches, decoded to text, to pair with the generated ones for
-  the GPT-2 Gradient Moment -- or `[]` when GM is off or cannot be computed.
-
-  GM (D-MMD arXiv:2603.20155 Eq. 13/14, `metrics.GradientMoment`) is a distance
-  *between two distributions*: the reference model's loss-gradient is averaged
-  over our samples (`g`) and over real data (`q`), and the metric is the squared
-  norm of the difference. Generative perplexity needs no data, so
-  `mode=sample_eval` never loaded any; this pulls one validation batch per
-  generated batch from the same shuffled loader `mode=ppl_eval` uses
-  (`valid_seed=config.seed`), which also makes both sides of a pair
-  `loader.eval_batch_size` rows wide. Decoded to text because the reference
-  model re-tokenizes with its own tokenizer, exactly as gen-ppl does.
-
-  The number of pairs is `min(sampling.num_sample_batches, eval.gm_num_batches)`
-  -- the same `M` the validation path uses -- and is logged and written to the
-  report, since it is what the estimator's variance rides on.
-  """
-  if not config.eval.get('compute_gm', False):
-    return []
-  if model.metrics.gm is None:
-    logger.warning(
-      'eval.compute_gm is set but this model was built without a '
-      'GradientMoment; skipping GM.')
-    return []
-  if config.sampling.semi_ar:
-    # Same reason generative perplexity is skipped below: semi-AR samples are
-    # full of <|endoftext|> and need post-processing before a reference model
-    # can score them.
-    logger.warning('GM is not computed for semi-AR sampling.')
-    return []
-  num_pairs = min(config.sampling.num_sample_batches,
-                  config.eval.get('gm_num_batches', 4))
-  if num_pairs < 2:
-    # `GradientMoment.compute` needs two independent draws to form a cross-pair
-    # (a single `d_m . d_m` would estimate the norm plus its own variance).
-    logger.warning(
-      'GM needs at least 2 paired (generated, data) batches but only %d are '
-      'configured (min of sampling.num_sample_batches=%d and '
-      'eval.gm_num_batches=%d); skipping GM.',
-      num_pairs, config.sampling.num_sample_batches,
-      config.eval.get('gm_num_batches', 4))
-    return []
-  model.metrics.gm.reset()
-  _, valid_ds = dataloader.get_dataloaders(
-    config, tokenizer, skip_train=True, valid_seed=config.seed)
-  texts = []
-  for batch in valid_ds:
-    texts.append(valid_ds.tokenizer.batch_decode(batch['input_ids']))
-    if len(texts) == num_pairs:
-      break
-  if len(texts) < 2:
-    logger.warning(
-      'The validation set yielded only %d batch(es); skipping GM.',
-      len(texts))
-    return []
-  logger.info(
-    'GM: %d paired (generated, data) batches of %d sequences '
-    '(reference model: %s).',
-    len(texts), config.loader.eval_batch_size,
-    config.eval.get('gm_eval_model_name_or_path', 'gpt2'))
-  return texts
-
-
 def _generate_samples(diffusion_model, config, logger,
                       tokenizer):
   logger.info('Starting Sample Eval.')
@@ -194,15 +238,13 @@ def _generate_samples(diffusion_model, config, logger,
     tokenizer=tokenizer)
   model.metrics.gen_ppl.reset()
   model.metrics.sample_entropy.reset()
-  model.metrics.pred_entropy.reset()
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
-  gm_data_texts = _prepare_gm_data(model, config, logger, tokenizer)
   stride_length = config.sampling.stride_length
   num_strides = config.sampling.num_strides
   all_samples = []
-  for _sb in range(config.sampling.num_sample_batches):
+  for _ in range(config.sampling.num_sample_batches):
     if config.sampling.semi_ar:
       _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample(
         stride_length=stride_length,
@@ -219,85 +261,240 @@ def _generate_samples(diffusion_model, config, logger,
         num_steps=config.sampling.steps)
       model.metrics.record_entropy(samples)
       text_samples = model.tokenizer.batch_decode(samples)
-      # `device=` by keyword: the third positional parameter is `retokenize`, so
-      # passing the device there left `device` at its 'cuda' default -- harmless
-      # while the model is on a GPU (a torch.device is truthy, so retokenization
-      # still happened) but a crash for a CPU eval.
       model.metrics.record_generative_perplexity(
-        text_samples, config.model.length, device=model.device)
+        text_samples, config.model.length, model.device)
       all_samples.extend(list(text_samples))
-      # GPT-2 GM: one (generated, data) pair per batch. Each pair contributes a
-      # gradient difference `d_m`; the estimator in `GradientMoment.compute`
-      # averages the `M (M - 1)` cross terms `d_i . d_j`, so this only needs the
-      # pairing to be independent across batches, not within one.
-      if _sb < len(gm_data_texts):
-        model.metrics.gm.accumulate(
-          text_samples, gm_data_texts[_sb], config.model.length,
-          model.device)
   generative_ppl = 0.
   entropy = 0.
-  pred_entropy = 0.
-  gpt2_gm = None
   if not config.sampling.semi_ar:
     generative_ppl = model.metrics.gen_ppl.compute().item()
     entropy = model.metrics.sample_entropy.compute().item()
     print('Generative perplexity:', generative_ppl)
     print('Sample entropy:', entropy)
-    if float(model.metrics.pred_entropy.weight) > 0:
-      pred_entropy = model.metrics.pred_entropy.compute().item()
-      print('Model predictive entropy:', pred_entropy)
-    if gm_data_texts:
-      # Lower is better; 0 means the reference model cannot tell the samples
-      # from the data. Unlike generative perplexity it is not improved by mode
-      # collapse, which is the point of reporting it beside gen-ppl.
-      gpt2_gm = model.metrics.gm.compute()
-      print('GPT-2 gradient moment:', gpt2_gm)
   samples_path = config.eval.generated_samples_path
   with fsspec.open(samples_path, 'w') as f:
     json.dump({'generative_ppl': generative_ppl,
                'entropy': entropy,
-               'pred_entropy': pred_entropy,
-               'gpt2_gm': gpt2_gm,
-               'gm_num_pairs': len(gm_data_texts),
                'generated_seqs': all_samples}, f, indent=4)
   print('Samples saved at:', samples_path)
 
 
-def _noise_diversity_eval(diffusion_model, config, logger, tokenizer):
-  """Sample the same batch under several input-noise draws and report how much
-  the noise -- rather than the sampler -- is driving sample diversity."""
-  logger.info('Starting Noise Diversity Eval.')
+def _load_student_weights(model, config, logger, path=None):
+  """Put a trained student's weights into a model built from the HF teacher.
+
+  `algo.backbone=hf_dit` builds the architecture from `eval.checkpoint_path` --
+  an HF hub id -- so that path cannot also carry the trained student. This
+  loads the Lightning `.ckpt` written by training on top of it.
+
+  Which weights: the EMA ones by default, because those are what every number
+  the run reported was measured on. A checkpoint stores BOTH -- `state_dict`
+  holds the raw live parameters, `ema` holds the shadow copy -- and reading
+  `state_dict` alone silently evaluates a different model from the one the
+  training curves describe. `eval.disable_ema=True` asks for the raw weights.
+
+  Returns a short label naming what was loaded, for the figure and the JSON.
+
+  `path` overrides `eval.student_ckpt_path`, which is how a multi-checkpoint
+  sweep walks a list: the architecture is built once and only the weights are
+  swapped, since every checkpoint in a sweep shares the `hf_dit` backbone that
+  `eval.checkpoint_path` names.
+  """
+  if path is None:
+    path = config.eval.get('student_ckpt_path', '') or ''
+  if not path:
+    logger.info('No eval.student_ckpt_path: evaluating '
+                f'{config.eval.checkpoint_path} as built.')
+    return f'{config.eval.checkpoint_path} (no student ckpt)'
+  path = model_assets.resolve_checkpoint(path, config.get('model_weights_dir'))
+  assert utils.fsspec_exists(path), f'no such checkpoint: {path}'
+  # Training wrote these on a newer `tokenizers` than this env pins, and every
+  # checkpoint embeds a pickled tokenizer under `hyper_parameters`.
+  with utils.tolerant_checkpoint_load():
+    checkpoint = torch.load(path, map_location='cpu')
+  state_dict = collections.OrderedDict(
+    (k, v) for k, v in checkpoint['state_dict'].items()
+    # A distillation checkpoint carries the frozen teacher and the fake critic
+    # alongside the student; only the student is being evaluated.
+    if not k.startswith(('teacher.', 'fake_model.')))
+  use_ema = not config.eval.disable_ema and 'ema' in checkpoint
+  if use_ema:
+    model._apply_checkpoint_ema_to_backbone_state(state_dict, checkpoint)
+  missing, unexpected = model.load_state_dict(state_dict, strict=False)
+  if missing:
+    logger.warning(f'{len(missing)} missing keys, first: {missing[:3]}')
+  if unexpected:
+    logger.warning(f'{len(unexpected)} unexpected keys, '
+                   f'first: {unexpected[:3]}')
+  # `_eval_mode` would otherwise copy this freshly-built model's own shadow
+  # params over the weights just loaded. The EMA choice is already baked in
+  # above, so take that path out of the picture entirely.
+  model.ema = None
+  step = checkpoint.get('global_step', '?')
+  which = 'ema' if use_ema else 'raw'
+  logger.info(f'Loaded {which} weights from {path} (global_step={step}).')
+  return f'{os.path.basename(path)} @ step {step} ({which})'
+
+
+def _init_distributed():
+  """Join the torchrun process group, if this process was launched by one.
+
+  `mode=pareto_eval` runs no Lightning trainer -- the sweep is a plain loop --
+  so nothing else would set this up. All distribution has to buy here is that
+  the ranks split the samples and the metrics all-reduce; there is no gradient
+  and so no need for DDP to wrap the model.
+
+  Returns `(rank, world_size, local_rank)`, and `(0, 1, 0)` for an ordinary
+  single-process run.
+  """
+  world_size = int(os.environ.get('WORLD_SIZE', 1))
+  if world_size <= 1:
+    return 0, 1, 0
+  local_rank = int(os.environ.get('LOCAL_RANK', 0))
+  torch.cuda.set_device(local_rank)
+  if not torch.distributed.is_initialized():
+    torch.distributed.init_process_group(backend='nccl')
+  return torch.distributed.get_rank(), world_size, local_rank
+
+
+def _pareto_checkpoints(config):
+  """The checkpoints this sweep covers, in the order they will be drawn.
+
+  `eval.student_ckpt_paths` wins whenever it is set; `eval.student_ckpt_path`
+  is the single-checkpoint spelling and stays the fallback, so every command
+  written before the list existed still means what it meant. An empty string
+  is a legal ENTRY, not a terminator: it names the model as
+  `eval.checkpoint_path` builds it, i.e. the teacher, which is the baseline the
+  students in the same list are read against.
+  """
+  paths = list(config.eval.get('student_ckpt_paths', None) or [])
+  if paths:
+    return [str(p) for p in paths]
+  return [str(config.eval.get('student_ckpt_path', '') or '')]
+
+
+def _short_labels(paths):
+  """Compact, unique legend names for a list of checkpoint paths.
+
+  The basename's stem is what a reader recognises -- `step=00014000` -- and for
+  the usual case, one run's checkpoint directory, that is the whole answer. Two
+  runs collide on it, so the name widens leftwards a path component at a time
+  until the names separate, skipping any component every path shares:
+  `checkpoints` is in all of them and discriminates nothing, so the pair reads
+  `run_a/step=00014000` rather than `run_a/checkpoints/step=00014000`. An index
+  is the last resort. Uniqueness matters beyond the legend, because these also
+  name the tracker series.
+  """
+  parts = [[c for c in os.path.abspath(path).split(os.sep) if c] if path
+           else ['teacher'] for path in paths]
+  for piece in parts:
+    # Only the file loses its extension; the directories keep their names.
+    piece[-1] = os.path.splitext(piece[-1])[0]
+
+  def render(depths):
+    return ['/'.join(piece[-d] for d in sorted(depths, reverse=True)
+                     if len(piece) >= d) for piece in parts]
+
+  deepest = max(len(piece) for piece in parts)
+  depths, depth = [1], 1
+  labels = render(depths)
+  while len(set(labels)) < len(labels) and depth < deepest:
+    depth += 1
+    # Only over the paths that reach this far: a short entry (`teacher`) would
+    # otherwise make a shared component look like a distinguishing one.
+    column = {piece[-depth] for piece in parts if len(piece) >= depth}
+    if len(column) < 2:
+      continue
+    depths.append(depth)
+    labels = render(depths)
+
+  seen = collections.Counter()
+  for i, label in enumerate(labels):
+    seen[label] += 1
+    if seen[label] > 1:
+      labels[i] = f'{label}#{seen[label]}'
+  return labels
+
+
+def _pareto_eval(diffusion_model, config, logger, tokenizer):
+  """Sweep checkpoints over sampling temperatures and step budgets."""
+  rank, world_size, local_rank = _init_distributed()
+  temperatures = config.eval.get('pareto_temperatures', None)
+  budgets = config.eval.get('owt_pareto_steps', None)
+  assert temperatures, 'set eval.pareto_temperatures, e.g. [0.7,1.0,2.0]'
+  assert budgets, 'set eval.owt_pareto_steps, e.g. [8,16,32]'
+  paths = _pareto_checkpoints(config)
+  shorts = _short_labels(paths)
+  if rank == 0:
+    logger.info(f'Starting temperature Pareto eval over {len(paths)} '
+                'checkpoint(s).'
+                + (f' Sharded over {world_size} ranks.'
+                   if world_size > 1 else ''))
+
+  # Built once for the whole list: every checkpoint in a sweep is the same
+  # architecture -- `eval.checkpoint_path` names it -- so only the weights need
+  # swapping, and rebuilding per checkpoint would re-download the hub config
+  # and re-allocate the model for nothing.
   model = _load_from_checkpoint(
-    diffusion_model=diffusion_model,
-    config=config,
-    tokenizer=tokenizer)
-  if config.eval.disable_ema:
-    logger.info('Disabling EMA.')
-    model.ema = None
-  if not model.has_noise_conditioning:
-    logger.warning(
-      'This model has no input-noise conditioning '
-      '(adversarial_distill.noise_dim = 0), so the noise arm is a replay of '
-      'one deterministic function: expect agree_noise = 1.0.')
+    diffusion_model=diffusion_model, config=config, tokenizer=tokenizer)
+  model = model.to(f'cuda:{local_rank}')
+  model.eval()
+  # An empty entry means "the model as built". That is only true before a
+  # student has been loaded over it, so when the baseline is not first in the
+  # list, keep a pristine CPU copy to restore from. Built only when the list
+  # actually asks for it, since it is a second copy of the weights.
+  pristine = None
+  if len(paths) > 1 and any(not p for p in paths):
+    pristine = {k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()}
 
-  model._eval_mode()
-  diversity = model.noise_diversity_report(
-    num_steps=config.sampling.steps, return_variants=True)
-  model._train_mode()
+  # One tracker run, not one per rank: `logger.force_new_run=true` would
+  # otherwise open `world_size` runs and scatter the sweep across all of them.
+  tracker = None
+  if rank == 0:
+    tracker = hydra.utils.instantiate(config.logger)
+    try:
+      tracker.log_hyperparams({
+        'eval/temperatures': str(list(temperatures)),
+        'eval/steps': str(list(budgets)),
+        'eval/checkpoints': ', '.join(shorts),
+        'eval/world_size': world_size})
+    except Exception as e:  # pragma: no cover - tracker best-effort
+      print(f'[pareto-temp] hyperparam log failed: {e}', flush=True)
 
-  print('Noise diversity:')
-  for name, value in diversity.metrics.items():
-    print(f'  {name}: {value:.6f}')
-  # The same row under each noise draw, decoding randomness held fixed: what
-  # `agree_noise` is measuring, in readable form.
-  print('Row 0 under each noise draw:')
-  for k, replicate in enumerate(diversity.variants):
-    print(f'  [noise {k}] {replicate[0][:200]!r}')
-  report_path = config.eval.noise_diversity_path
-  with fsspec.open(report_path, 'w') as f:
-    json.dump({'metrics': diversity.metrics,
-               'noise_variants': diversity.variants}, f, indent=4)
-  print('Noise diversity report saved at:', report_path)
+  sweeps = []
+  for index, (path, short) in enumerate(zip(paths, shorts)):
+    if not path and pristine is not None:
+      model.load_state_dict(pristine, strict=True)
+    label = _load_student_weights(model, config, logger, path=path)
+    if rank == 0 and len(paths) > 1:
+      print(f'[pareto-temp] === checkpoint {index + 1}/{len(paths)}: '
+            f'{short} -- {label} ===', flush=True)
+    curves, samples = pareto_temperature.sweep(
+      model,
+      temperatures=temperatures,
+      budgets=budgets,
+      seeds=config.eval.get('owt_pareto_seeds', 1),
+      num_batches=(config.eval.get('owt_pareto_num_batches', 0)
+                   or config.sampling.num_sample_batches),
+      batch_size=config.loader.eval_batch_size,
+      max_length=config.model.length)
+    sweeps.append({'label': label, 'short': short, 'path': path,
+                   'curves': curves, 'samples': samples})
+
+  if world_size > 1:
+    # Hold the other ranks until rank 0 is done: tearing the group down while a
+    # collective is outstanding is what turns a finished sweep into a hang.
+    torch.distributed.barrier()
+  if rank == 0:
+    pareto_temperature.publish_many(
+      sweeps, tracker,
+      save_dir=os.fspath(config.checkpointing.save_dir),
+      reference=owt_pareto_plot.load_reference(
+        config.eval.get('owt_pareto_reference', None)))
+    tracker.finalize('success')
+  if world_size > 1:
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
 
 
 def _eval_ppl(diffusion_model, config, logger, tokenizer):
@@ -340,11 +537,21 @@ def _train(diffusion_model, config, logger, tokenizer):
   #     **config.wandb)
   train_logger = hydra.utils.instantiate(config.logger)
 
+  # Before the existence check below, not after: on a restarted preemptible
+  # job the local disk is empty and this is what puts `last.ckpt` back on it.
+  # Check first and the run starts from scratch with a full snapshot sitting
+  # unused, silently losing every step of prior training.
+  snapshot = bool(config.checkpointing.get('snapshot', True))
+  snapshot_dir = os.fspath(config.checkpointing.save_dir)
+  nirvana_snapshot.restore(snapshot_dir, enabled=snapshot)
+  _warn_if_resume_unreachable(config, logger)
+
   if (config.checkpointing.resume_from_ckpt
       and config.checkpointing.resume_ckpt_path is not None
       and utils.fsspec_exists(
         config.checkpointing.resume_ckpt_path)):
     ckpt_path = config.checkpointing.resume_ckpt_path
+    logger.info(f'Resuming from {ckpt_path}')
   else:
     ckpt_path = None
 
@@ -356,16 +563,28 @@ def _train(diffusion_model, config, logger, tokenizer):
     if config.checkpointing.get('use_periodic_train_batch_checkpoint', False):
       callbacks.append(PeriodicStepCheckpoint(
         os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
-        config.callbacks.checkpoint_every_n_steps.every_n_train_steps))
+        config.callbacks.checkpoint_every_n_steps.every_n_train_steps,
+        snapshot_dir=snapshot_dir, snapshot=snapshot))
+    if snapshot:
+      callbacks.append(SnapshotSync(snapshot_dir, enabled=True))
+    _check_eval_window_monitors(config, callbacks)
+
+  if config.checkpointing.get('save_evaluated_checkpoints', False):
+    callbacks.append(EvaluatedCheckpoint(
+      os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
+      start_step=config.checkpointing.get('save_evaluated_from_step', 0),
+      snapshot_dir=snapshot_dir, snapshot=snapshot))
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)
   _print_batch(train_ds, valid_ds, tokenizer)
 
   if config.training.finetune_path != '':
-    assert utils.fsspec_exists(config.training.finetune_path)
+    finetune_path = model_assets.resolve_checkpoint(
+      config.training.finetune_path, config.get('model_weights_dir'))
+    assert utils.fsspec_exists(finetune_path)
     model = diffusion_model.load_from_checkpoint(
-      config.training.finetune_path,
+      finetune_path,
       tokenizer=tokenizer,
       config=config,
       weights_only=False)
@@ -386,19 +605,20 @@ def _train(diffusion_model, config, logger, tokenizer):
             config_name='config')
 def main(config):
   """Main entry point for training."""
+  model_assets.configure_model_weights(
+    config, base_dir=hydra.utils.get_original_cwd())
   L.seed_everything(config.seed)
-  _print_config(config, resolve=True, save_cfg=True)
+  # `save_cfg` writes a file into the run dir; under torchrun every rank shares
+  # that dir, so let one of them write it rather than eight racing on it.
+  if int(os.environ.get('RANK', 0)) == 0:
+    _print_config(config, resolve=True, save_cfg=True)
   
   logger = utils.get_logger(__name__)
   tokenizer = dataloader.get_tokenizer(config)
   if config.algo.name == 'ar':
     diffusion_model = algo.AR
   elif config.algo.name == 'mdlm':
-    diffusion_model = algo.MDLM_with_AR
-  elif config.algo.name == 'mdlm_dmmd':
-    diffusion_model = algo.MDLM_with_DMMD
-  elif config.algo.name == 'mdlm_rl':
-    diffusion_model = algo.MDLM_RL
+    diffusion_model = algo.MDLM
   elif config.algo.name == 'duo_base':
     diffusion_model = algo.DUO_BASE
   elif config.algo.name == 'd3pm':
@@ -420,10 +640,10 @@ def main(config):
             'logger': logger}
   if config.mode == 'sample_eval':
     _generate_samples(**kwargs)
-  elif config.mode == 'noise_diversity_eval':
-    _noise_diversity_eval(**kwargs)
   elif config.mode == 'ppl_eval':
     _eval_ppl(**kwargs)
+  elif config.mode == 'pareto_eval':
+    _pareto_eval(**kwargs)
   else:
     _train(**kwargs)
 
