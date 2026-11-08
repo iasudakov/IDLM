@@ -302,7 +302,7 @@ def sweep(model, examples):
     return curve
 
 
-def log_validation_gsm8k(model, initial=False):
+def log_validation_gsm8k(model, initial=False, final=False):
     """Called on every rank with EMA weights and evaluation mode already active."""
     cfg = model.config.eval
     every = int(cfg.get('gsm8k_every_n_validations', 1))
@@ -310,9 +310,11 @@ def log_validation_gsm8k(model, initial=False):
             or not cfg.get('gsm8k_at_validation', False) or every <= 0
             or (initial and (not cfg.get('validate_before_train', False) or model.global_step != 0))):
         return
+    if final and getattr(model, '_gsm8k_last_logged_step', None) == int(model.global_step):
+        return
     count = getattr(model, '_gsm8k_validation_count', 0)
     model._gsm8k_validation_count = count + 1
-    if count % every:
+    if count % every and not final:
         return
     devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
     with torch.random.fork_rng(devices=devices):
@@ -343,13 +345,14 @@ def log_validation_gsm8k(model, initial=False):
         curve = sweep(model, model._gsm8k_examples)
         error = None
         try:
-            publish(model, curve, initial=initial)
+            publish(model, curve, initial=initial, direct=final)
+            model._gsm8k_last_logged_step = int(model.global_step)
         except Exception as caught:
             error = caught
         _raise_if_failed(error)
 
 
-def publish(model, curve, initial=False):
+def publish(model, curve, initial=False, direct=False):
     """Preserve the reference metric names, native frontier, image and samples."""
     logger = model.trainer.logger
     metrics = {}
@@ -360,13 +363,13 @@ def publish(model, curve, initial=False):
             for prefix in ('val', 'pareto'):
                 name = f'{prefix}/gsm8k_{suffix}_thr{tag}'
                 metrics[name] = point[key]
-                if not initial:
+                if not (initial or direct):
                     model.log(name, torch.tensor(point[key], device=model.device, dtype=torch.float32),
                               on_epoch=True, on_step=False, sync_dist=False, rank_zero_only=True)
     if model.trainer.global_rank != 0:
         return
     step = int(model.global_step)
-    if initial and logger is not None:
+    if (initial or direct) and logger is not None:
         for destination in model.trainer.loggers:
             destination.log_metrics(metrics, step=step)
     path = Path(model.config.checkpointing.save_dir) / 'pareto_history.json'
@@ -430,7 +433,7 @@ def render_frontier(history, current_step):
         if not current:
             older_label = False
     axes.set(xlabel='Mean denoiser calls per example (NFE)',
-             ylabel='GSM8K execution accuracy (%)', title='SDTT confidence-threshold frontier',
+             ylabel='GSM8K execution accuracy (%)', title='TinyGSM confidence-threshold frontier',
              ylim=(0, 100))
     axes.grid(alpha=.2)
     if history:

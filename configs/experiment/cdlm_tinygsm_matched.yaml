@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - cdlm_tinygsm
+  - _self_
+
+# Optional optimizer-update budget for comparison with the MMD launch.
+trainer:
+  max_steps: 20000
+  max_epochs: -1
+logger:
+  name: cdlm tinygsm lr1e-5 matched 20k
+algo:
+  warmup_ratio: null
+lr_scheduler:
+  num_warmup_steps: 2500

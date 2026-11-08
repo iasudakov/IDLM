@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import timedelta
 
 import fsspec
 import hydra
@@ -61,7 +62,7 @@ class PeriodicStepCheckpoint(L.Callback):
 
 
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
-  if config.algo.name == 'sdtt':
+  if config.algo.name in {'sdtt', 'cdlm'}:
     model = diffusion_model(config, tokenizer=tokenizer, inference_only=True)
     model.load_evaluation_weights(config.eval.checkpoint_path,
                                   use_ema=not config.eval.disable_ema)
@@ -198,7 +199,7 @@ def _generate_samples(diffusion_model, config, logger,
     diffusion_model=diffusion_model,
     config=config,
     tokenizer=tokenizer)
-  if config.algo.name == 'sdtt' and config.data.train == 'tiny_gsm':
+  if config.algo.name in {'sdtt', 'cdlm'} and config.data.train == 'tiny_gsm':
     from sdtt_eval import evaluate
     model._eval_mode()
     with torch.inference_mode():
@@ -343,6 +344,72 @@ def _eval_ppl(diffusion_model, config, logger, tokenizer):
   trainer.validate(model, valid_ds)
 
 
+def _prepare_cdlm(diffusion_model, config, logger, tokenizer):
+  """Explicit distributed teacher collection; never starts student training."""
+  if config.algo.name != 'cdlm' or config.data.train != 'tiny_gsm':
+    raise ValueError('mode=prepare_cdlm requires algo=cdlm and TinyGSM.')
+  import torch.distributed as dist
+  from cdlm_trajectories import prepare_trajectories
+  from sdtt_eval import _raise_if_failed
+  world = int(os.environ.get('WORLD_SIZE', '1'))
+  rank = int(os.environ.get('RANK', '0'))
+  local = int(os.environ.get('LOCAL_RANK', '0'))
+  if not torch.cuda.is_available():
+    raise RuntimeError('CDLM teacher collection requires a CUDA environment.')
+  torch.cuda.set_device(local)
+  if world > 1 and not dist.is_initialized():
+    dist.init_process_group('nccl', timeout=timedelta(hours=24))
+  try:
+    original_loader = None
+    error = None
+    if rank == 0:
+      try:
+        original_loader, _ = dataloader.get_dataloaders(config, tokenizer, skip_valid=True)
+      except Exception as caught:
+        error = caught
+    _raise_if_failed(error)
+    # Rank zero prepares any missing original dataset cache before other ranks
+    # inspect it. Every rank obtains precisely the same dataset formatting and
+    # fingerprint as the subsequent training entry point.
+    error = None
+    try:
+      if rank != 0:
+        original_loader, _ = dataloader.get_dataloaders(config, tokenizer, skip_valid=True)
+      model = diffusion_model(config, tokenizer=tokenizer, inference_only=True)
+      model.load_evaluation_weights(config.training.finetune_path, use_ema=False)
+      model.to(torch.device('cuda', local)).eval()
+    except Exception as caught:
+      error = caught
+    _raise_if_failed(error)
+    logger.info('Collecting original-teacher CDLM trajectories; student training is a separate phase.')
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+      prepare_trajectories(model, config, tokenizer, original_loader.dataset)
+  finally:
+    if world > 1 and dist.is_initialized():
+      dist.destroy_process_group()
+
+
+def _cdlm_train_loader(config, tokenizer, original_loader):
+  from cdlm_trajectories import build_cache_identity, CDLMTrajectoryDataset
+  identity = build_cache_identity(config, tokenizer, original_loader.dataset)
+  dataset = CDLMTrajectoryDataset(config.algo.trajectory_cache_dir,
+                                 expected_fingerprint=identity)
+  global_batch = int(config.loader.global_batch_size)
+  usable = len(dataset) // global_batch * global_batch
+  if usable == 0:
+    raise ValueError('CDLM trajectory cache is smaller than loader.global_batch_size; '
+                     'prepare more trajectories or reduce the global batch.')
+  # Full global batches prevent Lightning from flushing a partial accumulation
+  # window at every epoch boundary on the relatively small offline dataset.
+  loader = torch.utils.data.DataLoader(
+    torch.utils.data.Subset(dataset, range(usable)),
+    batch_size=config.loader.batch_size, shuffle=True, drop_last=True,
+    num_workers=config.loader.num_workers, pin_memory=config.loader.pin_memory,
+    persistent_workers=config.loader.num_workers > 0)
+  loader.tokenizer = tokenizer
+  return loader, identity['fingerprint']
+
+
 def _train(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Training.')
   # wandb_logger = None
@@ -372,13 +439,18 @@ def _train(diffusion_model, config, logger, tokenizer):
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)
+  cdlm_fingerprint = None
+  if config.algo.name == 'cdlm':
+    train_ds, cdlm_fingerprint = _cdlm_train_loader(config, tokenizer, train_ds)
   _print_batch(train_ds, valid_ds, tokenizer)
 
-  if config.algo.name == 'sdtt':
+  if config.algo.name in {'sdtt', 'cdlm'}:
     model = diffusion_model(config, tokenizer=tokenizer)
+    if config.algo.name == 'cdlm':
+      model._cache_fingerprint = cdlm_fingerprint
     if ckpt_path is None:
       if not config.training.finetune_path:
-        raise ValueError('SDTT requires training.finetune_path for its MDLM teacher.')
+        raise ValueError('The baseline requires training.finetune_path for its MDLM teacher.')
       model.initialize_from_checkpoint(config.training.finetune_path)
   elif config.training.finetune_path != '':
     assert utils.fsspec_exists(config.training.finetune_path)
@@ -416,6 +488,9 @@ def main(config):
   elif config.algo.name == 'sdtt':
     from sdtt import SDTT
     diffusion_model = SDTT
+  elif config.algo.name == 'cdlm':
+    from cdlm import CDLM
+    diffusion_model = CDLM
   elif config.algo.name == 'mdlm':
     diffusion_model = algo.MDLM_with_AR
   elif config.algo.name == 'mdlm_dmmd':
@@ -441,7 +516,9 @@ def main(config):
             'config': config,
             'tokenizer': tokenizer,
             'logger': logger}
-  if config.mode == 'sample_eval':
+  if config.mode == 'prepare_cdlm':
+    _prepare_cdlm(**kwargs)
+  elif config.mode == 'sample_eval':
     _generate_samples(**kwargs)
   elif config.mode == 'noise_diversity_eval':
     _noise_diversity_eval(**kwargs)

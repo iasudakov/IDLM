@@ -1,0 +1,26 @@
+name: cdlm
+backbone: dit
+parameterization: subs
+time_conditioning: False
+T: 0
+subs_masking: False
+causal_attention: False
+ignore_bos: False
+loss_type: elbo
+
+# SqueezeAILab/CDLM (708800a), adapted to the full-sequence MDLM checkpoint.
+attention_mode: full
+kld_type: forward_kl
+distill_weight: 1.0
+consistency_weight: 0.5
+denoise_weight: 0.1
+denoise_mask_floor: 0.001
+# Derive warmup from the finite official epoch budget at runtime.
+warmup_ratio: 0.05
+segment_length: 32
+trajectory_temperatures: [0.0, 0.5]
+trajectory_num_examples: 20000
+trajectory_batch_size: 8
+trajectory_shard_size: 8
+teacher_hidden_dtype: bfloat16
+trajectory_cache_dir: ${hydra:runtime.cwd}/cache_dir/cdlm_tinygsm_trajectories

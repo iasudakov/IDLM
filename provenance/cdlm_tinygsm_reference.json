@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "branch": "baseline/cdlm-tinygsm",
+  "base_commit": "708e77c1691cdb4e147f9bffa05747133676a235",
+  "intended_comparison": "CDLM objectives adapted to IDLM MDLM on TinyGSM, preserving the MMD data and confidence-threshold GSM8K comparison protocol.",
+  "paper": {
+    "title": "CDLM: Consistency Diffusion Language Models for Faster Sampling",
+    "authors": "Minseo Kim et al.",
+    "arxiv_id": "2511.19269",
+    "url": "https://arxiv.org/abs/2511.19269"
+  },
+  "upstream": {
+    "repository": "https://github.com/SqueezeAILab/CDLM",
+    "commit": "708800ab0df03e2c284ab2cb358e42652a5e85a5",
+    "license": "MIT",
+    "license_copy": "../third_party/CDLM_LICENSE",
+    "sources": {
+      "CDLM-train/utils/loss.py": {
+        "git_blob_sha": "54e0995df08616eaad04feb2cd9a8b697a42fb22",
+        "url": "https://github.com/SqueezeAILab/CDLM/blob/708800ab0df03e2c284ab2cb358e42652a5e85a5/CDLM-train/utils/loss.py"
+      },
+      "CDLM-train/train.py": {
+        "git_blob_sha": "91a8c9296702e52d292e90fdc2d0d08c12cff7b9",
+        "url": "https://github.com/SqueezeAILab/CDLM/blob/708800ab0df03e2c284ab2cb358e42652a5e85a5/CDLM-train/train.py"
+      },
+      "CDLM-train/utils/trajectory.py": {
+        "git_blob_sha": "2093124cd80a62063de35add736eeb22bad38f20",
+        "url": "https://github.com/SqueezeAILab/CDLM/blob/708800ab0df03e2c284ab2cb358e42652a5e85a5/CDLM-train/utils/trajectory.py"
+      },
+      "CDLM-train/config/llada.yaml": {
+        "git_blob_sha": "e3f0af35c5b56a31af17dd4120714bab7b21f866",
+        "url": "https://github.com/SqueezeAILab/CDLM/blob/708800ab0df03e2c284ab2cb358e42652a5e85a5/CDLM-train/config/llada.yaml"
+      },
+      "CDLM-train/preprocess.py": {
+        "git_blob_sha": "377ba8ce3626b46d18ca787597eaac94935f27cf",
+        "url": "https://github.com/SqueezeAILab/CDLM/blob/708800ab0df03e2c284ab2cb358e42652a5e85a5/CDLM-train/preprocess.py"
+      },
+      "LICENSE": {
+        "git_blob_sha": "b436efe38dffe6dc618ee80dc114e33941f5a59b",
+        "url": "https://github.com/SqueezeAILab/CDLM/blob/708800ab0df03e2c284ab2cb358e42652a5e85a5/LICENSE"
+      }
+    }
+  },
+  "objective": {
+    "distillation": "Forward teacher-to-student cross entropy on positions newly revealed between the sampled trajectory state and window endpoint; teacher entropy is omitted as a constant.",
+    "self_consistency": "Forward cross entropy from detached current-student probabilities at the later state to student predictions at the earlier state, on positions masked in both states.",
+    "ground_truth": "Inverse-mask-probability-weighted cross entropy on independently corrupted true answer/padding tokens.",
+    "ground_truth_mask_probability": "p=(1-1e-3)*Uniform(0,1)+1e-3; divide token CE by p+1e-8.",
+    "weights": {
+      "distillation": 1,
+      "self_consistency": 0.5,
+      "ground_truth": 0.1
+    },
+    "teacher": "Frozen original MDLM checkpoint; no SDTT round promotion.",
+    "floating_point": "Float32 probability normalization and losses with bf16 mixed model execution."
+  },
+  "trajectory": {
+    "collection": "Offline before optimization, one reveal per teacher forward.",
+    "prompts": 20000,
+    "temperatures": [
+      0,
+      0.5
+    ],
+    "trajectories": 40000,
+    "cache": "Compact token/order records and bf16 inputs to the frozen teacher's final vocabulary projection, allowing logits to be reconstructed without caching per-step vocabulary tensors.",
+    "window_size": 32,
+    "consistency_endpoint": "End of a reveal window; later windows remain masked. A fully clean sequence endpoint would make the still-masked self-consistency loss empty.",
+    "storage_bound": "40000 * 512 * 768 * 2 = 31457280000 bytes (about 29.3 GiB) for full bf16 head-input tensors, including zero prompt rows; metadata and token records are additional. Shape estimate, not measured disk usage.",
+    "reveal_order": "Global highest-confidence eligible position per call; no contiguous token-block restriction.",
+    "cache_dir_key": "algo.trajectory_cache_dir",
+    "batch_size_key": "algo.trajectory_batch_size",
+    "batch_size": 8,
+    "shard_size": 8,
+    "default_num_shards": 5000,
+    "resume": "Atomic tensor shards and metadata; fingerprinted manifest must be complete before training; metadata and content checksums verify resumed shards.",
+    "cache_identity": "Teacher checkpoint content hash, tokenizer serialization/vocabulary, model, training data fingerprint, selected example indices, seed, temperatures and rollout settings; relocation of identical files is allowed.",
+    "record_tensors": {
+      "input_ids": "[512] int64 original ground truth",
+      "attention_mask": "[512] bool eligible span",
+      "final_tokens": "[512] int64 teacher generation",
+      "reveal_order": "[512] int16; -1 prompt,0..N-1 eligible reveal rank",
+      "teacher_hidden": "[512,768] bfloat16; post-final-normalization/AdaLN input to frozen output_layer.linear"
+    },
+    "cache_read_memory": "One resident shard per dataloader worker; logits reconstructed through frozen original vocabulary head.",
+    "schema_version": 2,
+    "teacher_hidden_dtype": "Only bfloat16/bf16 is supported; the normalized dtype is fingerprinted in the schema-2 cache."
+  },
+  "selected_setup": {
+    "attention": "Full bidirectional MDLM attention, with no KV caching; trajectory windows do not impose a causal attention mask.",
+    "default_budget": "16 epochs over the offline trajectory dataset, following the author epoch count.",
+    "optional_budget": "20000 student optimizer updates in cdlm_tinygsm_matched.",
+    "global_batch_size": 512,
+    "per_device_microbatch_size": 32,
+    "devices": 4,
+    "gradient_accumulation": 4,
+    "optimizer": "AdamW",
+    "learning_rate": 1e-05,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "epsilon": 1e-08,
+    "weight_decay": 0,
+    "ema_decay": 0.9999,
+    "sequence_length": 512,
+    "prompt_and_padding": "Preserve BOS/question/literal backslash-n separator; train and corrupt answer/EOS/padding, excluding the prompt.",
+    "default_epoch_trajectories": 39936,
+    "default_omitted_trajectories_per_epoch": 64,
+    "default_updates_per_epoch": 78,
+    "default_total_optimizer_updates": 1248,
+    "default_warmup_ratio": 0.05,
+    "default_estimated_warmup_updates": 62,
+    "matched_preset_warmup_updates": 2500,
+    "warmup_configuration": "Default algo.warmup_ratio=0.05 derives warmup at runtime; lr_scheduler.num_warmup_steps=0 is a placeholder. The matched preset sets warmup_ratio=null and fixes warmup at 2500 updates."
+  },
+  "explicit_adaptations": [
+    "The released CDLM jointly changes the objective and attention architecture to block causality with KV caching; this branch keeps full MDLM attention to preserve the comparison backbone. It does not reproduce the released cached model's latency claims.",
+    "TinyGSM and the existing SmolLM tokenizer replace the released model/task/dataset mixture.",
+    "Full backbone finetuning replaces the released LoRA setup.",
+    "MMD batch 512, AdamW betas (0.9,0.999), no weight decay and EMA 0.9999 replace the release's batch/optimizer/EMA settings. The 16-epoch default keeps CDLM 5% warmup; the 20k-update matched preset uses MMD 2500-update warmup.",
+    "Compact monotone reveal-order storage replaces explicit per-step token/mask trajectory tensors.",
+    "Only the confidence-threshold GSM8K frontier is matched; inherited SDTT documentation lists separate historical diagnostics that are not implemented.",
+    "A 16-epoch default and 20000-update optional budget are distinct experimental budgets; neither trajectory generation nor optimizer runtime has been measured here.",
+    "Teacher reveals the globally highest-confidence position, rather than following the release's contiguous block order; 32-reveal windows apply to the trajectory order.",
+    "The true TinyGSM Python answer supplies GT denoising, normalized over the per-example eligible span instead of a fixed 256-token generation length."
+  ],
+  "reference": {
+    "run_uid": "3e0ac6b1-7a8f-43c3-af58-d9e21b886da7",
+    "detailed_record": "sdtt_tinygsm_reference.json",
+    "evaluation": "27 thresholds: 0.325 through 0.95 in 0.025 increments, plus 0.98; greedy low_confidence_dynamic; full 512 positions; execution accuracy; mean active forwards per example.",
+    "tracker": "Underdeep generative-models/tinygsm",
+    "inherited_provenance_limit": "Exact frozen historical source was unavailable; numeric tracker parameters and launch records are retained in the inherited record."
+  },
+  "validation_status": {
+    "gpu_training": "Not run; user requested code to execute on another machine.",
+    "gpu_evaluation": "Not run.",
+    "distributed_gpu_or_performance": "Not run; no measured speed, accuracy or pretrained parity asserted.",
+    "recommended_command": "python -m unittest discover -s tests -p 'test_cdlm*.py' -v",
+    "real_pretrained_cpu_initialization": {
+      "status": "passed",
+      "checkpoint_repository": "jdeschena/s-flm",
+      "checkpoint_revision": "3ec8edc326c698b4f915dbfa42f0ef5c8b8815f9",
+      "checkpoint_file": "tinygsm/mdlm.ckpt",
+      "production_backbone": "DIT",
+      "strict_raw_backbone_state_tensors": 131,
+      "model_vocabulary": 49154,
+      "tokenizer_size": 49153,
+      "frozen_teacher_head_weight_shape": [
+        49154,
+        768
+      ],
+      "frozen_teacher_head_bias_shape": [
+        49154
+      ],
+      "frozen_teacher_head_matches_raw_student": true,
+      "fresh_ema_shadow_tensors": 130,
+      "fresh_ema_matches_raw_student": true,
+      "ema_updates": 0,
+      "forward_calls": 0,
+      "optimizer_steps": 0,
+      "downloads": false,
+      "execution": "CPU only with CUDA_VISIBLE_DEVICES empty and Hugging Face offline environment flags."
+    }
+  },
+  "checkpoint_lifecycle": "Save final last.ckpt with live student weights and separate EMA before final evaluation or tracker publication; final EMA frontier is evaluated if the last optimizer step was not already reported.",
+  "nirvana_run_command_example": "../examples/nirvana_cdlm_run_command.sh"
+}

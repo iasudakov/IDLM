@@ -1,0 +1,82 @@
+# @package _global_
+defaults:
+  - override /data: tiny-gsm
+  - override /model: small
+  - override /algo: cdlm
+
+# Keep the TinyGSM MDLM/data/evaluation setup; use CDLM's 16-epoch budget.
+seed: 1
+logger:
+  experiment: generative-models/tinygsm
+  name: cdlm tinygsm lr1e-5 16 epochs
+data:
+  separator: '\n'
+  cache_dir: ${hydra:runtime.cwd}/cache_dir/tinygsm
+  wrap: False
+  train_on_prompt: False
+  train_on_pad: True
+  filter_too_long: True
+model:
+  length: 512
+adversarial_distill:
+  is_distill: False
+loader:
+  global_batch_size: 512
+  batch_size: 32
+  eval_batch_size: 64
+  num_workers: 4
+training:
+  finetune_path: hf://jdeschena/s-flm/tinygsm/mdlm.ckpt
+  loss_precision: float32
+  ema: 0.9999
+  mask_layout: random
+optim:
+  lr: 1e-5
+lr_scheduler:
+  # CDLM replaces this placeholder with 5% of estimated optimizer updates.
+  num_warmup_steps: 0
+strategy:
+  find_unused_parameters: True
+sampling:
+  predictor: ancestral_cache
+  steps: 64
+  mask_layout: random
+  num_sample_batches: 2
+  num_sample_log: 8
+eval:
+  generate_samples: False
+  compute_generative_perplexity: False
+  validate_before_train: True
+  gsm8k_at_validation: True
+  gsm8k_every_n_validations: 1
+  gsm8k_batch_size: 16
+  gsm8k_grading_workers: 4
+  gsm8k_num_examples: null
+  gsm8k_data_path: null
+  gsm8k_max_steps: null
+  gsm8k_pareto_temperature: 0.0
+  tinygsm_exec_timeout: 5.0
+  gsm8k_pareto_thresholds: [0.325,0.35,0.375,0.4,0.425,0.45,0.475,0.5,0.525,0.55,0.575,0.6,0.625,0.65,0.675,0.7,0.725,0.75,0.775,0.8,0.825,0.85,0.875,0.9,0.925,0.95,0.98]
+trainer:
+  devices: 4
+  precision: bf16-mixed
+  gradient_clip_val: null
+  max_steps: -1
+  max_epochs: 16
+  val_check_interval: 2000
+  # Count across epoch boundaries, including caches shorter than 2000 batches.
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
+  limit_val_batches: 1000
+callbacks:
+  checkpoint_monitor:
+    monitor: val/nll
+    save_top_k: 0
+  checkpoint_every_n_steps:
+    every_n_train_steps: 1000
+    save_top_k: -1
+    save_last: True
+    # Refresh last.ckpt even when the last epoch misses the periodic interval.
+    save_on_train_epoch_end: True
+checkpointing:
+  resume_from_ckpt: False

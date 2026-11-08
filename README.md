@@ -1,6 +1,12 @@
 # [IDLM: Inverse-distilled Diffusion Language Models](https://david-cripto.github.io/idlm-project-page/)
 
-This branch adds a full-sequence **SDTT baseline for TinyGSM**, adapted from
+This branch adds **CDLM objectives on TinyGSM MDLM with full attention**.
+It keeps the existing MDLM checkpoint and GSM8K/Underdeep comparison protocol.
+Run `bash scripts/train_cdlm_tinygsm_nirvana.sh` to collect teacher trajectories
+and train for 16 epochs on four GPUs. See [the CDLM setup](docs/cdlm_tinygsm.md)
+and [the complete Nirvana run-command](examples/nirvana_cdlm_run_command.sh).
+
+The full-sequence **SDTT baseline for TinyGSM** is also available, adapted from
 [the official implementation](https://github.com/jdeschena/sdtt). Run
 `bash scripts/train_sdtt_tinygsm.sh` for the official 70,000-update schedule;
 see [the setup and evaluation commands](docs/sdtt_tinygsm.md) for the settings
