@@ -11,6 +11,7 @@ import torch
 
 import algo
 import dataloader
+import model_assets
 import utils
 import underdeep_logger  # noqa: F401  (registers `underdeep_logger.*` Hydra _target_)
 from ipdb import set_trace as debug
@@ -403,6 +404,8 @@ def _train(diffusion_model, config, logger, tokenizer):
             config_name='config')
 def main(config):
   """Main entry point for training."""
+  model_assets.configure_model_weights(
+    config, base_dir=hydra.utils.get_original_cwd())
   L.seed_everything(config.seed)
   _print_config(config, resolve=True, save_cfg=True)
   

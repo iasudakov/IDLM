@@ -8,6 +8,7 @@ import models.ema
 import trainer_base
 from sdtt_checkpoint import apply_ema, backbone_state, read_checkpoint
 from sdtt_objective import collect_teacher_targets, masked_reverse_kl, round_schedule
+from model_assets import resolve_checkpoint
 
 
 class SDTT(trainer_base.AbsorbingState):
@@ -48,6 +49,7 @@ class SDTT(trainer_base.AbsorbingState):
             self.teacher(xt, self._process_sigma(sigma)), xt, sigma)
 
     def initialize_from_checkpoint(self, source):
+        source = self._checkpoint_source(source)
         checkpoint = read_checkpoint(source)
         state = backbone_state(checkpoint)
         self.backbone.load_state_dict(state, strict=True)
@@ -59,6 +61,7 @@ class SDTT(trainer_base.AbsorbingState):
                 self._get_parameters(), decay=self.config.training.ema)
 
     def load_evaluation_weights(self, source, use_ema=True):
+        source = self._checkpoint_source(source)
         checkpoint = read_checkpoint(source)
         self.backbone.load_state_dict(backbone_state(checkpoint), strict=True)
         if use_ema:
@@ -68,6 +71,13 @@ class SDTT(trainer_base.AbsorbingState):
         # Weights are applied once; avoid replacing them with fresh EMA shadows.
         self.ema = None
         self._evaluation_weights = 'ema' if use_ema else 'live'
+
+    def _checkpoint_source(self, source):
+        bundle = self.config.get('model_weights_dir')
+        if bundle and source.startswith('hf://'):
+            raise ValueError('With model_weights_dir, supply a local MDLM checkpoint path; '
+                             'no Hugging Face checkpoint download will be attempted.')
+        return resolve_checkpoint(source, bundle)
 
     def _schedule(self, step=None):
         cfg = self.config.algo
@@ -133,6 +143,7 @@ class SDTT(trainer_base.AbsorbingState):
         predictions = self.forward(xt, self._sigma_from_alphat(alpha))
         loss = masked_reverse_kl(predictions, targets, xt.eq(self.mask_index) & valid)
         self.log('train/sdtt_kl', loss, on_step=True, sync_dist=True)
+        self.log('student_loss', loss, on_step=True, sync_dist=True)
         self.log('train/sdtt_round', int(self._sdtt_round), on_step=True)
         self.log('train/sdtt_student_steps', student_grid, on_step=True)
         return loss

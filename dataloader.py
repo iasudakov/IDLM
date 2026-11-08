@@ -19,6 +19,7 @@ import torch
 import transformers
 
 import utils
+from model_assets import pretrained_kwargs
 
 LOGGER = utils.get_logger(__name__)
 
@@ -870,7 +871,8 @@ def get_tokenizer(config):
     tokenizer = SyntheticTokenizer(vocab_size=256)
   else:
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-      config.data.tokenizer_name_or_path)
+      **pretrained_kwargs(config.data.tokenizer_name_or_path,
+                          config.get('model_weights_dir'), kind='tokenizer'))
 
   if (isinstance(tokenizer, transformers.GPT2TokenizerFast)
       or isinstance(tokenizer, transformers.GPT2Tokenizer)):

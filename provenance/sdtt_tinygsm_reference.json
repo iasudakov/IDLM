@@ -4,6 +4,12 @@
   "branch": "baseline/sdtt-tinygsm",
   "base_idlm_commit": "831fbac67fb753d86066f756faa06c63ff9b6dee",
   "implementation_scope": "Code for SDTT on the existing time-unconditional MDLM and TinyGSM protocol; no training job or GPU evaluation launched.",
+  "logging_alignment": {
+    "experiment": "generative-models/tinygsm",
+    "reference_metric_names_verified": ["student_loss", "trainer/lr", "val/gsm8k_acc_thr*", "val/gsm8k_nfe_thr*", "pareto/gsm8k_step_*", "pareto/frontier", "val/samples"],
+    "source": "Reference run refs and cached Underdeep scalar/image/table inventories.",
+    "not_implemented": "Separate fixed-64-step GSM8K scores and held-out answer-execution diagnostics; threshold results are not substituted for those evaluations."
+  },
   "official_sdtt": {
     "repository": "https://github.com/jdeschena/sdtt",
     "commit": "1150985e90b8f2d5749e4469d5154eff9ec922c4",
@@ -960,7 +966,7 @@
     "validation_interval_microbatches": 1000,
     "validation_interval_optimizer_updates_at_default_batch": 500,
     "original_logger_step_mapping": "Cached timing audit maps raw999 to500 student updates and raw13999 to7000; compare normalized optimizer updates, not raw logged steps.",
-    "checkpoint_difference": "New callback preserves full checkpoints every2000 optimizer updates and last.ckpt; reference periodic callback requested2000 train batches."
+    "checkpoint_difference": "New callback preserves full checkpoints every1000 optimizer updates and last.ckpt; reference requested2000 microbatches at accumulation2, matching the save cadence."
   },
   "separator": {
     "python_repr": "'\\\\n'",

@@ -5,6 +5,8 @@ This branch adds a full-sequence **SDTT baseline for TinyGSM**, adapted from
 `bash scripts/train_sdtt_tinygsm.sh` for the official 70,000-update schedule;
 see [the setup and evaluation commands](docs/sdtt_tinygsm.md) for the settings
 matched to MMD run `3e0ac6b1-7a8f-43c3-af58-d9e21b886da7`.
+For the same Nirvana code/checkpoint/offline-bundle layout and Underdeep
+experiment as that MMD run, use `bash scripts/train_sdtt_tinygsm_nirvana.sh`.
 
 <p align="center">
   <strong>By</strong><br>

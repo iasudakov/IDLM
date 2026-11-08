@@ -8,6 +8,8 @@ defaults:
 # Seven SDTT compression rounds fit inside 20k optimizer updates. The last
 # (8-step) round continues to the end; it is not compressed below 8 steps.
 seed: 1
+logger:
+  experiment: generative-models/tinygsm
 data:
   separator: '\n'
   cache_dir: ${hydra:runtime.cwd}/cache_dir/tinygsm
@@ -39,6 +41,7 @@ sampling:
   predictor: ancestral_cache
   steps: 64
   mask_layout: random
+  num_sample_log: 8
 eval:
   generate_samples: False
   compute_generative_perplexity: False
@@ -66,7 +69,8 @@ callbacks:
     monitor: val/nll
     save_top_k: 0
   checkpoint_every_n_steps:
-    every_n_train_steps: 2000
+    # MMD saved every 2000 microbatches = 1000 student updates.
+    every_n_train_steps: 1000
     save_top_k: -1
     save_last: True
 checkpointing:

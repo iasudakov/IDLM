@@ -16,6 +16,16 @@ bash scripts/train_sdtt_tinygsm.sh \
 
 If `training.finetune_path` is omitted, the preset downloads `hf://jdeschena/s-flm/tinygsm/mdlm.ckpt`. Use the original checkpoint from the MMD run when available: the public release is an explicit fallback, and checkpoint identity is not established by this implementation. `PYTHON=/path/to/python` selects a Python executable. Extra Hydra arguments passed to the launcher override the preset.
 
+For the historical Nirvana MMD launch layout, use the explicit cluster launcher:
+
+```bash
+bash "$SOURCE_CODE_PATH/code/scripts/train_sdtt_tinygsm_nirvana.sh"
+```
+
+It uses `$SOURCE_CODE_PATH/code/checkpoints/tinygsm/mdlm_notok.ckpt`, the existing `cache_dir/tinygsm_mmd_offline_bundle`, and the same Underdeep experiment, `generative-models/tinygsm`, with run name `sdtt tinygsm lr1e-5 official 70k`. Checkpoints, Hydra output, and `pareto_history.json` go to `$SOURCE_CODE_PATH/code/sdtt_tinygsm`. `SDTT_CODE_DIR=/absolute/path/to/code` overrides the code directory; when both directory variables are unset, it uses this checkout. The launcher lists the data, batching, validation, sampler, and official SDTT schedule overrides explicitly. Trailing Hydra overrides still win. For four GPUs with the same effective batch and validation cadence, append `trainer.devices=4 trainer.accumulate_grad_batches=4 trainer.val_check_interval=2000`.
+
+The SDTT GSM8K validation hook publishes the same accuracy/NFE curves independently of `eval.generate_samples`; the cluster launcher leaves this flag false to avoid an additional unconditional sample-generation path. Execution scoring and all reference confidence thresholds remain enabled.
+
 The default assumes eight CUDA devices, 32 examples per device per microbatch, and two microbatches per optimizer update: `8 × 32 × 2 = 512` examples. If changing hardware, preserve `loader.global_batch_size=512`; accumulation is derived automatically. For example:
 
 ```bash
@@ -94,11 +104,13 @@ Evaluation uses EMA weights by default. Add `eval.disable_ema=True` for live stu
 
 The sampler is the MMD comparison's `low_confidence_dynamic` decoder with temperature zero. Thresholds are `0.325, 0.35, …, 0.95, 0.98`. Each forward commits masked tokens whose confidence is strictly greater than the threshold; an unfinished row with no accepted token commits its most confident token. EOS does not stop decoding: the remaining answer/padding positions are completed. The default cap is 512 iterations, with a counted final noise-removal call if needed. `sampling.steps=64` is inherited metadata and does not limit this threshold decoder.
 
-Accuracy uses the project's S-FLM execution-based math scoring, with a five-second timeout. NFE is the mean number of active denoiser calls per example, including the capped final call. The JSON also records total batch forwards, checkpoint weight choice, the dataset hash, separator, seed, sequence length, and thresholds. Training logs expose `pareto/gsm8k_acc_thr*`, `pareto/gsm8k_nfe_thr*`, and `pareto_history.json`. `train/sdtt_kl`, `train/sdtt_round`, and `train/sdtt_student_steps` describe distillation progress; held-out `val/nll` remains an MDLM ELBO diagnostic.
+Accuracy uses the project's S-FLM execution-based math scoring, with a five-second timeout. NFE is the mean number of active denoiser calls per example, including the capped final call. The JSON also records total batch forwards, checkpoint weight choice, the dataset hash, separator, seed, sequence length, and thresholds. Underdeep uses the reference experiment `generative-models/tinygsm` and exact threshold keys `val/gsm8k_acc_thr*` and `val/gsm8k_nfe_thr*`; the earlier `pareto/*` aliases remain available. `pareto/gsm8k_step_*`, `pareto/frontier`, and `pareto_history.json` retain the accuracy/NFE frontier, including prior checkpoints. `val/samples` contains up to eight already-generated examples near threshold 0.9, without extra model calls. `student_loss` aliases the SDTT reverse KL; `trainer/lr`, `train/sdtt_kl`, `train/sdtt_round`, and `train/sdtt_student_steps` describe training. Held-out `val/nll`, `val/bpd`, and `val/ppl` remain MDLM ELBO diagnostics.
+
+The historical run also recorded separate fixed-64-step GSM8K and held-out answer-execution diagnostics (`val/gsm8k_acc`, `val/gsm8k_acc_greedy`, `val/gsm8k_nfe`, `val/answer_*`). Those separate evaluations are not implemented here and are not substituted with threshold-sweep scores. The matched comparison is the confidence-threshold accuracy/NFE frontier. MMD-specific rewards have no SDTT equivalent.
 
 ## Checkpoints and resume
 
-The new preset retains full Lightning checkpoints every 2,000 optimizer updates and writes `checkpoints/last.ckpt`. This differs from the reference's periodic train-batch checkpoint convention. Checkpoints retain student, frozen teacher, compression round, EMA, optimizer, scheduler, and Lightning loop state.
+The new preset retains full Lightning checkpoints every 1,000 optimizer updates and writes `checkpoints/last.ckpt`. This matches the reference's cadence of 2,000 microbatches at accumulation two. Checkpoints retain student, frozen teacher, compression round, EMA, optimizer, scheduler, and Lightning loop state.
 
 Use the same preset, schedule, output directory, and checkpoint when resuming:
 
@@ -113,4 +125,4 @@ On a resume, the full SDTT state is restored rather than reinitializing from `tr
 
 ## Validation status
 
-The 26 CPU tests cover the SDTT target/objective and schedule, checkpoint loading/EMA selection, conditional evaluation sampler, and scoring interface. Loading the actual S-FLM TinyGSM checkpoint into the production DiT was also checked on CPU: strict loading passes, all 130 student/teacher parameter tensors match, and the vocabulary/embedding shape is correct. Full GPU training, multi-device execution, and pretrained accuracy/NFE results remain to be run on the target machine. Neither comparison quality nor runtime is inferred from CPU checks.
+The 39 CPU tests cover the SDTT target/objective and schedule, checkpoint loading/EMA selection, offline model assets, cluster launch command, conditional evaluator, scoring interface, and exact Underdeep metric/image/table names. Loading the actual S-FLM TinyGSM checkpoint into the production DiT was also checked on CPU: strict loading passes, all 130 student/teacher parameter tensors match, and the vocabulary/embedding shape is correct. Full GPU training, multi-device execution, and pretrained accuracy/NFE results remain to be run on the target machine. Neither comparison quality nor runtime is inferred from CPU checks.

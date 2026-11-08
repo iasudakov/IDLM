@@ -55,6 +55,7 @@ class TinyGSMProtocolTest(unittest.TestCase):
         self.assertEqual(config.algo.parameterization, 'subs')
         self.assertFalse(config.algo.time_conditioning)
         self.assertFalse(config.adversarial_distill.is_distill)
+        self.assertEqual(config.logger.experiment, 'generative-models/tinygsm')
 
     def test_training_reference_uses_the_same_effective_global_batch(self):
         config = recipe()

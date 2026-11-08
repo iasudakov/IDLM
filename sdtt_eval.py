@@ -37,7 +37,7 @@ def load_examples(path, tokenizer, separator, length, limit=None):
             question.strip(), add_special_tokens=False).input_ids + separator_ids
         if len(tokens) >= length:
             raise ValueError(f'Example {index} leaves no answer space at sequence length {length}.')
-        examples.append({'input_ids': tokens, 'answer': answer})
+        examples.append({'input_ids': tokens, 'answer': answer, 'question': question.strip()})
     return examples
 
 
@@ -182,7 +182,8 @@ def _settings(cfg, thresholds):
     return thresholds, batch_size, workers, cap, temperature, timeout
 
 
-def _evaluate_threshold(model, examples, threshold, pool, batch_size, temperature, cap, timeout):
+def _evaluate_threshold(model, examples, threshold, pool, batch_size, temperature, cap, timeout,
+                        sample_records=None, max_sample_records=0):
     correct = count = total_nfe = batch_nfe = 0
     for start in range(0, len(examples), batch_size):
         batch = examples[start:start + batch_size]
@@ -191,7 +192,18 @@ def _evaluate_threshold(model, examples, threshold, pool, batch_size, temperatur
         texts = [model.tokenizer.decode(sample[len(prompt):].tolist(), skip_special_tokens=True)
                  for sample, prompt in zip(samples.cpu(), prompts)]
         pairs = zip(texts, [example['answer'] for example in batch])
-        correct += sum(pool.map(lambda pair: grade_sample(*pair, timeout_s=timeout), pairs))
+        grades = list(pool.map(lambda pair: grade_sample(*pair, timeout_s=timeout), pairs))
+        correct += sum(grades)
+        # Reuse decoded completions and grades; logging must not add model calls.
+        if sample_records is not None and len(sample_records) < max_sample_records:
+            nfes = metadata['nfe_per_row'].cpu().tolist()
+            for example, text, grade, nfe in zip(batch, texts, grades, nfes):
+                if len(sample_records) >= max_sample_records:
+                    break
+                sample_records.append({
+                    'question': example.get('question', ''), 'generated': text,
+                    'reference': example['answer'], 'grade': bool(grade),
+                    'nfe': int(nfe), 'threshold': float(threshold)})
         count += len(batch)
         total_nfe += int(metadata['nfe_per_row'].sum())
         batch_nfe += metadata['nfe']
@@ -261,13 +273,18 @@ def sweep(model, examples):
     local_examples = examples[rank::world_size]
     devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
     curve = []
+    sample_threshold = min(thresholds, key=lambda value: abs(value - .9))
+    sample_limit = max(0, int(model.config.sampling.get('num_sample_log', 8)))
+    model._gsm8k_sample_records = []
     with torch.random.fork_rng(devices=devices), ThreadPoolExecutor(max_workers=workers) as pool:
         for threshold in thresholds:
             torch.manual_seed(int(model.config.get('seed', 1)) + 104729 * rank)
             error = None
             try:
                 correct, count, total_nfe, _ = _evaluate_threshold(
-                    model, local_examples, threshold, pool, batch_size, temperature, cap, timeout)
+                    model, local_examples, threshold, pool, batch_size, temperature, cap, timeout,
+                    sample_records=model._gsm8k_sample_records if rank == 0 and threshold == sample_threshold else None,
+                    max_sample_records=sample_limit)
             except Exception as caught:
                 error = caught
             _raise_if_failed(error)
@@ -333,17 +350,19 @@ def log_validation_gsm8k(model, initial=False):
 
 
 def publish(model, curve, initial=False):
-    """Log threshold metrics and comparison curves under the Pareto namespace."""
+    """Preserve the reference metric names, native frontier, image and samples."""
     logger = model.trainer.logger
     metrics = {}
     for point in curve:
         tag = f'{point["threshold"]:g}'.replace('.', '')
         for suffix, key in [('acc', 'accuracy'), ('nfe', 'nfe')]:
-            name = f'pareto/gsm8k_{suffix}_thr{tag}'
-            metrics[name] = point[key]
-            if not initial:
-                model.log(name, torch.tensor(point[key], device=model.device, dtype=torch.float32),
-                          on_epoch=True, on_step=False, sync_dist=False, rank_zero_only=True)
+            # The reference run used val/*; retain the first SDTT aliases too.
+            for prefix in ('val', 'pareto'):
+                name = f'{prefix}/gsm8k_{suffix}_thr{tag}'
+                metrics[name] = point[key]
+                if not initial:
+                    model.log(name, torch.tensor(point[key], device=model.device, dtype=torch.float32),
+                              on_epoch=True, on_step=False, sync_dist=False, rank_zero_only=True)
     if model.trainer.global_rank != 0:
         return
     step = int(model.global_step)
@@ -374,3 +393,47 @@ def publish(model, curve, initial=False):
         for point in sorted(curve, key=lambda p: p['threshold']):
             logger.log_metrics({f'pareto/gsm8k_step_{step}': point['accuracy']},
                                step=int(round(point['nfe'] * 100)))
+
+        rows = getattr(model, '_gsm8k_sample_records', [])
+        if rows and hasattr(logger, 'log_table'):
+            logger.log_table('val/samples',
+                             ['question', 'generated', 'reference', 'grade', 'NFE', 'threshold'],
+                             [[row['question'], row['generated'], row['reference'], row['grade'],
+                               row['nfe'], row['threshold']] for row in rows], step=step)
+        if hasattr(logger, 'log_image'):
+            try:
+                logger.log_image('pareto/frontier', render_frontier(history, step), step=step)
+            except Exception as error:
+                warnings.warn(f'Could not render GSM8K Pareto frontier: {error}')
+
+
+def render_frontier(history, current_step):
+    """Render actual prior and current accuracy/NFE curves without interpolation."""
+    import numpy as np
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    figure = Figure(figsize=(8, 5), dpi=120, constrained_layout=True)
+    canvas = FigureCanvasAgg(figure)
+    axes = figure.add_subplot(111)
+    older_label = True
+    for step, curve in sorted(history.items(), key=lambda item: int(item[0])):
+        ordered = sorted(curve, key=lambda point: point['nfe'])
+        current = int(step) == int(current_step)
+        label = f'Step {step}' if current else ('Earlier checkpoints' if older_label else None)
+        axes.plot([point['nfe'] for point in ordered],
+                  [100 * point['accuracy'] for point in ordered],
+                  color='#1763a6' if current else '#888888',
+                  alpha=1. if current else .3,
+                  linewidth=2.2 if current else 1.,
+                  marker='o' if current else None, markersize=3, label=label)
+        if not current:
+            older_label = False
+    axes.set(xlabel='Mean denoiser calls per example (NFE)',
+             ylabel='GSM8K execution accuracy (%)', title='SDTT confidence-threshold frontier',
+             ylim=(0, 100))
+    axes.grid(alpha=.2)
+    if history:
+        axes.legend()
+    canvas.draw()
+    return np.asarray(canvas.buffer_rgba())[..., :3].copy()

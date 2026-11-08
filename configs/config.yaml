@@ -14,6 +14,9 @@ mode: train  # train / ppl_eval / sample_eval / noise_diversity_eval
 debug: False
 seed: 1
 
+# Optional local tokenizer/model asset bundle, as in the MMD launcher.
+model_weights_dir: null
+
 adversarial_distill:
   is_distill: False
   accum_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
