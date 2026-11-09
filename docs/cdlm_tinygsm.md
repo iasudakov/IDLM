@@ -88,6 +88,14 @@ bash "$SOURCE_CODE_PATH/code/scripts/train_cdlm_tinygsm_nirvana.sh"
 
 This wrapper prepares trajectories and then trains, using the code bundle's original `checkpoints/tinygsm/mdlm_notok.ckpt`, `cache_dir`, and `cache_dir/tinygsm_mmd_offline_bundle`. Outputs go to a separate `cdlm_tinygsm` directory. The tracker experiment stays `generative-models/tinygsm`. Keep shell arrays and parameter expansions inside the external script; Nirvana interprets some brace expressions in its run-command field before Bash starts.
 
+The model bundle supplies tokenizer/model assets, while the original TinyGSM
+data must be present separately under `data.cache_dir` for offline preparation.
+Both the untagged DatasetDict cache and the older matching-separator cache are
+supported. For this preset the latter directory is
+`tiny_gsm_bs512_answer_only_filtered_train_on_pad_HuggingFaceTB__SmolLM-135M_sep5c6e`,
+containing `train/` and `validation/`. These splits are loaded unchanged; the
+generic `tiny_gsm_train_bs512_unwrapped.dat` file is not required in that case.
+
 [examples/nirvana_cdlm_run_command.sh](../examples/nirvana_cdlm_run_command.sh) contains the full setup, input staging, and launcher invocation for the Nirvana run-command field. It uses the same environment and input names as the MMD job and invokes the external script for both CDLM phases.
 
 `PYTHON=/absolute/path/to/python` selects an environment. Trailing Hydra overrides change the run settings. Pass the same teacher/data/cache settings to preparation and training. Training-only and preparation-only wrappers are available for scheduling those stages separately.

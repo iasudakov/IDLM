@@ -293,6 +293,14 @@ def get_tiny_gsm_dataset(config, tokenizer):
          for split in split_names):
     return datasets.load_from_disk(save_dir)
 
+  # Reuse prepared caches from the older TinyGSM code.
+  separator_tag = config.data.separator.encode('utf-8').hex()
+  tagged_save_dir = f'{save_dir}_sep{separator_tag}'
+  if all(utils.fsspec_exists(os.path.join(tagged_save_dir, split))
+         for split in split_names):
+    LOGGER.info(f'Loading legacy TinyGSM cache from: {tagged_save_dir}')
+    return datasets.load_from_disk(tagged_save_dir)
+
   data_path = getattr(config.data, 'data_path', None)
   if data_path:
     LOGGER.info(f'Preparing TinyGSM-style dataset from {data_path}.')
