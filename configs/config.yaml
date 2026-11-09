@@ -100,6 +100,15 @@ adversarial_distill:
   mmd_sdtt_path: null
   mmd_sdtt_local_files_only: false
 
+  # Optional SDLLM MDLM-1.7B feature map on its own tokenizer. The student
+  # keeps its own tokenizer: GPT-2/OWT scores all native positions; TinyGSM
+  # scores native answers with the prompt retained as context, without pads.
+  # Requires feature/RBF/token/draws, score_positions=all and noise_level=0.
+  mmd_sdllm_model: nvidia/SDLLM-MDLM-1.7B-Base
+  mmd_sdllm_revision: 4007e0b2a23465a31adf282d843a61172932af2a
+  mmd_sdllm_path: null
+  mmd_sdllm_local_files_only: false
+
   # HF hub id (or a local dir with the same config.json / pytorch_model.bin).
   # Loaded via the vendored `models/backbone_dit_legacy.py`, because the
   # published remote code imports transformers.models.qwen3, which this
@@ -539,6 +548,22 @@ eval:
   gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
   generate_samples: True
   generated_samples_path: ${cwd:}/samples.json
+
+  # Optional conditional TinyGSM/GSM8K evaluation; off for existing OWT runs.
+  validate_before_train: false
+  gsm8k_at_validation: false
+  gsm8k_every_n_validations: 1
+  gsm8k_data_path: null
+  gsm8k_num_examples: null
+  gsm8k_batch_size: 16
+  gsm8k_steps: null  # Fixed greedy budget; null follows sampling.steps.
+  gsm8k_greedy_token: true
+  gsm8k_pareto_thresholds: []
+  gsm8k_pareto_temperature: 0.0
+  gsm8k_max_steps: null
+  gsm8k_grading_workers: 4
+  tinygsm_exec: true
+  tinygsm_exec_timeout: 5.0
 
   # --- Where the expensive evaluation runs -----------------------------------
   # `trainer.val_check_interval` fuses two very different cadences: the

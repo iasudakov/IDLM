@@ -285,6 +285,17 @@ class TrainerBase(L.LightningModule):
           persistent_workers=True))
     self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
+    if (self.config.data.train == 'tiny_gsm'
+        and self.config.eval.get('gsm8k_at_validation', False)
+        and self.config.eval.get('validate_before_train', False)
+        and self.global_step == 0):
+      from tinygsm_validation import log_validation_gsm8k
+      self._eval_mode()
+      try:
+        log_validation_gsm8k(self, initial=True)
+      finally:
+        self._train_mode()
+
   def optimizer_step(self, *args, **kwargs):
     super().optimizer_step(*args, **kwargs)
     if self.ema:
@@ -381,6 +392,14 @@ class TrainerBase(L.LightningModule):
     # what `eval.eval_step_range` / `eval.eval_at_steps` gate.
     if not getattr(self, '_gen_eval_active', True):
       self._train_mode()
+      return
+    if (self.config.data.train == 'tiny_gsm'
+        and self.config.eval.get('gsm8k_at_validation', False)):
+      try:
+        from tinygsm_validation import log_validation_gsm8k
+        log_validation_gsm8k(self)
+      finally:
+        self._train_mode()
       return
     if ((self.config.eval.compute_perplexity_on_sanity
          or not self.trainer.sanity_checking)

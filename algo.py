@@ -640,7 +640,7 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
     super().on_train_start()
     cfg = self.config.adversarial_distill
     if (self.is_adversarial_distill
-        and cfg.get('mmd_feature_source', 'ar') == 'sdtt_mdlm'
+        and cfg.get('mmd_feature_source', 'ar') in ('sdtt_mdlm', 'sdllm_mdlm')
         and cfg.get('mmd_reward_weight', 0.0)
         and cfg.get('mmd_reward_type', 'feature') in ('feature', 'feature_mse')):
       # Resolve/download the external teacher before the first training batch.
@@ -1067,9 +1067,51 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
           noise_level=cfg.mmd_noise_level)
         what = (f'SDTT MDLM features ({cfg.get("mmd_sdtt_revision", "teacher_400k_large_step_400000")}, '
                 f'noise={cfg.mmd_noise_level})')
+      elif source == 'sdllm_mdlm':
+        # Native SDLLM-token distributions need no positional projection back
+        # to the student's vocabulary. Fail before downloading the checkpoint
+        # if a source-position-dependent reward was requested.
+        requirements = {
+          'mmd_reward_type': ('feature', 'feature'),
+          'mmd_kernel': ('rbf', 'linear'),
+          'mmd_kernel_level': ('token', 'token'),
+          'mmd_kernel_source': ('draws', 'rows'),
+          'mmd_score_positions': ('all', 'written'),
+        }
+        for name, (expected, default) in requirements.items():
+          if cfg.get(name, default) != expected:
+            raise ValueError(f'mmd_feature_source=sdllm_mdlm requires '
+                             f'adversarial_distill.{name}={expected}; '
+                             'MMD is computed on native SDLLM token features')
+        if float(cfg.get('mmd_noise_level', 0.1)) != 0.0:
+          raise ValueError('mmd_feature_source=sdllm_mdlm requires '
+                           'adversarial_distill.mmd_noise_level=0.0')
+        data = getattr(self.config, 'data', None)
+        if data is not None and data.get('train') == 'tiny_gsm':
+          if data.get('wrap', False) or data.get('train_on_prompt', False):
+            raise ValueError('TinyGSM SDLLM features require data.wrap=False '
+                             'and data.train_on_prompt=False to identify '
+                             'the reference answer span')
+        from mmd_sdllm_features import load_sdllm_feature_model
+        from mmd_sdllm_reward import FrozenSdllmFeatures
+        backbone = load_sdllm_feature_model(
+          cfg.get('mmd_sdllm_model', 'nvidia/SDLLM-MDLM-1.7B-Base'), self.device,
+          tokenizer=self.tokenizer, mask_index=self.mask_index,
+          revision=cfg.get('mmd_sdllm_revision', '4007e0b2a23465a31adf282d843a61172932af2a'),
+          local_path=cfg.get('mmd_sdllm_path', None),
+          local_files_only=cfg.get('mmd_sdllm_local_files_only', False),
+          feature_layer=cfg.mmd_feature_layer)
+        self._mmd_critic_cached = FrozenSdllmFeatures(
+          backbone, self.tokenizer, self.mask_index,
+          layer_index=cfg.mmd_feature_layer,
+          layer_weights=cfg.get('mmd_feature_layer_weights', None), noise_level=0.0)
+        span = ('answers with prompt context' if
+                getattr(backbone, 'source_family', 'gpt2') == 'tinygsm'
+                else 'all positions')
+        what = f'SDLLM MDLM-1.7B features (native tokenizer, {span}, clean)'
       else:
         raise ValueError('adversarial_distill.mmd_feature_source must be '
-                         f'ar|diffusion|sdtt_mdlm, got {source!r}')
+                         f'ar|diffusion|sdtt_mdlm|sdllm_mdlm, got {source!r}')
       self._mmd_critic_cached.reward_type = kind
       self._mmd_critic_cached.kernel = kernel
       self._mmd_critic_cached.kernel_level = level

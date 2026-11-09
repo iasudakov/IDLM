@@ -1,5 +1,8 @@
 # MDLM-L features for the archived OWT MMD training code
 
+For the newer native-token SDLLM feature option, see
+[SDLLM MDLM-1.7B features](sdllm_features.md).
+
 This worktree starts from the exact frozen source of Underdeep run
 [3daa3e6f-1c54-4854-8bda-0b33dfd3257f](https://deep.yandex-team.ru/projects/generative-models/experiments/owt/run/3daa3e6f-1c54-4854-8bda-0b33dfd3257f).
 Its checkpoint label3218 matches all36 points of Figure2/Table2. The paper's

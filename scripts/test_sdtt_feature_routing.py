@@ -148,11 +148,14 @@ class SdttFeatureRoutingTests(unittest.TestCase):
         new = OmegaConf.to_container(OmegaConf.load(
             ROOT / 'configs/config.yaml').adversarial_distill, resolve=False)
         additions = {name: value for name, value in new.items()
-                     if name.startswith('mmd_sdtt_')}
+                     if name.startswith(('mmd_sdtt_', 'mmd_sdllm_'))}
         self.assertEqual(additions, {
             'mmd_sdtt_model': 'jdeschena/sdtt',
             'mmd_sdtt_revision': 'teacher_400k_large_step_400000',
-            'mmd_sdtt_path': None, 'mmd_sdtt_local_files_only': False})
+            'mmd_sdtt_path': None, 'mmd_sdtt_local_files_only': False,
+            'mmd_sdllm_model': 'nvidia/SDLLM-MDLM-1.7B-Base',
+            'mmd_sdllm_revision': '4007e0b2a23465a31adf282d843a61172932af2a',
+            'mmd_sdllm_path': None, 'mmd_sdllm_local_files_only': False})
         self.assertEqual({key: value for key, value in new.items()
                           if key not in additions}, old)
         self.assertEqual(new['mmd_feature_source'], old['mmd_feature_source'])

@@ -26,5 +26,7 @@ timm
 ocifs
 hf_transfer
 huggingface-hub
+# Only needed by the opt-in SDLLM feature source; imported lazily.
+tiktoken==0.9.0
 # Install flash attention only after installing the above modules via pip install -r requirements.txt
 # flash_attn==2.7.4.post1
