@@ -15,6 +15,7 @@ exec "${PYTHON:-python}" -u -m main \
   +experiment=sdtt_tinygsm \
   mode=sample_eval \
   trainer.devices=1 \
+  eval.gsm8k_pareto_thresholds=null \
   "eval.checkpoint_path=$sdtt_checkpoint_path" \
   eval.generated_samples_path=sdtt_tinygsm_eval.json \
   "$@"
