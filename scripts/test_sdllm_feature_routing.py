@@ -197,10 +197,10 @@ class SDLLMStartupTests(unittest.TestCase):
         return legacy_startup.SDTTStartupTests().make(
             mmd_feature_source='sdllm_mdlm', **settings)
 
-    def test_prepares_native_teacher_once_after_parent_hook(self):
+    def test_prepares_native_teacher_before_parent_initial_evaluation(self):
         model = self.make()
         model.on_train_start()
-        self.assertEqual(model.events, ['noise schedule', 'parent', 'feature model'])
+        self.assertEqual(model.events, ['noise schedule', 'feature model', 'parent'])
 
     def test_disabled_zero_weight_or_ratio_modes_do_not_prepare_sdllm(self):
         for changes in ({'mmd_reward_weight': 0.}, {'mmd_reward_type': 'idlm'}):
@@ -213,12 +213,12 @@ class SDLLMStartupTests(unittest.TestCase):
         model.on_train_start()
         self.assertEqual(model.events, ['parent'])
 
-    def test_preparation_failure_stops_startup_after_parent(self):
+    def test_preparation_failure_stops_startup_before_parent_evaluation(self):
         model = self.make()
         model.download_error = RuntimeError('native release unavailable')
         with self.assertRaisesRegex(RuntimeError, 'native release unavailable'):
             model.on_train_start()
-        self.assertEqual(model.events, ['noise schedule', 'parent', 'feature model'])
+        self.assertEqual(model.events, ['noise schedule', 'feature model'])
 
     def test_legacy_sources_do_not_activate_external_startup(self):
         for source in ('ar', 'diffusion'):

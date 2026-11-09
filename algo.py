@@ -637,15 +637,16 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
         utils.activate_model(self.backbone)
         utils.freeze_model(self.fake_model)
       self._sync_noise_schedule()
-    super().on_train_start()
     cfg = self.config.adversarial_distill
     if (self.is_adversarial_distill
         and cfg.get('mmd_feature_source', 'ar') in ('sdtt_mdlm', 'sdllm_mdlm')
         and cfg.get('mmd_reward_weight', 0.0)
         and cfg.get('mmd_reward_type', 'feature') in ('feature', 'feature_mse')):
-      # Resolve/download the external teacher before the first training batch.
+      # Resolve the external teacher before the parent's initial GSM8K sweep,
+      # so a checkpoint failure does not waste a complete evaluation first.
       # HF cache file locks coordinate concurrent DDP ranks; no extra barrier.
       _ = self._mmd_critic
+    super().on_train_start()
 
   def _sync_noise_schedule(self):
     """Point the injection's warmup ramp at the current global step.
@@ -1094,17 +1095,22 @@ class MDLM(DistillMaskScheduleMixin, trainer_base.AbsorbingState):
                              'the reference answer span')
         from mmd_sdllm_features import load_sdllm_feature_model
         from mmd_sdllm_reward import FrozenSdllmFeatures
-        backbone = load_sdllm_feature_model(
-          cfg.get('mmd_sdllm_model', 'nvidia/SDLLM-MDLM-1.7B-Base'), self.device,
-          tokenizer=self.tokenizer, mask_index=self.mask_index,
-          revision=cfg.get('mmd_sdllm_revision', '4007e0b2a23465a31adf282d843a61172932af2a'),
-          local_path=cfg.get('mmd_sdllm_path', None),
-          local_files_only=cfg.get('mmd_sdllm_local_files_only', False),
-          feature_layer=cfg.mmd_feature_layer)
-        self._mmd_critic_cached = FrozenSdllmFeatures(
-          backbone, self.tokenizer, self.mask_index,
-          layer_index=cfg.mmd_feature_layer,
-          layer_weights=cfg.get('mmd_feature_layer_weights', None), noise_level=0.0)
+        try:
+          backbone = load_sdllm_feature_model(
+            cfg.get('mmd_sdllm_model', 'nvidia/SDLLM-MDLM-1.7B-Base'), self.device,
+            tokenizer=self.tokenizer, mask_index=self.mask_index,
+            revision=cfg.get('mmd_sdllm_revision', '4007e0b2a23465a31adf282d843a61172932af2a'),
+            local_path=cfg.get('mmd_sdllm_path', None),
+            local_files_only=cfg.get('mmd_sdllm_local_files_only', False),
+            feature_layer=cfg.mmd_feature_layer)
+          self._mmd_critic_cached = FrozenSdllmFeatures(
+            backbone, self.tokenizer, self.mask_index,
+            layer_index=cfg.mmd_feature_layer,
+            layer_weights=cfg.get('mmd_feature_layer_weights', None), noise_level=0.0)
+        except AttributeError as error:
+          # nn.Module.__getattr__ otherwise replaces AttributeError from this
+          # property's body with the misleading "MDLM has no _mmd_critic".
+          raise RuntimeError(f'SDLLM feature initialization failed: {error}') from error
         span = ('answers with prompt context' if
                 getattr(backbone, 'source_family', 'gpt2') == 'tinygsm'
                 else 'all positions')

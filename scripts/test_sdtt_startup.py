@@ -56,15 +56,15 @@ class SDTTStartupTests(unittest.TestCase):
     model._sync_noise_schedule = lambda: model.events.append('noise schedule')
     return model
 
-  def test_prepares_features_after_parent_before_training(self):
+  def test_prepares_features_before_parent_initial_evaluation(self):
     model = self.make()
     model.on_train_start()
-    self.assertEqual(model.events, ['noise schedule', 'parent', 'feature model'])
+    self.assertEqual(model.events, ['noise schedule', 'feature model', 'parent'])
 
   def test_feature_mse_also_prepares_model(self):
     model = self.make(mmd_reward_type='feature_mse')
     model.on_train_start()
-    self.assertEqual(model.events[-1], 'feature model')
+    self.assertEqual(model.events, ['noise schedule', 'feature model', 'parent'])
 
   def test_legacy_sources_do_not_prepare_sdtt(self):
     for source in ('ar', 'diffusion'):
@@ -94,7 +94,7 @@ class SDTTStartupTests(unittest.TestCase):
     model.download_error = RuntimeError('Hub unavailable')
     with self.assertRaisesRegex(RuntimeError, 'Hub unavailable'):
       model.on_train_start()
-    self.assertEqual(model.events, ['noise schedule', 'parent', 'feature model'])
+    self.assertEqual(model.events, ['noise schedule', 'feature model'])
 
 
 if __name__ == '__main__':

@@ -100,7 +100,8 @@ from immutable Hub revision `4007e0b2a23465a31adf282d843a61172932af2a`:
 The normal Hugging Face cache and its file locks are used, including across
 DDP workers. Set `HF_HOME`/`HF_HUB_CACHE` to change the cache location. An
 explicit `SDLLM_MODEL_DIR=/path/to/release` uses those same three local files
-and fails if any is missing. Download failures stop startup before training
+and fails if any is missing. Feature-model initialization happens before the
+initial GSM8K sweep, so loading failures stop before evaluation or training
 updates. A config-only check does not download or initialize the model:
 
 ```bash
@@ -152,6 +153,13 @@ native `state_dict.backbone.*` weights; EMA and optimizer weights are not
 substituted. The native checkpoint uses Python pickle, so local overrides
 must be trusted artifacts. No downloaded Python model code is executed.
 Memory mapping avoids materializing the checkpoint's optimizer state in RAM.
+The released checkpoint also embeds an unused `dataloader.CustomTikTokenizer`
+and its nested `tiktoken.core.Encoding` in `hyper_parameters.tokenizer`. The
+SDLLM-specific unpickler discards exactly these two metadata objects; it does
+not modify the application's dataloader or relax tensor validation. The real
+feature tokenizer is built from `tokenizer/tiktokenizer.json`. Initialization
+errors preserve their original cause instead of being masked by PyTorch as
+`MDLM has no attribute _mmd_critic`.
 
 The local archived DiT has the released model's parameter layout and block
 equations. Its PyTorch SDPA backend can differ numerically from the release's
@@ -172,6 +180,7 @@ been measured; this option does not claim the old feature path's throughput.
 
 ```bash
 OMP_NUM_THREADS=1 python -B scripts/test_sdllm_features.py
+OMP_NUM_THREADS=1 python -B scripts/test_sdllm_checkpoint_metadata.py
 OMP_NUM_THREADS=1 python -B scripts/test_sdllm_reward.py
 OMP_NUM_THREADS=1 python -B scripts/test_sdllm_feature_routing.py
 OMP_NUM_THREADS=1 python -B scripts/test_sdllm_tinygsm.py
@@ -191,8 +200,13 @@ CPU cases, including forward inputs, NFE and the final RNG state. DDP count
 aggregation was exercised with simulated uneven/empty rank shards.
 Existing SDTT/original-feature regression tests also passed; their opt-in CUDA
 test was skipped. Both launchers resolved successfully for 4 and 8 GPUs.
+Six checkpoint-metadata regression tests cover the unused serialized
+tokenizers, exact tensor/RNG preservation and initialization error reporting.
 
-The full released 1.7B checkpoint and production/DDP training have not been
-executed in this environment: Hub downloads time out and GPUs are occupied.
-Tiny-model checks qualify the adapter and estimator, not the actual released
-weight values or production memory/throughput.
+The actual pinned release's `data.pkl` was read separately from the tensor
+payloads: the old loader's missing `CustomTikTokenizer` error was reproduced,
+and the fixed unpickler recovered the metadata using meta-device storages.
+All 291 native backbone tensor names, shapes and FP32 dtypes match the local
+DiT architecture. The full 1.7B tensor payloads and production/DDP training
+have not been executed locally; these checks do not measure production
+memory/throughput or validate the released tensor values numerically.

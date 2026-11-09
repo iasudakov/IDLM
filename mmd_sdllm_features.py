@@ -14,6 +14,7 @@ from collections import defaultdict
 import hashlib
 import json
 from pathlib import Path
+import pickle
 import re
 
 import torch
@@ -126,11 +127,34 @@ def _architecture(config):
   return {'model': result, 'algo': {'causal_attention': False}}
 
 
+class _UnusedCheckpointTokenizer:
+  """Discard the release's pickled tokenizer; load the real one from JSON."""
+
+  def __setstate__(self, state):
+    pass
+
+
+class _SdllmCheckpointUnpickler(pickle.Unpickler):
+  def find_class(self, module, name):
+    # These two verified globals belong to hyper_parameters.tokenizer in the
+    # native release, not state_dict. Do not import the release's dataloader or
+    # rebuild its nested BPE engine; the real feature tokenizer comes from JSON.
+    if (module, name) in {('dataloader', 'CustomTikTokenizer'),
+                          ('tiktoken.core', 'Encoding')}:
+      return _UnusedCheckpointTokenizer
+    return super().find_class(module, name)
+
+
+class _SdllmCheckpointPickle:
+  Unpickler = _SdllmCheckpointUnpickler
+  load = pickle.load
+
+
 def _native_state(weights_path):
   # mmap keeps the much larger optimizer state from occupying resident CPU RAM.
   # The standard native Lightning format is trusted explicitly, as in sdllm.py.
   checkpoint = torch.load(str(weights_path), map_location='cpu', mmap=True,
-                          weights_only=False)
+                          weights_only=False, pickle_module=_SdllmCheckpointPickle)
   if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get('state_dict'), dict):
     raise ValueError('SDLLM model.ckpt must contain a native Lightning state_dict')
   raw = checkpoint['state_dict']
