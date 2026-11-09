@@ -47,6 +47,7 @@ cdlm_overrides=(
   callbacks.checkpoint_every_n_steps.save_on_train_epoch_end=True
   checkpointing.use_periodic_train_batch_checkpoint=False
   checkpointing.resume_from_ckpt=False
+  checkpointing.snapshot=True
   trainer.devices=4 trainer.precision=bf16-mixed
   trainer.accumulate_grad_batches=4 trainer.gradient_clip_val=null
   trainer.val_check_interval=2000 trainer.check_val_every_n_epoch=null

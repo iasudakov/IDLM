@@ -85,3 +85,5 @@ callbacks:
     save_on_train_epoch_end: True
 checkpointing:
   resume_from_ckpt: False
+  snapshot: True
+  snapshot_namespace: cdlm_tinygsm

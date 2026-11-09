@@ -199,3 +199,11 @@ class CDLM(trainer_base.AbsorbingState):
             log_validation_gsm8k(self, final=True)
         finally:
             self._train_mode()
+            if self.config.checkpointing.get('snapshot', False):
+                import nirvana_snapshot
+                # The CheckpointIO already published last.ckpt before evaluation;
+                # now retain the final JSON/frontier and tracker metadata too.
+                nirvana_snapshot.save(
+                    str(self.config.checkpointing.save_dir), enabled=True,
+                    namespace=self.config.checkpointing.get('snapshot_namespace'),
+                    reason=f'final evaluation step={self.global_step}')

@@ -219,6 +219,49 @@ Underdeep retains `val/gsm8k_acc_thr*`, `val/gsm8k_nfe_thr*`, the `pareto/*` fro
 
 Full checkpoints are saved every 1,000 optimizer updates, with `checkpoints/last.ckpt` also refreshed at epoch boundaries so the final short interval is retained. Use the same preset, trajectory cache, and output directory when restoring a full Lightning checkpoint. Set `checkpointing.resume_from_ckpt=True`, `checkpointing.resume_ckpt_path=/absolute/path/to/checkpoints/last.ckpt`, and the original `hydra.run.dir`. Keep the teacher and trajectory manifest consistent. A student-only checkpoint is for evaluation or explicit initialization, not a full optimizer resume.
 
+The CDLM presets and the Nirvana launcher enable `checkpointing.snapshot=True`.
+After each completed checkpoint write, the run directory is published through
+the same Nirvana snapshot APIs used by IDLM:
+`nirvana_dl.snapshot.get_snapshot_path()` and `dump_snapshot()`. Its default
+namespace is `cdlm_tinygsm`, so the snapshot contains
+`cdlm_tinygsm/checkpoints/` together with Underdeep metadata, the saved config,
+and evaluation history. `checkpointing.snapshot_namespace` changes that
+relative namespace. `checkpointing.snapshot=False` keeps local checkpoints
+without publishing them.
+
+The active Lightning checkpoint-I/O backend is wrapped after Trainer creation.
+It first finishes the full checkpoint write, then copies and publishes the run
+directory on global rank zero. This covers periodic callbacks, epoch-end
+`last.ckpt`, optional best-model callbacks, and the final module save. Each
+snapshot file is copied to a temporary destination and renamed after the copy
+finishes. The final checkpoint is published before final GSM8K evaluation;
+another publication afterward retains the final JSON/frontier too.
+
+Fresh runs keep `checkpointing.resume_from_ckpt=False`. For a restart using the
+published MMD initialization preset, use:
+
+```bash
+CDLM_PRESET=cdlm_tinygsm_mmd \
+bash "$SOURCE_CODE_PATH/code/scripts/train_cdlm_tinygsm_nirvana.sh" \
+  checkpointing.resume_from_ckpt=True
+```
+
+If the requested local resume checkpoint is absent, the snapshot namespace is
+restored into the current `checkpointing.save_dir` before declaring that path
+missing or initializing the training tracker. The default resume path selects
+`checkpoints/last.ckpt`. An existing local checkpoint takes priority, so an
+older snapshot cannot overwrite progress whose upload failed. Restoration is
+only requested for an explicit resume; a fresh run does not import old snapshot
+weights. Successful uploads print `[snapshot] pushed ...`.
+
+Snapshotting this run directory does not include the separate
+`algo.trajectory_cache_dir`, original teacher weights, tokenizer or input
+datasets. Keep the original inputs available and preserve or regenerate the
+same trajectory cache before resuming. Full resume restores student, frozen
+teacher head, EMA, optimizer, scheduler and training loops; it does not need the
+external MMD initialization checkpoint. Outside Nirvana, or on a snapshot SDK
+failure, a diagnostic is printed and local checkpoint saving continues.
+
 An explicit CDLM resume request with a missing checkpoint raises an error;
 it does not fall back to a fresh MMD or MDLM initialization.
 

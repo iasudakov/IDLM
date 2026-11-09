@@ -1,6 +1,7 @@
 """Fresh initialization and full resume follow different CDLM entry paths."""
 
 from contextlib import ExitStack
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -76,6 +77,55 @@ class WarmStartEntrypointTest(unittest.TestCase):
         model.initialize_from_checkpoint.assert_not_called()
         trainer.fit.assert_not_called()
         data.assert_not_called()
+
+    def test_snapshot_restore_precedes_resume_check_and_installs_active_io_wrapper(self):
+        from snapshot_checkpoint import SnapshotCheckpointIO
+        cfg, factory, model, trainer, _ = self.fixture(resume=True)
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            cfg.checkpointing.update({'save_dir': directory, 'snapshot': True,
+                                      'snapshot_namespace': 'cdlm_tinygsm'})
+            with patch('nirvana_snapshot.restore', side_effect=lambda *a, **k: events.append('restored')) as restore, \
+                 patch('main.utils.fsspec_exists', side_effect=lambda path: 'restored' in events):
+                main._train(factory, cfg, Mock(), object())
+            restore.assert_called_once_with(directory, enabled=True, namespace='cdlm_tinygsm')
+            self.assertIsInstance(trainer.strategy.checkpoint_io, SnapshotCheckpointIO)
+        self.assertEqual(trainer.fit.call_args.kwargs['ckpt_path'], 'cdlm-last.ckpt')
+        model.initialize_from_checkpoint.assert_not_called()
+
+    def test_fresh_snapshot_run_does_not_restore_old_student(self):
+        from snapshot_checkpoint import SnapshotCheckpointIO
+        cfg, factory, model, trainer, _ = self.fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            cfg.checkpointing.update({'save_dir': directory, 'snapshot': True,
+                                      'snapshot_namespace': 'cdlm_tinygsm'})
+            with patch('nirvana_snapshot.restore') as restore:
+                main._train(factory, cfg, Mock(), object())
+            restore.assert_not_called()
+            self.assertIsInstance(trainer.strategy.checkpoint_io, SnapshotCheckpointIO)
+        model.initialize_from_checkpoint.assert_called_once()
+
+    def test_existing_local_checkpoint_is_not_overwritten_by_an_older_snapshot(self):
+        from snapshot_checkpoint import SnapshotCheckpointIO
+        cfg, factory, model, trainer, _ = self.fixture(resume=True, exists=True)
+        with tempfile.TemporaryDirectory() as directory:
+            cfg.checkpointing.update({'save_dir': directory, 'snapshot': True,
+                                      'snapshot_namespace': 'cdlm_tinygsm'})
+            with patch('nirvana_snapshot.restore') as restore:
+                main._train(factory, cfg, Mock(), object())
+            restore.assert_not_called()
+            self.assertIsInstance(trainer.strategy.checkpoint_io, SnapshotCheckpointIO)
+        model.initialize_from_checkpoint.assert_not_called()
+        self.assertEqual(trainer.fit.call_args.kwargs['ckpt_path'], 'cdlm-last.ckpt')
+
+    def test_disabled_snapshot_preserves_existing_checkpoint_backend(self):
+        cfg, factory, model, trainer, _ = self.fixture()
+        cfg.checkpointing.snapshot = False
+        backend = trainer.strategy.checkpoint_io
+        with patch('nirvana_snapshot.restore') as restore:
+            main._train(factory, cfg, Mock(), object())
+        restore.assert_not_called()
+        self.assertIs(trainer.strategy.checkpoint_io, backend)
 
 
 if __name__ == '__main__':

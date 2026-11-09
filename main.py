@@ -418,6 +418,17 @@ def _cdlm_train_loader(config, tokenizer, original_loader):
 
 def _train(diffusion_model, config, logger, tokenizer):
   logger.info('Starting Training.')
+  snapshot_enabled = bool(config.checkpointing.get('snapshot', False))
+  snapshot_namespace = config.checkpointing.get('snapshot_namespace')
+  resume_path = config.checkpointing.get('resume_ckpt_path')
+  if (snapshot_enabled and config.checkpointing.resume_from_ckpt
+      and (resume_path is None or not utils.fsspec_exists(resume_path))):
+    import nirvana_snapshot
+    # A restarted container has no local checkpoint until restoration finishes.
+    # A valid local checkpoint takes priority: a failed earlier upload can leave
+    # the snapshot older than local progress. Fresh runs do not restore either.
+    nirvana_snapshot.restore(os.fspath(config.checkpointing.save_dir), enabled=True,
+                             namespace=snapshot_namespace)
   # wandb_logger = None
   # if config.get('wandb', None) is not None:
   #   wandb_logger = L.pytorch.loggers.WandbLogger(
@@ -490,6 +501,13 @@ def _train(diffusion_model, config, logger, tokenizer):
     strategy=hydra.utils.instantiate(config.strategy),
     logger=train_logger,
     enable_progress_bar=False if config.debug else True)
+  if snapshot_enabled:
+    from snapshot_checkpoint import SnapshotCheckpointIO
+    # The actual CheckpointIO is called after checkpoint serialization and only
+    # on the writing rank. It covers every callback and the final module save.
+    trainer.strategy.checkpoint_io = SnapshotCheckpointIO(
+      trainer.strategy.checkpoint_io, snapshot_dir=os.fspath(config.checkpointing.save_dir),
+      enabled=True, namespace=snapshot_namespace)
   trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
 
 

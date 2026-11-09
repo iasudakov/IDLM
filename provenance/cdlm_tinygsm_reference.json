@@ -225,5 +225,29 @@
       "report_key": "greedy",
       "scope": "Initial, periodic and final validation, and standalone evaluation; independent RNG from confidence decoding."
     }
+  },
+  "snapshot": {
+    "enabled_key": "checkpointing.snapshot",
+    "cdlm_default": true,
+    "namespace_key": "checkpointing.snapshot_namespace",
+    "default_namespace": "cdlm_tinygsm",
+    "reference": "Neighboring IDLM nirvana_snapshot.py and yt_tools/nirvana_utils.py; same Nirvana SDK snapshot APIs, implemented here without a yt_tools/distutils dependency.",
+    "sdk": [
+      "nirvana_dl.snapshot.get_snapshot_path",
+      "nirvana_dl.snapshot.dump_snapshot"
+    ],
+    "trigger": "After every successful actual checkpoint-I/O write, including periodic, epoch-end, monitored and direct final saves; final reporting also publishes updated metadata.",
+    "scope": "Complete checkpointing.save_dir, including full checkpoints, Underdeep metadata, config and evaluation history.",
+    "checkpoint_state": "Live student, frozen original teacher head, separate student EMA, optimizer, scheduler, callbacks, loops and trajectory cache fingerprint.",
+    "copy_policy": "Global rank zero only; complete local write first, atomic per-file destination copy, then dump_snapshot; preserve other snapshot files and namespaces.",
+    "restore": "On explicit resume_from_ckpt=True, an existing local checkpoint takes priority. Otherwise restore the namespace before declaring the resume path missing and initializing the tracker. Fresh runs do not restore old snapshot weights.",
+    "not_included": [
+      "algo.trajectory_cache_dir",
+      "original teacher checkpoint",
+      "tokenizer bundle",
+      "input datasets"
+    ],
+    "failure_policy": "Missing SDK and snapshot transfer errors are reported without failing local checkpoint saves.",
+    "validation": "Filesystem-only fake-SDK tests and tiny CPU CDLM full-checkpoint tests; no actual Nirvana upload or GPU model job was run."
   }
 }

@@ -11,6 +11,10 @@ initializes the student from the published
 [TinyGSM MMD EMA checkpoint](https://huggingface.co/yresearch/MDLM-MMD-TinyGSM/blob/main/model.ckpt),
 using Hugging Face or its local cache, while retaining the original MDLM teacher.
 
+CDLM checkpoints and run metadata are also published to the Nirvana snapshot
+store by default. Resume with `checkpointing.resume_from_ckpt=True`; retain
+the original data inputs and the separate trajectory cache.
+
 The full-sequence **SDTT baseline for TinyGSM** is also available, adapted from
 [the official implementation](https://github.com/jdeschena/sdtt). Run
 `bash scripts/train_sdtt_tinygsm.sh` for the official 70,000-update schedule;
