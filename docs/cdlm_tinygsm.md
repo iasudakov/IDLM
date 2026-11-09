@@ -88,6 +88,25 @@ bash "$SOURCE_CODE_PATH/code/scripts/train_cdlm_tinygsm_nirvana.sh"
 
 This wrapper prepares trajectories and then trains, using the code bundle's original `checkpoints/tinygsm/mdlm_notok.ckpt`, `cache_dir`, and `cache_dir/tinygsm_mmd_offline_bundle`. Outputs go to a separate `cdlm_tinygsm` directory. The tracker experiment stays `generative-models/tinygsm`. Keep shell arrays and parameter expansions inside the external script; Nirvana interprets some brace expressions in its run-command field before Bash starts.
 
+Preparation reports progress from rank zero every 30 seconds, starting before
+data and teacher loading. Console messages use the `[cdlm-prepare]` prefix.
+When Underdeep is configured, a separate run named `<logger.name> [prepare]`
+records completed/total trajectories and shards, progress, elapsed time, and
+the rate of newly completed trajectories. Its tracker metadata lives under
+`<checkpointing.save_dir>/cdlm_prepare/`, so repeated preparation can resume
+that run. The subsequent training run keeps the original name and metadata.
+The monitor reads committed shard receipts without loading tensors or adding
+distributed collectives; tracker requests run in a background thread.
+
+An older job can spend its entire preparation phase without creating an
+Underdeep run. Its console landmark is `Collecting original-teacher CDLM
+trajectories; student training is a separate phase.` The cache manifest stays
+`building` until all workers finish; each `part-*.json` receipt represents a
+committed shard. At the default settings, 5,000 shards contain 40,000
+trajectories. `Starting Training.` marks the transition to the student run.
+If that message appears without a tracker run, inspect the console for
+`[underdeep] disabled (setup failed: ...)`.
+
 The model bundle supplies tokenizer/model assets, while the original TinyGSM
 data must be present separately under `data.cache_dir` for offline preparation.
 Both the untagged DatasetDict cache and the older matching-separator cache are

@@ -349,6 +349,7 @@ def _prepare_cdlm(diffusion_model, config, logger, tokenizer):
   if config.algo.name != 'cdlm' or config.data.train != 'tiny_gsm':
     raise ValueError('mode=prepare_cdlm requires algo=cdlm and TinyGSM.')
   import torch.distributed as dist
+  from cdlm_progress import PreparationProgress
   from cdlm_trajectories import prepare_trajectories
   from sdtt_eval import _raise_if_failed
   world = int(os.environ.get('WORLD_SIZE', '1'))
@@ -356,10 +357,13 @@ def _prepare_cdlm(diffusion_model, config, logger, tokenizer):
   local = int(os.environ.get('LOCAL_RANK', '0'))
   if not torch.cuda.is_available():
     raise RuntimeError('CDLM teacher collection requires a CUDA environment.')
-  torch.cuda.set_device(local)
-  if world > 1 and not dist.is_initialized():
-    dist.init_process_group('nccl', timeout=timedelta(hours=24))
+  progress = PreparationProgress(config, rank=rank)
+  progress.start()
+  preparation_status = 'failed'
   try:
+    torch.cuda.set_device(local)
+    if world > 1 and not dist.is_initialized():
+      dist.init_process_group('nccl', timeout=timedelta(hours=24))
     original_loader = None
     error = None
     if rank == 0:
@@ -384,7 +388,9 @@ def _prepare_cdlm(diffusion_model, config, logger, tokenizer):
     logger.info('Collecting original-teacher CDLM trajectories; student training is a separate phase.')
     with torch.autocast('cuda', dtype=torch.bfloat16):
       prepare_trajectories(model, config, tokenizer, original_loader.dataset)
+    preparation_status = 'complete'
   finally:
+    progress.close(preparation_status)
     if world > 1 and dist.is_initialized():
       dist.destroy_process_group()
 
