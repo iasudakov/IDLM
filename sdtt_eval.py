@@ -140,13 +140,82 @@ def _greedy_protocol(model, cfg=None):
             'nfe_definition': 'actual cached batch forwards, shared by all rows in each batch'}
 
 
+def _ancestral_sweep_enabled(cfg):
+    return (cfg.get('gsm8k_ancestral_steps') is not None
+            or cfg.get('gsm8k_ancestral_seeds') is not None
+            or cfg.get('gsm8k_ancestral_final_denoise', False))
+
+
+def _write_report(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.write_text(json.dumps(payload, indent=2, allow_nan=False) + '\n')
+    temporary.replace(path)
+
+
+def _ancestral_context(model, protocol):
+    comparison = getattr(model, '_gsm8k_protocol', {})
+    fields = ('data_path', 'data_sha256', 'examples', 'sequence_length', 'separator',
+              'weights', 'timeout_seconds')
+    return {**{key: comparison[key] for key in fields if key in comparison},
+            **protocol, 'training_step': int(model.global_step)}
+
+
+def _save_ancestral_history(model, result, *, complete):
+    if model.trainer.global_rank != 0:
+        return
+    path = Path(model.config.checkpointing.save_dir) / 'ancestral_history.json'
+    step = int(model.global_step)
+    history = getattr(model, '_gsm8k_ancestral_history', None)
+    if history is None:
+        history = {}
+        if step > 0 and getattr(model.trainer, 'ckpt_path', None) is not None and path.is_file():
+            try:
+                stored = json.loads(path.read_text())
+                history = {int(key): value for key, value in stored['evaluations'].items()
+                           if int(key) <= step}
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                warnings.warn(f'Could not restore ancestral history: {error}')
+        model._gsm8k_ancestral_history = history
+    history[step] = {**result, 'complete': complete}
+    _write_report(path, {'schema_version': 1, 'evaluations': history})
+
+
+def _validation_ancestral_sweep(model):
+    from cdlm_ancestral_sweep import protocol, sweep as sweep_ancestral
+    from cdlm_ancestral_logging import log_point, publish_result
+    error = None
+    try:
+        partial = {'points': [], 'protocol': _ancestral_context(model, protocol(model))}
+    except Exception as caught:
+        error = caught
+    _raise_if_failed(error)
+
+    def completed_point(point):
+        partial['points'].append(point)
+        _save_ancestral_history(model, partial, complete=False)
+        log_point(model, point, partial['protocol'])
+
+    result = sweep_ancestral(model, model._gsm8k_examples, on_point=completed_point)
+    result['protocol'] = _ancestral_context(model, result['protocol'])
+    error = None
+    try:
+        _save_ancestral_history(model, result, complete=True)
+        publish_result(model, result)
+    except Exception as caught:
+        error = caught
+    _raise_if_failed(error)
+    return result
+
+
 @torch.no_grad()
-def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5):
+def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5, *, final_denoise=False):
     """S-FLM fixed-budget random unmasking with greedy token proposals.
 
     Unmasking remains stochastic. This differs from the confidence-threshold
-    sampler above, which chooses positions by confidence. The final scheduled
-    iteration removes all remaining masks, so no extra denoising call is added.
+    sampler above, which chooses positions by confidence. By default the final
+    scheduled iteration removes all masks. The chart-comparison mode instead
+    takes S scheduled transitions and an extra cleanup forward at epsilon.
     """
     if not prompts or any(not 0 < len(p) < model.num_tokens for p in prompts):
         raise ValueError('Each prompt must leave at least one answer position.')
@@ -173,7 +242,8 @@ def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5):
     for step in range(num_steps):
         t = times[step] * torch.ones(x.shape[0], 1, device=model.device)
         _, alpha_t = model.noise(t)
-        alpha_s = torch.ones_like(alpha_t) if step == num_steps - 1 else model.noise(t - dt)[1]
+        alpha_s = (torch.ones_like(alpha_t) if step == num_steps - 1 and not final_denoise
+                   else model.noise(t - dt)[1])
         if cached is None:
             cached = model.forward(x, model._sigma_from_alphat(alpha_t)).exp()
             nfe += 1
@@ -187,6 +257,11 @@ def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5):
         x = next_x
         for row, prefix in enumerate(prefixes):
             x[row, :len(prefix)] = prefix
+    if final_denoise:
+        time = torch.full((len(prompts), 1), eps, device=model.device)
+        proposed = model.forward(x, model._sigma_from_alphat(model.noise(time)[1])).argmax(dim=-1)
+        nfe += 1
+        x = torch.where(x == model.mask_index, proposed, x)
     if bool((x == model.mask_index).any()):
         raise ValueError('Greedy decoder returned masks after final removal.')
     return x, {'nfe': nfe,
@@ -299,12 +374,13 @@ def _evaluate_threshold(model, examples, threshold, pool, batch_size, temperatur
     return correct, count, total_nfe, batch_nfe
 
 
-def _evaluate_greedy(model, examples, pool, batch_size, steps, timeout):
+def _evaluate_greedy(model, examples, pool, batch_size, steps, timeout, *, final_denoise=False):
     correct = count = total_nfe = batch_nfe = 0
     for start in range(0, len(examples), batch_size):
         batch = examples[start:start + batch_size]
         prompts = [example['input_ids'] for example in batch]
-        samples, metadata = generate_greedy_samples(model, prompts, num_steps=steps)
+        samples, metadata = generate_greedy_samples(
+            model, prompts, num_steps=steps, final_denoise=final_denoise)
         texts = [model.tokenizer.decode(sample[len(prompt):].tolist(), skip_special_tokens=True)
                  for sample, prompt in zip(samples.cpu(), prompts)]
         pairs = zip(texts, [example['answer'] for example in batch])
@@ -343,7 +419,30 @@ def evaluate(model, config):
     output.parent.mkdir(parents=True, exist_ok=True)
     _seed_model_rng(model, int(config.seed))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        if cfg.get('gsm8k_greedy_token', False):
+        if cfg.get('gsm8k_greedy_token', False) and _ancestral_sweep_enabled(cfg):
+            from cdlm_ancestral_sweep import protocol, sweep as sweep_ancestral
+            from cdlm_ancestral_logging import render_ancestral
+            shared = {key: payload[key] for key in ('checkpoint', 'weights', 'data_path',
+                      'data_sha256', 'sequence_length', 'separator', 'timeout_seconds')}
+            payload['ancestral'] = {'points': [], 'protocol': {**shared, **protocol(model, cfg)},
+                                    'complete': False}
+
+            def completed_point(point):
+                payload['ancestral']['points'].append(point)
+                _write_report(output, payload)
+
+            result = sweep_ancestral(model, examples, distributed=False,
+                                     on_point=completed_point, cfg=cfg)
+            result['protocol'] = {**shared, **result['protocol']}
+            payload['ancestral'] = {**result, 'complete': True}
+            _write_report(output, payload)
+            try:
+                from PIL import Image
+                Image.fromarray(render_ancestral(result['points'])).save(
+                    output.with_name(output.stem + '_ancestral.png'))
+            except Exception as error:
+                warnings.warn(f'Could not render ancestral sweep: {error}')
+        elif cfg.get('gsm8k_greedy_token', False):
             protocol = _greedy_protocol(model, cfg)
             # Keep the confidence sweep's seed stream unchanged by this extra run.
             with torch.random.fork_rng(devices=_rng_devices(model)):
@@ -505,15 +604,21 @@ def log_validation_gsm8k(model, initial=False, final=False):
         try:
             greedy_enabled = cfg.get('gsm8k_greedy_token', False)
             model._gsm8k_protocol = getattr(model, '_gsm8k_protocol', {})
-            if greedy_enabled:
+            if greedy_enabled and not _ancestral_sweep_enabled(cfg):
                 model._gsm8k_protocol['greedy'] = _greedy_protocol(model)
             else:
                 model._gsm8k_protocol.pop('greedy', None)
         except Exception as caught:
             error = caught
         _raise_if_failed(error)
-        model._gsm8k_greedy_result = (sweep_greedy(model, model._gsm8k_examples)
-                                     if greedy_enabled else None)
+        model._gsm8k_ancestral_result = None
+        model._gsm8k_greedy_result = None
+        model._gsm8k_protocol.pop('ancestral', None)
+        if greedy_enabled and _ancestral_sweep_enabled(cfg):
+            model._gsm8k_ancestral_result = _validation_ancestral_sweep(model)
+            model._gsm8k_protocol['ancestral'] = model._gsm8k_ancestral_result['protocol']
+        elif greedy_enabled:
+            model._gsm8k_greedy_result = sweep_greedy(model, model._gsm8k_examples)
         curve = sweep(model, model._gsm8k_examples)
         error = None
         try:
@@ -567,6 +672,7 @@ def publish(model, curve, initial=False, direct=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps({'curves': history, 'greedy': greedy,
+                                     'ancestral': getattr(model, '_gsm8k_ancestral_result', None),
                                      'protocol': getattr(model, '_gsm8k_protocol', {})}, indent=2) + '\n')
     temporary.replace(path)
     if logger is None:

@@ -21,6 +21,12 @@ builds a code archive containing MMD weights; use it as the Nirvana source bundl
 The [complete MMD run-command](examples/nirvana_cdlm_mmd_run_command.sh) performs
 environment setup, asset preparation, trajectory collection and training.
 
+CDLM validation also logs an ancestral T=0 accuracy curve at configured steps
+`[4,8,16,32,48,64]`, with mean and sample SD across generation seeds 1–5.
+Search `ancestral` in Underdeep; `ancestral/accuracy_vs_steps` contains the plot.
+The separate final denoise is included in measured NFE. Per-seed results and
+partial evaluation history are saved alongside checkpoints.
+
 CDLM checkpoints, run metadata and trajectory caches are published to the Nirvana
 snapshot store by default. Trajectories are separated by teacher checkpoint,
 raw/EMA selection and generation settings; completed shards are reused on

@@ -53,9 +53,12 @@ eval:
   validate_before_train: True
   gsm8k_at_validation: True
   gsm8k_every_n_validations: 1
-  # Fixed-budget ancestral random unmasking with argmax token proposals (T=0).
+  # Ancestral T=0 curve: mean and sample SD across five generation seeds.
   gsm8k_greedy_token: True
-  gsm8k_steps: null  # Follow sampling.steps (64), independently of confidence thresholds.
+  gsm8k_steps: null  # Used only when the ancestral grid is disabled.
+  gsm8k_ancestral_steps: [4,8,16,32,48,64]
+  gsm8k_ancestral_seeds: [1,2,3,4,5]
+  gsm8k_ancestral_final_denoise: True
   gsm8k_batch_size: 16
   gsm8k_grading_workers: 4
   gsm8k_num_examples: null

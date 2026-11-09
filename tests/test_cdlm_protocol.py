@@ -137,6 +137,9 @@ class CDLMRecipeTest(unittest.TestCase):
         self.assertTrue(cfg.eval.gsm8k_at_validation)
         self.assertTrue(cfg.eval.gsm8k_greedy_token)
         self.assertIsNone(cfg.eval.gsm8k_steps)
+        self.assertEqual(list(cfg.eval.gsm8k_ancestral_steps), [4, 8, 16, 32, 48, 64])
+        self.assertEqual(list(cfg.eval.gsm8k_ancestral_seeds), [1, 2, 3, 4, 5])
+        self.assertTrue(cfg.eval.gsm8k_ancestral_final_denoise)
         self.assertEqual(cfg.sampling.steps, 64)
         self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds), VALIDATION_THRESHOLDS)
         self.assertEqual(cfg.eval.gsm8k_pareto_temperature, 0.)
@@ -145,6 +148,15 @@ class CDLMRecipeTest(unittest.TestCase):
         self.assertFalse(cfg.eval.generate_samples)
         self.assertFalse(cfg.eval.compute_generative_perplexity)
         self.assertEqual(cfg.sampling.num_sample_log, 8)
+
+    def test_global_and_sdtt_defaults_keep_legacy_single_budget_decoder(self):
+        for overrides in ((), ('+experiment=sdtt_tinygsm',),
+                          ('+experiment=sdtt_tinygsm_official',)):
+            with self.subTest(overrides=overrides):
+                cfg = compose_cli(*overrides)
+                self.assertIsNone(cfg.eval.gsm8k_ancestral_steps)
+                self.assertIsNone(cfg.eval.gsm8k_ancestral_seeds)
+                self.assertFalse(cfg.eval.gsm8k_ancestral_final_denoise)
 
 
 class CDLMLauncherTest(unittest.TestCase):

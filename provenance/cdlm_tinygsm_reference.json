@@ -219,20 +219,51 @@
     "ancestral_temperature_zero": {
       "enabled_key": "eval.gsm8k_greedy_token",
       "enabled_default": true,
-      "budget_key": "eval.gsm8k_steps",
-      "budget_default": "null -> sampling.steps=64",
+      "budget_key": "eval.gsm8k_ancestral_steps",
+      "budget_default": [
+        4,
+        8,
+        16,
+        32,
+        48,
+        64
+      ],
       "positions": "Independent Bernoulli reveals with probability (alpha_s-alpha_t)/(1-alpha_t); prompt fixed.",
       "tokens": "argmax untempered model probability, temperature 0.",
-      "grid": "linspace(1,1e-5,steps+1); last scheduled transition alpha_s=1; no extra final forward.",
+      "grid": "linspace(1,1e-5,S+1); S ancestral transitions, then one mask-only greedy cleanup forward at epsilon. Measured cached NFE includes cleanup.",
       "cache": "ancestral_cache reuses predictions while the batch state is unchanged, for time-unconditional MDLM.",
       "nfe": "Actual shared-batch forward calls assigned to each batch member, then globally averaged over examples.",
       "local_reference": "IDLM-mdlm-large-features/tinygsm_validation.py and scripts/test_tinygsm_validation.py; equations checked against archived trainer_base.py at IDLM commit 14594e94576d3ecd752d9d4fa4458ddc20055fe7.",
       "metrics": [
-        "val/gsm8k_acc_greedy",
-        "val/gsm8k_nfe_greedy"
+        "val/gsm8k_acc_ancestral_steps<S>",
+        "val/gsm8k_acc_ancestral_std_steps<S>",
+        "val/gsm8k_nfe_ancestral_steps<S>",
+        "val/gsm8k_nfe_ancestral_std_steps<S>",
+        "val/gsm8k_{acc,nfe}_ancestral_steps<S>_seed<N>",
+        "ancestral/gsm8k_step_<training-step>",
+        "ancestral/gsm8k_std_step_<training-step>",
+        "ancestral/results",
+        "ancestral/accuracy_vs_steps"
       ],
-      "report_key": "greedy",
-      "scope": "Initial, periodic and final validation, and standalone evaluation; independent RNG from confidence decoding."
+      "report_key": "ancestral",
+      "scope": "Initial, periodic and final validation, and standalone evaluation; independent RNG from confidence decoding.",
+      "seed_key": "eval.gsm8k_ancestral_seeds",
+      "generation_seeds": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "final_denoise_key": "eval.gsm8k_ancestral_final_denoise",
+      "final_denoise_default": true,
+      "statistics": "One completion per question per seed (pass@1); globally pool counts across ranks per seed, then mean and sample SD (ddof=1) over seeds. Single-seed SD is null.",
+      "chart_reference": "Preserved our_previous_results.csv and gsm8k_with_sdtt_paper_20261108 comparison: budgets4/8/16/32/48/64, five seeds, separate cleanup (reported NFE=S+1). Seeds1\u20135 inferred from archived output-directory name; original JSONLs/batch/world/checkpoint identities absent. New results record topology and measured NFE.",
+      "rng": "Reseed each budget/seed with seed+104729*rank in model-local fork_rng; restore training and confidence streams. Exact reproduction requires same batch/world size.",
+      "legacy": "Both ancestral lists null and final_denoise=False retain prior single-budget eval.gsm8k_steps/sampling.steps behavior, inside-S removal and greedy metric names. Shared SDTT defaults remain null/null/False.",
+      "history": "ancestral_history.json: per-training-step protocol, budget summaries and per-seed counts/NFE; atomic after each budget, completion flag; restored prior history on training resume; included in run snapshot.",
+      "publication": "Direct exact optimizer-step scalars immediately after each completed budget, before confidence sweep; errorbar image and seed table on complete ancestral sweep.",
+      "validation": "CPU independent sampler-oracle, seed-statistics/RNG/collective tests, logging/render checks, initial/periodic/final/standalone integration. No model training or full GPU evaluation."
     }
   },
   "snapshot": {

@@ -247,27 +247,79 @@ bash scripts/generation_cdlm_tinygsm.sh \
 
 Evaluation reuses the MMD/SDTT confidence-threshold decoder and execution scorer. Training validation uses 10 thresholds: `0.325, 0.4, 0.475, 0.55, 0.625, 0.7, 0.775, 0.85, 0.925, 0.98`. The standalone generation script retains all 27 historical thresholds, `0.325, 0.35, …, 0.95, 0.98`. Both use greedy token proposals at temperature zero; `eval.gsm8k_pareto_thresholds=[...]` overrides either sweep. Decoding completes all 512 positions, including padding after the answer. NFE is the mean active denoiser calls per example, including a capped final removal if needed; accuracy uses the same execution-based math grader and five-second timeout.
 
-CDLM also evaluates a separate fixed-budget **ancestral sampler at temperature
-zero**, enabled by `eval.gsm8k_greedy_token=True`. It follows the neighboring
-TinyGSM S-FLM protocol: choose each token by `argmax`, while randomly revealing
-masked positions with probability `(alpha_s-alpha_t)/(1-alpha_t)`. Prompt tokens
-remain fixed. The grid spans time 1 to `1e-5`; the last scheduled transition
-sets `alpha_s=1` to finish all masks without an extra denoiser call. With
-`sampling.predictor=ancestral_cache`, predictions are reused while the full
-batch state is unchanged. NFE counts actual batch forward calls and assigns
-that count to each batch member, matching the reference implementation.
+CDLM evaluates a separate **ancestral sampler at temperature zero**, enabled
+by `eval.gsm8k_greedy_token=True`. The default curve uses configured budgets
+`[4,8,16,32,48,64]` and generation seeds `[1,2,3,4,5]`. For every budget/seed it
+generates one completion for each GSM8K question, pools correct/count across
+GPU ranks, and computes the mean and **sample SD (`ddof=1`)** of the five global
+accuracies. This is mean pass@1 over seeds; it does not combine their completions
+into pass@5. A one-seed override records undefined SD as `null`, not zero.
 
-The default budget is `sampling.steps=64`. Set `eval.gsm8k_steps=32`, for example,
-to change only this evaluation budget. The confidence sweep keeps its own
-threshold-dependent stopping rule. Both evaluations use the same GSM8K
-examples, execution scorer, and validation EMA weights, with independent
-seeded RNG scopes. Initial validation, periodic validation, final reporting,
-and the standalone evaluation script all include the ancestral result.
-Set `eval.gsm8k_greedy_token=False` to skip it.
+Tokens are chosen by `argmax`, while masked positions are revealed with
+probability `(alpha_s-alpha_t)/(1-alpha_t)` and prompts remain fixed. The grid
+spans time 1 to `1e-5`. The default
+`eval.gsm8k_ancestral_final_denoise=True` takes S scheduled transitions followed
+by one separate cleanup forward at epsilon. This follows the final-cleanup
+convention in the supplied comparison chart, normally yielding S+1 calls.
+`ancestral_cache` can skip forwards when the full batch state is unchanged,
+so **actual NFE is measured**, never hardcoded to S or S+1. The chart x axis is
+configured S; actual NFE is reported in its table and separate metrics.
+
+Change the grid or seeds with:
+
+```bash
+'eval.gsm8k_ancestral_steps=[4,8,16,32,48,64]' \
+'eval.gsm8k_ancestral_seeds=[1,2,3,4,5]' \
+eval.gsm8k_ancestral_final_denoise=True
+```
+
+These defaults apply to both CDLM presets and their launchers, including
+initial, periodic and final validation and standalone evaluation. Each
+validation now includes 30 ancestral passes, in addition to the confidence
+sweep. Both samplers use the same questions, scorer and EMA/live weights.
+Each `(budget, seed)` starts a fresh isolated RNG stream, with rank offset
+104729; training and confidence RNG are restored. Reproduction requires the
+same batch size and world size, which are recorded with the result. The old
+chart's preserved aggregates do not contain its exact batch/world/checkpoint
+identities or per-seed JSONLs, so matching conventions does not imply bitwise
+reproduction of its plotted numbers.
+
+For the former single-budget behavior, set both lists to `null` and
+`eval.gsm8k_ancestral_final_denoise=False`; then `eval.gsm8k_steps` (or
+`sampling.steps` when null) selects the budget and final removal occurs inside
+S. That mode retains `val/gsm8k_acc_greedy` / `val/gsm8k_nfe_greedy`.
+The new grid has explicit `ancestral` names and does not overwrite those
+historical series with different statistics. `eval.gsm8k_greedy_token=False`
+disables either ancestral mode.
 
 EMA is enabled by default; `eval.disable_ema=True` selects live student weights. `eval.gsm8k_data_path` can point to the existing GSM8K test JSON. Full GSM8K remains the default; limits are only for explicit smoke checks. `eval.generate_samples=False` does not disable the GSM8K validation hook.
 
-Underdeep retains `val/gsm8k_acc_thr*`, `val/gsm8k_nfe_thr*`, the `pareto/*` frontier, `val/samples`, and `pareto_history.json`. The ancestral temperature-zero result is logged separately as `val/gsm8k_acc_greedy` and `val/gsm8k_nfe_greedy`, and saved under `greedy` in `pareto_history.json` and the standalone evaluation JSON. The historical temperature-one `val/gsm8k_acc` and held-out `val/answer_*` diagnostics remain separate and are not implemented here. Claims about released CDLM block-causal KV-cache speedups require a separate architectural experiment; this run measures the full-attention MDLM frontier.
+Underdeep retains `val/gsm8k_acc_thr*`, `val/gsm8k_nfe_thr*`, the confidence
+`pareto/*` frontier and `val/samples`. Search **ancestral** for the new outputs:
+
+- `val/gsm8k_acc_ancestral_steps4` (and steps8/16/32/48/64): mean accuracy,
+  stored as a fraction; `val/gsm8k_acc_ancestral_std_steps4` is its sample SD.
+- `val/gsm8k_nfe_ancestral_steps4` and `..._std_steps4`: actual mean NFE and SD.
+- The corresponding `..._steps4_seed1` names hold individual seed results.
+- `ancestral/gsm8k_step_<training-step>` is accuracy versus configured budget;
+  `ancestral/gsm8k_std_step_<training-step>` is its SD.
+- `ancestral/accuracy_vs_steps` is the percentage plot with error bars, and
+  `ancestral/results` is the per-budget/per-seed counts/NFE table.
+
+Each completed budget is published directly at the exact optimizer step before
+the confidence sweep. `ancestral_history.json` is atomically updated after each
+budget, retaining complete/partial results and per-evaluation protocol through
+resume. It is included in run snapshots. `pareto_history.json` additionally
+contains the latest ancestral result under `ancestral`. Standalone evaluation
+writes the same seed-level results in its JSON and an adjacent
+`<output-stem>_ancestral.png`. Already running processes do not acquire new
+evaluation code; use the updated code on resume or evaluate their saved
+checkpoint separately with the generation script above.
+
+The historical temperature-one `val/gsm8k_acc` and held-out `val/answer_*`
+diagnostics remain separate and are not implemented here. Claims about released
+CDLM block-causal KV-cache speedups require a separate architectural experiment;
+this run measures the full-attention MDLM frontier.
 
 ## Resume and validation
 
