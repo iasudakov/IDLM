@@ -172,7 +172,26 @@
     "teacher": "training.finetune_path remains the original raw MDLM used by the frozen teacher head and cached trajectories.",
     "scope": "Import strict student backbone weights only; fresh optimizer, scheduler, and student EMA; no MMD loop/optimizer history.",
     "cache": "Student initialization does not enter the trajectory cache identity.",
-    "resume": "Full CDLM resume bypasses external student initialization; missing requested resume fails explicitly."
+    "resume": "Full CDLM resume bypasses external student initialization; missing requested resume fails explicitly.",
+    "published_preset": "cdlm_tinygsm_mmd",
+    "published_checkpoint": {
+      "repository": "yresearch/MDLM-MMD-TinyGSM",
+      "filename": "model.ckpt",
+      "source": "hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt",
+      "url": "https://huggingface.co/yresearch/MDLM-MMD-TinyGSM/blob/main/model.ckpt",
+      "readme_reference": "dlm-mmd README, Post-trained models / TinyGSM; generation_mmd_mdlm_tinygsm.sh",
+      "student_init_use_ema": true,
+      "verified_cached_artifact": {
+        "snapshot_revision": "2d822472911d432cc1cdc22f3ef1a74424b946e0",
+        "checkpoint_weights": "ema",
+        "global_step": 7000,
+        "backbone_state_tensors": 131,
+        "backbone_keys_and_shapes_match_original_mdlm": true,
+        "bytes": 671796985,
+        "verification_scope": "Inspected existing local HF cache on CPU without downloading; current remote main revision was not reverified."
+      },
+      "network_policy": "Explicit student URI opts in to Hub loading and standard HF cache lookup, even with a local teacher/tokenizer bundle. Global HF offline flags are honored. Preparation/full resume never fetch the external student."
+    }
   },
   "evaluation": {
     "validation_confidence_thresholds": [

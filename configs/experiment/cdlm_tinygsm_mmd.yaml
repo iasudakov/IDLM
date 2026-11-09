@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - cdlm_tinygsm
+  - _self_
+
+# Published TinyGSM MMD student from the project's README. The native release
+# contains EMA inference weights; the original MDLM teacher/cache stay fixed.
+training:
+  student_init_path: hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt
+  student_init_use_ema: True
+logger:
+  name: mmd to cdlm tinygsm lr1e-5 16 epochs

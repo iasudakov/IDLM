@@ -59,6 +59,13 @@ class CDLM(trainer_base.AbsorbingState):
             raise ValueError('With model_weights_dir, supply a local MDLM checkpoint path.')
         return resolve_checkpoint(source, bundle)
 
+    def _student_checkpoint_source(self, source):
+        # An explicit student Hub source is an opt-in download/cache lookup.
+        # The original teacher and evaluation assets keep their bundle policy.
+        if source.startswith('hf://'):
+            return source
+        return self._checkpoint_source(source)
+
     def initialize_from_checkpoint(self, source, student_source=None, student_use_ema=False):
         """Keep the original teacher head while optionally warm-starting the student.
 
@@ -71,7 +78,7 @@ class CDLM(trainer_base.AbsorbingState):
         self.teacher_head.load_state_dict(self.backbone.output_layer.linear.state_dict(), strict=True)
         del checkpoint
         if student_source:
-            checkpoint = read_checkpoint(self._checkpoint_source(student_source))
+            checkpoint = read_checkpoint(self._student_checkpoint_source(student_source))
             if not student_use_ema and checkpoint.get('checkpoint_weights') == 'ema':
                 raise ValueError('Student initialization checkpoint contains only EMA weights; '
                                  'set training.student_init_use_ema=True to use them.')

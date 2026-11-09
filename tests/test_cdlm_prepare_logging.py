@@ -11,12 +11,12 @@ import main
 
 
 class PreparationLoggingTest(unittest.TestCase):
-    def run_preparation(self, failure=None):
+    def run_preparation(self, failure=None, student_source='/not-mounted-on-collector/mmd.ckpt'):
         events = []
         config = OmegaConf.create({
             'algo': {'name': 'cdlm'}, 'data': {'train': 'tiny_gsm'},
             'training': {'finetune_path': 'original-mdlm.ckpt',
-                         'student_init_path': '/not-mounted-on-collector/mmd.ckpt',
+                         'student_init_path': student_source,
                          'student_init_use_ema': True},
         })
         progress = Mock()
@@ -55,6 +55,14 @@ class PreparationLoggingTest(unittest.TestCase):
 
     def test_reporting_starts_before_loading_and_closes_after_collection(self):
         events, progress = self.run_preparation()
+        self.assertEqual(events, ['progress started', 'data loading', 'collecting', 'complete'])
+        progress.close.assert_called_once_with('complete')
+
+    def test_hub_student_initialization_never_downloads_during_teacher_preparation(self):
+        with patch('sdtt_checkpoint.hf_hub_download') as download:
+            events, progress = self.run_preparation(
+                student_source='hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt')
+        download.assert_not_called()
         self.assertEqual(events, ['progress started', 'data loading', 'collecting', 'complete'])
         progress.close.assert_called_once_with('complete')
 

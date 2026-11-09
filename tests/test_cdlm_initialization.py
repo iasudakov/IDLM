@@ -16,6 +16,9 @@ from test_cdlm_training import (CPUDenoiser, Original, Tokenizer,
                                 config as make_config, trainer as make_trainer)
 
 
+PUBLISHED_MMD = 'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt'
+
+
 class StudentInitializationTest(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch('models.dit.DIT', CPUDenoiser))
@@ -94,6 +97,41 @@ class StudentInitializationTest(unittest.TestCase):
                                               student_use_ema=True)
         self.assert_fresh_student(self.student)
 
+    def test_explicit_hub_mmd_student_works_with_local_original_teacher_bundle(self):
+        bundle = self.directory / 'offline bundle'
+        bundle.mkdir()
+        self.config.model_weights_dir = str(bundle)
+        self.write_student(ema_only=True)
+        with patch('sdtt_checkpoint.hf_hub_download',
+                   return_value=str(self.student_path)) as download:
+            self.model.initialize_from_checkpoint(self.config.training.finetune_path,
+                                                  student_source=PUBLISHED_MMD,
+                                                  student_use_ema=True)
+        download.assert_called_once_with(repo_id='yresearch/MDLM-MMD-TinyGSM',
+                                         filename='model.ckpt')
+        self.assert_fresh_student(self.student)
+
+    def test_offline_bundle_still_rejects_hub_teacher_and_evaluation_checkpoints(self):
+        bundle = self.directory / 'offline bundle'
+        bundle.mkdir()
+        self.config.model_weights_dir = str(bundle)
+        with patch('sdtt_checkpoint.hf_hub_download') as download:
+            with self.assertRaisesRegex(ValueError, 'local MDLM checkpoint'):
+                self.model.initialize_from_checkpoint('hf://jdeschena/s-flm/tinygsm/mdlm.ckpt')
+            with self.assertRaisesRegex(ValueError, 'local MDLM checkpoint'):
+                self.model.load_evaluation_weights(PUBLISHED_MMD)
+        download.assert_not_called()
+
+    def test_missing_local_student_is_not_reinterpreted_as_a_hub_checkpoint(self):
+        bundle = self.directory / 'offline bundle'
+        bundle.mkdir()
+        self.config.model_weights_dir = str(bundle)
+        with patch('sdtt_checkpoint.hf_hub_download') as download:
+            with self.assertRaises(FileNotFoundError):
+                self.model.initialize_from_checkpoint(self.config.training.finetune_path,
+                                                      student_source=str(self.student_path))
+        download.assert_not_called()
+
     def test_requested_ema_must_exist_and_match_student_parameter_shapes(self):
         for shadows, message in [(None, 'no EMA'), ([torch.zeros(1)], 'EMA shapes')]:
             with self.subTest(shadows=shadows):
@@ -112,13 +150,17 @@ class StudentInitializationTest(unittest.TestCase):
 
     def test_student_init_fields_do_not_change_original_teacher_cache_identity(self):
         before = build_cache_identity(self.config, self.tokenizer, Original())
-        OmegaConf.update(self.config, 'training.student_init_path',
-                         str(self.student_path), force_add=True)
         OmegaConf.update(self.config, 'training.student_init_use_ema', True, force_add=True)
         # No student checkpoint exists: identity construction must not read it.
         self.assertFalse(self.student_path.exists())
-        after = build_cache_identity(self.config, self.tokenizer, Original())
-        self.assertEqual(before, after)
+        with patch('sdtt_checkpoint.hf_hub_download') as download:
+            for source in [str(self.student_path), PUBLISHED_MMD]:
+                with self.subTest(student_source=source):
+                    OmegaConf.update(self.config, 'training.student_init_path',
+                                     source, force_add=True)
+                    after = build_cache_identity(self.config, self.tokenizer, Original())
+                    self.assertEqual(before, after)
+        download.assert_not_called()
 
     def test_full_resume_survives_deleted_mmd_initialization_checkpoint(self):
         self.write_student()

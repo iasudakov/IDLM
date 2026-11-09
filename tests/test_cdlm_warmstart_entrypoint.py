@@ -60,6 +60,15 @@ class WarmStartEntrypointTest(unittest.TestCase):
         model.initialize_from_checkpoint.assert_not_called()
         self.assertEqual(trainer.fit.call_args.kwargs['ckpt_path'], 'cdlm-last.ckpt')
 
+    def test_full_resume_never_downloads_the_original_hub_student(self):
+        cfg, factory, model, trainer, _ = self.fixture(resume=True)
+        cfg.training.student_init_path = 'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt'
+        with patch('sdtt_checkpoint.hf_hub_download') as download:
+            main._train(factory, cfg, Mock(), object())
+        download.assert_not_called()
+        model.initialize_from_checkpoint.assert_not_called()
+        self.assertEqual(trainer.fit.call_args.kwargs['ckpt_path'], 'cdlm-last.ckpt')
+
     def test_missing_resume_checkpoint_never_falls_back_to_fresh_mmd_weights(self):
         cfg, factory, model, trainer, data = self.fixture(resume=True, exists=False)
         with self.assertRaisesRegex(FileNotFoundError, 'CDLM resume checkpoint is missing'):

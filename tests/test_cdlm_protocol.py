@@ -33,6 +33,21 @@ def recipe(*overrides):
 
 
 class CDLMRecipeTest(unittest.TestCase):
+    def test_published_mmd_preset_changes_student_initialization_only(self):
+        original = recipe()
+        cfg = compose_cli('+experiment=cdlm_tinygsm_mmd')
+        self.assertEqual(cfg.training.finetune_path, original.training.finetune_path)
+        self.assertEqual(cfg.training.student_init_path,
+                         'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt')
+        self.assertTrue(cfg.training.student_init_use_ema)
+        self.assertEqual(OmegaConf.to_container(cfg.algo, resolve=False),
+                         OmegaConf.to_container(original.algo, resolve=False))
+        self.assertTrue(cfg.eval.gsm8k_greedy_token)
+        self.assertEqual(cfg.sampling.steps, 64)
+        self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds), VALIDATION_THRESHOLDS)
+        self.assertEqual(cfg.trainer.max_epochs, 16)
+        self.assertIsNone(original.training.student_init_path)
+
     def test_same_mdlm_backbone_and_conditional_tinygsm_format(self):
         cfg = recipe()
         self.assertEqual(cfg.algo.name, 'cdlm')
@@ -219,6 +234,25 @@ class CDLMLauncherTest(unittest.TestCase):
             self.assertEqual(cfg.logger.name, 'cluster cdlm')
             self.assertEqual(cfg.trainer.accumulate_grad_batches, 4)
             self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds), VALIDATION_THRESHOLDS)
+
+    def test_cluster_published_mmd_preset_keeps_local_teacher_and_greedy_comparison(self):
+        result, commands, code, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',
+                                                 preset='cdlm_tinygsm_mmd', bundle=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(commands), 2)
+        for command, mode in zip(commands, ['prepare_cdlm', 'train']):
+            cfg = self.main_config(command)
+            self.assertEqual(cfg.mode, mode)
+            self.assertEqual(cfg.training.finetune_path,
+                             str(code / 'checkpoints/tinygsm/mdlm_notok.ckpt'))
+            self.assertEqual(cfg.training.student_init_path,
+                             'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt')
+            self.assertTrue(cfg.training.student_init_use_ema)
+            self.assertEqual(cfg.model_weights_dir,
+                             str(code / 'cache_dir/tinygsm_mmd_offline_bundle'))
+            self.assertTrue(cfg.eval.gsm8k_greedy_token)
+            self.assertEqual(cfg.sampling.steps, 64)
+            self.assertEqual(cfg.eval.gsm8k_pareto_temperature, 0.)
 
     def test_cluster_code_override_and_failed_prepare_prevent_training(self):
         result, commands, _, code = self.capture('train_cdlm_tinygsm_nirvana.sh',

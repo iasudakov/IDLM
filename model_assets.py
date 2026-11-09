@@ -159,6 +159,10 @@ def configure_model_weights(config, *, base_dir=None):
   for section, key in native_keys:
     path = config[section].get(key)
     if path:
+      if (section, key) == ('training', 'student_init_path') and str(path).startswith('hf://'):
+        # Only an explicitly configured CDLM student may use the Hub alongside
+        # local teacher/tokenizer assets. Resolve it on fresh initialization.
+        continue
       config[section][key] = resolve_checkpoint(
         path, config.model_weights_dir, base_dir=base, required=False)
   if config.eval.get('student_ckpt_paths'):

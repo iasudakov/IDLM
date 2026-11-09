@@ -37,19 +37,56 @@ bash scripts/train_cdlm_tinygsm.sh \
 
 If the teacher path is omitted, the preset uses the public `hf://jdeschena/s-flm/tinygsm/mdlm.ckpt` release. Use the original run's local checkpoint for checkpoint-level matching. No separately pretrained CDLM weights are required: preparation loads the existing MDLM, and optimization needs its frozen output projection plus the generated cache. With `model_weights_dir` configured, supply a local checkpoint path; the offline bundle does not trigger a Hub fallback.
 
-To initialize the student from an already trained MMD checkpoint, add
-`training.student_init_path`. Keep `training.finetune_path` pointing to the
-original MDLM teacher. For the existing Nirvana layout:
+The MMD initialization uses the published
+[yresearch/MDLM-MMD-TinyGSM checkpoint](https://huggingface.co/yresearch/MDLM-MMD-TinyGSM),
+`model.ckpt`, linked from the MMD project's README. Select the
+`cdlm_tinygsm_mmd` preset to load it automatically from Hugging Face or the
+standard HF cache. Keep `training.finetune_path` pointing to the original
+MDLM teacher. For the existing Nirvana layout:
 
 ```bash
+CDLM_PRESET=cdlm_tinygsm_mmd \
 bash "$SOURCE_CODE_PATH/code/scripts/train_cdlm_tinygsm_nirvana.sh" \
-  "training.student_init_path=$SOURCE_CODE_PATH/code/checkpoints/tinygsm/mmd.ckpt" \
-  training.student_init_use_ema=True \
   'logger.name=mmd to cdlm tinygsm 4xB300 16 epochs'
 ```
 
-Place the chosen MMD checkpoint at the example path, or supply its actual path.
-`student_init_use_ema=False` (the default) imports live `backbone.*` weights;
+This preset sets
+`training.student_init_path=hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt` and
+`training.student_init_use_ema=True`. The verified cached release contains
+EMA-only weights at MMD step 7000, so EMA selection is required. An explicit
+student `hf://` source is allowed alongside `model_weights_dir`; local
+teacher/tokenizer loading keeps the bundle policy. Preparation and full resume
+do not fetch the external student checkpoint; fresh student initialization
+performs the Hub lookup.
+
+To prefetch the checkpoint before spending time collecting trajectories, run
+this in the same environment on a machine with network access:
+
+```bash
+python -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="yresearch/MDLM-MMD-TinyGSM", filename="model.ckpt"))'
+```
+
+An offline Nirvana worker needs this asset staged in its HF cache. Prepare a
+portable cache on a connected machine:
+
+```bash
+python -c 'from huggingface_hub import hf_hub_download; hf_hub_download(repo_id="yresearch/MDLM-MMD-TinyGSM", filename="model.ckpt", cache_dir="cdlm_mmd_hf_cache")'
+```
+
+Pass that entire `cdlm_mmd_hf_cache` directory as a Nirvana input, then add this
+after creating `HF_HUB_CACHE` in the run-command:
+
+```bash
+cp -a "$INPUT_PATH/cdlm_mmd_hf_cache/." "$HF_HUB_CACHE/"
+export HF_HUB_OFFLINE=1
+```
+
+The same preset then reads the staged cache without network requests. Global
+Hugging Face offline settings are respected; selecting a Hub URI does not
+provide network access on a disconnected worker.
+
+For a different local MMD checkpoint, override `training.student_init_path`.
+`student_init_use_ema=False` (the base CDLM default) imports live `backbone.*` weights;
 `True` imports the checkpoint's EMA weights. An EMA-only export requires the
 explicit `True` setting. Architecture and vocabulary must match the current
 MDLM; incompatible checkpoints fail strict loading. Native MMD checkpoints

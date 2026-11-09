@@ -6,6 +6,11 @@ Run `bash scripts/train_cdlm_tinygsm_nirvana.sh` to collect teacher trajectories
 and train for 16 epochs on four GPUs. See [the CDLM setup](docs/cdlm_tinygsm.md)
 and [the complete Nirvana run-command](examples/nirvana_cdlm_run_command.sh).
 
+For MMD to CDLM, set `CDLM_PRESET=cdlm_tinygsm_mmd` before that launcher. It
+initializes the student from the published
+[TinyGSM MMD EMA checkpoint](https://huggingface.co/yresearch/MDLM-MMD-TinyGSM/blob/main/model.ckpt),
+using Hugging Face or its local cache, while retaining the original MDLM teacher.
+
 The full-sequence **SDTT baseline for TinyGSM** is also available, adapted from
 [the official implementation](https://github.com/jdeschena/sdtt). Run
 `bash scripts/train_sdtt_tinygsm.sh` for the official 70,000-update schedule;
