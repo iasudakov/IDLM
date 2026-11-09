@@ -432,6 +432,10 @@ def _train(diffusion_model, config, logger, tokenizer):
     ckpt_path = config.checkpointing.resume_ckpt_path
   else:
     ckpt_path = None
+    if config.algo.name == 'cdlm' and config.checkpointing.resume_from_ckpt:
+      raise FileNotFoundError(
+        f'CDLM resume checkpoint is missing: {config.checkpointing.resume_ckpt_path}. '
+        'Set checkpointing.resume_from_ckpt=False for a fresh student initialization.')
 
   # Lightning callbacks
   callbacks = []
@@ -457,7 +461,18 @@ def _train(diffusion_model, config, logger, tokenizer):
     if ckpt_path is None:
       if not config.training.finetune_path:
         raise ValueError('The baseline requires training.finetune_path for its MDLM teacher.')
-      model.initialize_from_checkpoint(config.training.finetune_path)
+      if config.algo.name == 'cdlm':
+        student_source = config.training.get('student_init_path')
+        student_use_ema = config.training.get('student_init_use_ema', False)
+        model.initialize_from_checkpoint(
+          config.training.finetune_path, student_source=student_source,
+          student_use_ema=student_use_ema)
+        logger.info('CDLM teacher: %s; student initialization: %s (%s weights).',
+                    config.training.finetune_path,
+                    student_source or config.training.finetune_path,
+                    'EMA' if student_source and student_use_ema else 'raw')
+      else:
+        model.initialize_from_checkpoint(config.training.finetune_path)
   elif config.training.finetune_path != '':
     assert utils.fsspec_exists(config.training.finetune_path)
     model = diffusion_model.load_from_checkpoint(

@@ -149,7 +149,8 @@ def configure_model_weights(config, *, base_dir=None):
   requested = Path(weights_dir).expanduser()
   config.model_weights_dir = str(_bundle_root(
     requested if requested.is_absolute() else base / requested))
-  native_keys = [('training', 'finetune_path'), ('eval', 'student_ckpt_path')]
+  native_keys = [('training', 'finetune_path'), ('training', 'student_init_path'),
+                 ('eval', 'student_ckpt_path')]
   if 'hf' not in config.algo.backbone:
     native_keys.append(('eval', 'checkpoint_path'))
   ar_path = config.adversarial_distill.get('mmd_ar_model', '')

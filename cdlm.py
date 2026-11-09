@@ -59,10 +59,27 @@ class CDLM(trainer_base.AbsorbingState):
             raise ValueError('With model_weights_dir, supply a local MDLM checkpoint path.')
         return resolve_checkpoint(source, bundle)
 
-    def initialize_from_checkpoint(self, source):
+    def initialize_from_checkpoint(self, source, student_source=None, student_use_ema=False):
+        """Keep the original teacher head while optionally warm-starting the student.
+
+        Only backbone weights are imported from the optional student checkpoint;
+        optimizer, scheduler, loop state and its old EMA history are discarded.
+        Full training resumes bypass this initializer in the main entry point.
+        """
         checkpoint = read_checkpoint(self._checkpoint_source(source))
         self.backbone.load_state_dict(backbone_state(checkpoint), strict=True)
         self.teacher_head.load_state_dict(self.backbone.output_layer.linear.state_dict(), strict=True)
+        del checkpoint
+        if student_source:
+            checkpoint = read_checkpoint(self._checkpoint_source(student_source))
+            if not student_use_ema and checkpoint.get('checkpoint_weights') == 'ema':
+                raise ValueError('Student initialization checkpoint contains only EMA weights; '
+                                 'set training.student_init_use_ema=True to use them.')
+            self.backbone.load_state_dict(backbone_state(checkpoint), strict=True)
+            if student_use_ema:
+                # _get_parameters contains only student/noise parameters; the
+                # frozen original teacher_head must retain its own vocabulary map.
+                apply_ema(self, checkpoint)
         if self.ema:
             self.ema = models.ema.ExponentialMovingAverage(
                 self._get_parameters(), decay=self.config.training.ema)

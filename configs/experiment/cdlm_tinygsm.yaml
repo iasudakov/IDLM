@@ -30,6 +30,8 @@ training:
   loss_precision: float32
   ema: 0.9999
   mask_layout: random
+  student_init_path: null
+  student_init_use_ema: False
 optim:
   lr: 1e-5
 lr_scheduler:
@@ -49,6 +51,9 @@ eval:
   validate_before_train: True
   gsm8k_at_validation: True
   gsm8k_every_n_validations: 1
+  # Fixed-budget ancestral random unmasking with argmax token proposals (T=0).
+  gsm8k_greedy_token: True
+  gsm8k_steps: null  # Follow sampling.steps (64), independently of confidence thresholds.
   gsm8k_batch_size: 16
   gsm8k_grading_workers: 4
   gsm8k_num_examples: null

@@ -15,7 +15,9 @@ class PreparationLoggingTest(unittest.TestCase):
         events = []
         config = OmegaConf.create({
             'algo': {'name': 'cdlm'}, 'data': {'train': 'tiny_gsm'},
-            'training': {'finetune_path': 'original-mdlm.ckpt'},
+            'training': {'finetune_path': 'original-mdlm.ckpt',
+                         'student_init_path': '/not-mounted-on-collector/mmd.ckpt',
+                         'student_init_use_ema': True},
         })
         progress = Mock()
         progress.start.side_effect = lambda: events.append('progress started')
@@ -47,6 +49,8 @@ class PreparationLoggingTest(unittest.TestCase):
             else:
                 main._prepare_cdlm(Mock(return_value=model), config, Mock(), object())
             factory.assert_called_once_with(config, rank=0)
+            model.load_evaluation_weights.assert_called_once_with('original-mdlm.ckpt', use_ema=False)
+            model.initialize_from_checkpoint.assert_not_called()
         return events, progress
 
     def test_reporting_starts_before_loading_and_closes_after_collection(self):

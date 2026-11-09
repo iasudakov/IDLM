@@ -119,7 +119,7 @@
     "Full backbone finetuning replaces the released LoRA setup.",
     "MMD batch 512, AdamW betas (0.9,0.999), no weight decay and EMA 0.9999 replace the release's batch/optimizer/EMA settings. The 16-epoch default keeps CDLM 5% warmup; the 20k-update matched preset uses MMD 2500-update warmup.",
     "Compact monotone reveal-order storage replaces explicit per-step token/mask trajectory tensors.",
-    "Only the confidence-threshold GSM8K frontier is matched; inherited SDTT documentation lists separate historical diagnostics that are not implemented.",
+    "The confidence-threshold frontier and the separate S-FLM random-position ancestral temperature-zero score are reported. Historical temperature-one val/gsm8k_acc and held-out val/answer_* diagnostics are not implemented.",
     "A 16-epoch default and 20000-update optional budget are distinct experimental budgets; neither trajectory generation nor optimizer runtime has been measured here.",
     "Teacher reveals the globally highest-confidence position, rather than following the release's contiguous block order; 32-reveal windows apply to the trajectory order.",
     "The true TinyGSM Python answer supplies GT denoising, normalized over the per-example eligible span instead of a fixed 256-token generation length."
@@ -163,5 +163,48 @@
     }
   },
   "checkpoint_lifecycle": "Save final last.ckpt with live student weights and separate EMA before final evaluation or tracker publication; final EMA frontier is evaluated if the last optimizer step was not already reported.",
-  "nirvana_run_command_example": "../examples/nirvana_cdlm_run_command.sh"
+  "nirvana_run_command_example": "../examples/nirvana_cdlm_run_command.sh",
+  "student_initialization": {
+    "default": "Original MDLM from training.finetune_path.",
+    "optional_checkpoint_key": "training.student_init_path",
+    "optional_ema_key": "training.student_init_use_ema",
+    "optional_ema_default": false,
+    "teacher": "training.finetune_path remains the original raw MDLM used by the frozen teacher head and cached trajectories.",
+    "scope": "Import strict student backbone weights only; fresh optimizer, scheduler, and student EMA; no MMD loop/optimizer history.",
+    "cache": "Student initialization does not enter the trajectory cache identity.",
+    "resume": "Full CDLM resume bypasses external student initialization; missing requested resume fails explicitly."
+  },
+  "evaluation": {
+    "validation_confidence_thresholds": [
+      0.325,
+      0.4,
+      0.475,
+      0.55,
+      0.625,
+      0.7,
+      0.775,
+      0.85,
+      0.925,
+      0.98
+    ],
+    "standalone_confidence_thresholds": "Historical full 27-point reference grid.",
+    "ancestral_temperature_zero": {
+      "enabled_key": "eval.gsm8k_greedy_token",
+      "enabled_default": true,
+      "budget_key": "eval.gsm8k_steps",
+      "budget_default": "null -> sampling.steps=64",
+      "positions": "Independent Bernoulli reveals with probability (alpha_s-alpha_t)/(1-alpha_t); prompt fixed.",
+      "tokens": "argmax untempered model probability, temperature 0.",
+      "grid": "linspace(1,1e-5,steps+1); last scheduled transition alpha_s=1; no extra final forward.",
+      "cache": "ancestral_cache reuses predictions while the batch state is unchanged, for time-unconditional MDLM.",
+      "nfe": "Actual shared-batch forward calls assigned to each batch member, then globally averaged over examples.",
+      "local_reference": "IDLM-mdlm-large-features/tinygsm_validation.py and scripts/test_tinygsm_validation.py; equations checked against archived trainer_base.py at IDLM commit 14594e94576d3ecd752d9d4fa4458ddc20055fe7.",
+      "metrics": [
+        "val/gsm8k_acc_greedy",
+        "val/gsm8k_nfe_greedy"
+      ],
+      "report_key": "greedy",
+      "scope": "Initial, periodic and final validation, and standalone evaluation; independent RNG from confidence decoding."
+    }
+  }
 }

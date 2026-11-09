@@ -476,6 +476,9 @@ training:
   change_of_variables: False
   loss_precision: 'bf16'  # bf16, float32, float64
   finetune_path: ''
+  # CDLM: optional student warm start; finetune_path remains the original teacher.
+  student_init_path: null
+  student_init_use_ema: False
   # Mask layout for the *plain* ELBO training loss (`Diffusion.nll`'s own
   # `q_xt` call) -- the sampling-time and DMMD-distillation-time counterparts
   # are `sampling.mask_layout` and `adversarial_distill.dmmd_mask_layout`.

@@ -52,6 +52,8 @@ class CDLMRecipeTest(unittest.TestCase):
         self.assertFalse(cfg.data.wrap)
         self.assertTrue(cfg.data.filter_too_long)
         self.assertEqual(cfg.training.finetune_path, 'hf://jdeschena/s-flm/tinygsm/mdlm.ckpt')
+        self.assertIsNone(cfg.training.student_init_path)
+        self.assertFalse(cfg.training.student_init_use_ema)
 
     def test_4_gpu_batch_and_validation_match_reference_student_updates(self):
         cfg = recipe()
@@ -107,6 +109,9 @@ class CDLMRecipeTest(unittest.TestCase):
         self.assertEqual(cfg.logger.experiment, 'generative-models/tinygsm')
         self.assertTrue(cfg.eval.validate_before_train)
         self.assertTrue(cfg.eval.gsm8k_at_validation)
+        self.assertTrue(cfg.eval.gsm8k_greedy_token)
+        self.assertIsNone(cfg.eval.gsm8k_steps)
+        self.assertEqual(cfg.sampling.steps, 64)
         self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds), VALIDATION_THRESHOLDS)
         self.assertEqual(cfg.eval.gsm8k_pareto_temperature, 0.)
         self.assertIsNone(cfg.eval.gsm8k_num_examples)
@@ -222,6 +227,21 @@ class CDLMLauncherTest(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertEqual(commands[0]['cwd'], str(code.resolve()))
         self.assertEqual(self.main_config(commands[0]).mode, 'prepare_cdlm')
+
+    def test_cluster_warmstart_overrides_leave_original_teacher_and_default_eval(self):
+        result, commands, code, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',
+            ['training.student_init_path=/trained/student mmd.ckpt',
+             'training.student_init_use_ema=True', 'eval.gsm8k_steps=32'], bundle=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            cfg = self.main_config(command)
+            self.assertEqual(cfg.training.finetune_path,
+                             str(code / 'checkpoints/tinygsm/mdlm_notok.ckpt'))
+            self.assertEqual(cfg.training.student_init_path, '/trained/student mmd.ckpt')
+            self.assertTrue(cfg.training.student_init_use_ema)
+            self.assertTrue(cfg.eval.gsm8k_greedy_token)
+            self.assertEqual(cfg.eval.gsm8k_steps, 32)
 
     def test_generation_threshold_override_wins_over_full_sweep_default(self):
         result, commands, _, _ = self.capture('generation_cdlm_tinygsm.sh',

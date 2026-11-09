@@ -37,6 +37,7 @@ cdlm_overrides=(
   eval.generate_samples=False eval.compute_generative_perplexity=False
   eval.validate_before_train=True eval.gsm8k_at_validation=True
   eval.gsm8k_every_n_validations=1 eval.gsm8k_batch_size=16
+  eval.gsm8k_greedy_token=True
   eval.gsm8k_pareto_temperature=0.0
   'eval.gsm8k_pareto_thresholds=[0.325,0.4,0.475,0.55,0.625,0.7,0.775,0.85,0.925,0.98]'
   callbacks.checkpoint_monitor.monitor=val/nll

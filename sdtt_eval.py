@@ -2,7 +2,8 @@
 
 Adapted from dlm-mmd/mmd/tinygsm_validation.py (commit ebb2a6b).
 The default threshold grid follows reference run
-3e0ac6b1-7a8f-43c3-af58-d9e21b886da7.
+3e0ac6b1-7a8f-43c3-af58-d9e21b886da7. Optional ancestral T=0 evaluation
+follows archived S-FLM TinyGSM source 14594e: random reveals and argmax tokens.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,22 @@ import torch
 import torch.distributed as dist
 
 THRESHOLDS = [i / 1000 for i in range(325, 951, 25)] + [.98]
+
+
+def _rng_devices(model):
+    """Fork only the model's CUDA generator; CPU checks must not open GPUs."""
+    device = torch.device(model.device)
+    if device.type != 'cuda':
+        return []
+    return [torch.cuda.current_device() if device.index is None else device.index]
+
+
+def _seed_model_rng(model, seed):
+    torch.random.default_generator.manual_seed(seed)
+    device = torch.device(model.device)
+    if device.type == 'cuda':
+        with torch.cuda.device(device):
+            torch.cuda.manual_seed(seed)
 
 
 def load_examples(path, tokenizer, separator, length, limit=None):
@@ -103,6 +120,78 @@ def generate_samples(model, prompts, threshold, temperature=0., max_steps=None):
     if bool((x == model.mask_index).any()):
         raise ValueError('Decoder returned masked tokens after final noise removal.')
     return x, {'nfe': nfe, 'nfe_per_row': per_row}
+
+
+def _greedy_steps(model, cfg=None):
+    cfg = model.config.eval if cfg is None else cfg
+    steps = cfg.get('gsm8k_steps')
+    if steps is None:
+        steps = model.config.sampling.steps
+    if type(steps) is not int or steps <= 0:
+        raise ValueError('GSM8K greedy steps must be a positive integer.')
+    return steps
+
+
+def _greedy_protocol(model, cfg=None):
+    return {'sampler': 'random', 'predictor': model.config.sampling.get('predictor', 'ancestral_cache'),
+            'temperature': 0., 'steps': _greedy_steps(model, cfg), 'epsilon': 1e-5,
+            'position_selection': 'ancestral Bernoulli unmasking',
+            'final_removal': 'inside the last scheduled step; no extra forward',
+            'nfe_definition': 'actual cached batch forwards, shared by all rows in each batch'}
+
+
+@torch.no_grad()
+def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5):
+    """S-FLM fixed-budget random unmasking with greedy token proposals.
+
+    Unmasking remains stochastic. This differs from the confidence-threshold
+    sampler above, which chooses positions by confidence. The final scheduled
+    iteration removes all remaining masks, so no extra denoising call is added.
+    """
+    if not prompts or any(not 0 < len(p) < model.num_tokens for p in prompts):
+        raise ValueError('Each prompt must leave at least one answer position.')
+    if num_steps is None:
+        num_steps = _greedy_steps(model)
+    if type(num_steps) is not int or num_steps <= 0:
+        raise ValueError('GSM8K greedy steps must be a positive integer.')
+    if not math.isfinite(eps) or not 0 < eps < 1:
+        raise ValueError('GSM8K greedy sampling epsilon must be in (0, 1).')
+    predictor = model.config.sampling.get('predictor', 'ancestral_cache')
+    if predictor not in ('ancestral', 'ancestral_cache'):
+        raise ValueError('GSM8K greedy evaluation requires an ancestral predictor.')
+    x = model.prior_sample(len(prompts), model.num_tokens)
+    prefixes = []
+    for row, prompt in enumerate(prompts):
+        prefix = torch.as_tensor(prompt, dtype=torch.long, device=model.device)
+        if bool((prefix == model.mask_index).any()):
+            raise ValueError('Prompt cannot contain the diffusion mask token.')
+        prefixes.append(prefix)
+        x[row, :len(prefix)] = prefix
+    times = torch.linspace(1, eps, num_steps + 1, device=model.device)
+    dt = (1 - eps) / num_steps
+    cached, nfe = None, 0
+    for step in range(num_steps):
+        t = times[step] * torch.ones(x.shape[0], 1, device=model.device)
+        _, alpha_t = model.noise(t)
+        alpha_s = torch.ones_like(alpha_t) if step == num_steps - 1 else model.noise(t - dt)[1]
+        if cached is None:
+            cached = model.forward(x, model._sigma_from_alphat(alpha_t)).exp()
+            nfe += 1
+        proposed = cached.argmax(dim=-1)
+        probability = ((alpha_s - alpha_t) / (1 - alpha_t).clamp_min(1e-12)).clamp(0, 1)
+        unmask = torch.rand(x.shape, device=x.device) < probability
+        next_x = torch.where((x == model.mask_index) & unmask, proposed, x)
+        if (predictor != 'ancestral_cache' or not torch.allclose(next_x, x)
+                or getattr(model, 'time_conditioning', False)):
+            cached = None
+        x = next_x
+        for row, prefix in enumerate(prefixes):
+            x[row, :len(prefix)] = prefix
+    if bool((x == model.mask_index).any()):
+        raise ValueError('Greedy decoder returned masks after final removal.')
+    return x, {'nfe': nfe,
+               'nfe_per_row': torch.full((len(prompts),), nfe, dtype=torch.long,
+                                         device=model.device)}
 
 
 def grade_sample(sample, answer, timeout_s=5.):
@@ -210,6 +299,22 @@ def _evaluate_threshold(model, examples, threshold, pool, batch_size, temperatur
     return correct, count, total_nfe, batch_nfe
 
 
+def _evaluate_greedy(model, examples, pool, batch_size, steps, timeout):
+    correct = count = total_nfe = batch_nfe = 0
+    for start in range(0, len(examples), batch_size):
+        batch = examples[start:start + batch_size]
+        prompts = [example['input_ids'] for example in batch]
+        samples, metadata = generate_greedy_samples(model, prompts, num_steps=steps)
+        texts = [model.tokenizer.decode(sample[len(prompt):].tolist(), skip_special_tokens=True)
+                 for sample, prompt in zip(samples.cpu(), prompts)]
+        pairs = zip(texts, [example['answer'] for example in batch])
+        correct += sum(pool.map(lambda pair: grade_sample(*pair, timeout_s=timeout), pairs))
+        count += len(batch)
+        total_nfe += int(metadata['nfe_per_row'].sum())
+        batch_nfe += metadata['nfe']
+    return correct, count, total_nfe, batch_nfe
+
+
 @torch.no_grad()
 def evaluate(model, config):
     """Standalone GSM8K evaluation through main.py mode=sample_eval."""
@@ -236,8 +341,24 @@ def evaluate(model, config):
     }
     output = Path(to_absolute_path(str(Path(cfg.generated_samples_path).expanduser())))
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.manual_seed(config.seed)
+    _seed_model_rng(model, int(config.seed))
     with ThreadPoolExecutor(max_workers=workers) as pool:
+        if cfg.get('gsm8k_greedy_token', False):
+            protocol = _greedy_protocol(model, cfg)
+            # Keep the confidence sweep's seed stream unchanged by this extra run.
+            with torch.random.fork_rng(devices=_rng_devices(model)):
+                _seed_model_rng(model, int(config.seed))
+                correct, count, total_nfe, batch_nfe = _evaluate_greedy(
+                    model, examples, pool, batch_size, protocol['steps'], timeout)
+            payload['greedy_protocol'] = protocol
+            payload['greedy'] = {'accuracy': correct / count, 'correct': correct, 'count': count,
+                                 'nfe': total_nfe / count, 'total_batch_forwards': batch_nfe,
+                                 'steps': protocol['steps'], 'sampler': 'random', 'temperature': 0.}
+            temporary = output.with_suffix(output.suffix + '.tmp')
+            temporary.write_text(json.dumps(payload, indent=2) + '\n')
+            temporary.replace(output)
+            print(f'ancestral T=0: {correct}/{count} ({100 * correct / count:.2f}%) '
+                  f'at {total_nfe / count:.2f} NFE/example', flush=True)
         for threshold in thresholds:
             correct, count, total_nfe, batch_nfe = _evaluate_threshold(
                 model, examples, threshold, pool, batch_size, temperature, cap, timeout)
@@ -271,14 +392,14 @@ def sweep(model, examples):
     rank = dist.get_rank() if distributed else model.trainer.global_rank
     world_size = dist.get_world_size() if distributed else getattr(model.trainer, 'world_size', 1)
     local_examples = examples[rank::world_size]
-    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    devices = _rng_devices(model)
     curve = []
     sample_threshold = min(thresholds, key=lambda value: abs(value - .9))
     sample_limit = max(0, int(model.config.sampling.get('num_sample_log', 8)))
     model._gsm8k_sample_records = []
     with torch.random.fork_rng(devices=devices), ThreadPoolExecutor(max_workers=workers) as pool:
         for threshold in thresholds:
-            torch.manual_seed(int(model.config.get('seed', 1)) + 104729 * rank)
+            _seed_model_rng(model, int(model.config.get('seed', 1)) + 104729 * rank)
             error = None
             try:
                 correct, count, total_nfe, _ = _evaluate_threshold(
@@ -302,6 +423,44 @@ def sweep(model, examples):
     return curve
 
 
+@torch.no_grad()
+def sweep_greedy(model, examples):
+    """Pool fixed-budget ancestral T=0 accuracy and actual cached NFE across ranks."""
+    cfg = model.config.eval
+    error = None
+    try:
+        if not examples:
+            raise ValueError('GSM8K examples must be nonempty.')
+        _, batch_size, workers, _, _, timeout = _settings(cfg, [0.])
+        steps = _greedy_steps(model)
+    except Exception as caught:
+        error = caught
+    _raise_if_failed(error)
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else model.trainer.global_rank
+    world_size = dist.get_world_size() if distributed else getattr(model.trainer, 'world_size', 1)
+    local_examples = examples[rank::world_size]
+    with torch.random.fork_rng(devices=_rng_devices(model)), ThreadPoolExecutor(max_workers=workers) as pool:
+        _seed_model_rng(model, int(model.config.get('seed', 1)) + 104729 * rank)
+        error = None
+        try:
+            correct, count, total_nfe, _ = _evaluate_greedy(
+                model, local_examples, pool, batch_size, steps, timeout)
+        except Exception as caught:
+            error = caught
+        _raise_if_failed(error)
+    totals = torch.tensor([correct, count, total_nfe], dtype=torch.float64, device=model.device)
+    if distributed:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    correct, count, total_nfe = [int(value) for value in totals.tolist()]
+    point = {'accuracy': correct / count, 'correct': correct, 'count': count,
+             'nfe': total_nfe / count, 'steps': steps, 'sampler': 'random', 'temperature': 0.}
+    if rank == 0:
+        print(f'[gsm8k-greedy] step {model.global_step}: {100 * point["accuracy"]:.2f}% '
+              f'({correct}/{count}) at {point["nfe"]:.2f} NFE/example [ancestral, T=0]', flush=True)
+    return point
+
+
 def log_validation_gsm8k(model, initial=False, final=False):
     """Called on every rank with EMA weights and evaluation mode already active."""
     cfg = model.config.eval
@@ -316,7 +475,7 @@ def log_validation_gsm8k(model, initial=False, final=False):
     model._gsm8k_validation_count = count + 1
     if count % every and not final:
         return
-    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    devices = _rng_devices(model)
     with torch.random.fork_rng(devices=devices):
         error = None
         try:
@@ -342,6 +501,19 @@ def log_validation_gsm8k(model, initial=False, final=False):
         except Exception as caught:
             error = caught
         _raise_if_failed(error)
+        error = None
+        try:
+            greedy_enabled = cfg.get('gsm8k_greedy_token', False)
+            model._gsm8k_protocol = getattr(model, '_gsm8k_protocol', {})
+            if greedy_enabled:
+                model._gsm8k_protocol['greedy'] = _greedy_protocol(model)
+            else:
+                model._gsm8k_protocol.pop('greedy', None)
+        except Exception as caught:
+            error = caught
+        _raise_if_failed(error)
+        model._gsm8k_greedy_result = (sweep_greedy(model, model._gsm8k_examples)
+                                     if greedy_enabled else None)
         curve = sweep(model, model._gsm8k_examples)
         error = None
         try:
@@ -356,6 +528,13 @@ def publish(model, curve, initial=False, direct=False):
     """Preserve the reference metric names, native frontier, image and samples."""
     logger = model.trainer.logger
     metrics = {}
+    greedy = getattr(model, '_gsm8k_greedy_result', None)
+    if greedy is not None:
+        for name, key in [('val/gsm8k_acc_greedy', 'accuracy'), ('val/gsm8k_nfe_greedy', 'nfe')]:
+            metrics[name] = greedy[key]
+            if not (initial or direct):
+                model.log(name, torch.tensor(greedy[key], device=model.device, dtype=torch.float32),
+                          on_epoch=True, on_step=False, sync_dist=False, rank_zero_only=True)
     for point in curve:
         tag = f'{point["threshold"]:g}'.replace('.', '')
         for suffix, key in [('acc', 'accuracy'), ('nfe', 'nfe')]:
@@ -387,7 +566,7 @@ def publish(model, curve, initial=False, direct=False):
     history[step] = curve
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps({'curves': history,
+    temporary.write_text(json.dumps({'curves': history, 'greedy': greedy,
                                      'protocol': getattr(model, '_gsm8k_protocol', {})}, indent=2) + '\n')
     temporary.replace(path)
     if logger is None:

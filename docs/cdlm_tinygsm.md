@@ -37,6 +37,33 @@ bash scripts/train_cdlm_tinygsm.sh \
 
 If the teacher path is omitted, the preset uses the public `hf://jdeschena/s-flm/tinygsm/mdlm.ckpt` release. Use the original run's local checkpoint for checkpoint-level matching. No separately pretrained CDLM weights are required: preparation loads the existing MDLM, and optimization needs its frozen output projection plus the generated cache. With `model_weights_dir` configured, supply a local checkpoint path; the offline bundle does not trigger a Hub fallback.
 
+To initialize the student from an already trained MMD checkpoint, add
+`training.student_init_path`. Keep `training.finetune_path` pointing to the
+original MDLM teacher. For the existing Nirvana layout:
+
+```bash
+bash "$SOURCE_CODE_PATH/code/scripts/train_cdlm_tinygsm_nirvana.sh" \
+  "training.student_init_path=$SOURCE_CODE_PATH/code/checkpoints/tinygsm/mmd.ckpt" \
+  training.student_init_use_ema=True \
+  'logger.name=mmd to cdlm tinygsm 4xB300 16 epochs'
+```
+
+Place the chosen MMD checkpoint at the example path, or supply its actual path.
+`student_init_use_ema=False` (the default) imports live `backbone.*` weights;
+`True` imports the checkpoint's EMA weights. An EMA-only export requires the
+explicit `True` setting. Architecture and vocabulary must match the current
+MDLM; incompatible checkpoints fail strict loading. Native MMD checkpoints
+may include teacher, fake-model and optimizer tensors: only the student
+backbone is imported.
+
+The original MDLM output head and cached teacher trajectories remain fixed.
+Student initialization does not change the cache fingerprint, so a matching
+prepared cache is reused. CDLM starts a fresh optimizer/scheduler and fresh
+student EMA from the imported weights, with its normal 16-epoch budget.
+Label this run **MMD to CDLM** to record its starting point. Leaving
+`student_init_path=null` keeps direct MDLM initialization. Full checkpoint
+resume takes precedence and does not reopen the MMD initialization file.
+
 The preparation default selects 20,000 TinyGSM training prompts and produces one trajectory at each temperature, zero and 0.5: 40,000 trajectories in total. Each teacher call reveals the globally most confident eligible token; unlike the released collector, it does not restrict selection to contiguous token blocks. Prompts stay visible, and answer/EOS/padding positions are generated. Only training-split examples are used for collection. Preparation is substantial work and must be counted separately when reporting training cost.
 
 The cache stores the monotone reveal order, generated tokens, ground truth, and bf16 inputs to the frozen linear vocabulary head. It reconstructs intermediate states and teacher logits when training, instead of storing a full vocabulary tensor or a complete token/mask sequence at every step. At 40,000 trajectories, length 512, and hidden width 768, head inputs alone occupy about 29.3 GiB by shape; prompt rows are retained as zeros. Allow additional storage for token records, metadata, and filesystem overhead. This is an estimate, not a measured cache size.
@@ -127,15 +154,36 @@ bash scripts/generation_cdlm_tinygsm.sh \
   eval.generated_samples_path=/absolute/path/to/results/cdlm_tinygsm_eval.json
 ```
 
-Evaluation reuses the MMD/SDTT confidence-threshold decoder and execution scorer. Training validation uses 10 thresholds: `0.325, 0.4, 0.475, 0.55, 0.625, 0.7, 0.775, 0.85, 0.925, 0.98`. The standalone generation script retains all 27 historical thresholds, `0.325, 0.35, …, 0.95, 0.98`. Both use greedy decoding at temperature zero; `eval.gsm8k_pareto_thresholds=[...]` overrides either sweep. Decoding completes all 512 positions, including padding after the answer. NFE is the mean active denoiser calls per example, including a capped final removal if needed; accuracy uses the same execution-based math grader and five-second timeout.
+Evaluation reuses the MMD/SDTT confidence-threshold decoder and execution scorer. Training validation uses 10 thresholds: `0.325, 0.4, 0.475, 0.55, 0.625, 0.7, 0.775, 0.85, 0.925, 0.98`. The standalone generation script retains all 27 historical thresholds, `0.325, 0.35, …, 0.95, 0.98`. Both use greedy token proposals at temperature zero; `eval.gsm8k_pareto_thresholds=[...]` overrides either sweep. Decoding completes all 512 positions, including padding after the answer. NFE is the mean active denoiser calls per example, including a capped final removal if needed; accuracy uses the same execution-based math grader and five-second timeout.
+
+CDLM also evaluates a separate fixed-budget **ancestral sampler at temperature
+zero**, enabled by `eval.gsm8k_greedy_token=True`. It follows the neighboring
+TinyGSM S-FLM protocol: choose each token by `argmax`, while randomly revealing
+masked positions with probability `(alpha_s-alpha_t)/(1-alpha_t)`. Prompt tokens
+remain fixed. The grid spans time 1 to `1e-5`; the last scheduled transition
+sets `alpha_s=1` to finish all masks without an extra denoiser call. With
+`sampling.predictor=ancestral_cache`, predictions are reused while the full
+batch state is unchanged. NFE counts actual batch forward calls and assigns
+that count to each batch member, matching the reference implementation.
+
+The default budget is `sampling.steps=64`. Set `eval.gsm8k_steps=32`, for example,
+to change only this evaluation budget. The confidence sweep keeps its own
+threshold-dependent stopping rule. Both evaluations use the same GSM8K
+examples, execution scorer, and validation EMA weights, with independent
+seeded RNG scopes. Initial validation, periodic validation, final reporting,
+and the standalone evaluation script all include the ancestral result.
+Set `eval.gsm8k_greedy_token=False` to skip it.
 
 EMA is enabled by default; `eval.disable_ema=True` selects live student weights. `eval.gsm8k_data_path` can point to the existing GSM8K test JSON. Full GSM8K remains the default; limits are only for explicit smoke checks. `eval.generate_samples=False` does not disable the GSM8K validation hook.
 
-Underdeep retains `val/gsm8k_acc_thr*`, `val/gsm8k_nfe_thr*`, the `pareto/*` frontier, `val/samples`, and `pareto_history.json`. Historical fixed-64-step and held-out answer-execution diagnostics are not substituted with threshold-sweep scores. Claims about released CDLM block-causal KV-cache speedups require a separate architectural experiment; this run measures the full-attention MDLM frontier.
+Underdeep retains `val/gsm8k_acc_thr*`, `val/gsm8k_nfe_thr*`, the `pareto/*` frontier, `val/samples`, and `pareto_history.json`. The ancestral temperature-zero result is logged separately as `val/gsm8k_acc_greedy` and `val/gsm8k_nfe_greedy`, and saved under `greedy` in `pareto_history.json` and the standalone evaluation JSON. The historical temperature-one `val/gsm8k_acc` and held-out `val/answer_*` diagnostics remain separate and are not implemented here. Claims about released CDLM block-causal KV-cache speedups require a separate architectural experiment; this run measures the full-attention MDLM frontier.
 
 ## Resume and validation
 
 Full checkpoints are saved every 1,000 optimizer updates, with `checkpoints/last.ckpt` also refreshed at epoch boundaries so the final short interval is retained. Use the same preset, trajectory cache, and output directory when restoring a full Lightning checkpoint. Set `checkpointing.resume_from_ckpt=True`, `checkpointing.resume_ckpt_path=/absolute/path/to/checkpoints/last.ckpt`, and the original `hydra.run.dir`. Keep the teacher and trajectory manifest consistent. A student-only checkpoint is for evaluation or explicit initialization, not a full optimizer resume.
+
+An explicit CDLM resume request with a missing checkpoint raises an error;
+it does not fall back to a fresh MMD or MDLM initialization.
 
 At training end, the final `last.ckpt` is saved with live student weights and separate EMA state **before** final EMA evaluation and tracker publication. A final frontier is then evaluated if that optimizer step was not already reported, so a 16-epoch run ending between periodic validations still has an end-of-training comparison.
 
