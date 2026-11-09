@@ -18,6 +18,7 @@ from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_THRESHOLDS = [i / 1000 for i in range(325, 951, 25)] + [.98]
+VALIDATION_THRESHOLDS = [.325, .4, .475, .55, .625, .7, .775, .85, .925, .98]
 
 
 def compose_cli(*overrides):
@@ -76,11 +77,11 @@ class TinyGSMProtocolTest(unittest.TestCase):
                                 * config.trainer.num_nodes * config.trainer.accumulate_grad_batches)
                 self.assertEqual(actual_batch, 512)
 
-    def test_eval_is_full_reference_grid_and_exec_accuracy(self):
+    def test_validation_uses_reduced_grid_and_exec_accuracy(self):
         config = recipe()
         self.assertTrue(config.eval.gsm8k_at_validation)
         self.assertTrue(config.eval.validate_before_train)
-        self.assertEqual(list(config.eval.gsm8k_pareto_thresholds), REFERENCE_THRESHOLDS)
+        self.assertEqual(list(config.eval.gsm8k_pareto_thresholds), VALIDATION_THRESHOLDS)
         self.assertEqual(config.eval.gsm8k_pareto_temperature, 0.)
         self.assertIsNone(config.eval.gsm8k_num_examples)
         self.assertFalse(config.eval.compute_generative_perplexity)
@@ -147,7 +148,16 @@ class LauncherTest(unittest.TestCase):
             self.assertEqual(config.mode, 'sample_eval')
             self.assertEqual(config.trainer.devices, 1)
             self.assertEqual(config.eval.gsm8k_batch_size, 7)
+            self.assertIsNone(config.eval.gsm8k_pareto_thresholds)
             self.assertIsNone(config.eval.gsm8k_num_examples)
+
+    def test_generation_threshold_override_wins_over_full_sweep_default(self):
+        result, command = self.capture('generation_sdtt_tinygsm.sh',
+                                       ['hf://owner/repository/model.ckpt',
+                                        'eval.gsm8k_pareto_thresholds=[0.4,0.7,0.98]'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = compose_cli(*command['args'][3:])
+        self.assertEqual(list(config.eval.gsm8k_pareto_thresholds), [.4, .7, .98])
 
     def test_generation_launcher_requires_checkpoint_before_python(self):
         result, command = self.capture('generation_sdtt_tinygsm.sh', [])

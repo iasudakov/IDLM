@@ -14,6 +14,7 @@ export TOKENIZERS_PARALLELISM=false
 exec "${PYTHON:-python}" -u -m main \
   +experiment=cdlm_tinygsm \
   mode=sample_eval \
+  eval.gsm8k_pareto_thresholds=null \
   trainer.devices=1 \
   "eval.checkpoint_path=$cdlm_checkpoint_path" \
   eval.generated_samples_path=cdlm_tinygsm_eval.json \

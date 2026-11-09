@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 
-from test_sdtt_protocol import compose_cli, REFERENCE_THRESHOLDS
+from test_sdtt_protocol import compose_cli, VALIDATION_THRESHOLDS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,7 +80,7 @@ class NirvanaLaunchTest(unittest.TestCase):
         self.assertTrue(config.eval.validate_before_train)
         self.assertTrue(config.eval.gsm8k_at_validation)
         self.assertFalse(config.eval.generate_samples)
-        self.assertEqual(list(config.eval.gsm8k_pareto_thresholds), REFERENCE_THRESHOLDS)
+        self.assertEqual(list(config.eval.gsm8k_pareto_thresholds), VALIDATION_THRESHOLDS)
 
     def test_explicit_code_dir_and_trailing_overrides_win(self):
         arguments, _ = self.capture(code_override=True, arguments=[

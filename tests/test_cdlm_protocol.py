@@ -13,7 +13,8 @@ from omegaconf import OmegaConf
 
 
 ROOT = Path(__file__).resolve().parents[1]
-THRESHOLDS = [i / 1000 for i in range(325, 951, 25)] + [.98]
+REFERENCE_THRESHOLDS = [i / 1000 for i in range(325, 951, 25)] + [.98]
+VALIDATION_THRESHOLDS = [.325, .4, .475, .55, .625, .7, .775, .85, .925, .98]
 
 
 def compose_cli(*overrides):
@@ -106,7 +107,7 @@ class CDLMRecipeTest(unittest.TestCase):
         self.assertEqual(cfg.logger.experiment, 'generative-models/tinygsm')
         self.assertTrue(cfg.eval.validate_before_train)
         self.assertTrue(cfg.eval.gsm8k_at_validation)
-        self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds), THRESHOLDS)
+        self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds), VALIDATION_THRESHOLDS)
         self.assertEqual(cfg.eval.gsm8k_pareto_temperature, 0.)
         self.assertIsNone(cfg.eval.gsm8k_num_examples)
         self.assertEqual(cfg.eval.gsm8k_batch_size, 16)
@@ -212,6 +213,7 @@ class CDLMLauncherTest(unittest.TestCase):
             self.assertEqual(cfg.logger.experiment, 'generative-models/tinygsm')
             self.assertEqual(cfg.logger.name, 'cluster cdlm')
             self.assertEqual(cfg.trainer.accumulate_grad_batches, 4)
+            self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds), VALIDATION_THRESHOLDS)
 
     def test_cluster_code_override_and_failed_prepare_prevent_training(self):
         result, commands, _, code = self.capture('train_cdlm_tinygsm_nirvana.sh',
@@ -220,6 +222,14 @@ class CDLMLauncherTest(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertEqual(commands[0]['cwd'], str(code.resolve()))
         self.assertEqual(self.main_config(commands[0]).mode, 'prepare_cdlm')
+
+    def test_generation_threshold_override_wins_over_full_sweep_default(self):
+        result, commands, _, _ = self.capture('generation_cdlm_tinygsm.sh',
+                                             ['hf://owner/repository/model.ckpt',
+                                              'eval.gsm8k_pareto_thresholds=[0.4,0.7,0.98]'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cfg = self.main_config(commands[0])
+        self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds), [.4, .7, .98])
 
     def test_generation_requires_checkpoint_and_preserves_spaces(self):
         result, commands, _, _ = self.capture('generation_cdlm_tinygsm.sh')
@@ -237,6 +247,7 @@ class CDLMLauncherTest(unittest.TestCase):
             self.assertEqual(cfg.trainer.devices, 1)
             self.assertEqual(cfg.eval.checkpoint_path, str(checkpoint.resolve()))
             self.assertEqual(cfg.eval.gsm8k_batch_size, 7)
+            self.assertIsNone(cfg.eval.gsm8k_pareto_thresholds)
             self.assertIsNone(cfg.eval.gsm8k_num_examples)
 
 
