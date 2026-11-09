@@ -293,6 +293,15 @@ def get_tiny_gsm_dataset(config, tokenizer):
          for split in split_names):
     return datasets.load_from_disk(save_dir)
 
+  # Older MMD runs included the exact separator bytes in this cache name.
+  # Reuse only the matching separator, preserving the original tokens/splits.
+  separator_tag = config.data.separator.encode('utf-8').hex()
+  tagged_save_dir = f'{save_dir}_sep{separator_tag}'
+  if all(utils.fsspec_exists(os.path.join(tagged_save_dir, split))
+         for split in split_names):
+    LOGGER.info(f'Loading existing TinyGSM cache: {tagged_save_dir}')
+    return datasets.load_from_disk(tagged_save_dir)
+
   data_path = getattr(config.data, 'data_path', None)
   if data_path:
     LOGGER.info(f'Preparing TinyGSM-style dataset from {data_path}.')

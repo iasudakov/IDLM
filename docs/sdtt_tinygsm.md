@@ -26,6 +26,18 @@ It uses `$SOURCE_CODE_PATH/code/checkpoints/tinygsm/mdlm_notok.ckpt`, the existi
 
 The SDTT GSM8K validation hook publishes the same accuracy/NFE curves independently of `eval.generate_samples`; the cluster launcher leaves this flag false to avoid an additional unconditional sample-generation path. Execution scoring and all reference confidence thresholds remain enabled.
 
+`model_weights_dir` supplies model/tokenizer assets; training data must also be
+present under `data.cache_dir` on a machine without network access. The loader
+accepts both the original TinyGSM DatasetDict cache name and older MMD caches
+with a separator suffix. For this preset the latter directory is
+`tiny_gsm_bs512_answer_only_filtered_train_on_pad_HuggingFaceTB__SmolLM-135M_sep5c6e`,
+containing both `train/` and `validation/`. It reuses their tokens and split
+membership directly. The generic `tiny_gsm_train_bs512_unwrapped.dat` cache
+may be absent when this DatasetDict exists. If neither format exists, supply
+the original cache from the MMD job, or set `data.data_path` to an existing
+TinyGSM question/code JSON to preprocess locally. GSM8K evaluation separately
+needs `data/gsm8k_test.json` or an explicit `eval.gsm8k_data_path`.
+
 The default assumes eight CUDA devices, 32 examples per device per microbatch, and two microbatches per optimizer update: `8 × 32 × 2 = 512` examples. If changing hardware, preserve `loader.global_batch_size=512`; accumulation is derived automatically. For example:
 
 ```bash
