@@ -12,7 +12,10 @@ collects trajectories and initializes the student using the published
 using Hugging Face or its local cache. The launcher prepares checkpoint assets
 once before starting GPU workers, automatically reuses staged weights or a
 checkpoint snapshot, and passes the same local file to both phases. The base
-preset retains the raw MDLM teacher. For a first run without network access,
+preset retains the raw MDLM teacher. Missing Hub weights are downloaded through
+the Nirvana proxy from the original launch command, scoped to the preflight
+process (`CDLM_DOWNLOAD_PROXY` overrides it; an empty value opts out).
+For a first run without a reachable download proxy or direct network access,
 `python -m cdlm_package --output cdlm-tinygsm-mmd.tar.gz` on a connected machine
 builds a code archive containing MMD weights; use it as the Nirvana source bundle.
 The [complete MMD run-command](examples/nirvana_cdlm_mmd_run_command.sh) performs

@@ -289,6 +289,16 @@
     "identity": "Exact checkpoint bytes retained; asset metadata contains source URI, byte count and SHA256. Trajectory identity remains content-based.",
     "offline_package": "python -m cdlm_package --output cdlm-tinygsm-mmd.tar.gz creates a committed-code archive with code/cdlm_model_assets/mmd_tinygsm.ckpt and provenance on a connected machine; no separate weight input required.",
     "failure": "Unavailable assets fail before GPU launch; code cannot obtain missing first-run bytes without network or staged data.",
-    "validation": "CPU/filesystem tests with mocked Hub and Nirvana SDK; no GPU training."
+    "validation": "CPU/filesystem tests with mocked Hub and Nirvana SDK; no GPU training.",
+    "nirvana_download_proxy": {
+      "source": "Proxy supplied in the original user Nirvana run-command; isolated download process follows neighboring launch_nirvana_g4_freemarker_v4.sh (SDLLM).",
+      "default": "http://survival-mode.klg.yp-c.yandex.net:6953",
+      "environment_key": "CDLM_DOWNLOAD_PROXY",
+      "override": "Custom HTTP(S) proxy; an explicitly empty value opts out and preserves inherited network settings.",
+      "registration": "Default proxy only, before a missing Hub download: direct requests Session with trust_env=False, GET register/quoted-hostname, no redirects, no HF credentials or response-body logging; require 2xx.",
+      "scope": "HTTP(S)_PROXY/no_proxy changes are limited to download context in the preflight child and restored before snapshot I/O. No registration for local/cache/snapshot hits or HF offline mode.",
+      "transport": "HF_HUB_DISABLE_XET=1 and HF_HUB_ENABLE_HF_TRANSFER=0 are set before importing Hub when CDLM_DOWNLOAD_PROXY is nonempty.",
+      "validation": "CPU mocked registration/download and shell environment-capture tests; proxy reachability in the user job is not verified here."
+    }
   }
 }

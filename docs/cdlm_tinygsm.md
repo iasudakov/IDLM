@@ -80,6 +80,23 @@ the checkpoint does not invalidate existing trajectory caches. Preflight
 messages use the `[cdlm-assets]` prefix; an unavailable asset stops the launcher
 before GPU workers start.
 
+The Nirvana launcher uses the HTTP proxy from the original job command,
+`http://survival-mode.klg.yp-c.yandex.net:6953`, for missing checkpoint downloads.
+It first registers the job hostname directly on that proxy. Proxy variables and
+`NO_PROXY` changes are confined to the download context inside the preflight
+child; training, Underdeep and snapshot operations retain their own network
+settings. Xet and `hf_transfer` are disabled before the Hub import in that child
+to use Requests/HTTP CONNECT for the weight file. Existing local, cached or
+snapshot weights need no proxy registration.
+
+`CDLM_DOWNLOAD_PROXY=http://your-proxy:port` selects another proxy without the
+Nirvana-specific registration; `CDLM_DOWNLOAD_PROXY=''` disables this automatic
+proxy and preserves the process's existing HTTP proxy settings. HF offline
+mode still prevents downloads and does not register the job. Proxy registration
+errors stop the preflight with a direct diagnostic. A `Network is unreachable`
+error for a direct `huggingface.co` connection means the job has no route to the
+Hub; the pip warnings about scripts outside `PATH` are unrelated.
+
 On a connected worker, the original MMD launcher command now downloads missing
 weights automatically. A first offline worker must receive the bytes through
 its inputs, code bundle, cache or snapshot. To prepare the **code and weights

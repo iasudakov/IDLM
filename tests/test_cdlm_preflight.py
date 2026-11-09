@@ -165,6 +165,41 @@ class CheckpointPreflightTest(unittest.TestCase):
         self.assertIn('Preflight failed before GPU launch', errors.getvalue())
         self.assertIn('missing student', errors.getvalue())
 
+    def test_proxy_transport_flags_are_ready_before_first_hub_import(self):
+        script = '''import builtins, json, os, sys
+observed = []
+original_import = builtins.__import__
+def capture_import(name, *args, **kwargs):
+    if name == 'huggingface_hub' and not observed:
+        observed.append({key: os.environ.get(key) for key in (
+            'CDLM_DOWNLOAD_PROXY', 'HF_HUB_DISABLE_XET', 'HF_HUB_ENABLE_HF_TRANSFER')})
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = capture_import
+from cdlm_preflight import compose_config
+import huggingface_hub
+cfg = compose_config(['+experiment=cdlm_tinygsm_mmd'])
+print(json.dumps({'hub_import': observed[0], 'torch': 'torch' in sys.modules,
+                  'trainer': 'trainer_base' in sys.modules, 'teacher': cfg.training.finetune_path}))
+'''
+        for configured in ('http://custom.proxy:1234', '', None):
+            with self.subTest(proxy=configured):
+                env = dict(os.environ, HF_HUB_DISABLE_XET='0', HF_HUB_ENABLE_HF_TRANSFER='1')
+                env.pop('CDLM_DOWNLOAD_PROXY', None)
+                if configured is not None:
+                    env['CDLM_DOWNLOAD_PROXY'] = configured
+                env['PYTHONPATH'] = str(ROOT) + os.pathsep + env.get('PYTHONPATH', '')
+                result = subprocess.run([sys.executable, '-c', script], cwd=self.code, env=env,
+                                        text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                before_import = report['hub_import']
+                self.assertEqual(before_import['CDLM_DOWNLOAD_PROXY'], configured)
+                self.assertEqual(before_import['HF_HUB_DISABLE_XET'], '1' if configured else '0')
+                self.assertEqual(before_import['HF_HUB_ENABLE_HF_TRANSFER'], '0' if configured else '1')
+                self.assertFalse(report['torch'])
+                self.assertFalse(report['trainer'])
+                self.assertEqual(report['teacher'], MMD)
+
     def test_composition_in_fresh_process_never_imports_training_or_torch(self):
         script = '''import json, sys
 from cdlm_preflight import compose_config

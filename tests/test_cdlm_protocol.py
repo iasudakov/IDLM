@@ -15,6 +15,7 @@ from omegaconf import OmegaConf
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_THRESHOLDS = [i / 1000 for i in range(325, 951, 25)] + [.98]
 VALIDATION_THRESHOLDS = [.325, .4, .475, .55, .625, .7, .775, .85, .925, .98]
+DEFAULT_DOWNLOAD_PROXY = 'http://survival-mode.klg.yp-c.yandex.net:6953'
 
 
 def compose_cli(*overrides):
@@ -148,7 +149,8 @@ class CDLMRecipeTest(unittest.TestCase):
 
 class CDLMLauncherTest(unittest.TestCase):
     def capture(self, script, args=(), *, preset=None, prepare_gpus=None,
-                bundle=False, code_override=False, fail_prepare=False, fail_preflight=False):
+                bundle=False, code_override=False, fail_prepare=False, fail_preflight=False,
+                download_proxy=None):
         with tempfile.TemporaryDirectory(prefix='cdlm launcher ') as directory:
             temporary = Path(directory).resolve()
             bundle_code = temporary / 'source bundle' / 'code'
@@ -158,7 +160,9 @@ class CDLMLauncherTest(unittest.TestCase):
             capture = temporary / 'commands.jsonl'
             python = temporary / 'mock python'
             python.write_text('#!' + sys.executable + '\n' + r'''import json, os, pathlib, sys
-record = {"args": sys.argv[1:], "cwd": os.getcwd()}
+record = {"args": sys.argv[1:], "cwd": os.getcwd(),
+          "env": {key: os.environ.get(key) for key in (
+              "CDLM_DOWNLOAD_PROXY", "HF_HUB_DISABLE_XET", "HF_HUB_ENABLE_HF_TRANSFER")}}
 with pathlib.Path(os.environ["CDLM_CAPTURE"]).open("a") as stream:
     stream.write(json.dumps(record) + "\n")
 if "cdlm_preflight" in sys.argv:
@@ -191,9 +195,13 @@ if (os.environ.get("CDLM_MOCK_FAIL_PREPARE") and "main" in sys.argv
     sys.exit(17)
 ''')
             python.chmod(0o755)
-            env = dict(os.environ, PYTHON=str(python), CDLM_CAPTURE=str(capture))
-            for key in ['CDLM_PRESET', 'CDLM_PREPARE_GPUS', 'SOURCE_CODE_PATH', 'CDLM_CODE_DIR']:
+            env = dict(os.environ, PYTHON=str(python), CDLM_CAPTURE=str(capture),
+                       HF_HUB_DISABLE_XET='0', HF_HUB_ENABLE_HF_TRANSFER='1')
+            for key in ['CDLM_PRESET', 'CDLM_PREPARE_GPUS', 'SOURCE_CODE_PATH', 'CDLM_CODE_DIR',
+                        'CDLM_DOWNLOAD_PROXY']:
                 env.pop(key, None)
+            if download_proxy is not None:
+                env['CDLM_DOWNLOAD_PROXY'] = download_proxy
             if preset:
                 env['CDLM_PRESET'] = preset
             if prepare_gpus:
@@ -327,6 +335,31 @@ if (os.environ.get("CDLM_MOCK_FAIL_PREPARE") and "main" in sys.argv
             self.assertTrue(cfg.training.student_init_use_ema)
             self.assertTrue(cfg.eval.gsm8k_greedy_token)
             self.assertEqual(cfg.eval.gsm8k_steps, 32)
+
+    def test_default_download_proxy_is_scoped_to_preflight_child(self):
+        result, commands, _, _ = self.capture('train_cdlm_tinygsm_nirvana.sh')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(commands), 3)
+        self.assertEqual(commands[0]['env']['CDLM_DOWNLOAD_PROXY'], DEFAULT_DOWNLOAD_PROXY)
+        for worker in commands[1:]:
+            self.assertIsNone(worker['env']['CDLM_DOWNLOAD_PROXY'])
+            self.assertEqual(worker['env']['HF_HUB_DISABLE_XET'], '0')
+            self.assertEqual(worker['env']['HF_HUB_ENABLE_HF_TRANSFER'], '1')
+
+    def test_custom_download_proxy_and_empty_optout_preserve_user_environment(self):
+        for configured in ('http://custom.proxy:1234', ''):
+            with self.subTest(proxy=configured):
+                result, commands, _, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',
+                                                     download_proxy=configured)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(commands), 3)
+                self.assertEqual(commands[0]['env']['CDLM_DOWNLOAD_PROXY'], configured)
+                # User exports survive in later phases; the launcher only adds
+                # its default to the preflight command when the variable is unset.
+                for worker in commands[1:]:
+                    self.assertEqual(worker['env']['CDLM_DOWNLOAD_PROXY'], configured)
+                    self.assertEqual(worker['env']['HF_HUB_DISABLE_XET'], '0')
+                    self.assertEqual(worker['env']['HF_HUB_ENABLE_HF_TRANSFER'], '1')
 
     def test_preflight_failure_prevents_all_workers(self):
         result, commands, _, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',

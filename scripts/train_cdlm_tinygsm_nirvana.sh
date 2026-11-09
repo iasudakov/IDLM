@@ -72,6 +72,9 @@ cdlm_overrides=(
 # receive the same local bytes; diagnostic output is separate from arguments.
 cdlm_asset_file="$(mktemp)"
 trap 'rm -f -- "$cdlm_asset_file"' EXIT
+# Use the proxy from the original Nirvana job only in asset preparation.
+# An explicitly empty value opts out; training keeps its original environment.
+CDLM_DOWNLOAD_PROXY="${CDLM_DOWNLOAD_PROXY-http://survival-mode.klg.yp-c.yandex.net:6953}" \
 "${PYTHON:-python}" -u -m cdlm_preflight --output "$cdlm_asset_file" "${cdlm_overrides[@]}"
 mapfile -d '' -t cdlm_asset_overrides < "$cdlm_asset_file"
 rm -f -- "$cdlm_asset_file"

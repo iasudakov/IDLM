@@ -12,6 +12,12 @@ import os
 from pathlib import Path, PurePosixPath
 import tempfile
 
+# Hub reads these transport switches at import time. The Nirvana launcher sets
+# CDLM_DOWNLOAD_PROXY only for the preflight child, leaving training unchanged.
+if os.environ.get('CDLM_DOWNLOAD_PROXY'):
+    os.environ['HF_HUB_DISABLE_XET'] = '1'
+    os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
+
 from huggingface_hub import hf_hub_download
 
 import nirvana_snapshot
@@ -260,12 +266,14 @@ def prepare_checkpoint(source, *, code_dir, input_dir=None, weights_dir=None,
             return str(directory / _CHECKPOINT)
         print(f'[cdlm-assets] Downloading requested checkpoint {source} '
               'from Hugging Face.', flush=True)
-        try:
-            downloaded = hf_hub_download(repo_id=repo_id, filename=filename)
-        except Exception:
-            # Hub and filesystem errors can contain credential-bearing URLs;
-            # provide useful locations without reproducing request details.
-            downloaded = None
+        from cdlm_download_proxy import download_proxy
+        with download_proxy():
+            try:
+                downloaded = hf_hub_download(repo_id=repo_id, filename=filename)
+            except Exception:
+                # Hub and filesystem errors can contain credential-bearing URLs;
+                # provide useful locations without reproducing request details.
+                downloaded = None
         if downloaded is not None:
             # A local staging failure (for example, a full disk) is a separate
             # actionable error and must not become a misleading Hub miss.

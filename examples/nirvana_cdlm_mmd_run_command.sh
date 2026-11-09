@@ -39,7 +39,8 @@ python -V
 command -v python
 nvidia-smi
 
-# Resolve MMD once (bundled/input/cached/snapshot weights, then HF download),
+# Resolve MMD once (bundled/input/cached/snapshot weights, then HF download
+# through the original Nirvana proxy in the preflight child only),
 # restore or collect trajectories, and train/evaluate on four GPUs.
 CDLM_PRESET=cdlm_tinygsm_mmd \
 bash "$SOURCE_CODE_PATH/code/scripts/train_cdlm_tinygsm_nirvana.sh" \
