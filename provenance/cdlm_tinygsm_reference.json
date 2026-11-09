@@ -51,7 +51,7 @@
       "self_consistency": 0.5,
       "ground_truth": 0.1
     },
-    "teacher": "Frozen original MDLM checkpoint; no SDTT round promotion.",
+    "teacher": "Frozen selected teacher: raw MDLM in the base preset; published MMD EMA in cdlm_tinygsm_mmd. No SDTT round promotion.",
     "floating_point": "Float32 probability normalization and losses with bf16 mixed model execution."
   },
   "trajectory": {
@@ -73,7 +73,7 @@
     "shard_size": 8,
     "default_num_shards": 5000,
     "resume": "Atomic tensor shards and metadata; fingerprinted manifest must be complete before training; metadata and content checksums verify resumed shards.",
-    "cache_identity": "Teacher checkpoint content hash, tokenizer serialization/vocabulary, model, training data fingerprint, selected example indices, seed, temperatures and rollout settings; relocation of identical files is allowed.",
+    "cache_identity": "Selected teacher checkpoint content hash plus raw/EMA selection, tokenizer serialization/vocabulary, model, training data fingerprint, selected indices, seed, temperatures and rollout settings; relocation of identical files is allowed. Student-only initialization is excluded.",
     "record_tensors": {
       "input_ids": "[512] int64 original ground truth",
       "attention_mask": "[512] bool eligible span",
@@ -81,9 +81,12 @@
       "reveal_order": "[512] int16; -1 prompt,0..N-1 eligible reveal rank",
       "teacher_hidden": "[512,768] bfloat16; post-final-normalization/AdaLN input to frozen output_layer.linear"
     },
-    "cache_read_memory": "One resident shard per dataloader worker; logits reconstructed through frozen original vocabulary head.",
+    "cache_read_memory": "One resident shard per dataloader worker; logits reconstructed through the frozen selected teacher vocabulary head.",
     "schema_version": 2,
-    "teacher_hidden_dtype": "Only bfloat16/bf16 is supported; the normalized dtype is fingerprinted in the schema-2 cache."
+    "teacher_hidden_dtype": "Only bfloat16/bf16 is supported; the normalized dtype is fingerprinted in the schema-2 cache.",
+    "local_directory": "algo.trajectory_cache_dir/teacher-<teacher_checkpoint_sha256[:16]>/<raw-or-ema>/<full_cache_fingerprint>; matching legacy flat caches are reused in place.",
+    "model_directory_key": "algo.trajectory_cache_per_model=True by default.",
+    "manifest_teacher_label": "teacher_source records the generating checkpoint path/URI outside the identity."
   },
   "selected_setup": {
     "attention": "Full bidirectional MDLM attention, with no KV caching; trajectory windows do not impose a causal attention mask.",
@@ -169,9 +172,9 @@
     "optional_checkpoint_key": "training.student_init_path",
     "optional_ema_key": "training.student_init_use_ema",
     "optional_ema_default": false,
-    "teacher": "training.finetune_path remains the original raw MDLM used by the frozen teacher head and cached trajectories.",
+    "teacher": "training.finetune_path selects the actual trajectory teacher; training.teacher_use_ema selects raw or EMA before copying its frozen output head.",
     "scope": "Import strict student backbone weights only; fresh optimizer, scheduler, and student EMA; no MMD loop/optimizer history.",
-    "cache": "Student initialization does not enter the trajectory cache identity.",
+    "cache": "Student-only overrides do not change teacher cache identity; changing the selected teacher or its raw/EMA mode selects a separate cache.",
     "resume": "Full CDLM resume bypasses external student initialization; missing requested resume fails explicitly.",
     "published_preset": "cdlm_tinygsm_mmd",
     "published_checkpoint": {
@@ -190,7 +193,13 @@
         "bytes": 671796985,
         "verification_scope": "Inspected existing local HF cache on CPU without downloading; current remote main revision was not reverified."
       },
-      "network_policy": "Explicit student URI opts in to Hub loading and standard HF cache lookup, even with a local teacher/tokenizer bundle. Global HF offline flags are honored. Preparation/full resume never fetch the external student."
+      "network_policy": "The MMD preset opts in to teacher Hub lookup for preparation and identity verification, while standard HF offline settings are respected. Optional student-only initialization is skipped during preparation/full resume; the selected teacher asset is still required.",
+      "roles": [
+        "MMD EMA trajectory teacher",
+        "MMD EMA student initialization"
+      ],
+      "teacher_use_ema": true,
+      "teacher_allow_hub": true
     }
   },
   "evaluation": {
@@ -238,16 +247,31 @@
     ],
     "trigger": "After every successful actual checkpoint-I/O write, including periodic, epoch-end, monitored and direct final saves; final reporting also publishes updated metadata.",
     "scope": "Complete checkpointing.save_dir, including full checkpoints, Underdeep metadata, config and evaluation history.",
-    "checkpoint_state": "Live student, frozen original teacher head, separate student EMA, optimizer, scheduler, callbacks, loops and trajectory cache fingerprint.",
+    "checkpoint_state": "Live student, frozen selected teacher head, separate student EMA, optimizer, scheduler, callbacks, loops and trajectory cache fingerprint.",
     "copy_policy": "Global rank zero only; complete local write first, atomic per-file destination copy, then dump_snapshot; preserve other snapshot files and namespaces.",
     "restore": "On explicit resume_from_ckpt=True, an existing local checkpoint takes priority. Otherwise restore the namespace before declaring the resume path missing and initializing the tracker. Fresh runs do not restore old snapshot weights.",
     "not_included": [
-      "algo.trajectory_cache_dir",
-      "original teacher checkpoint",
+      "selected teacher checkpoint",
       "tokenizer bundle",
       "input datasets"
     ],
     "failure_policy": "Missing SDK and snapshot transfer errors are reported without failing local checkpoint saves.",
-    "validation": "Filesystem-only fake-SDK tests and tiny CPU CDLM full-checkpoint tests; no actual Nirvana upload or GPU model job was run."
+    "validation": "Filesystem-only fake-SDK tests and tiny CPU CDLM full-checkpoint tests; no actual Nirvana upload or GPU model job was run.",
+    "trajectory_cache": {
+      "enabled_key": "checkpointing.snapshot_trajectories",
+      "cdlm_default": true,
+      "master_switch": "checkpointing.snapshot",
+      "namespace_key": "checkpointing.trajectory_snapshot_namespace",
+      "namespace_default": "cdlm_trajectories",
+      "directory": "<namespace>/teacher-<teacher_checkpoint_sha256[:16]>/<raw-or-ema>/<full_cache_fingerprint>",
+      "interval_key": "checkpointing.trajectory_snapshot_interval_seconds",
+      "interval_seconds": 300,
+      "trigger": "Rank-zero periodic background publication plus synchronous final publication on success or controlled failure; no per-shard collectives.",
+      "contents": "Confirmed immutable part-*.pt and matching checksum receipts; manifest published last; locks and temporary files excluded.",
+      "status": "Partial cache remains building; complete only when every expected shard/receipt is committed.",
+      "restore": "Matching model/config only; restored before cache scanning. Existing valid identical pairs and unconfirmed local payloads are retained; missing pairs are merged. Conflicting immutable shard hashes fail clearly.",
+      "incremental_scope": "Already verified unchanged shards are not recopied locally. The SDK publishes the global snapshot root; no network deduplication claim.",
+      "serialization": "Process-wide STORE_LOCK serializes trajectory and checkpoint snapshot writes/publication."
+    }
   }
 }

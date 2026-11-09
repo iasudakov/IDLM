@@ -11,11 +11,13 @@ import main
 
 
 class PreparationLoggingTest(unittest.TestCase):
-    def run_preparation(self, failure=None, student_source='/not-mounted-on-collector/mmd.ckpt'):
+    def run_preparation(self, failure=None, student_source='/not-mounted-on-collector/mmd.ckpt',
+                        teacher_source='original-mdlm.ckpt', teacher_use_ema=False):
         events = []
         config = OmegaConf.create({
             'algo': {'name': 'cdlm'}, 'data': {'train': 'tiny_gsm'},
-            'training': {'finetune_path': 'original-mdlm.ckpt',
+            'training': {'finetune_path': teacher_source,
+                         'teacher_use_ema': teacher_use_ema,
                          'student_init_path': student_source,
                          'student_init_use_ema': True},
         })
@@ -49,9 +51,16 @@ class PreparationLoggingTest(unittest.TestCase):
             else:
                 main._prepare_cdlm(Mock(return_value=model), config, Mock(), object())
             factory.assert_called_once_with(config, rank=0)
-            model.load_evaluation_weights.assert_called_once_with('original-mdlm.ckpt', use_ema=False)
+            model.load_teacher_weights.assert_called_once_with(teacher_source, use_ema=teacher_use_ema)
+            model.load_evaluation_weights.assert_not_called()
             model.initialize_from_checkpoint.assert_not_called()
         return events, progress
+
+    def test_mmd_teacher_is_selected_for_collection(self):
+        events, progress = self.run_preparation(
+            teacher_source='hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt', teacher_use_ema=True)
+        self.assertEqual(events, ['progress started', 'data loading', 'collecting', 'complete'])
+        progress.close.assert_called_once_with('complete')
 
     def test_reporting_starts_before_loading_and_closes_after_collection(self):
         events, progress = self.run_preparation()

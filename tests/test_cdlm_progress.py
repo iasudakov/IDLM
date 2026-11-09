@@ -59,6 +59,27 @@ def receipt(directory, descriptor, *, fingerprint='teacher-data-id', tensor=True
 
 
 class PreparationProgressTest(unittest.TestCase):
+    def test_model_specific_selection_ignores_other_model_and_excludes_restored_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            cfg = config(directory)
+            cfg.algo.trajectory_cache_per_model = True
+            legacy = directory / 'cache'
+            saved = manifest(legacy)
+            for descriptor in saved['shards']:
+                receipt(legacy, descriptor)
+            progress = PreparationProgress(cfg)
+            # A different model's flat cache cannot appear as current progress.
+            self.assertEqual(progress._snapshot(), (0, 16, 0, 2))
+            selected = directory / 'selected-model'
+            restored = manifest(selected)
+            receipt(selected, restored['shards'][0])
+            progress.set_cache_directory(selected)
+            self.assertEqual(progress._snapshot(), (8, 16, 1, 2))
+            progress._started = time.monotonic() - 10
+            self.assertEqual(progress._metrics(progress._snapshot(), 'running')
+                             ['prep/cdlm_trajectories_per_second'], 0.)
+
     def test_constructor_is_idle_and_nonzero_rank_does_nothing(self):
         with tempfile.TemporaryDirectory() as tmp, patch('cdlm_progress.hydra.utils.instantiate') as create:
             progress = PreparationProgress(config(Path(tmp)), rank=1, interval_seconds=.01)

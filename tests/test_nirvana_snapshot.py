@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import threading
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -92,6 +93,32 @@ class SnapshotTest(unittest.TestCase):
                 self.assertFalse(snapshot.restore(self.run))
         self.assertEqual(self.get_calls, [])
         self.assertEqual(self.dumps, [])
+
+    def test_save_and_restore_hold_the_shared_store_lock_before_copying(self):
+        self.write_run('last.ckpt', b'checkpoint')
+        (self.store / 'last.ckpt').write_bytes(b'snapshot checkpoint')
+        original = snapshot._copy_directory
+        for operation in (snapshot.save, snapshot.restore):
+            with self.subTest(operation=operation.__name__):
+                started, copying = threading.Event(), threading.Event()
+
+                def copy(*args):
+                    copying.set()
+                    return original(*args)
+
+                def worker():
+                    started.set()
+                    operation(self.run)
+
+                with patch.object(snapshot, '_copy_directory', side_effect=copy):
+                    with snapshot.STORE_LOCK:
+                        thread = threading.Thread(target=worker)
+                        thread.start()
+                        self.assertTrue(started.wait(2))
+                        self.assertFalse(copying.wait(.05))
+                    thread.join(2)
+                self.assertFalse(thread.is_alive())
+                self.assertTrue(copying.is_set())
 
     def test_global_rank_zero_takes_precedence_over_local_rank(self):
         self.write_run('last.ckpt', b'checkpoint')

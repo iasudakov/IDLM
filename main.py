@@ -380,14 +380,18 @@ def _prepare_cdlm(diffusion_model, config, logger, tokenizer):
       if rank != 0:
         original_loader, _ = dataloader.get_dataloaders(config, tokenizer, skip_valid=True)
       model = diffusion_model(config, tokenizer=tokenizer, inference_only=True)
-      model.load_evaluation_weights(config.training.finetune_path, use_ema=False)
+      model.load_teacher_weights(config.training.finetune_path,
+                                 use_ema=bool(config.training.get('teacher_use_ema', False)))
       model.to(torch.device('cuda', local)).eval()
     except Exception as caught:
       error = caught
     _raise_if_failed(error)
-    logger.info('Collecting original-teacher CDLM trajectories; student training is a separate phase.')
+    logger.info('Collecting CDLM trajectories with teacher %s (%s weights); student training is a separate phase.',
+                config.training.finetune_path,
+                'EMA' if config.training.get('teacher_use_ema', False) else 'raw')
     with torch.autocast('cuda', dtype=torch.bfloat16):
-      prepare_trajectories(model, config, tokenizer, original_loader.dataset)
+      prepare_trajectories(model, config, tokenizer, original_loader.dataset,
+                          on_cache_ready=progress.set_cache_directory)
     preparation_status = 'complete'
   finally:
     progress.close(preparation_status)
@@ -397,8 +401,9 @@ def _prepare_cdlm(diffusion_model, config, logger, tokenizer):
 
 def _cdlm_train_loader(config, tokenizer, original_loader):
   from cdlm_trajectories import build_cache_identity, CDLMTrajectoryDataset
+  from cdlm_cache import cache_directory
   identity = build_cache_identity(config, tokenizer, original_loader.dataset)
-  dataset = CDLMTrajectoryDataset(config.algo.trajectory_cache_dir,
+  dataset = CDLMTrajectoryDataset(cache_directory(config, identity),
                                  expected_fingerprint=identity)
   global_batch = int(config.loader.global_batch_size)
   usable = len(dataset) // global_batch * global_batch
@@ -478,10 +483,12 @@ def _train(diffusion_model, config, logger, tokenizer):
         model.initialize_from_checkpoint(
           config.training.finetune_path, student_source=student_source,
           student_use_ema=student_use_ema)
-        logger.info('CDLM teacher: %s; student initialization: %s (%s weights).',
+        teacher_ema = bool(config.training.get('teacher_use_ema', False))
+        logger.info('CDLM teacher: %s (%s weights); student initialization: %s (%s weights).',
                     config.training.finetune_path,
+                    'EMA' if teacher_ema else 'raw',
                     student_source or config.training.finetune_path,
-                    'EMA' if student_source and student_use_ema else 'raw')
+                    'EMA' if (student_use_ema if student_source else teacher_ema) else 'raw')
       else:
         model.initialize_from_checkpoint(config.training.finetune_path)
   elif config.training.finetune_path != '':

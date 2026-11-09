@@ -11,12 +11,17 @@ else
 fi
 cd -- "$cdlm_code_dir"
 cdlm_code_dir="$PWD"
+cdlm_preset="${CDLM_PRESET:-cdlm_tinygsm}"
+cdlm_teacher_overrides=()
+if [[ "$cdlm_preset" != cdlm_tinygsm_mmd ]]; then
+  cdlm_teacher_overrides=("training.finetune_path=$cdlm_code_dir/checkpoints/tinygsm/mdlm_notok.ckpt")
+fi
 
 # Four B300 GPUs, 32 examples per GPU, accumulation 4: global batch 512.
 # Collection is explicit and completes before training starts. Trailing Hydra
 # overrides are shared by both phases; the phase itself is fixed after them.
 cdlm_overrides=(
-  "+experiment=${CDLM_PRESET:-cdlm_tinygsm}"
+  "+experiment=$cdlm_preset"
   data=tiny-gsm data.wrap=False data.train_on_prompt=False
   data.train_on_pad=True data.filter_too_long=True
   model=small model.length=512 algo=cdlm
@@ -29,7 +34,7 @@ cdlm_overrides=(
   algo.trajectory_shard_size=8 algo.teacher_hidden_dtype=bfloat16
   "algo.trajectory_cache_dir=$cdlm_code_dir/cache_dir/cdlm_tinygsm_trajectories"
   strategy.find_unused_parameters=True adversarial_distill.is_distill=False
-  "training.finetune_path=$cdlm_code_dir/checkpoints/tinygsm/mdlm_notok.ckpt"
+  "${cdlm_teacher_overrides[@]}"
   training.loss_precision=float32
   loader.batch_size=32 loader.eval_batch_size=64
   loader.global_batch_size=512 loader.num_workers=4
@@ -48,6 +53,7 @@ cdlm_overrides=(
   checkpointing.use_periodic_train_batch_checkpoint=False
   checkpointing.resume_from_ckpt=False
   checkpointing.snapshot=True
+  checkpointing.snapshot_trajectories=True
   trainer.devices=4 trainer.precision=bf16-mixed
   trainer.accumulate_grad_batches=4 trainer.gradient_clip_val=null
   trainer.val_check_interval=2000 trainer.check_val_every_n_epoch=null

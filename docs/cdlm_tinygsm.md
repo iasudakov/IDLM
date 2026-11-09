@@ -8,12 +8,12 @@ The comparison reference is MMD run `3e0ac6b1-7a8f-43c3-af58-d9e21b886da7`. [The
 
 ## Objective
 
-The frozen original MDLM teacher produces trajectories offline. It is never promoted from the student. From each saved trajectory, training selects an earlier partially masked state and a later window endpoint, then optimizes:
+The selected frozen teacher produces trajectories offline: raw MDLM in the base preset, or the published MMD EMA model in `cdlm_tinygsm_mmd`. It is never promoted from the student. From each saved trajectory, training selects an earlier partially masked state and a later window endpoint, then optimizes:
 
 `loss = distillation + 0.5 × self_consistency + 0.1 × ground_truth_denoising`
 
 - **Distillation:** teacher-to-student forward cross entropy on tokens revealed between the two states. The teacher distribution is reconstructed from the frozen vocabulary projection and the saved head inputs at each token's reveal time. Omitting teacher entropy leaves the forward-KL gradient unchanged.
-- **Self consistency:** the current student's detached later-state distribution supervises its earlier-state prediction at positions that remain masked in both states. It is a separate student consistency target, not another copy of the original MDLM teacher.
+- **Self consistency:** the current student's detached later-state distribution supervises its earlier-state prediction at positions that remain masked in both states. The target is the current student; the frozen trajectory teacher supplies the separate distillation term.
 - **Ground truth:** randomly mask the true answer/EOS/padding span and apply inverse-mask-probability-weighted token cross entropy. Draw `p = 0.001 + 0.999 × Uniform(0,1)` and scale masked token losses by `1 / (p + 1e-8)`.
 
 These terms follow [the released loss implementation](https://github.com/SqueezeAILab/CDLM/blob/708800ab0df03e2c284ab2cb358e42652a5e85a5/CDLM-train/utils/loss.py). All probability normalization and losses use float32. The weights follow [the released LLaDA configuration](https://github.com/SqueezeAILab/CDLM/blob/708800ab0df03e2c284ab2cb358e42652a5e85a5/CDLM-train/config/llada.yaml).
@@ -41,8 +41,8 @@ The MMD initialization uses the published
 [yresearch/MDLM-MMD-TinyGSM checkpoint](https://huggingface.co/yresearch/MDLM-MMD-TinyGSM),
 `model.ckpt`, linked from the MMD project's README. Select the
 `cdlm_tinygsm_mmd` preset to load it automatically from Hugging Face or the
-standard HF cache. Keep `training.finetune_path` pointing to the original
-MDLM teacher. For the existing Nirvana layout:
+standard HF cache. In this preset MMD supplies both the trajectory teacher and
+the starting student weights. For the existing Nirvana layout:
 
 ```bash
 CDLM_PRESET=cdlm_tinygsm_mmd \
@@ -50,14 +50,15 @@ bash "$SOURCE_CODE_PATH/code/scripts/train_cdlm_tinygsm_nirvana.sh" \
   'logger.name=mmd to cdlm tinygsm 4xB300 16 epochs'
 ```
 
-This preset sets
-`training.student_init_path=hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt` and
+This preset sets `training.finetune_path` and `training.student_init_path` to
+`hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt`, with
+`training.teacher_use_ema=True`, `training.teacher_allow_hub=True` and
 `training.student_init_use_ema=True`. The verified cached release contains
-EMA-only weights at MMD step 7000, so EMA selection is required. An explicit
-student `hf://` source is allowed alongside `model_weights_dir`; local
-teacher/tokenizer loading keeps the bundle policy. Preparation and full resume
-do not fetch the external student checkpoint; fresh student initialization
-performs the Hub lookup.
+EMA-only weights at MMD step 7000. Preparation loads those EMA weights, and
+training copies the frozen vocabulary head from the same selected teacher
+before initializing the student. The Nirvana launcher preserves this teacher
+selection instead of replacing it with the local MDLM checkpoint. Other model
+assets continue using the supplied local bundle.
 
 To prefetch the checkpoint before spending time collecting trajectories, run
 this in the same environment on a machine with network access:
@@ -85,7 +86,11 @@ The same preset then reads the staged cache without network requests. Global
 Hugging Face offline settings are respected; selecting a Hub URI does not
 provide network access on a disconnected worker.
 
-For a different local MMD checkpoint, override `training.student_init_path`.
+For a different local trajectory teacher, override `training.finetune_path`
+and choose `training.teacher_use_ema` explicitly. Set
+`training.student_init_path=null` to start the student from that selected
+teacher, or provide a separate student initialization checkpoint. Changing only
+`student_init_path` changes the student, while preserving teacher trajectories.
 `student_init_use_ema=False` (the base CDLM default) imports live `backbone.*` weights;
 `True` imports the checkpoint's EMA weights. An EMA-only export requires the
 explicit `True` setting. Architecture and vocabulary must match the current
@@ -93,21 +98,22 @@ MDLM; incompatible checkpoints fail strict loading. Native MMD checkpoints
 may include teacher, fake-model and optimizer tensors: only the student
 backbone is imported.
 
-The original MDLM output head and cached teacher trajectories remain fixed.
-Student initialization does not change the cache fingerprint, so a matching
+The selected teacher output head and cached teacher trajectories remain fixed.
+Student-only initialization does not change the cache fingerprint, so a matching
 prepared cache is reused. CDLM starts a fresh optimizer/scheduler and fresh
 student EMA from the imported weights, with its normal 16-epoch budget.
 Label this run **MMD to CDLM** to record its starting point. Leaving
-`student_init_path=null` keeps direct MDLM initialization. Full checkpoint
-resume takes precedence and does not reopen the MMD initialization file.
+`student_init_path=null` initializes from the selected teacher. Full checkpoint
+resume does not reopen the optional student-only initialization file; the
+selected teacher checkpoint remains necessary to verify cache identity.
 
 The preparation default selects 20,000 TinyGSM training prompts and produces one trajectory at each temperature, zero and 0.5: 40,000 trajectories in total. Each teacher call reveals the globally most confident eligible token; unlike the released collector, it does not restrict selection to contiguous token blocks. Prompts stay visible, and answer/EOS/padding positions are generated. Only training-split examples are used for collection. Preparation is substantial work and must be counted separately when reporting training cost.
 
 The cache stores the monotone reveal order, generated tokens, ground truth, and bf16 inputs to the frozen linear vocabulary head. It reconstructs intermediate states and teacher logits when training, instead of storing a full vocabulary tensor or a complete token/mask sequence at every step. At 40,000 trajectories, length 512, and hidden width 768, head inputs alone occupy about 29.3 GiB by shape; prompt rows are retained as zeros. Allow additional storage for token records, metadata, and filesystem overhead. This is an estimate, not a measured cache size.
 
-`algo.trajectory_cache_dir` selects the cache. Its default is `cache_dir/cdlm_tinygsm_trajectories` under the checkout. Preparation runs on four processes by default; `CDLM_PREPARE_GPUS` selects the process count. `algo.trajectory_batch_size=8` sets the collection microbatch and `algo.trajectory_shard_size=8` sets eight trajectories per file. The full default creates 5,000 tensor shards plus metadata.
+`algo.trajectory_cache_dir` selects the cache root. Its default is `cache_dir/cdlm_tinygsm_trajectories` under the checkout. With the default `algo.trajectory_cache_per_model=True`, the actual directory is `<root>/teacher-<checkpoint_sha256_prefix>/<raw-or-ema>/<full_cache_fingerprint>/`. Preparation and training use the same resolver. Matching older flat caches are reused in place; another model's flat cache is retained while the selected model gets its own child directory. The manifest records `teacher_source` for mapping a folder to its model. Preparation runs on four processes by default; `CDLM_PREPARE_GPUS` selects the process count. `algo.trajectory_batch_size=8` sets the collection microbatch and `algo.trajectory_shard_size=8` sets eight trajectories per file. The full default creates 5,000 tensor shards plus metadata.
 
-The cache format is schema 2. The manifest fingerprints the original checkpoint's bytes, tokenizer implementation/vocabulary, model config, source training data, selected indices, seed, temperatures, and rollout settings, including hidden-state dtype. `algo.teacher_hidden_dtype` supports only `bfloat16` or its `bf16` alias. Repeating preparation resumes completed matching shards after verifying their metadata/checksums; new shards are published atomically. Training requires the manifest to be complete and match the inputs. Earlier schemas are rejected and need a new cache. Changing teacher, tokenizer, separator, prompt selection, sequence length, or fingerprinted collection settings requires a different cache. Relocating identical files does not change content identity.
+The cache format is schema 2. The manifest fingerprints the selected teacher checkpoint's bytes, raw/EMA selection, tokenizer implementation/vocabulary, model config, source training data, selected indices, seed, temperatures, and rollout settings, including hidden-state dtype. `algo.teacher_hidden_dtype` supports only `bfloat16` or its `bf16` alias. Repeating preparation resumes completed matching shards after verifying their metadata/checksums; new shards are published atomically. Training requires the manifest to be complete and match the inputs. Earlier schemas are rejected and need a new cache. Changing teacher, raw/EMA selection, tokenizer, separator, prompt selection, sequence length, or fingerprinted collection settings selects a different cache directory. Relocating identical files does not change content identity. A checkpoint trained with MDLM trajectories cannot resume against an MMD trajectory cache: the saved cache fingerprint deliberately rejects that mismatch.
 
 The default training budget is 16 epochs over the saved trajectories, matching the released author's epoch count. The loader uses 39,936 of the 40,000 trajectories per epoch so all updates contain the full global batch of 512; the remaining 64 are omitted. This gives 78 optimizer updates per epoch, or 1,248 updates across 16 epochs. The default follows CDLM's 5% warmup, calculated at runtime from the estimated optimizer budget: 62 updates for this dataset. The configured `lr_scheduler.num_warmup_steps=0` is a placeholder replaced by that calculation.
 
@@ -150,7 +156,7 @@ After the same environment and input staging used for the MMD job, the Nirvana r
 bash "$SOURCE_CODE_PATH/code/scripts/train_cdlm_tinygsm_nirvana.sh"
 ```
 
-This wrapper prepares trajectories and then trains, using the code bundle's original `checkpoints/tinygsm/mdlm_notok.ckpt`, `cache_dir`, and `cache_dir/tinygsm_mmd_offline_bundle`. Outputs go to a separate `cdlm_tinygsm` directory. The tracker experiment stays `generative-models/tinygsm`. Keep shell arrays and parameter expansions inside the external script; Nirvana interprets some brace expressions in its run-command field before Bash starts.
+This wrapper prepares trajectories and then trains. The base preset uses the code bundle's original `checkpoints/tinygsm/mdlm_notok.ckpt`; the MMD preset uses the published MMD EMA teacher. Both use the existing `cache_dir` and `cache_dir/tinygsm_mmd_offline_bundle`. Outputs go to a separate `cdlm_tinygsm` directory. The tracker experiment stays `generative-models/tinygsm`. Keep shell arrays and parameter expansions inside the external script; Nirvana interprets some brace expressions in its run-command field before Bash starts.
 
 Preparation reports progress from rank zero every 30 seconds, starting before
 data and teacher loading. Console messages use the `[cdlm-prepare]` prefix.
@@ -254,13 +260,44 @@ older snapshot cannot overwrite progress whose upload failed. Restoration is
 only requested for an explicit resume; a fresh run does not import old snapshot
 weights. Successful uploads print `[snapshot] pushed ...`.
 
-Snapshotting this run directory does not include the separate
-`algo.trajectory_cache_dir`, original teacher weights, tokenizer or input
-datasets. Keep the original inputs available and preserve or regenerate the
-same trajectory cache before resuming. Full resume restores student, frozen
-teacher head, EMA, optimizer, scheduler and training loops; it does not need the
-external MMD initialization checkpoint. Outside Nirvana, or on a snapshot SDK
-failure, a diagnostic is printed and local checkpoint saving continues.
+Trajectory caches are persisted separately when
+`checkpointing.snapshot_trajectories=True` (the CDLM default, together with
+`checkpointing.snapshot=True`). Their snapshot directories are:
+
+```text
+cdlm_trajectories/
+  teacher-<checkpoint_sha256_prefix>/
+    raw-or-ema/
+      <full_cache_fingerprint>/
+        manifest.json
+        part-00000000.pt
+        part-00000000.json
+        ...
+```
+
+This key uses the model that actually generated the trajectories. MDLM raw,
+MMD EMA and different generation settings are isolated. A different student
+initialization can reuse the same teacher cache. The namespace root is
+configurable through `checkpointing.trajectory_snapshot_namespace`.
+
+Preparation restores the matching partial or complete cache before workers
+inspect shards. Rank zero publishes confirmed shard/receipt pairs every
+`checkpointing.trajectory_snapshot_interval_seconds` (300 seconds by default),
+and forces a final publication on completion or a controlled failure. Temporary
+files and locks are excluded. Valid local work is retained; only missing pairs
+are restored. Manifests remain `building` until all required shards are present.
+Different confirmed shard contents under the same identity are rejected as a
+conflict; neither valid cache is silently overwritten.
+Previously verified immutable snapshot shards are not recopied locally. The
+Nirvana SDK still publishes the snapshot root; network-level deduplication is
+not assumed. Cache and checkpoint publications share a lock.
+
+The original teacher weights, tokenizer and input datasets remain separate
+inputs. For the MMD preset, the published MMD file must remain available as a
+teacher asset even on full resume, although optional student initialization is
+skipped. Full resume restores student, frozen teacher head, EMA, optimizer,
+scheduler and training loops. Outside Nirvana, or on a snapshot SDK failure,
+a diagnostic is printed and local cache/checkpoint saving continues.
 
 An explicit CDLM resume request with a missing checkpoint raises an error;
 it does not fall back to a fresh MMD or MDLM initialization.

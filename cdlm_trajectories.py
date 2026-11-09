@@ -140,7 +140,8 @@ def build_cache_identity(config, tokenizer, original_train_dataset):
     parameters = {
         'schema_version': SCHEMA_VERSION, 'source_commit': SOURCE_COMMIT,
         'teacher_checkpoint_sha256': _file_sha256(_checkpoint_path(source)),
-        'teacher_weights': 'raw', 'teacher_model': _plain(config.model),
+        'teacher_weights': 'ema' if config.training.get('teacher_use_ema', False) else 'raw',
+        'teacher_model': _plain(config.model),
         'teacher_time_conditioning': False, 'teacher_attention': 'full',
         'tokenizer': _tokenizer_identity(config, tokenizer),
         'dataset': {'fingerprint': str(dataset_fingerprint),
@@ -401,7 +402,8 @@ def _prepare_local_shards(model, train_dataset, settings, selected, directory,
             _atomic_json(path.with_suffix('.json'), metadata)
 
 
-def prepare_trajectories(model, config, tokenizer, train_dataset, *, rank=None, world_size=None):
+def prepare_trajectories(model, config, tokenizer, train_dataset, *, rank=None, world_size=None,
+                         on_cache_ready=None):
     """Prepare atomic resumable shards; initialized DDP ranks partition shards.
 
     Explicit rank/world_size also permit independently launched workers sharing
@@ -411,8 +413,9 @@ def prepare_trajectories(model, config, tokenizer, train_dataset, *, rank=None, 
     """
     rank, world_size, initialized = _distributed_context(rank, world_size)
     with _collective_failure_boundary(initialized, 'preparation setup'):
-        if getattr(model, '_evaluation_weights', 'live') == 'ema':
-            raise ValueError('CDLM offline trajectories require raw original teacher weights, not EMA.')
+        expected_weights = 'ema' if config.training.get('teacher_use_ema', False) else 'live'
+        if getattr(model, '_evaluation_weights', 'live') != expected_weights:
+            raise ValueError(f'CDLM trajectories require the configured teacher weights: {expected_weights}.')
         settings = _settings(config, len(train_dataset))
     shared = [None]
     with _collective_failure_boundary(initialized, 'cache identity construction'):
@@ -422,52 +425,82 @@ def prepare_trajectories(model, config, tokenizer, train_dataset, *, rank=None, 
         torch.distributed.broadcast_object_list(shared, src=0)
     identity = shared[0]
     fingerprint = identity['fingerprint']
-    with _collective_failure_boundary(initialized, 'cache initialization'):
-        default_dir = Path(str(config.data.cache_dir)) / 'cdlm_trajectories'
-        directory = Path(str(config.algo.get('trajectory_cache_dir') or default_dir)).expanduser()
-        if not directory.is_absolute():
-            try:
-                from hydra.utils import to_absolute_path
-                directory = Path(to_absolute_path(str(directory)))
-            except ImportError:
-                directory = directory.absolute()
-        directory.mkdir(parents=True, exist_ok=True)
+    with _collective_failure_boundary(initialized, 'cache path selection'):
+        from cdlm_cache import cache_directory
+        directory = cache_directory(config, identity)
         total = settings['num_examples'] * len(settings['temperatures'])
         descriptors = [_shard_descriptor(i, total, settings['shard_size'])
                        for i in range(math.ceil(total / settings['shard_size']))]
-        with _file_lock(directory / 'manifest.lock'):
-            if (directory / 'manifest.json').exists():
+        checkpointing = config.get('checkpointing', {})
+        snapshot_enabled = (checkpointing.get('snapshot', False)
+                            and checkpointing.get('snapshot_trajectories', False))
+        controller = None
+        if snapshot_enabled:
+            from cdlm_trajectory_snapshot import TrajectorySnapshot
+            controller = TrajectorySnapshot(
+                directory, identity, descriptors, enabled=True,
+                namespace=checkpointing.get('trajectory_snapshot_namespace', 'cdlm_trajectories'),
+                interval_seconds=checkpointing.get('trajectory_snapshot_interval_seconds', 300), rank=rank)
+    try:
+        # Restoring is rank-zero-only in the controller. Every rank reaches the
+        # boundary before inspecting files that restoration can still be writing.
+        with _collective_failure_boundary(initialized, 'trajectory snapshot restore'):
+            if controller is not None:
+                controller.restore()
+        with _collective_failure_boundary(initialized, 'cache initialization'):
+            directory.mkdir(parents=True, exist_ok=True)
+            with _file_lock(directory / 'manifest.lock'):
+                if (directory / 'manifest.json').exists():
+                    manifest = read_cache_manifest(directory)
+                    if manifest['identity']['fingerprint'] != fingerprint:
+                        raise ValueError('CDLM trajectory cache configuration/teacher/data mismatch; '
+                                         'select a different algo.trajectory_cache_dir.')
+                else:
+                    manifest = {'schema_version': SCHEMA_VERSION, 'identity': identity,
+                                'teacher_source': str(config.training.finetune_path),
+                                'status': 'building', 'num_trajectories': total, 'shards': descriptors}
+                    _atomic_json(directory / 'manifest.json', manifest)
+            selected = _selected_indices(len(train_dataset), settings['num_examples'], settings['seed'])
+        if on_cache_ready is not None:
+            try:
+                on_cache_ready(str(directory))
+            except Exception as error:
+                print(f'[cdlm-prepare] cache progress callback failed: {error}', flush=True)
+        with _collective_failure_boundary(initialized, 'trajectory snapshot monitoring'):
+            if controller is not None:
+                controller.start()
+        # The boundary surrounds the entire local loop: ranks may own different
+        # numbers of shards and therefore must not synchronize once per shard.
+        with _collective_failure_boundary(initialized, 'trajectory shard generation'):
+            _prepare_local_shards(model, train_dataset, settings, selected, directory,
+                                  descriptors, fingerprint, rank, world_size)
+        if initialized:
+            torch.distributed.barrier()
+        with _collective_failure_boundary(initialized, 'cache finalization'):
+            # Every completion is atomic, so independent workers may inspect
+            # receipts while another is still writing its final shard.
+            with _file_lock(directory / 'manifest.lock'):
+                receipts = [_valid_shard(directory, descriptor, fingerprint, verify_hash=False)
+                            for descriptor in descriptors]
                 manifest = read_cache_manifest(directory)
-                if manifest['identity']['fingerprint'] != fingerprint:
-                    raise ValueError('CDLM trajectory cache configuration/teacher/data mismatch; '
-                                     'select a different algo.trajectory_cache_dir.')
-            else:
-                manifest = {'schema_version': SCHEMA_VERSION, 'identity': identity,
-                            'status': 'building', 'num_trajectories': total, 'shards': descriptors}
+                if all(receipt is not None for receipt in receipts):
+                    manifest['status'] = 'complete'
+                    manifest['shards'] = [{key: receipt[key] for key in ('file', 'start', 'count', 'sha256')}
+                                          for receipt in receipts]
+                else:
+                    manifest['status'] = 'building'
                 _atomic_json(directory / 'manifest.json', manifest)
-        selected = _selected_indices(len(train_dataset), settings['num_examples'], settings['seed'])
-    # The boundary surrounds the entire local loop: ranks may own different
-    # numbers of shards and therefore must not synchronize once per shard.
-    with _collective_failure_boundary(initialized, 'trajectory shard generation'):
-        _prepare_local_shards(model, train_dataset, settings, selected, directory,
-                              descriptors, fingerprint, rank, world_size)
-    if initialized:
-        torch.distributed.barrier()
-    with _collective_failure_boundary(initialized, 'cache finalization'):
-        # Every completion is atomic, so independent workers may inspect
-        # receipts while another is still writing its final shard.
-        with _file_lock(directory / 'manifest.lock'):
-            receipts = [_valid_shard(directory, descriptor, fingerprint, verify_hash=False)
-                        for descriptor in descriptors]
-            manifest = read_cache_manifest(directory)
-            if all(receipt is not None for receipt in receipts):
-                manifest['status'] = 'complete'
-                manifest['shards'] = [{key: receipt[key] for key in ('file', 'start', 'count', 'sha256')}
-                                      for receipt in receipts]
-            else:
-                manifest['status'] = 'building'
-            _atomic_json(directory / 'manifest.json', manifest)
-    return str(directory)
+        return str(directory)
+    finally:
+        try:
+            with _collective_failure_boundary(initialized, 'trajectory snapshot finalization'):
+                if controller is not None:
+                    controller.close()
+        finally:
+            # Nonzero torchrun workers must not exit while rank zero is still
+            # publishing the last confirmed shards after completion or failure.
+            if initialized:
+                torch.distributed.barrier()
 
 
 class CDLMTrajectoryDataset(Dataset):

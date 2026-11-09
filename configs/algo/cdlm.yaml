@@ -24,3 +24,4 @@ trajectory_batch_size: 8
 trajectory_shard_size: 8
 teacher_hidden_dtype: bfloat16
 trajectory_cache_dir: ${hydra:runtime.cwd}/cache_dir/cdlm_tinygsm_trajectories
+trajectory_cache_per_model: True

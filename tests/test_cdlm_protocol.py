@@ -33,10 +33,13 @@ def recipe(*overrides):
 
 
 class CDLMRecipeTest(unittest.TestCase):
-    def test_published_mmd_preset_changes_student_initialization_only(self):
+    def test_published_mmd_preset_selects_mmd_teacher_and_student(self):
         original = recipe()
         cfg = compose_cli('+experiment=cdlm_tinygsm_mmd')
-        self.assertEqual(cfg.training.finetune_path, original.training.finetune_path)
+        self.assertEqual(cfg.training.finetune_path,
+                         'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt')
+        self.assertTrue(cfg.training.teacher_use_ema)
+        self.assertTrue(cfg.training.teacher_allow_hub)
         self.assertEqual(cfg.training.student_init_path,
                          'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt')
         self.assertTrue(cfg.training.student_init_use_ema)
@@ -47,6 +50,7 @@ class CDLMRecipeTest(unittest.TestCase):
         self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds), VALIDATION_THRESHOLDS)
         self.assertEqual(cfg.trainer.max_epochs, 16)
         self.assertIsNone(original.training.student_init_path)
+        self.assertFalse(original.training.teacher_use_ema)
 
     def test_same_mdlm_backbone_and_conditional_tinygsm_format(self):
         cfg = recipe()
@@ -67,6 +71,7 @@ class CDLMRecipeTest(unittest.TestCase):
         self.assertFalse(cfg.data.wrap)
         self.assertTrue(cfg.data.filter_too_long)
         self.assertEqual(cfg.training.finetune_path, 'hf://jdeschena/s-flm/tinygsm/mdlm.ckpt')
+        self.assertFalse(cfg.training.teacher_allow_hub)
         self.assertIsNone(cfg.training.student_init_path)
         self.assertFalse(cfg.training.student_init_use_ema)
 
@@ -85,6 +90,7 @@ class CDLMRecipeTest(unittest.TestCase):
         self.assertTrue(cfg.callbacks.checkpoint_every_n_steps.save_last)
         self.assertTrue(cfg.callbacks.checkpoint_every_n_steps.save_on_train_epoch_end)
         self.assertTrue(cfg.checkpointing.snapshot)
+        self.assertTrue(cfg.checkpointing.snapshot_trajectories)
         self.assertEqual(cfg.checkpointing.snapshot_namespace, 'cdlm_tinygsm')
         self.assertFalse(cfg.checkpointing.resume_from_ckpt)
         self.assertEqual(cfg.trainer.precision, 'bf16-mixed')
@@ -118,6 +124,7 @@ class CDLMRecipeTest(unittest.TestCase):
         self.assertEqual(cfg.algo.trajectory_batch_size, 8)
         self.assertEqual(cfg.algo.trajectory_shard_size, 8)
         self.assertEqual(cfg.algo.teacher_hidden_dtype, 'bfloat16')
+        self.assertTrue(cfg.algo.trajectory_cache_per_model)
         raw = OmegaConf.to_container(cfg.algo, resolve=False)
         self.assertEqual(raw['trajectory_cache_dir'],
                          '${hydra:runtime.cwd}/cache_dir/cdlm_tinygsm_trajectories')
@@ -239,7 +246,7 @@ class CDLMLauncherTest(unittest.TestCase):
             self.assertEqual(cfg.trainer.accumulate_grad_batches, 4)
             self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds), VALIDATION_THRESHOLDS)
 
-    def test_cluster_published_mmd_preset_keeps_local_teacher_and_greedy_comparison(self):
+    def test_cluster_published_mmd_preset_keeps_mmd_teacher_and_greedy_comparison(self):
         result, commands, code, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',
                                                  preset='cdlm_tinygsm_mmd', bundle=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -248,7 +255,9 @@ class CDLMLauncherTest(unittest.TestCase):
             cfg = self.main_config(command)
             self.assertEqual(cfg.mode, mode)
             self.assertEqual(cfg.training.finetune_path,
-                             str(code / 'checkpoints/tinygsm/mdlm_notok.ckpt'))
+                             'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt')
+            self.assertTrue(cfg.training.teacher_use_ema)
+            self.assertTrue(cfg.training.teacher_allow_hub)
             self.assertEqual(cfg.training.student_init_path,
                              'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt')
             self.assertTrue(cfg.training.student_init_use_ema)

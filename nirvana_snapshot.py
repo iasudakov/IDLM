@@ -10,6 +10,10 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import threading
+
+
+STORE_LOCK = threading.RLock()
 
 
 def _rank():
@@ -94,16 +98,17 @@ def save(path, enabled=True, reason='', namespace=None):
     except Exception as error:
         print(f'[snapshot] Nirvana SDK unavailable; not saving: {error}', flush=True)
         return False
-    try:
-        run, root, target = _paths(path, sdk.snapshot.get_snapshot_path(), namespace)
-        _copy_directory(run, target)
-        sdk.snapshot.dump_snapshot(str(root))
-        suffix = f' ({reason})' if reason else ''
-        print(f'[snapshot] pushed {run} into {target}{suffix}', flush=True)
-        return True
-    except Exception as error:
-        print(f'[snapshot] push failed, continuing: {error}', flush=True)
-        return False
+    with STORE_LOCK:
+        try:
+            run, root, target = _paths(path, sdk.snapshot.get_snapshot_path(), namespace)
+            _copy_directory(run, target)
+            sdk.snapshot.dump_snapshot(str(root))
+            suffix = f' ({reason})' if reason else ''
+            print(f'[snapshot] pushed {run} into {target}{suffix}', flush=True)
+            return True
+        except Exception as error:
+            print(f'[snapshot] push failed, continuing: {error}', flush=True)
+            return False
 
 
 def restore(path, enabled=True, namespace=None):
@@ -115,14 +120,15 @@ def restore(path, enabled=True, namespace=None):
     except Exception as error:
         print(f'[snapshot] Nirvana SDK unavailable; not restoring: {error}', flush=True)
         return False
-    try:
-        run, _, source = _paths(path, sdk.snapshot.get_snapshot_path(), namespace)
-        if not source.is_dir():
-            print(f'[snapshot] no saved directory at {source}; not restoring', flush=True)
+    with STORE_LOCK:
+        try:
+            run, _, source = _paths(path, sdk.snapshot.get_snapshot_path(), namespace)
+            if not source.is_dir():
+                print(f'[snapshot] no saved directory at {source}; not restoring', flush=True)
+                return False
+            _copy_directory(source, run)
+            print(f'[snapshot] restored {source} into {run}', flush=True)
+            return True
+        except Exception as error:
+            print(f'[snapshot] restore failed, continuing: {error}', flush=True)
             return False
-        _copy_directory(source, run)
-        print(f'[snapshot] restored {source} into {run}', flush=True)
-        return True
-    except Exception as error:
-        print(f'[snapshot] restore failed, continuing: {error}', flush=True)
-        return False

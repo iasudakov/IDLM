@@ -27,6 +27,8 @@ loader:
   num_workers: 4
 training:
   finetune_path: hf://jdeschena/s-flm/tinygsm/mdlm.ckpt
+  teacher_use_ema: False
+  teacher_allow_hub: False
   loss_precision: float32
   ema: 0.9999
   mask_layout: random
@@ -87,3 +89,6 @@ checkpointing:
   resume_from_ckpt: False
   snapshot: True
   snapshot_namespace: cdlm_tinygsm
+  snapshot_trajectories: True
+  trajectory_snapshot_namespace: cdlm_trajectories
+  trajectory_snapshot_interval_seconds: 300

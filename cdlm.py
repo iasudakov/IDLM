@@ -61,22 +61,48 @@ class CDLM(trainer_base.AbsorbingState):
 
     def _student_checkpoint_source(self, source):
         # An explicit student Hub source is an opt-in download/cache lookup.
-        # The original teacher and evaluation assets keep their bundle policy.
+        # Evaluation assets keep their bundle policy.
         if source.startswith('hf://'):
             return source
         return self._checkpoint_source(source)
 
-    def initialize_from_checkpoint(self, source, student_source=None, student_use_ema=False):
-        """Keep the original teacher head while optionally warm-starting the student.
+    def _teacher_checkpoint_source(self, source):
+        if (source.startswith('hf://')
+                and self.config.training.get('teacher_allow_hub', False)):
+            return source
+        return self._checkpoint_source(source)
+
+    def _load_teacher_backbone(self, source, use_ema):
+        if use_ema is None:
+            use_ema = self.config.training.get('teacher_use_ema', False)
+        checkpoint = read_checkpoint(self._teacher_checkpoint_source(source))
+        if not use_ema and checkpoint.get('checkpoint_weights') == 'ema':
+            raise ValueError('Teacher checkpoint contains only EMA weights; '
+                             'set training.teacher_use_ema=True to use them.')
+        self.backbone.load_state_dict(backbone_state(checkpoint), strict=True)
+        if use_ema:
+            if checkpoint.get('checkpoint_weights') != 'ema' and 'ema' not in checkpoint:
+                raise ValueError('Teacher checkpoint has no EMA; '
+                                 'set training.teacher_use_ema=False for live weights.')
+            apply_ema(self, checkpoint)
+        return use_ema
+
+    def load_teacher_weights(self, source, use_ema=None):
+        """Load the selected trajectory teacher without retaining EMA history."""
+        use_ema = self._load_teacher_backbone(source, use_ema)
+        self.ema = None
+        self._evaluation_weights = 'ema' if use_ema else 'live'
+
+    def initialize_from_checkpoint(self, source, student_source=None, student_use_ema=False,
+                                   teacher_use_ema=None):
+        """Keep the selected teacher head while optionally warm-starting the student.
 
         Only backbone weights are imported from the optional student checkpoint;
         optimizer, scheduler, loop state and its old EMA history are discarded.
         Full training resumes bypass this initializer in the main entry point.
         """
-        checkpoint = read_checkpoint(self._checkpoint_source(source))
-        self.backbone.load_state_dict(backbone_state(checkpoint), strict=True)
+        self._load_teacher_backbone(source, teacher_use_ema)
         self.teacher_head.load_state_dict(self.backbone.output_layer.linear.state_dict(), strict=True)
-        del checkpoint
         if student_source:
             checkpoint = read_checkpoint(self._student_checkpoint_source(student_source))
             if not student_use_ema and checkpoint.get('checkpoint_weights') == 'ema':
@@ -85,7 +111,7 @@ class CDLM(trainer_base.AbsorbingState):
             self.backbone.load_state_dict(backbone_state(checkpoint), strict=True)
             if student_use_ema:
                 # _get_parameters contains only student/noise parameters; the
-                # frozen original teacher_head must retain its own vocabulary map.
+                # frozen teacher_head must retain its own vocabulary map.
                 apply_ema(self, checkpoint)
         if self.ema:
             self.ema = models.ema.ExponentialMovingAverage(

@@ -79,6 +79,8 @@ def config(directory):
     cfg.training.finetune_path = str(Path(directory) / 'original.ckpt')
     cfg.data.cache_dir = str(Path(directory) / 'data-cache')
     cfg.algo.trajectory_cache_dir = str(Path(directory) / 'trajectories')
+    OmegaConf.update(cfg, 'algo.trajectory_cache_per_model', False, force_add=True)
+    OmegaConf.update(cfg, 'checkpointing.snapshot_trajectories', False, force_add=True)
     cfg.checkpointing.save_dir = str(directory)
     return cfg
 

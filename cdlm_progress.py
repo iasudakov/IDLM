@@ -35,6 +35,8 @@ class PreparationProgress:
                                if count is not None else 0)
         size = int(config.algo.get('trajectory_shard_size', 8))
         self.expected_shards = (self.expected_total + size - 1) // size
+        self._cache_selected = not bool(config.algo.get('trajectory_cache_per_model', False))
+        self._selection_lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
         self._status = 'complete'
@@ -44,8 +46,11 @@ class PreparationProgress:
     def _snapshot(self):
         total, shards = self.expected_total, self.expected_shards
         done = completed = 0
+        if not self._cache_selected:
+            return done, total, completed, shards
+        directory = self.directory
         try:
-            manifest = json.loads((self.directory / 'manifest.json').read_text())
+            manifest = json.loads((directory / 'manifest.json').read_text())
             total = int(manifest['num_trajectories'])
             descriptors = manifest['shards']
             shards = len(descriptors)
@@ -54,7 +59,7 @@ class PreparationProgress:
                 name = descriptor['file']
                 if Path(name).name != name:
                     continue
-                tensor = self.directory / name
+                tensor = directory / name
                 try:
                     receipt = json.loads(tensor.with_suffix('.json').read_text())
                     if (not tensor.is_file()
@@ -70,6 +75,16 @@ class PreparationProgress:
         except (OSError, ValueError, KeyError, TypeError):
             pass
         return done, total, completed, shards
+
+    def set_cache_directory(self, directory):
+        """Use the teacher-specific cache only after identity/restore validation."""
+        with self._selection_lock:
+            self.directory = Path(directory)
+            self._cache_selected = True
+            # Existing/restored trajectories are not newly generated work.
+            self._baseline_done = self._snapshot()[0]
+        if self.rank == 0:
+            print(f'[cdlm-prepare] selected cache={self.directory}', flush=True)
 
     def _metrics(self, snapshot, status):
         done, total, completed, shards = snapshot
@@ -109,8 +124,9 @@ class PreparationProgress:
     def _run(self):
         logger = None
         try:
-            initial = self._snapshot()
-            self._baseline_done = initial[0]
+            with self._selection_lock:
+                initial = self._snapshot()
+                self._baseline_done = initial[0]
             # Console visibility must not wait for tracker initialization.
             self._emit(initial, 'running', None)
             try:

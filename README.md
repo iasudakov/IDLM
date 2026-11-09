@@ -7,13 +7,15 @@ and train for 16 epochs on four GPUs. See [the CDLM setup](docs/cdlm_tinygsm.md)
 and [the complete Nirvana run-command](examples/nirvana_cdlm_run_command.sh).
 
 For MMD to CDLM, set `CDLM_PRESET=cdlm_tinygsm_mmd` before that launcher. It
-initializes the student from the published
+collects trajectories and initializes the student using the published
 [TinyGSM MMD EMA checkpoint](https://huggingface.co/yresearch/MDLM-MMD-TinyGSM/blob/main/model.ckpt),
-using Hugging Face or its local cache, while retaining the original MDLM teacher.
+using Hugging Face or its local cache. The base preset retains the raw MDLM teacher.
 
-CDLM checkpoints and run metadata are also published to the Nirvana snapshot
-store by default. Resume with `checkpointing.resume_from_ckpt=True`; retain
-the original data inputs and the separate trajectory cache.
+CDLM checkpoints, run metadata and trajectory caches are published to the Nirvana
+snapshot store by default. Trajectories are separated by teacher checkpoint,
+raw/EMA selection and generation settings; completed shards are reused on
+restart. Resume training with `checkpointing.resume_from_ckpt=True` and keep
+the selected teacher and original data inputs available.
 
 The full-sequence **SDTT baseline for TinyGSM** is also available, adapted from
 [the official implementation](https://github.com/jdeschena/sdtt). Run
