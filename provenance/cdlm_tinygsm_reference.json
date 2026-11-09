@@ -193,7 +193,7 @@
         "bytes": 671796985,
         "verification_scope": "Inspected existing local HF cache on CPU without downloading; current remote main revision was not reverified."
       },
-      "network_policy": "The MMD preset opts in to teacher Hub lookup for preparation and identity verification, while standard HF offline settings are respected. Optional student-only initialization is skipped during preparation/full resume; the selected teacher asset is still required.",
+      "network_policy": "Nirvana launcher resolves checkpoints once before torchrun using managed/staged assets, HF caches and the connected snapshot, then Hub download. Both phases receive identical local bytes. Offline/proxy settings are respected; a first offline run needs weights staged in the source bundle, input, cache or snapshot. Full resume skips optional student initialization.",
       "roles": [
         "MMD EMA trajectory teacher",
         "MMD EMA student initialization"
@@ -251,7 +251,7 @@
     "copy_policy": "Global rank zero only; complete local write first, atomic per-file destination copy, then dump_snapshot; preserve other snapshot files and namespaces.",
     "restore": "On explicit resume_from_ckpt=True, an existing local checkpoint takes priority. Otherwise restore the namespace before declaring the resume path missing and initializing the tracker. Fresh runs do not restore old snapshot weights.",
     "not_included": [
-      "selected teacher checkpoint",
+      "explicit local teacher checkpoints not resolved from a Hub source",
       "tokenizer bundle",
       "input datasets"
     ],
@@ -272,6 +272,23 @@
       "restore": "Matching model/config only; restored before cache scanning. Existing valid identical pairs and unconfirmed local payloads are retained; missing pairs are merged. Conflicting immutable shard hashes fail clearly.",
       "incremental_scope": "Already verified unchanged shards are not recopied locally. The SDK publishes the global snapshot root; no network deduplication claim.",
       "serialization": "Process-wide STORE_LOCK serializes trajectory and checkpoint snapshot writes/publication."
+    },
+    "checkpoint_assets": {
+      "enabled_key": "checkpointing.snapshot",
+      "namespace": "cdlm_assets/<source_URI_hash>",
+      "contents": "Hub checkpoint bytes and source/size/SHA256 metadata",
+      "purpose": "Reuse MMD weights automatically in a later offline Nirvana run as well as its trajectories."
     }
+  },
+  "checkpoint_preflight": {
+    "entrypoint": "python -m cdlm_preflight; called automatically by scripts/train_cdlm_tinygsm_nirvana.sh",
+    "ordering": "Compose final overrides, preserve teacher Hub policy, deduplicate teacher/student sources, resolve local paths, then start collection and training.",
+    "argument_transport": "Atomic NUL-separated Hydra path overrides; no shell eval; trailing user choices are resolved before path substitution.",
+    "local_directory": "cache_dir/cdlm_checkpoint_assets",
+    "snapshot_namespace": "cdlm_assets",
+    "identity": "Exact checkpoint bytes retained; asset metadata contains source URI, byte count and SHA256. Trajectory identity remains content-based.",
+    "offline_package": "python -m cdlm_package --output cdlm-tinygsm-mmd.tar.gz creates a committed-code archive with code/cdlm_model_assets/mmd_tinygsm.ckpt and provenance on a connected machine; no separate weight input required.",
+    "failure": "Unavailable assets fail before GPU launch; code cannot obtain missing first-run bytes without network or staged data.",
+    "validation": "CPU/filesystem tests with mocked Hub and Nirvana SDK; no GPU training."
   }
 }

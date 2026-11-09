@@ -68,6 +68,16 @@ cdlm_overrides=(
   "$@"
 )
 
+# Resolve/download each checkpoint once before torchrun starts. Both phases
+# receive the same local bytes; diagnostic output is separate from arguments.
+cdlm_asset_file="$(mktemp)"
+trap 'rm -f -- "$cdlm_asset_file"' EXIT
+"${PYTHON:-python}" -u -m cdlm_preflight --output "$cdlm_asset_file" "${cdlm_overrides[@]}"
+mapfile -d '' -t cdlm_asset_overrides < "$cdlm_asset_file"
+rm -f -- "$cdlm_asset_file"
+trap - EXIT
+cdlm_overrides+=("${cdlm_asset_overrides[@]}")
+
 "${PYTHON:-python}" -u -m torch.distributed.run \
   --standalone "--nproc_per_node=${CDLM_PREPARE_GPUS:-4}" \
   -m main "${cdlm_overrides[@]}" mode=prepare_cdlm

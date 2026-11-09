@@ -9,13 +9,21 @@ and [the complete Nirvana run-command](examples/nirvana_cdlm_run_command.sh).
 For MMD to CDLM, set `CDLM_PRESET=cdlm_tinygsm_mmd` before that launcher. It
 collects trajectories and initializes the student using the published
 [TinyGSM MMD EMA checkpoint](https://huggingface.co/yresearch/MDLM-MMD-TinyGSM/blob/main/model.ckpt),
-using Hugging Face or its local cache. The base preset retains the raw MDLM teacher.
+using Hugging Face or its local cache. The launcher prepares checkpoint assets
+once before starting GPU workers, automatically reuses staged weights or a
+checkpoint snapshot, and passes the same local file to both phases. The base
+preset retains the raw MDLM teacher. For a first run without network access,
+`python -m cdlm_package --output cdlm-tinygsm-mmd.tar.gz` on a connected machine
+builds a code archive containing MMD weights; use it as the Nirvana source bundle.
+The [complete MMD run-command](examples/nirvana_cdlm_mmd_run_command.sh) performs
+environment setup, asset preparation, trajectory collection and training.
 
 CDLM checkpoints, run metadata and trajectory caches are published to the Nirvana
 snapshot store by default. Trajectories are separated by teacher checkpoint,
 raw/EMA selection and generation settings; completed shards are reused on
 restart. Resume training with `checkpointing.resume_from_ckpt=True` and keep
-the selected teacher and original data inputs available.
+the selected teacher and original data inputs available. Hub checkpoints
+resolved by the Nirvana launcher are also persisted under `cdlm_assets/`.
 
 The full-sequence **SDTT baseline for TinyGSM** is also available, adapted from
 [the official implementation](https://github.com/jdeschena/sdtt). Run

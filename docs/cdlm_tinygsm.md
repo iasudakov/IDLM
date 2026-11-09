@@ -60,6 +60,44 @@ before initializing the student. The Nirvana launcher preserves this teacher
 selection instead of replacing it with the local MDLM checkpoint. Other model
 assets continue using the supplied local bundle.
 
+The Nirvana launcher runs `cdlm_preflight` once, before `torchrun`. It composes
+the final user overrides and resolves teacher and optional student checkpoints
+to local files. Identical teacher/student sources are fetched only once, and
+both collection and training receive the same resolved paths. Weight-selection
+flags (raw/EMA), explicit student overrides and full-resume semantics are
+preserved. An unset student initialization inherits the selected teacher;
+full resume does not fetch an unused student initialization checkpoint.
+
+For Hub sources the preflight checks managed local assets, known staged MMD
+files, available HF caches and the connected Nirvana snapshot before downloading.
+MMD can be discovered at `$INPUT_PATH/mmd_tinygsm.ckpt`,
+`checkpoints/tinygsm/mmd_tinygsm.ckpt`, or
+`cdlm_model_assets/mmd_tinygsm.ckpt` inside the code bundle. Resolved Hub assets
+are stored locally under `cache_dir/cdlm_checkpoint_assets` with source and
+checksum metadata and persisted in their own `cdlm_assets/` snapshot namespace
+when `checkpointing.snapshot=True`. Exact bytes are preserved, so relocating
+the checkpoint does not invalidate existing trajectory caches. Preflight
+messages use the `[cdlm-assets]` prefix; an unavailable asset stops the launcher
+before GPU workers start.
+
+On a connected worker, the original MMD launcher command now downloads missing
+weights automatically. A first offline worker must receive the bytes through
+its inputs, code bundle, cache or snapshot. To prepare the **code and weights
+together automatically**, run this from the committed checkout on a machine
+with Hugging Face access:
+
+```bash
+python -m cdlm_package --output /absolute/path/to/cdlm-tinygsm-mmd.tar.gz
+```
+
+Use the resulting archive as the Nirvana source bundle. It contains the
+committed source under `code/` and the MMD file under
+`code/cdlm_model_assets/mmd_tinygsm.ckpt`; no separate MMD input or path override
+is required. This directory is separate from the existing `cache_dir`, `data`
+and `checkpoints` inputs moved by the run-command. The packager records source
+revision, checkpoint source and checksum, and never starts training.
+See [the complete MMD run-command](../examples/nirvana_cdlm_mmd_run_command.sh).
+
 To prefetch the checkpoint before spending time collecting trajectories, run
 this in the same environment on a machine with network access:
 
@@ -67,22 +105,15 @@ this in the same environment on a machine with network access:
 python -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="yresearch/MDLM-MMD-TinyGSM", filename="model.ckpt"))'
 ```
 
-An offline Nirvana worker needs this asset staged in its HF cache. Prepare a
-portable cache on a connected machine:
+Alternatively, stage an HF cache on a connected machine:
 
 ```bash
 python -c 'from huggingface_hub import hf_hub_download; hf_hub_download(repo_id="yresearch/MDLM-MMD-TinyGSM", filename="model.ckpt", cache_dir="cdlm_mmd_hf_cache")'
 ```
 
-Pass that entire `cdlm_mmd_hf_cache` directory as a Nirvana input, then add this
-after creating `HF_HUB_CACHE` in the run-command:
-
-```bash
-cp -a "$INPUT_PATH/cdlm_mmd_hf_cache/." "$HF_HUB_CACHE/"
-export HF_HUB_OFFLINE=1
-```
-
-The same preset then reads the staged cache without network requests. Global
+Pass that entire `cdlm_mmd_hf_cache` directory as a Nirvana input. The launcher
+discovers it automatically; direct `python -m main` launches instead require
+copying it into `HF_HUB_CACHE` or explicit local checkpoint paths. Global
 Hugging Face offline settings are respected; selecting a Hub URI does not
 provide network access on a disconnected worker.
 
@@ -292,10 +323,12 @@ Previously verified immutable snapshot shards are not recopied locally. The
 Nirvana SDK still publishes the snapshot root; network-level deduplication is
 not assumed. Cache and checkpoint publications share a lock.
 
-The original teacher weights, tokenizer and input datasets remain separate
-inputs. For the MMD preset, the published MMD file must remain available as a
-teacher asset even on full resume, although optional student initialization is
-skipped. Full resume restores student, frozen teacher head, EMA, optimizer,
+The tokenizer and input datasets remain separate inputs. The teacher asset
+is required even on full resume: the Nirvana preflight can restore a previously
+persisted Hub checkpoint from `cdlm_assets/`, use the code/input bundle or HF
+cache, or download it with network access. Explicit local checkpoint paths must
+still exist at their requested location. Optional student initialization is
+skipped on full resume. Full resume restores student, frozen teacher head, EMA, optimizer,
 scheduler and training loops. Outside Nirvana, or on a snapshot SDK failure,
 a diagnostic is printed and local cache/checkpoint saving continues.
 

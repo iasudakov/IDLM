@@ -148,23 +148,48 @@ class CDLMRecipeTest(unittest.TestCase):
 
 class CDLMLauncherTest(unittest.TestCase):
     def capture(self, script, args=(), *, preset=None, prepare_gpus=None,
-                bundle=False, code_override=False, fail_prepare=False):
+                bundle=False, code_override=False, fail_prepare=False, fail_preflight=False):
         with tempfile.TemporaryDirectory(prefix='cdlm launcher ') as directory:
-            temporary = Path(directory)
+            temporary = Path(directory).resolve()
             bundle_code = temporary / 'source bundle' / 'code'
             bundle_code.mkdir(parents=True)
             explicit_code = temporary / 'explicit code'
             explicit_code.mkdir()
             capture = temporary / 'commands.jsonl'
             python = temporary / 'mock python'
-            python.write_text(
-                '#!' + sys.executable + '\n'
-                'import json, os, pathlib, sys\n'
-                'record = {"args": sys.argv[1:], "cwd": os.getcwd()}\n'
-                'with pathlib.Path(os.environ["CDLM_CAPTURE"]).open("a") as stream:\n'
-                '    stream.write(json.dumps(record) + "\\n")\n'
-                'if os.environ.get("CDLM_MOCK_FAIL_PREPARE") and "mode=prepare_cdlm" in sys.argv:\n'
-                '    sys.exit(17)\n')
+            python.write_text('#!' + sys.executable + '\n' + r'''import json, os, pathlib, sys
+record = {"args": sys.argv[1:], "cwd": os.getcwd()}
+with pathlib.Path(os.environ["CDLM_CAPTURE"]).open("a") as stream:
+    stream.write(json.dumps(record) + "\n")
+if "cdlm_preflight" in sys.argv:
+    if os.environ.get("CDLM_MOCK_FAIL_PREFLIGHT"):
+        sys.exit(23)
+    def value(name, default=None):
+        found = default
+        for arg in sys.argv[1:]:
+            if arg.startswith(name + "="):
+                found = arg.split("=", 1)[1]
+        if found and found.startswith('"'):
+            found = json.loads(found)
+        return None if found in ("null", "None", "") else found
+    mmd = value("+experiment") == "cdlm_tinygsm_mmd"
+    published = "hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt"
+    teacher = value("training.finetune_path", published if mmd else "teacher.ckpt")
+    student = value("training.student_init_path", published if mmd else None)
+    local_teacher = (str(pathlib.Path.cwd() / "preflight assets" / "teacher weights.ckpt")
+                     if teacher.startswith("hf://") else teacher)
+    overrides = ["training.finetune_path=" + json.dumps(local_teacher)]
+    if student is not None and value("checkpointing.resume_from_ckpt", "False").lower() != "true":
+        local_student = (local_teacher if student == teacher else
+                         str(pathlib.Path.cwd() / "preflight assets" / "student weights.ckpt")
+                         if student.startswith("hf://") else student)
+        overrides.append("training.student_init_path=" + json.dumps(local_student))
+    output = pathlib.Path(sys.argv[sys.argv.index("--output") + 1])
+    output.write_bytes(b"\0".join(item.encode() for item in overrides) + b"\0")
+if (os.environ.get("CDLM_MOCK_FAIL_PREPARE") and "main" in sys.argv
+        and "mode=prepare_cdlm" in sys.argv):
+    sys.exit(17)
+''')
             python.chmod(0o755)
             env = dict(os.environ, PYTHON=str(python), CDLM_CAPTURE=str(capture))
             for key in ['CDLM_PRESET', 'CDLM_PREPARE_GPUS', 'SOURCE_CODE_PATH', 'CDLM_CODE_DIR']:
@@ -179,6 +204,8 @@ class CDLMLauncherTest(unittest.TestCase):
                 env['CDLM_CODE_DIR'] = str(explicit_code)
             if fail_prepare:
                 env['CDLM_MOCK_FAIL_PREPARE'] = '1'
+            if fail_preflight:
+                env['CDLM_MOCK_FAIL_PREFLIGHT'] = '1'
             result = subprocess.run(['bash', str(ROOT / 'scripts' / script), *args],
                                     cwd=temporary, env=env, text=True, capture_output=True)
             commands = [json.loads(line) for line in capture.read_text().splitlines()] if capture.exists() else []
@@ -188,6 +215,13 @@ class CDLMLauncherTest(unittest.TestCase):
         arguments = command['args']
         main = arguments.index('main')
         return compose_cli(*arguments[main + 1:])
+
+    def preflight_config(self, command):
+        arguments = command['args']
+        start = arguments.index('cdlm_preflight') + 1
+        options = arguments[start:]
+        output = options.index('--output')
+        return compose_cli(*(options[:output] + options[output + 2:]))
 
     def test_training_only_wrapper_and_trailing_overrides(self):
         result, commands, _, _ = self.capture('train_cdlm_tinygsm.sh',
@@ -226,10 +260,11 @@ class CDLMLauncherTest(unittest.TestCase):
         result, commands, code, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',
                                                  ['logger.name=cluster cdlm'], bundle=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(commands), 2)
-        self.assertIn('torch.distributed.run', commands[0]['args'])
-        self.assertIn('--nproc_per_node=4', commands[0]['args'])
-        for command, mode in zip(commands, ['prepare_cdlm', 'train']):
+        self.assertEqual(len(commands), 3)
+        self.assertEqual(commands[0]['args'][:3], ['-u', '-m', 'cdlm_preflight'])
+        self.assertIn('torch.distributed.run', commands[1]['args'])
+        self.assertIn('--nproc_per_node=4', commands[1]['args'])
+        for command, mode in zip(commands[1:], ['prepare_cdlm', 'train']):
             self.assertEqual(command['cwd'], str(code.resolve()))
             cfg = self.main_config(command)
             self.assertEqual(cfg.mode, mode)
@@ -250,16 +285,19 @@ class CDLMLauncherTest(unittest.TestCase):
         result, commands, code, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',
                                                  preset='cdlm_tinygsm_mmd', bundle=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(commands), 2)
-        for command, mode in zip(commands, ['prepare_cdlm', 'train']):
+        self.assertEqual(len(commands), 3)
+        preflight = self.preflight_config(commands[0])
+        self.assertEqual(preflight.training.finetune_path,
+                         'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt')
+        self.assertEqual(preflight.training.student_init_path, preflight.training.finetune_path)
+        for command, mode in zip(commands[1:], ['prepare_cdlm', 'train']):
             cfg = self.main_config(command)
             self.assertEqual(cfg.mode, mode)
             self.assertEqual(cfg.training.finetune_path,
-                             'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt')
+                             str(code / 'preflight assets/teacher weights.ckpt'))
             self.assertTrue(cfg.training.teacher_use_ema)
             self.assertTrue(cfg.training.teacher_allow_hub)
-            self.assertEqual(cfg.training.student_init_path,
-                             'hf://yresearch/MDLM-MMD-TinyGSM/model.ckpt')
+            self.assertEqual(cfg.training.student_init_path, cfg.training.finetune_path)
             self.assertTrue(cfg.training.student_init_use_ema)
             self.assertEqual(cfg.model_weights_dir,
                              str(code / 'cache_dir/tinygsm_mmd_offline_bundle'))
@@ -271,17 +309,17 @@ class CDLMLauncherTest(unittest.TestCase):
         result, commands, _, code = self.capture('train_cdlm_tinygsm_nirvana.sh',
                                                 code_override=True, fail_prepare=True)
         self.assertEqual(result.returncode, 17)
-        self.assertEqual(len(commands), 1)
-        self.assertEqual(commands[0]['cwd'], str(code.resolve()))
-        self.assertEqual(self.main_config(commands[0]).mode, 'prepare_cdlm')
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[1]['cwd'], str(code.resolve()))
+        self.assertEqual(self.main_config(commands[1]).mode, 'prepare_cdlm')
 
     def test_cluster_warmstart_overrides_leave_original_teacher_and_default_eval(self):
         result, commands, code, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',
             ['training.student_init_path=/trained/student mmd.ckpt',
              'training.student_init_use_ema=True', 'eval.gsm8k_steps=32'], bundle=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(commands), 2)
-        for command in commands:
+        self.assertEqual(len(commands), 3)
+        for command in commands[1:]:
             cfg = self.main_config(command)
             self.assertEqual(cfg.training.finetune_path,
                              str(code / 'checkpoints/tinygsm/mdlm_notok.ckpt'))
@@ -289,6 +327,38 @@ class CDLMLauncherTest(unittest.TestCase):
             self.assertTrue(cfg.training.student_init_use_ema)
             self.assertTrue(cfg.eval.gsm8k_greedy_token)
             self.assertEqual(cfg.eval.gsm8k_steps, 32)
+
+    def test_preflight_failure_prevents_all_workers(self):
+        result, commands, _, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',
+                                             preset='cdlm_tinygsm_mmd', fail_preflight=True)
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(len(commands), 1)
+        self.assertIn('cdlm_preflight', commands[0]['args'])
+        self.assertNotIn('torch.distributed.run', commands[0]['args'])
+
+    def test_preflight_respects_custom_teacher_null_student_and_snapshot_override(self):
+        teacher = '/mounted/custom teacher weights.ckpt'
+        result, commands, _, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',
+            ['training.finetune_path=' + teacher, 'training.student_init_path=null',
+             'checkpointing.snapshot=False'], preset='cdlm_tinygsm_mmd', bundle=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(commands), 3)
+        for cfg in [self.preflight_config(commands[0]), *map(self.main_config, commands[1:])]:
+            self.assertEqual(cfg.training.finetune_path, teacher)
+            self.assertIsNone(cfg.training.student_init_path)
+            self.assertFalse(cfg.checkpointing.snapshot)
+
+    def test_full_resume_preserves_unused_student_source_without_resolving_it(self):
+        student = 'hf://unused/student/model.ckpt'
+        result, commands, _, _ = self.capture('train_cdlm_tinygsm_nirvana.sh',
+            ['checkpointing.resume_from_ckpt=True', 'training.student_init_path=' + student],
+            preset='cdlm_tinygsm_mmd', bundle=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(commands), 3)
+        for command in commands[1:]:
+            cfg = self.main_config(command)
+            self.assertTrue(cfg.checkpointing.resume_from_ckpt)
+            self.assertEqual(cfg.training.student_init_path, student)
 
     def test_generation_threshold_override_wins_over_full_sweep_default(self):
         result, commands, _, _ = self.capture('generation_cdlm_tinygsm.sh',
