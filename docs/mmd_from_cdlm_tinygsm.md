@@ -65,7 +65,7 @@ different warm start from CDLM's EMA weights, use both
 | Feature forward batch | 8 |
 | Optimizer | AdamW, LR `1e-5`, betas `.9/.999`, epsilon `1e-8`, no weight decay or clipping |
 | Warmup / budget | 2500 / 7000 optimizer updates |
-| Precision | BF16 mixed, FP32 feature-kernel arithmetic |
+| Precision | BF16 mixed training, FP32 feature-kernel arithmetic and evaluation logit normalization |
 | EMA | `0.9999`; inherit CDLM EMA shadows and update counter |
 | Validation | Every 2000 microbatches = 500 optimizer updates |
 
@@ -89,6 +89,16 @@ reward, advantage, learning rate, NLL and confidence-validation metrics.
 Confidence decoding uses the reduced 10-threshold grid and temperature 0 on
 all 1,319 GSM8K questions. **Ancestral validation is disabled for this stage.**
 The previous CDLM and SDTT presets retain their existing evaluation settings.
+
+Evaluation normalizes logits in **FP32**, matching CDLM before the first MMD
+update, during periodic validation, at training end and in standalone evaluation.
+This keeps confidence thresholds comparable when the same checkpoint is loaded
+through either algorithm. MMD training retains its historical BF16 normalization.
+Earlier MMD evaluations used BF16 normalization, which can change both the token
+reveal order and NFE. Re-evaluate saved weights with the updated code to compare
+those results with CDLM; existing Underdeep points are not rewritten. The launch
+command needs no additional flags, but a running process must restart to use the
+updated code.
 
 ## Checkpoints and snapshots
 
@@ -139,6 +149,8 @@ is supplied.
 
 CPU checks cover snapshot selection, fresh-stage isolation, frozen features,
 EMA selection, checkpoint export, snapshot publication, toy optimizer updates
-and full resume. Dense kernel and gradient references check the historical MMD
+and full resume. Confidence-decoding checks compare CDLM and MMD probabilities,
+tokens and NFE on the same BF16 logits, including evaluation before training.
+Dense kernel and gradient references check the historical MMD
 objective, including chunked student forwards. Real TinyGSM training and GPU
 evaluation are left to the Nirvana launch.

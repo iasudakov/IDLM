@@ -70,9 +70,10 @@ class MMDFinetune(trainer_base.AbsorbingState):
         return self
 
     def _process_model_output(self, model_output, xt, sigma):
-        # Preserve the historical MDLM output dtype (BF16 for the local DiT).
-        # Only the detached representation-kernel arithmetic uses FP32.
-        logits = model_output
+        # Match CDLM's FP32 confidence normalization during evaluation, while
+        # keeping the historical MDLM dtype for MMD training (including no-grad
+        # rollouts). _eval_mode() switches the backbone, not the parent module.
+        logits = model_output if self.backbone.training else model_output.float()
         logits[:, :, self.mask_index] += self.neg_infinity
         logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
         visible = xt.ne(self.mask_index)
