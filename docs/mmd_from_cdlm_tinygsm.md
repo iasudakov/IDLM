@@ -1,8 +1,9 @@
 # MMD finetuning from a completed CDLM snapshot
 
 This recipe starts the MMD student from the latest saved CDLM checkpoint and
-keeps the **original MDLM** as its frozen feature extractor. It uses the actual
-TinyGSM MMD run underlying the paper's Figure 3, `3e0ac6b1-7a8f-43c3-af58-d9e21b886da7`.
+keeps the **original MDLM** as its frozen feature extractor. It is based on the
+TinyGSM MMD run underlying the paper's Figure 3, `3e0ac6b1-7a8f-43c3-af58-d9e21b886da7`,
+with group size **G=2** for this experiment (the historical run used G=8).
 It creates a new training stage and a new Underdeep run. It does not generate or
 read CDLM trajectories.
 
@@ -17,7 +18,7 @@ For a snapshot containing the namespace used in the preceding example:
 ```bash
 CDLM_SOURCE_NAMESPACE=cdlm_tinygsm_ancestral_sweep \
 bash "$SOURCE_CODE_PATH/code/scripts/train_mmd_from_cdlm_tinygsm_nirvana.sh" \
-  'logger.name=cdlm to mmd tinygsm 4xB300 paper recipe'
+  'logger.name=cdlm to mmd tinygsm 4xB300 g2'
 ```
 
 Use `CDLM_SOURCE_NAMESPACE=cdlm_tinygsm` for the original default CDLM namespace.
@@ -53,7 +54,7 @@ different warm start from CDLM's EMA weights, use both
 | Frozen feature source | Raw `checkpoints/tinygsm/mdlm_notok.ckpt` |
 | Feature layer / noise | Block 6 (zero-based), clean input, noise 0 |
 | Kernel | Historical paired-token RBF, alpha `6e-5` |
-| Group | 8 candidates, 1 sequence each; sum over candidates |
+| Group | 2 candidates, 1 sequence each; sum over candidates |
 | Feature forward batch | 8 |
 | Optimizer | AdamW, LR `1e-5`, betas `.9/.999`, epsilon `1e-8`, no weight decay or clipping |
 | Warmup / budget | 2500 / 7000 optimizer updates |
@@ -84,7 +85,7 @@ The previous CDLM and SDTT presets retain their existing evaluation settings.
 
 ## Checkpoints and snapshots
 
-Every **1000 optimizer updates**, a numbered checkpoint contains **only the
+Every **500 optimizer updates**, a numbered checkpoint contains **only the
 student's EMA inference weights**, with the minimal metadata needed to load
 them. It excludes optimizer/scheduler state, CDLM trajectories and the frozen
 feature network. All numbered files are retained and published to the separate
@@ -94,8 +95,8 @@ snapshot namespace `mmd_from_cdlm_tinygsm`:
 mmd_from_cdlm_tinygsm/
   mmd_initialization.json
   checkpoints/
+    step=00000500.ckpt
     step=00001000.ckpt
-    step=00002000.ckpt
     ...
     step=00007000.ckpt
     last.ckpt

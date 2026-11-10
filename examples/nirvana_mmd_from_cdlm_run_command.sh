@@ -47,4 +47,4 @@ python -c 'import torch, flash_attn; print("torch:", torch.__version__, "CUDA:",
 # Select the namespace used by the previous CDLM launch.
 CDLM_SOURCE_NAMESPACE=cdlm_tinygsm_ancestral_sweep \
 bash "$SOURCE_CODE_PATH/code/scripts/train_mmd_from_cdlm_tinygsm_nirvana.sh" \
-  'logger.name=cdlm to mmd tinygsm 4xB300 paper recipe'
+  'logger.name=cdlm to mmd tinygsm 4xB300 g2'

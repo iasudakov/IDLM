@@ -65,7 +65,7 @@ class MMDPreflightTest(unittest.TestCase):
         cfg = self.config()
         self.assertEqual(cfg.algo.name, 'mmd_finetune')
         self.assertEqual(cfg.mmd.kernel, 'rbf')
-        self.assertEqual(cfg.mmd.group_size, 8)
+        self.assertEqual(cfg.mmd.group_size, 2)
         self.assertEqual(cfg.mmd.draws_per_candidate, 1)
         self.assertFalse(cfg.mmd.average_candidates)
         self.assertEqual(cfg.mmd.feature_layer, 6)
@@ -95,13 +95,13 @@ class MMDPreflightTest(unittest.TestCase):
         self.assertTrue(cfg.checkpointing.snapshot)
         self.assertEqual(cfg.checkpointing.snapshot_namespace, 'mmd_from_cdlm_tinygsm')
         periodic = cfg.callbacks.checkpoint_every_n_steps
-        self.assertEqual(periodic.every_n_train_steps, 1000)
+        self.assertEqual(periodic.every_n_train_steps, 500)
         self.assertEqual(periodic.save_top_k, 0)
         self.assertFalse(periodic.save_last)
         self.assertFalse(periodic.save_on_train_epoch_end)
         weights = cfg.callbacks.mmd_weights
         self.assertEqual(weights._target_, 'mmd_weights_checkpoint.MMDWeightsCheckpoint')
-        self.assertEqual(weights.every_n_train_steps, 1000)
+        self.assertEqual(weights.every_n_train_steps, 500)
         self.assertTrue(weights.snapshot)
         self.assertEqual(weights.namespace, 'mmd_from_cdlm_tinygsm')
 

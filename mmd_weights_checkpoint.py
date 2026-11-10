@@ -79,7 +79,7 @@ class MMDWeightsCheckpoint(Callback):
     on every rank; optional snapshot service failures remain best effort.
     """
 
-    def __init__(self, save_dir, every_n_train_steps=1000, snapshot=True,
+    def __init__(self, save_dir, every_n_train_steps=500, snapshot=True,
                  namespace='mmd_from_cdlm_tinygsm'):
         if type(every_n_train_steps) is not int or every_n_train_steps <= 0:
             raise ValueError('every_n_train_steps must be a positive integer.')

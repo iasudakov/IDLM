@@ -7,6 +7,7 @@ defaults:
 # Historical Figure 3 MMD run 3e0ac6b1: G=8, one sequence/candidate,
 # paired token RBF (within-sequence off-diagonals), summed group objective.
 # Its plotted checkpoint is optimizer step 7000; the old launch cap was 20000.
+# This CDLM-to-MMD variant uses G=2 at the user's request.
 mmd:
   kernel: rbf
   feature_layer: 6
@@ -15,7 +16,7 @@ mmd:
   feature_batch_size: 8
   student_forward_batch_size: 8
   student_activation_checkpointing: True
-  group_size: 8
+  group_size: 2
   draws_per_candidate: 1
   average_candidates: False
   retain_student_ema: True
@@ -53,7 +54,7 @@ trainer:
 
 callbacks:
   checkpoint_every_n_steps:
-    every_n_train_steps: 1000
+    every_n_train_steps: 500
     # Periodic exports below contain only the student EMA, without a duplicate
     # frozen feature model or optimizer state. Full last.ckpt is saved at end.
     save_top_k: 0
@@ -62,7 +63,7 @@ callbacks:
   mmd_weights:
     _target_: mmd_weights_checkpoint.MMDWeightsCheckpoint
     save_dir: ${checkpointing.save_dir}
-    every_n_train_steps: 1000
+    every_n_train_steps: 500
     snapshot: ${checkpointing.snapshot}
     namespace: ${checkpointing.snapshot_namespace}
 
@@ -73,5 +74,5 @@ checkpointing:
   snapshot_trajectories: False
 
 logger:
-  name: cdlm to mmd tinygsm paper recipe 7k
+  name: cdlm to mmd tinygsm g2 7k
   force_new_run: False  # resume=False creates a fresh run; MMD resume can reuse it.
