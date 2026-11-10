@@ -14,7 +14,7 @@ from omegaconf import OmegaConf, read_write
 from cdlm_checkpoint_assets import prepare_checkpoint
 
 
-def compose_config(overrides, code_dir=None):
+def compose_config(overrides, code_dir=None, *, resolved_fields=()):
     """Resolve only asset fields; composing must not import the training stack."""
     code_dir = Path(code_dir or Path.cwd()).resolve()
     if not OmegaConf.has_resolver('cwd'):
@@ -37,7 +37,8 @@ def compose_config(overrides, code_dir=None):
         hydra_config.set_config(config)
         for key in ('training.finetune_path', 'training.student_init_path',
                     'training.teacher_allow_hub', 'model_weights_dir',
-                    'checkpointing.snapshot', 'checkpointing.resume_from_ckpt'):
+                    'checkpointing.snapshot', 'checkpointing.resume_from_ckpt',
+                    *resolved_fields):
             value = OmegaConf.select(config, key)
             OmegaConf.update(config, key, value)
         return config

@@ -62,7 +62,7 @@ class PeriodicStepCheckpoint(L.Callback):
 
 
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
-  if config.algo.name in {'sdtt', 'cdlm'}:
+  if config.algo.name in {'sdtt', 'cdlm', 'mmd_finetune'}:
     model = diffusion_model(config, tokenizer=tokenizer, inference_only=True)
     model.load_evaluation_weights(config.eval.checkpoint_path,
                                   use_ema=not config.eval.disable_ema)
@@ -199,7 +199,7 @@ def _generate_samples(diffusion_model, config, logger,
     diffusion_model=diffusion_model,
     config=config,
     tokenizer=tokenizer)
-  if config.algo.name in {'sdtt', 'cdlm'} and config.data.train == 'tiny_gsm':
+  if config.algo.name in {'sdtt', 'cdlm', 'mmd_finetune'} and config.data.train == 'tiny_gsm':
     from sdtt_eval import evaluate
     model._eval_mode()
     with torch.inference_mode():
@@ -448,9 +448,10 @@ def _train(diffusion_model, config, logger, tokenizer):
     ckpt_path = config.checkpointing.resume_ckpt_path
   else:
     ckpt_path = None
-    if config.algo.name == 'cdlm' and config.checkpointing.resume_from_ckpt:
+    if config.algo.name in {'cdlm', 'mmd_finetune'} and config.checkpointing.resume_from_ckpt:
+      baseline = 'CDLM' if config.algo.name == 'cdlm' else 'MMD'
       raise FileNotFoundError(
-        f'CDLM resume checkpoint is missing: {config.checkpointing.resume_ckpt_path}. '
+        f'{baseline} resume checkpoint is missing: {config.checkpointing.resume_ckpt_path}. '
         'Set checkpointing.resume_from_ckpt=False for a fresh student initialization.')
 
   # Lightning callbacks
@@ -470,14 +471,23 @@ def _train(diffusion_model, config, logger, tokenizer):
     train_ds, cdlm_fingerprint = _cdlm_train_loader(config, tokenizer, train_ds)
   _print_batch(train_ds, valid_ds, tokenizer)
 
-  if config.algo.name in {'sdtt', 'cdlm'}:
+  if config.algo.name in {'sdtt', 'cdlm', 'mmd_finetune'}:
     model = diffusion_model(config, tokenizer=tokenizer)
     if config.algo.name == 'cdlm':
       model._cache_fingerprint = cdlm_fingerprint
     if ckpt_path is None:
       if not config.training.finetune_path:
         raise ValueError('The baseline requires training.finetune_path for its MDLM teacher.')
-      if config.algo.name == 'cdlm':
+      if config.algo.name == 'mmd_finetune':
+        if not config.training.student_init_path:
+          raise ValueError('MMD needs training.student_init_path; run the snapshot preflight first.')
+        model.initialize_from_checkpoint(
+          config.training.student_init_path,
+          feature_source=config.training.finetune_path,
+          student_use_ema=config.training.student_init_use_ema,
+          retain_ema=config.mmd.retain_student_ema,
+          feature_use_ema=config.training.teacher_use_ema)
+      elif config.algo.name == 'cdlm':
         student_source = config.training.get('student_init_path')
         student_use_ema = config.training.get('student_init_use_ema', False)
         model.initialize_from_checkpoint(
@@ -537,6 +547,9 @@ def main(config):
   elif config.algo.name == 'cdlm':
     from cdlm import CDLM
     diffusion_model = CDLM
+  elif config.algo.name == 'mmd_finetune':
+    from mmd_finetune import MMD
+    diffusion_model = MMD
   elif config.algo.name == 'mdlm':
     diffusion_model = algo.MDLM_with_AR
   elif config.algo.name == 'mdlm_dmmd':

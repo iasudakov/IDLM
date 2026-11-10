@@ -1,0 +1,77 @@
+# @package _global_
+defaults:
+  - cdlm_tinygsm
+  - override /algo: mmd_finetune
+  - _self_
+
+# Historical Figure 3 MMD run 3e0ac6b1: G=8, one sequence/candidate,
+# paired token RBF (within-sequence off-diagonals), summed group objective.
+# Its plotted checkpoint is optimizer step 7000; the old launch cap was 20000.
+mmd:
+  kernel: rbf
+  feature_layer: 6
+  rbf_alpha: 6e-5
+  kernel_block_size: 0
+  feature_batch_size: 8
+  student_forward_batch_size: 8
+  student_activation_checkpointing: True
+  group_size: 8
+  draws_per_candidate: 1
+  average_candidates: False
+  retain_student_ema: True
+  # null: obtain the root through nirvana_dl; autodetect a unique CDLM run.
+  cdlm_snapshot_root: null
+  cdlm_snapshot_namespace: null
+  initialization_manifest: null
+
+training:
+  # The frozen MMD feature extractor remains the ORIGINAL MDLM.
+  finetune_path: ${hydra:runtime.cwd}/checkpoints/tinygsm/mdlm_notok.ckpt
+  teacher_use_ema: False
+  teacher_allow_hub: False
+  # The preflight chooses this from the input CDLM snapshot.
+  student_init_path: null
+  student_init_use_ema: False
+  loss_precision: bf16
+
+lr_scheduler:
+  num_warmup_steps: 2500
+
+eval:
+  # This MMD stage keeps confidence validation; the ancestral sweep is opt-in.
+  gsm8k_greedy_token: False
+  gsm8k_ancestral_steps: null
+  gsm8k_ancestral_seeds: null
+  gsm8k_ancestral_final_denoise: False
+
+trainer:
+  max_steps: 7000
+  max_epochs: -1
+  devices: 4
+  accumulate_grad_batches: 4
+  precision: bf16-mixed
+
+callbacks:
+  checkpoint_every_n_steps:
+    every_n_train_steps: 1000
+    # Periodic exports below contain only the student EMA, without a duplicate
+    # frozen feature model or optimizer state. Full last.ckpt is saved at end.
+    save_top_k: 0
+    save_last: False
+    save_on_train_epoch_end: False
+  mmd_weights:
+    _target_: mmd_weights_checkpoint.MMDWeightsCheckpoint
+    save_dir: ${checkpointing.save_dir}
+    every_n_train_steps: 1000
+    snapshot: ${checkpointing.snapshot}
+    namespace: ${checkpointing.snapshot_namespace}
+
+checkpointing:
+  resume_from_ckpt: False
+  snapshot: True
+  snapshot_namespace: mmd_from_cdlm_tinygsm
+  snapshot_trajectories: False
+
+logger:
+  name: cdlm to mmd tinygsm paper recipe 7k
+  force_new_run: False  # resume=False creates a fresh run; MMD resume can reuse it.

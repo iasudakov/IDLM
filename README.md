@@ -34,6 +34,15 @@ restart. Resume training with `checkpointing.resume_from_ckpt=True` and keep
 the selected teacher and original data inputs available. Hub checkpoints
 resolved by the Nirvana launcher are also persisted under `cdlm_assets/`.
 
+For **CDLM → MMD**, run
+`bash scripts/train_mmd_from_cdlm_tinygsm_nirvana.sh` with the CDLM training
+snapshot connected. It selects the latest CDLM checkpoint by saved step, keeps
+the original MDLM as the frozen feature model, and trains a fresh MMD stage on
+four GPUs using the historical Figure 3 recipe. Ancestral validation is off;
+confidence metrics remain enabled. Student EMA weights are exported every
+1000 updates and retained in the snapshot; final `last.ckpt` supports full resume.
+See [the setup and checkpoint policy](docs/mmd_from_cdlm_tinygsm.md).
+
 The full-sequence **SDTT baseline for TinyGSM** is also available, adapted from
 [the official implementation](https://github.com/jdeschena/sdtt). Run
 `bash scripts/train_sdtt_tinygsm.sh` for the official 70,000-update schedule;
