@@ -43,6 +43,11 @@ confidence metrics remain enabled. Student EMA weights are exported every
 500 updates and retained in the snapshot; final `last.ckpt` supports full resume.
 See [the setup and checkpoint policy](docs/mmd_from_cdlm_tinygsm.md).
 
+For **original MDLM → MMD with the complete model in FP32**, run
+`bash scripts/train_mmd_tinygsm_fp32_nirvana.sh`. This separate preset uses the
+paper's G=8 recipe on four GPUs and saves EMA weights to its own snapshot every
+500 updates. See the [full-FP32 setup](docs/mmd_tinygsm_fp32.md).
+
 The full-sequence **SDTT baseline for TinyGSM** is also available, adapted from
 [the official implementation](https://github.com/jdeschena/sdtt). Run
 `bash scripts/train_sdtt_tinygsm.sh` for the official 70,000-update schedule;

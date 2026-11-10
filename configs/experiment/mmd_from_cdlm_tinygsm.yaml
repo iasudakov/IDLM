@@ -9,6 +9,7 @@ defaults:
 # Its plotted checkpoint is optimizer step 7000; the old launch cap was 20000.
 # This CDLM-to-MMD variant uses G=2 at the user's request.
 mmd:
+  initialization_source: cdlm_snapshot
   kernel: rbf
   feature_layer: 6
   rbf_alpha: 6e-5

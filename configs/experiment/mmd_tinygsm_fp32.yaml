@@ -1,0 +1,34 @@
+# @package _global_
+defaults:
+  - mmd_from_cdlm_tinygsm
+  - _self_
+
+# Figure 3 MMD recipe, starting from the ORIGINAL MDLM, in full FP32.
+# The paper's selected checkpoint is step 7000 of a 20000-update launch.
+mmd:
+  initialization_source: mdlm
+  group_size: 8
+  retain_student_ema: True
+  cdlm_snapshot_root: null
+  cdlm_snapshot_namespace: null
+
+model:
+  force_fp32: True
+
+training:
+  # Preflight resolves this same original checkpoint for student and features.
+  student_init_path: null
+  student_init_use_ema: False
+  teacher_use_ema: False
+  loss_precision: float32
+
+trainer:
+  precision: 32-true
+  devices: 4
+  accumulate_grad_batches: 4
+
+checkpointing:
+  snapshot_namespace: mmd_tinygsm_fp32
+
+logger:
+  name: mdlm to mmd tinygsm full fp32 g8 7k

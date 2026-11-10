@@ -1,5 +1,6 @@
 import math
 import typing
+from contextlib import nullcontext
 
 import einops
 import flash_attn
@@ -125,22 +126,38 @@ def split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin):
   return q, k, v
 
 
+def split_and_apply_rotary_pos_emb_fp32(qkv, rotary_cos_sin):
+  """The same non-interleaved RoPE using only FP32 PyTorch operations."""
+  if qkv.dtype != torch.float32:
+    raise ValueError('Full-FP32 attention requires FP32 Q/K/V projections.')
+  cos, sin = rotary_cos_sin
+  cos, sin = cos[:, :, 0].float(), sin[:, :, 0].float()
+  q, k, v = qkv.unbind(dim=2)
+  return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin, v
+
+
 def apply_rotary_pos_emb(qkv, cos, sin):
   cos = cos[0,:,0,0,:cos.shape[-1]//2]
   sin = sin[0,:,0,0,:sin.shape[-1]//2]
   return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
 
 
-def regular_attention_multi_headed(q, k, v):
+def regular_attention_multi_headed(q, k, v, force_fp32=False):
   # Assuming qkv is a tensor with shape [batch, seq_len, 3, num_heads, head_dim]
   # where the 3 represents Q, K, V packed in that order
-  attention_output = F.scaled_dot_product_attention(
-    query=q.transpose(1, 2),
-    key=k.transpose(1, 2),
-    value=v.transpose(1, 2),
-    attn_mask=None,
-    dropout_p=0.0,
-    is_causal=False)
+  context = nullcontext()
+  if force_fp32:
+    # Do not silently select a reduced-precision fused attention backend.
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    context = sdpa_kernel(SDPBackend.MATH)
+  with context:
+    attention_output = F.scaled_dot_product_attention(
+      query=q.transpose(1, 2),
+      key=k.transpose(1, 2),
+      value=v.transpose(1, 2),
+      attn_mask=None,
+      dropout_p=0.0,
+      is_causal=False)
   # [batch_size, seq_len, num_heads, head_dim]
   attention_output = attention_output.transpose(1, 2)
   return einops.rearrange(attention_output, 'b s h d -> b s (h d)')
@@ -305,10 +322,11 @@ class DDiTBlockCausal(nn.Module):
 class DDiTBlock(nn.Module):
   def __init__(self, dim, n_heads, adaLN,
                cond_dim=None, mlp_ratio=4,
-               dropout=0.1):
+               dropout=0.1, force_fp32=False):
     super().__init__()
     self.n_heads = n_heads
     self.adaLN = adaLN
+    self.force_fp32 = force_fp32
 
     self.norm1 = LayerNorm(dim)
     self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
@@ -356,9 +374,12 @@ class DDiTBlock(nn.Module):
       'b s (three h d) -> b s three h d',
       three=3,
       h=self.n_heads)
-    q, k, v = split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin)
+    if self.force_fp32:
+      q, k, v = split_and_apply_rotary_pos_emb_fp32(qkv, rotary_cos_sin)
+    else:
+      q, k, v = split_and_apply_rotary_pos_emb(qkv, rotary_cos_sin)
     
-    x = regular_attention_multi_headed(q, k, v)
+    x = regular_attention_multi_headed(q, k, v, force_fp32=self.force_fp32)
 
     if self.adaLN:
       x = bias_dropout_scale_fn(self.attn_out(x),
@@ -426,7 +447,12 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
     super().__init__()
     if type(config) == dict:
       config = omegaconf.OmegaConf.create(config)
+    self.force_fp32 = config.model.get('force_fp32', False)
+    if type(self.force_fp32) is not bool:
+      raise ValueError('model.force_fp32 must be a boolean.')
     self.causal = config.algo.causal_attention
+    if self.force_fp32 and self.causal:
+      raise ValueError('model.force_fp32 requires full-attention DiT (causal_attention=False).')
     self.adaLN = not self.causal
     self.config = config
     self.vocab_size = vocab_size
@@ -450,7 +476,8 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
           n_heads=config.model.n_heads,
           cond_dim=cond_dim,
           adaLN=self.adaLN,
-          dropout=config.model.dropout)
+          dropout=config.model.dropout,
+          force_fp32=self.force_fp32)
       blocks.append(block)
     self.blocks = nn.ModuleList(blocks)
 
@@ -468,6 +495,14 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       return  bias_dropout_add_scale_fused_inference
 
   def forward(self, x, sigma):
+    if self.force_fp32:
+      # Cover the complete forward, including the timestep embedding, even if
+      # a caller has enabled mixed precision around this module.
+      with torch.autocast(device_type=x.device.type, enabled=False):
+        return self._forward(x, sigma)
+    return self._forward(x, sigma)
+
+  def _forward(self, x, sigma):
     x = self.vocab_embed(x)
     if self.causal:
       t_cond = None
@@ -476,7 +511,9 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
     rotary_cos_sin = self.rotary_emb(x)
 
-    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+    context = (nullcontext() if self.force_fp32
+               else torch.cuda.amp.autocast(dtype=torch.bfloat16))
+    with context:
       for i in range(len(self.blocks)):
         x = self.blocks[i](x, rotary_cos_sin, c=t_cond)
       x = self.output_layer(x, c=t_cond)

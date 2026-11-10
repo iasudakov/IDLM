@@ -1,4 +1,4 @@
-"""Choose the latest CDLM snapshot checkpoint before MMD starts GPU workers."""
+"""Prepare CDLM or original-MDLM initialization before MMD starts GPU workers."""
 
 import argparse
 from collections.abc import Mapping
@@ -12,6 +12,7 @@ import tempfile
 from cdlm_checkpoint_assets import prepare_checkpoint
 from cdlm_preflight import compose_config
 from cdlm_snapshot_init import resolve_snapshot_root, select_checkpoint
+from full_precision import validate_full_fp32_config
 
 
 def _atomic_write(path, data):
@@ -127,12 +128,25 @@ def prepare_overrides(config, *, code_dir=None):
         raise ValueError('MMD snapshot preflight requires algo=mmd_finetune.')
     if config.mode != 'train':
         raise ValueError('The MMD launcher supports mode=train.')
+    validate_full_fp32_config(config)
     code_dir = Path(code_dir or Path.cwd()).resolve()
     # Full MMD resumes restore both student and feature network from their own
     # checkpoint. They must not depend on the input CDLM state still existing.
     if config.checkpointing.resume_from_ckpt:
         target = validate_resume_checkpoint(config, code_dir=code_dir)
         return ['checkpointing.resume_ckpt_path=' + json.dumps(target, ensure_ascii=False)]
+    source_kind = config.mmd.get('initialization_source', 'cdlm_snapshot')
+    if source_kind not in ('cdlm_snapshot', 'mdlm'):
+        raise ValueError('mmd.initialization_source must be cdlm_snapshot or mdlm.')
+    if source_kind == 'mdlm':
+        if config.training.student_init_path:
+            raise ValueError('The MDLM recipe uses training.finetune_path for both student and features; '
+                             'leave training.student_init_path=null.')
+        feature = _prepare_feature_checkpoint(config, code_dir)
+        selected = {'path': feature, 'sha256': _hash(feature),
+                    'source_kind': 'mdlm', 'source': str(config.training.finetune_path)}
+        print(f'[mmd-init] Original MDLM selected for student and frozen features: {feature}', flush=True)
+        return _write_initialization(config, code_dir, selected, feature)
     if config.training.student_init_path:
         raise ValueError('This launcher selects the latest CDLM snapshot checkpoint. '
                          'Use mmd.cdlm_snapshot_root / mmd.cdlm_snapshot_namespace '
@@ -158,6 +172,11 @@ def prepare_overrides(config, *, code_dir=None):
                 or source in output.parents or output in source.parents):
             raise ValueError('MMD snapshot_namespace must be separate from the input CDLM namespace.')
 
+    feature = _prepare_feature_checkpoint(config, code_dir)
+    return _write_initialization(config, code_dir, selected, feature)
+
+
+def _prepare_feature_checkpoint(config, code_dir):
     feature_source = config.training.finetune_path
     if not feature_source:
         raise ValueError('training.finetune_path must identify the original MDLM feature checkpoint.')
@@ -170,17 +189,26 @@ def prepare_overrides(config, *, code_dir=None):
             and not config.training.teacher_allow_hub):
         raise ValueError('With an offline bundle, use a local original MDLM checkpoint '
                          'or explicitly enable training.teacher_allow_hub.')
-    feature = str(prepare_checkpoint(
+    return str(prepare_checkpoint(
         str(feature_source), code_dir=code_dir, input_dir=os.environ.get('INPUT_PATH'),
         weights_dir=weights_dir,
         snapshot_enabled=bool(config.checkpointing.get('snapshot', False))))
+
+
+def _write_initialization(config, code_dir, selected, feature):
+    if config.checkpointing.get('snapshot', False):
+        namespace = config.checkpointing.get('snapshot_namespace')
+        if (not namespace or not Path(str(namespace)).parts
+                or Path(str(namespace)).is_absolute() or '..' in Path(str(namespace)).parts):
+            raise ValueError('MMD snapshots require a nonempty relative snapshot_namespace.')
     output_dir = Path(str(config.checkpointing.save_dir)).expanduser()
     if not output_dir.is_absolute():
         output_dir = code_dir / output_dir
-    snapshot_root = Path(selected['snapshot_root']).resolve()
     destination = output_dir.resolve()
-    if destination == snapshot_root or snapshot_root in destination.parents:
-        raise ValueError('MMD save_dir must be outside the input snapshot directory.')
+    if selected.get('snapshot_root'):
+        snapshot_root = Path(selected['snapshot_root']).resolve()
+        if destination == snapshot_root or snapshot_root in destination.parents:
+            raise ValueError('MMD save_dir must be outside the input snapshot directory.')
     manifest = output_dir / 'mmd_initialization.json'
     provenance = {
         'schema_version': 1,
@@ -191,12 +219,16 @@ def prepare_overrides(config, *, code_dir=None):
         'feature_extractor': {'path': feature, 'sha256': _hash(feature),
                               'weights': 'ema' if config.training.teacher_use_ema else 'raw'},
         'fresh_optimizer_and_scheduler': True,
+        'precision': {'trainer': str(config.trainer.precision),
+                      'full_fp32': bool(config.model.get('force_fp32', False)),
+                      'tf32': False if config.model.get('force_fp32', False) else None},
     }
     _atomic_write(manifest, (json.dumps(provenance, indent=2) + '\n').encode())
     values = {'training.student_init_path': selected['path'],
               'training.finetune_path': feature,
               'mmd.initialization_manifest': str(manifest.resolve())}
-    print(f"[mmd-init] CDLM step={selected['global_step']} from {selected['path']}", flush=True)
+    if selected.get('global_step') is not None:
+        print(f"[mmd-init] CDLM step={selected['global_step']} from {selected['path']}", flush=True)
     print(f'[mmd-init] Frozen MDLM features: {feature}; provenance: {manifest}', flush=True)
     return [f'{key}={json.dumps(value, ensure_ascii=False)}' for key, value in values.items()]
 
