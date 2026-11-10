@@ -1,6 +1,7 @@
 """Plan a common evaluation of the three selected TinyGSM CDLM chains.
 
-The parent process checks all input files and offline assets before torchrun.
+The parent process inventories available checkpoints and checks offline assets
+before torchrun. Missing catalog checkpoints are reported and skipped by default.
 Only selected checkpoint files are staged from archive inputs; trajectories are
 never extracted. Actual model evaluation lives in cdlm_checkpoint_eval_worker.
 """
@@ -46,14 +47,20 @@ def _within(path, root):
     return path == root or root in path.parents
 
 
-def build_plan(sources, output_dir):
-    """Validate the complete requested set, without reading tensors or writing files."""
+def _validate_missing_policy(value):
+    if value not in ('skip', 'error'):
+        raise ValueError(f'Unknown missing checkpoint policy: {value!r}; use skip or error.')
+
+
+def build_plan(sources, output_dir, *, missing_checkpoints='skip'):
+    """Inventory requested sources without reading tensors or writing files."""
+    _validate_missing_policy(missing_checkpoints)
     if not sources:
         raise ValueError('At least one source snapshot is required.')
     if not str(output_dir).strip():
         raise ValueError('An output directory is required.')
     output = Path(output_dir).expanduser().resolve()
-    entries, seen = [], set()
+    entries, skipped, seen = [], [], set()
     for source in sources:
         uid = resolve_source_run(source['source_run'])
         if uid in seen:
@@ -71,17 +78,31 @@ def build_plan(sources, output_dir):
         directory = (root / spec['namespace'] / 'checkpoints').resolve()
         if not _within(directory, root):
             raise ValueError(f'Checkpoint namespace escapes input snapshot: {directory}')
+        source_count = 0
         for filename, step in spec['checkpoints']:
             path = (directory / filename).resolve()
             if not _within(path, directory):
                 raise ValueError(f'Checkpoint link escapes its namespace: {path}')
-            if not path.is_file() or path.stat().st_size == 0:
-                raise FileNotFoundError(f'Required checkpoint missing or empty: {path}')
+            if path.exists() and not path.is_file():
+                raise ValueError(f'Checkpoint path is not a regular file: {path}')
+            reason = 'missing' if not path.is_file() else ('empty' if path.stat().st_size == 0 else None)
+            if reason is not None:
+                if missing_checkpoints == 'error':
+                    raise FileNotFoundError(f'Required checkpoint missing or empty: {path}')
+                skipped.append({'source_run': uid, 'family': spec['family'],
+                                'checkpoint': str(path), 'step': step, 'reason': reason})
+                continue
             entries.append({'source_run': uid, 'family': spec['family'],
                             'checkpoint': str(path), 'step': step,
                             'output_dir': str(output / uid / f'step={step:08d}')})
+            source_count += 1
+        if source_count == 0:
+            raise FileNotFoundError(f'No usable expected checkpoints for source {uid} in {directory}. '
+                                    'Check that the matching training snapshot is connected; '
+                                    'no other namespace or inherited last.ckpt will be used.')
     return {'schema_version': 1, 'output_dir': str(output),
-            'snapshot_namespace': 'cdlm_checkpoint_eval', 'entries': entries}
+            'snapshot_namespace': 'cdlm_checkpoint_eval', 'entries': entries,
+            'missing_checkpoints': missing_checkpoints, 'skipped_checkpoints': skipped}
 
 
 def _atomic_json(path, value):
@@ -91,8 +112,9 @@ def _atomic_json(path, value):
     temporary.replace(path)
 
 
-def stage_archive(archive, uid, staging_root):
-    """Extract only the required regular checkpoint members, never arbitrary tar paths."""
+def stage_archive(archive, uid, staging_root, *, missing_checkpoints='skip'):
+    """Extract available catalog checkpoint members, never arbitrary tar paths."""
+    _validate_missing_policy(missing_checkpoints)
     archive = Path(archive).expanduser().resolve()
     destination = (Path(staging_root) / uid).resolve()
     spec = SOURCE_RUNS[uid]
@@ -103,11 +125,16 @@ def stage_archive(archive, uid, staging_root):
     receipt_path = destination / 'archive_receipt.json'
     if receipt_path.is_file():
         receipt = json.loads(receipt_path.read_text())
-        if receipt.get('archive_identity') == identity and set(receipt.get('files', {})) == expected:
-            if all((destination / name).is_file() and (destination / name).stat().st_size == size
-                   for name, size in receipt['files'].items()):
+        files = receipt.get('files', {})
+        usable = {name for name, size in files.items() if size > 0}
+        if (receipt.get('archive_identity') == identity and set(files) <= expected and usable
+                and (missing_checkpoints == 'skip' or usable == expected)):
+            if all(_within((destination / name).resolve(), destination)
+                   and (destination / name).is_file() and (destination / name).stat().st_size == size
+                   for name, size in files.items()) and not any(
+                       (destination / name).exists() for name in expected - set(files)):
                 return destination
-    print(f'[checkpoint-eval] Indexing archive {archive}; extracting only {len(expected)} checkpoints.', flush=True)
+    print(f'[checkpoint-eval] Indexing archive {archive}; looking for {len(expected)} catalog checkpoints.', flush=True)
     with tarfile.open(archive, mode='r:*') as tar:
         selected = {}
         for member in tar:
@@ -116,14 +143,24 @@ def stage_archive(archive, uid, staging_root):
             suffix = '/'.join(parts[-3:])
             if suffix not in expected:
                 continue
-            if member.name.startswith('/') or '..' in parts or not member.isfile() or member.size <= 0:
+            if member.name.startswith('/') or '..' in parts or not member.isfile() or member.size < 0:
                 raise ValueError(f'Invalid checkpoint archive member: {member.name}')
             if suffix in selected:
                 raise ValueError(f'Ambiguous duplicate checkpoint in archive: {suffix}')
             selected[suffix] = member
-        missing = expected - set(selected)
-        if missing:
+        usable = {name for name, member in selected.items() if member.size > 0}
+        missing = expected - usable
+        if missing and missing_checkpoints == 'error':
             raise FileNotFoundError(f'Archive is missing required checkpoints: {sorted(missing)}')
+        if not usable:
+            raise FileNotFoundError(f'No usable expected checkpoints for source {uid} in archive {archive}.')
+        # An archive can be replaced by an earlier/partial snapshot at the same
+        # input path. Never let old staged weights fill gaps in the new state.
+        for name in expected - set(selected):
+            target = destination / name
+            if not _within(target.resolve(), destination):
+                raise ValueError('Staged checkpoint path escapes the staging directory.')
+            target.unlink(missing_ok=True)
         sizes = {}
         for name, member in sorted(selected.items()):
             target = destination / name
@@ -147,7 +184,8 @@ def stage_archive(archive, uid, staging_root):
     return destination
 
 
-def prepare_sources(sources, staging_root):
+def prepare_sources(sources, staging_root, *, missing_checkpoints='skip'):
+    _validate_missing_policy(missing_checkpoints)
     prepared = []
     for source in sources:
         uid = resolve_source_run(source['source_run'])
@@ -156,7 +194,7 @@ def prepare_sources(sources, staging_root):
             raise ValueError(f'Snapshot path is empty for {uid}.')
         path = Path(value).expanduser().resolve()
         if path.is_file():
-            path = stage_archive(path, uid, staging_root)
+            path = stage_archive(path, uid, staging_root, missing_checkpoints=missing_checkpoints)
         elif not path.is_dir():
             raise FileNotFoundError(f'Snapshot input not found: {path}')
         prepared.append({'source_run': uid, 'snapshot_root': str(path)})
@@ -279,6 +317,8 @@ def main(argv=None):
     parser.add_argument('--input-root', default=os.environ.get('INPUT_PATH'), help='Directory containing cdlm_state, cdlm_mmd_state and mmd_cdlm_state inputs.')
     parser.add_argument('--output-dir', default=os.environ.get('CDLM_EVAL_OUTPUT_DIR', str(Path.cwd() / 'cdlm_checkpoint_eval')))
     parser.add_argument('--devices', type=int, default=4)
+    parser.add_argument('--missing-checkpoints', choices=('skip', 'error'), default='skip',
+                        help='Skip and report absent/empty catalog checkpoints (default), or require the complete catalog.')
     parser.add_argument('--plan-only', action='store_true')
     parser.add_argument('--no-restore-results', action='store_true', help='Do not restore prior evaluation outputs from the connected snapshot.')
     parser.add_argument('--list-sources', action='store_true')
@@ -311,8 +351,15 @@ def main(argv=None):
                    for uid, spec in SOURCE_RUNS.items()]
     output = Path(options.output_dir).expanduser().resolve()
     staging = output.parent / ('.' + output.name + '-weights')
-    prepared = prepare_sources(sources, staging)
-    plan = build_plan(prepared, output)
+    prepared = prepare_sources(sources, staging, missing_checkpoints=options.missing_checkpoints)
+    plan = build_plan(prepared, output, missing_checkpoints=options.missing_checkpoints)
+    for source in prepared:
+        uid = source['source_run']
+        steps = [entry['step'] for entry in plan['entries'] if entry['source_run'] == uid]
+        print(f'[checkpoint-eval] {uid}: selected {len(steps)} available checkpoints at steps {steps}.', flush=True)
+    for item in plan['skipped_checkpoints']:
+        print(f'[checkpoint-eval] WARNING: Skipping {item["reason"]} checkpoint '
+              f'(step={item["step"]}): {item["checkpoint"]}', flush=True)
     config = compose_evaluation_config(overrides, code_dir=Path.cwd().resolve(),
                                        output_dir=output, devices=options.devices)
     if not options.no_restore_results:
@@ -322,7 +369,8 @@ def main(argv=None):
     _atomic_json(output / 'plan.json', plan)
     from omegaconf import OmegaConf
     OmegaConf.save(config, output / 'evaluation_config.yaml')
-    print(f'[checkpoint-eval] Verified {len(plan["entries"])} checkpoints from {len(prepared)} source runs.', flush=True)
+    print(f'[checkpoint-eval] Verified {len(plan["entries"])} checkpoints from {len(prepared)} source runs; '
+          f'skipped {len(plan["skipped_checkpoints"])} absent/empty checkpoints.', flush=True)
     if options.plan_only:
         print(f'[checkpoint-eval] Plan only; no GPU work: {output / "plan.json"}', flush=True)
         return 0

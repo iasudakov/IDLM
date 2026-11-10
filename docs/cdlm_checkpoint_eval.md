@@ -1,8 +1,10 @@
 # Evaluate the three TinyGSM CDLM chains
 
-This evaluates **18 saved checkpoints**, without training or trajectory generation:
+This evaluates the **available checkpoints from an expected catalog of up to 18**,
+without training or trajectory generation. Training logs describe the expected
+catalog; a connected snapshot can contain fewer files.
 
-| Source run | Chain | Saved optimizer steps |
+| Source run | Chain | Expected optimizer steps |
 | --- | --- | --- |
 | `5e0ee1da-8780-42d3-b120-9590e9dc8351` | MDLM → CDLM | 1000, 1248 (`last.ckpt`) |
 | `dbb3b25d-4937-4f27-966f-898e696a1f48` | CDLM → MMD | 500, 1000, …, 7000 |
@@ -52,9 +54,35 @@ Keep the existing tokenizer bundle under `code/cache_dir/tinygsm_mmd_offline_bun
 The [complete environment setup example](../examples/nirvana_cdlm_checkpoint_eval_run_command.sh)
 includes the same pinned packages and reads the offline assets directly from
 their input paths. Only change its `CDLM_EVAL_SOURCE_RUN` value for each block.
-No Hugging Face downloads are attempted. All required checkpoint paths and
-offline assets are checked before starting GPU workers. `--plan-only` writes
-the plan and checks inputs without starting evaluation.
+No Hugging Face downloads are attempted. Available checkpoint paths and offline
+assets are checked before starting GPU workers. `--plan-only` writes the plan
+and checks inputs without starting evaluation.
+
+### Partial snapshots
+
+By default, missing or zero-byte catalog files are skipped with a warning. The
+launcher prints the selected steps and every skipped path before GPU workers
+start. Both lists are stored in `plan.json` (`entries` and `skipped_checkpoints`)
+and published with the evaluation results. For example, a missing
+`step=00006000.ckpt` does not prevent evaluation of steps 5500, 6500 or 7000 if
+those files are present. No missing checkpoint is downloaded or reconstructed.
+This works for the ordinary unpacked Nirvana state and archive inputs.
+
+The existing three launch commands already use this behavior. To make the
+policy explicit:
+
+```bash
+CDLM_EVAL_SOURCE_RUN=dbb3b25d \
+bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh" \
+  --missing-checkpoints skip
+```
+
+Use `--missing-checkpoints error` to require the complete catalog. Both policies
+fail before GPU initialization if any selected source has no usable expected
+checkpoint, the state is absent, or a checkpoint path escapes its namespace.
+Inherited CDLM weights and unverified `last.ckpt` files are never substituted
+for missing MMD weights. Nonempty files still undergo strict weight loading and
+saved-step validation; corrupt weights are errors rather than silently skipped.
 
 ## Common evaluation protocol
 

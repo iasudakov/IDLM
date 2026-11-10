@@ -118,11 +118,57 @@ class CheckpointEvaluationPlanTest(unittest.TestCase):
         path = roots[CDLM_MMD] / 'mmd_from_cdlm_tinygsm/checkpoints/step=00007000.ckpt'
         path.unlink()
         with self.assertRaises((ValueError, FileNotFoundError)):
-            evaluator.build_plan(sources, str(self.output))
+            evaluator.build_plan(sources, str(self.output), missing_checkpoints='error')
         path.touch()
         with self.assertRaises((ValueError, FileNotFoundError)):
+            evaluator.build_plan(sources, str(self.output), missing_checkpoints='error')
+        self.assertFalse(self.output.exists())
+
+    def test_partial_snapshot_skips_missing_and_empty_without_stopping_at_first_gap(self):
+        root = self.snapshot(CDLM_MMD)
+        directory = root / 'mmd_from_cdlm_tinygsm/checkpoints'
+        (directory / 'step=00006000.ckpt').unlink()
+        (directory / 'step=00007000.ckpt').write_bytes(b'')
+        plan = evaluator.build_plan([self.source(CDLM_MMD, root)], str(self.output))
+        self.assertEqual(plan['missing_checkpoints'], 'skip')
+        self.assertEqual([row['step'] for row in plan['entries']],
+                         list(range(500, 6000, 500)) + [6500])
+        skipped = plan['skipped_checkpoints']
+        self.assertEqual([(row['step'], row['reason']) for row in skipped],
+                         [(6000, 'missing'), (7000, 'empty')])
+        self.assertTrue(all(row['source_run'] == CDLM_MMD for row in skipped))
+        self.assertTrue(all(row['family'] == 'CDLM to MMD' for row in skipped))
+        self.assertEqual([Path(row['checkpoint']).name for row in skipped],
+                         ['step=00006000.ckpt', 'step=00007000.ckpt'])
+        self.assertFalse(self.output.exists())
+        self.assertTrue((directory / 'step=00006500.ckpt').is_file())
+        self.assertEqual((directory / 'step=00007000.ckpt').stat().st_size, 0)
+
+    def test_each_selected_source_needs_usable_weights_even_if_others_are_present(self):
+        first = self.snapshot(MDLM_CDLM)
+        second = self.snapshot(CDLM_MMD)
+        directory = second / 'mmd_from_cdlm_tinygsm/checkpoints'
+        sources = [self.source(MDLM_CDLM, first), self.source(CDLM_MMD, second)]
+        for path in directory.glob('*.ckpt'):
+            path.unlink()
+        # An inherited or unverified last checkpoint is not a substitute for
+        # the catalogued MMD exports.
+        (directory / 'last.ckpt').write_bytes(b'inherited-last')
+        with self.assertRaises(FileNotFoundError):
+            evaluator.build_plan(sources, str(self.output))
+        for filename, _ in EXPECTED[CDLM_MMD][1]:
+            (directory / filename).touch()
+        with self.assertRaises(FileNotFoundError):
             evaluator.build_plan(sources, str(self.output))
         self.assertFalse(self.output.exists())
+
+    def test_nonregular_checkpoint_is_not_silently_skipped(self):
+        root = self.snapshot(MDLM_CDLM)
+        path = root / 'cdlm_tinygsm_ancestral_sweep/checkpoints/last.ckpt'
+        path.unlink()
+        path.mkdir()
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            evaluator.build_plan([self.source(MDLM_CDLM, root)], str(self.output))
 
     def test_wrong_snapshot_does_not_fall_back_to_another_namespace(self):
         root = self.snapshot(MDLM_CDLM)
@@ -208,9 +254,59 @@ class CheckpointArchiveStagingTest(unittest.TestCase):
     def test_missing_member_fails_before_publishing_any_checkpoint(self):
         self.write_archive([self.member('12-1000.ckpt')])
         with self.assertRaises(FileNotFoundError):
-            evaluator.stage_archive(self.archive, MDLM_CDLM, self.staging)
+            evaluator.stage_archive(self.archive, MDLM_CDLM, self.staging,
+                                    missing_checkpoints='error')
         self.assertFalse((self.staging / MDLM_CDLM / 'archive_receipt.json').exists())
         self.assertFalse(list(self.staging.rglob('*.ckpt')))
+
+    def test_partial_archive_reuses_receipt_but_strict_policy_rejects_missing_member(self):
+        self.write_archive([self.member('12-1000.ckpt')])
+        destination = evaluator.stage_archive(self.archive, MDLM_CDLM, self.staging)
+        self.assertTrue((destination / self.namespace / 'checkpoints/12-1000.ckpt').is_file())
+        self.assertFalse((destination / self.namespace / 'checkpoints/last.ckpt').exists())
+        with patch.object(evaluator.tarfile, 'open', side_effect=AssertionError('Reuse partial cache')):
+            self.assertEqual(evaluator.stage_archive(self.archive, MDLM_CDLM, self.staging), destination)
+        with self.assertRaises(FileNotFoundError):
+            evaluator.stage_archive(self.archive, MDLM_CDLM, self.staging,
+                                    missing_checkpoints='error')
+        prepared = evaluator.prepare_sources(
+            [{'source_run': MDLM_CDLM, 'snapshot_root': str(self.archive)}], self.staging)
+        plan = evaluator.build_plan(prepared, self.base / 'results')
+        self.assertEqual([row['step'] for row in plan['entries']], [1000])
+        self.assertEqual([row['step'] for row in plan['skipped_checkpoints']], [1248])
+
+    def test_zero_byte_archive_member_is_reported_as_empty_in_plan(self):
+        self.write_archive([self.member('12-1000.ckpt'), self.member('last.ckpt', payload=b'')])
+        destination = evaluator.stage_archive(self.archive, MDLM_CDLM, self.staging)
+        plan = evaluator.build_plan(
+            [{'source_run': MDLM_CDLM, 'snapshot_root': str(destination)}], self.base / 'results')
+        self.assertEqual([row['step'] for row in plan['entries']], [1000])
+        self.assertEqual([(row['step'], row['reason']) for row in plan['skipped_checkpoints']],
+                         [(1248, 'empty')])
+
+    def test_archive_without_usable_expected_checkpoints_fails_even_in_skip_mode(self):
+        for members in ([], [self.member('last.ckpt', payload=b'')]):
+            with self.subTest(members=len(members)):
+                self.write_archive(members)
+                with self.assertRaises(FileNotFoundError):
+                    evaluator.stage_archive(self.archive, MDLM_CDLM, self.staging)
+                self.assertFalse(list(self.staging.rglob('*.ckpt')))
+
+    def test_changed_archive_cannot_reuse_checkpoint_absent_from_new_snapshot(self):
+        self.write_archive()
+        destination = evaluator.stage_archive(self.archive, MDLM_CDLM, self.staging)
+        old_last = destination / self.namespace / 'checkpoints/last.ckpt'
+        self.assertTrue(old_last.is_file())
+        previous_stat = self.archive.stat()
+        self.write_archive([self.member('12-1000.ckpt', payload=b'new-model')])
+        os.utime(self.archive, ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns + 1_000_000))
+        destination = evaluator.stage_archive(self.archive, MDLM_CDLM, self.staging)
+        self.assertFalse((destination / self.namespace / 'checkpoints/last.ckpt').exists())
+        self.assertEqual((destination / self.namespace / 'checkpoints/12-1000.ckpt').read_bytes(),
+                         b'new-model')
+        plan = evaluator.build_plan(
+            [{'source_run': MDLM_CDLM, 'snapshot_root': str(destination)}], self.base / 'results')
+        self.assertEqual([row['step'] for row in plan['entries']], [1000])
 
     def test_duplicate_suffixes_under_different_prefixes_are_rejected(self):
         members = [self.member(name) for name, _ in self.files]
@@ -441,6 +537,42 @@ class CheckpointEvaluationOutputTest(unittest.TestCase):
             discover.side_effect = FileNotFoundError('Required input state is absent')
             with self.assertRaisesRegex(FileNotFoundError, 'input state is absent'):
                 evaluator.main(['--source-run', MDLM_CDLM[:8], '--output-dir', str(self.output)])
+            compose.assert_not_called()
+            worker.assert_not_called()
+
+    def test_cli_defaults_to_available_checkpoints_and_supports_explicit_strict_policy(self):
+        from omegaconf import OmegaConf
+        namespace, files = EXPECTED[CDLM_MMD]
+        directory = self.state / namespace / 'checkpoints'
+        directory.mkdir(parents=True)
+        for filename, step in files:
+            if step != 6000:
+                (directory / filename).write_bytes(b'checkpoint')
+        config = OmegaConf.create({'checkpointing': {'snapshot': False}})
+        args = ['--source-run', CDLM_MMD[:8], '--snapshot-root', str(self.state),
+                '--output-dir', str(self.output), '--plan-only']
+        stdout = io.StringIO()
+        with patch.object(evaluator, 'compose_evaluation_config', return_value=config) as compose, \
+                patch.object(evaluator, 'restore_evaluation_output', return_value=False), \
+                patch.object(evaluator.subprocess, 'run') as worker, \
+                patch('sys.stdout', stdout):
+            self.assertEqual(evaluator.main(args), 0)
+            plan = json.loads((self.output / 'plan.json').read_text())
+            self.assertEqual(plan['missing_checkpoints'], 'skip')
+            self.assertEqual(len(plan['entries']), 13)
+            self.assertEqual([row['step'] for row in plan['entries']][-2:], [6500, 7000])
+            self.assertEqual([row['step'] for row in plan['skipped_checkpoints']], [6000])
+            self.assertIn('step=00006000.ckpt', stdout.getvalue())
+            worker.assert_not_called()
+            compose.reset_mock()
+            with self.assertRaises(FileNotFoundError):
+                evaluator.main(args + ['--missing-checkpoints', 'error'])
+            compose.assert_not_called()
+            worker.assert_not_called()
+            for filename, _ in files:
+                (directory / filename).unlink(missing_ok=True)
+            with self.assertRaises(FileNotFoundError):
+                evaluator.main(args)
             compose.assert_not_called()
             worker.assert_not_called()
 

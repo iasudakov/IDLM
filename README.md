@@ -53,7 +53,9 @@ MMD → CDLM**, connect each run's snapshot to a separate evaluation block and r
 `scripts/eval_cdlm_checkpoints_nirvana.sh` with `CDLM_EVAL_SOURCE_RUN` set.
 The [three-run evaluation setup](docs/cdlm_checkpoint_eval.md) compares BF16 and
 FP32 logit normalization with the same BF16 forward, plus one-seed ancestral
-curves, on four GPUs. It creates separate Underdeep evaluation runs.
+curves, on four GPUs. It creates separate Underdeep evaluation runs. Missing
+checkpoint files in a partial snapshot are reported and skipped; a source with
+no usable checkpoints still fails before GPU initialization.
 
 The full-sequence **SDTT baseline for TinyGSM** is also available, adapted from
 [the official implementation](https://github.com/jdeschena/sdtt). Run
