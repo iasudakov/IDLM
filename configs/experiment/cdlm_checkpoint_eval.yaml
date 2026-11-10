@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - cdlm_tinygsm
+
+# Inference adapter only: never construct a teacher, optimizer or trajectories.
+mode: checkpoint_eval
+model:
+  force_fp32: False
+training:
+  finetune_path: ''
+  student_init_path: null
+adversarial_distill:
+  accum_batches: 1
+trainer:
+  devices: 4
+  accumulate_grad_batches: 1
+eval:
+  disable_ema: False
+  gsm8k_ancestral_seeds: [1]
+checkpointing:
+  snapshot_namespace: cdlm_checkpoint_eval
+  snapshot_trajectories: False
+logger:
+  name: cdlm checkpoint evaluation
+  resume: True
+  force_new_run: False

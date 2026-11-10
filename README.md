@@ -48,6 +48,13 @@ For **original MDLM → MMD with the complete model in FP32**, run
 paper's G=8 recipe on four GPUs and saves EMA weights to its own snapshot every
 500 updates. See the [full-FP32 setup](docs/mmd_tinygsm_fp32.md).
 
+To reevaluate all saved checkpoints of **MDLM → CDLM, CDLM → MMD and
+MMD → CDLM**, connect each run's snapshot to a separate evaluation block and run
+`scripts/eval_cdlm_checkpoints_nirvana.sh` with `CDLM_EVAL_SOURCE_RUN` set.
+The [three-run evaluation setup](docs/cdlm_checkpoint_eval.md) compares BF16 and
+FP32 logit normalization with the same BF16 forward, plus one-seed ancestral
+curves, on four GPUs. It creates separate Underdeep evaluation runs.
+
 The full-sequence **SDTT baseline for TinyGSM** is also available, adapted from
 [the official implementation](https://github.com/jdeschena/sdtt). Run
 `bash scripts/train_sdtt_tinygsm.sh` for the official 70,000-update schedule;
