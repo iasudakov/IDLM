@@ -117,6 +117,27 @@ def _candidates(directory, root):
     return candidates
 
 
+def resolve_snapshot_root(snapshot_root=None):
+    """Require an existing state directory; an empty SDK path is never cwd."""
+    if snapshot_root is None:
+        import nirvana_snapshot
+        try:
+            snapshot_root = nirvana_snapshot._sdk().snapshot.get_snapshot_path()
+        except Exception as error:
+            raise RuntimeError(
+                'Cannot locate the Nirvana snapshot. Connect the previous state or '
+                'set CDLM_SNAPSHOT_ROOT to an already unpacked snapshot directory.'
+            ) from error
+    if snapshot_root is None or not str(snapshot_root).strip():
+        raise FileNotFoundError(
+            'Snapshot state path is empty. Connect the previous state to the '
+            'Nirvana block or set CDLM_SNAPSHOT_ROOT to an unpacked state directory.')
+    root = Path(snapshot_root).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f'Snapshot state directory does not exist: {root}')
+    return root
+
+
 def select_checkpoint(snapshot_root=None, namespace=None):
     """Return the latest valid CDLM checkpoint's path and provenance as a dict.
 
@@ -132,18 +153,7 @@ def select_checkpoint(snapshot_root=None, namespace=None):
     ``global_step``, ``epoch``, ``size_bytes``, ``sha256`` and
     ``cdlm_cache_fingerprint``. It contains no loaded tensors or old run state.
     """
-    if snapshot_root is None:
-        import nirvana_snapshot
-        try:
-            snapshot_root = nirvana_snapshot._sdk().snapshot.get_snapshot_path()
-        except Exception as error:
-            raise RuntimeError(
-                'Cannot locate the Nirvana snapshot. Connect the previous state or '
-                'set CDLM_SNAPSHOT_ROOT to an already unpacked snapshot directory.'
-            ) from error
-    root = Path(snapshot_root).expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f'CDLM snapshot directory does not exist: {root}')
+    root = resolve_snapshot_root(snapshot_root)
     if namespace is not None:
         directories = [_namespace_path(root, namespace)]
     else:

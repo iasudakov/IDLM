@@ -30,6 +30,13 @@ SDK's snapshot discovery. A trajectory-only snapshot cannot supply trained CDLM
 weights. The [complete setup example](../examples/nirvana_mmd_from_cdlm_run_command.sh)
 includes the existing environment and input preparation.
 
+The launcher requires readable input state **before model asset preparation or
+GPU worker startup**. A missing/empty snapshot directory, a wrong namespace or
+a snapshot without a valid CDLM checkpoint stops the command with a nonzero
+exit status. Empty paths from the Nirvana SDK never fall back to the working
+directory. On success the log prints `[mmd-init] CDLM state verified` with the
+chosen checkpoint path and training step.
+
 Before launching training workers, the preflight inspects `.ckpt` files in the
 selected namespace's `checkpoints/` directory. It selects the greatest saved
 `global_step`, preferring `last.ckpt` only on ties. Unreadable files are reported
@@ -118,10 +125,15 @@ bash "$SOURCE_CODE_PATH/code/scripts/train_mmd_from_cdlm_tinygsm_nirvana.sh" \
   trainer.max_steps=20000
 ```
 
-On full MMD resume, the preflight skips CDLM selection and original feature asset
-preparation: both models are inside the MMD checkpoint. Data and tokenizers are
-still required. Full resume reuses the saved Underdeep run unless
-`logger.force_new_run=True` is supplied. Missing full checkpoints cause an error.
+On full MMD resume, the preflight validates the requested full MMD checkpoint
+and, if needed, restores it from the MMD snapshot namespace before starting
+`main`. Existing local state takes precedence; corrupt local files are errors,
+not a reason to silently load an older snapshot. Missing state, periodic
+weights-only exports, or a failed restore stop the command before GPU workers.
+CDLM selection and original feature asset preparation are skipped because both
+models are inside the full MMD checkpoint. Data and tokenizers are still required.
+Full resume reuses the saved Underdeep run unless `logger.force_new_run=True`
+is supplied.
 
 ## Verification
 

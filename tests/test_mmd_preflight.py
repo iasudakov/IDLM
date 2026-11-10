@@ -186,25 +186,31 @@ class MMDPreflightTest(unittest.TestCase):
                     preflight.prepare_overrides(cfg, code_dir=self.code)
         self.assertFalse((self.snapshot / 'mmd_initialization.json').exists())
 
-    def test_full_mmd_resume_skips_cdlm_selection_and_assets_entirely(self):
+    def test_full_mmd_resume_checks_its_own_state_without_cdlm_selection_or_assets(self):
         cfg = self.config('checkpointing.resume_from_ckpt=True',
                           'training.student_init_path=hf://unused/student/checkpoint.ckpt',
                           'training.finetune_path=hf://unused/teacher/checkpoint.ckpt',
                           'mmd.cdlm_snapshot_root=/missing/previous-state')
-        with patch.object(preflight, 'select_checkpoint') as select, \
+        target = str(self.output / 'checkpoints' / 'last.ckpt')
+        expected = ['checkpointing.resume_ckpt_path=' + json.dumps(target)]
+        with patch.object(preflight, 'validate_resume_checkpoint', return_value=target) as validate, \
+                patch.object(preflight, 'select_checkpoint') as select, \
                 patch.object(preflight, 'prepare_checkpoint') as prepare:
-            self.assertEqual(preflight.prepare_overrides(cfg, code_dir=self.code), [])
+            self.assertEqual(preflight.prepare_overrides(cfg, code_dir=self.code), expected)
+        validate.assert_called_once_with(cfg, code_dir=self.code)
         select.assert_not_called()
         prepare.assert_not_called()
         self.assertFalse(self.output.exists())
         output = self.base / 'resume-arguments.bin'
         with patch.object(preflight.Path, 'cwd', return_value=self.code), \
+                patch.object(preflight, 'validate_resume_checkpoint', return_value=target) as validate, \
                 patch.object(preflight, 'select_checkpoint') as select, \
                 patch.object(preflight, 'prepare_checkpoint') as prepare:
             result = preflight.main(['--output', str(output), *self.arguments(),
                                      'checkpointing.resume_from_ckpt=True'])
         self.assertEqual(result, 0)
-        self.assertEqual(output.read_bytes(), b'')
+        self.assertEqual(output.read_bytes(), (expected[0] + '\0').encode())
+        validate.assert_called_once()
         select.assert_not_called()
         prepare.assert_not_called()
 

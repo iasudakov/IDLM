@@ -1,6 +1,7 @@
 """Choose the latest CDLM snapshot checkpoint before MMD starts GPU workers."""
 
 import argparse
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -10,7 +11,7 @@ import tempfile
 
 from cdlm_checkpoint_assets import prepare_checkpoint
 from cdlm_preflight import compose_config
-from cdlm_snapshot_init import select_checkpoint
+from cdlm_snapshot_init import resolve_snapshot_root, select_checkpoint
 
 
 def _atomic_write(path, data):
@@ -33,6 +34,94 @@ def _hash(path):
     return digest.hexdigest()
 
 
+def _local_path(value, code_dir, label):
+    if value is None or not str(value).strip() or '://' in str(value):
+        raise ValueError(f'{label} must identify a local path for the Nirvana launcher.')
+    path = Path(str(value)).expanduser()
+    return path if path.is_absolute() else code_dir / path
+
+
+def _validate_full_mmd_state(path, require_ema):
+    from sdtt_checkpoint import read_checkpoint
+    from torch import Tensor
+
+    try:
+        checkpoint = read_checkpoint(str(path))
+    except Exception as error:
+        raise ValueError(f'Cannot read MMD resume state at {path}: {type(error).__name__}') from error
+    error_message = (f'A full MMD training state is required at {path}. '
+                     'Use the final last.ckpt; periodic student-only weights cannot resume training.')
+    if not isinstance(checkpoint, Mapping) or checkpoint.get('mmd_finetune_schema') != 1:
+        raise ValueError(error_message)
+    step = checkpoint.get('global_step')
+    state = checkpoint.get('state_dict')
+    if type(step) is not int or step < 0 or not isinstance(state, Mapping):
+        raise ValueError(error_message)
+    for prefix in ('backbone.', 'teacher.'):
+        if not any(isinstance(key, str) and key.startswith(prefix) and isinstance(value, Tensor)
+                   for key, value in state.items()):
+            raise ValueError(error_message)
+    for field in ('optimizer_states', 'lr_schedulers'):
+        values = checkpoint.get(field)
+        if not isinstance(values, list) or not values or not all(isinstance(v, Mapping) for v in values):
+            raise ValueError(error_message)
+    if not isinstance(checkpoint.get('loops'), Mapping) or not checkpoint['loops']:
+        raise ValueError(error_message)
+    if require_ema:
+        ema = checkpoint.get('ema')
+        if (not isinstance(ema, Mapping) or not isinstance(ema.get('shadow_params'), (list, tuple))
+                or not ema['shadow_params'] or not all(isinstance(value, Tensor) for value in ema['shadow_params'])):
+            raise ValueError(error_message + ' EMA weights are missing.')
+    return step
+
+
+def validate_resume_checkpoint(config, *, code_dir=None):
+    """Validate and restore full MMD state before main can launch GPU workers."""
+    code_dir = Path(code_dir or Path.cwd()).resolve()
+    target = _local_path(config.checkpointing.get('resume_ckpt_path'), code_dir,
+                         'checkpointing.resume_ckpt_path')
+    require_ema = config.training.ema > 0
+    if target.exists() or target.is_symlink():
+        # A corrupt explicitly requested local state must not fall back to an
+        # older snapshot. Preserve the same local-first policy as main._train.
+        if not target.is_file():
+            raise FileNotFoundError(f'MMD resume state is not a readable file: {target}')
+        step = _validate_full_mmd_state(target, require_ema)
+    else:
+        if not config.checkpointing.get('snapshot', False):
+            raise FileNotFoundError(f'MMD resume state is missing: {target}; snapshot restore is disabled.')
+        import nirvana_snapshot
+        run = _local_path(config.checkpointing.save_dir, code_dir, 'checkpointing.save_dir').resolve()
+        try:
+            relative = target.resolve().relative_to(run)
+        except ValueError as error:
+            raise FileNotFoundError(
+                f'MMD resume state is missing: {target}. Snapshot restoration only supplies files '
+                'inside checkpointing.save_dir.') from error
+        try:
+            root = resolve_snapshot_root()
+        except (RuntimeError, FileNotFoundError) as error:
+            raise FileNotFoundError(
+                f'MMD resume state is missing: {target}; no usable Nirvana snapshot is connected. '
+                'Connect the MMD state or set checkpointing.resume_ckpt_path to an existing '
+                'local full checkpoint.') from error
+        namespace = config.checkpointing.get('snapshot_namespace')
+        _, _, source_dir = nirvana_snapshot._paths(run, root, namespace)
+        source = source_dir / relative
+        if not source.resolve().is_relative_to(source_dir):
+            raise ValueError('MMD resume checkpoint escapes its snapshot namespace.')
+        if not source.is_file():
+            raise FileNotFoundError(
+                f'MMD resume state is missing from the connected snapshot: {source}. '
+                'Connect the MMD state containing the full final last.ckpt and select its '
+                'checkpointing.snapshot_namespace; a trajectory-only or periodic-weights state is insufficient.')
+        step = _validate_full_mmd_state(source, require_ema)
+        if not nirvana_snapshot.restore(str(run), enabled=True, namespace=namespace) or not target.is_file():
+            raise RuntimeError(f'MMD state restoration failed: {source} -> {target}. Training was not started.')
+    print(f'[mmd-init] Full MMD state verified: step={step}, checkpoint={target}', flush=True)
+    return str(target)
+
+
 def prepare_overrides(config, *, code_dir=None):
     if config.algo.name != 'mmd_finetune':
         raise ValueError('MMD snapshot preflight requires algo=mmd_finetune.')
@@ -42,18 +131,23 @@ def prepare_overrides(config, *, code_dir=None):
     # Full MMD resumes restore both student and feature network from their own
     # checkpoint. They must not depend on the input CDLM state still existing.
     if config.checkpointing.resume_from_ckpt:
-        print('[mmd-init] Full MMD resume: skipping CDLM checkpoint selection.', flush=True)
-        return []
+        target = validate_resume_checkpoint(config, code_dir=code_dir)
+        return ['checkpointing.resume_ckpt_path=' + json.dumps(target, ensure_ascii=False)]
     if config.training.student_init_path:
         raise ValueError('This launcher selects the latest CDLM snapshot checkpoint. '
                          'Use mmd.cdlm_snapshot_root / mmd.cdlm_snapshot_namespace '
                          'to select its source, or invoke main directly for an explicit student.')
     source_root = config.mmd.get('cdlm_snapshot_root')
-    if source_root:
+    if source_root is not None:
+        if not str(source_root).strip():
+            raise FileNotFoundError('CDLM snapshot state path is empty; connect the previous state.')
         source_root = Path(str(source_root)).expanduser()
         if not source_root.is_absolute():
             source_root = code_dir / source_root
+    print('[mmd-init] Checking required CDLM snapshot state before loading model assets.', flush=True)
     selected = select_checkpoint(source_root, config.mmd.get('cdlm_snapshot_namespace'))
+    print(f"[mmd-init] CDLM state verified: step={selected['global_step']}, checkpoint={selected['path']}",
+          flush=True)
     output_namespace = config.checkpointing.get('snapshot_namespace')
     if config.checkpointing.get('snapshot', False):
         if not output_namespace:
@@ -117,7 +211,7 @@ def main(argv=None):
     try:
         output.unlink(missing_ok=True)
         config = compose_config(overrides, resolved_fields=(
-            'checkpointing.save_dir', 'checkpointing.snapshot_namespace',
+            'checkpointing.save_dir', 'checkpointing.snapshot_namespace', 'checkpointing.resume_ckpt_path',
             'mmd.cdlm_snapshot_root', 'mmd.cdlm_snapshot_namespace'))
         values = prepare_overrides(config)
         data = ('\0'.join(values) + '\0').encode() if values else b''
