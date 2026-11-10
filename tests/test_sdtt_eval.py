@@ -103,10 +103,10 @@ class DecoderTest(unittest.TestCase):
 
 
 class PromptAndReportTest(unittest.TestCase):
-    def test_reference_grid_and_literal_separator(self):
-        self.assertEqual(len(sdtt_eval.THRESHOLDS), 27)
+    def test_extended_reference_grid_and_literal_separator(self):
+        self.assertEqual(len(sdtt_eval.THRESHOLDS), 29)
         self.assertEqual(sdtt_eval.THRESHOLDS[:3], [.325, .35, .375])
-        self.assertEqual(sdtt_eval.THRESHOLDS[-2:], [.95, .98])
+        self.assertEqual(sdtt_eval.THRESHOLDS[-4:], [.95, .98, .99, .995])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'examples.json'
             path.write_text(json.dumps([{'prompt': ' Q ', 'response_ground_truth': '#### 42'}]))

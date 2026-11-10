@@ -30,7 +30,7 @@ original MDLM once, records its SHA-256 for both roles in
 | Optimizer | AdamW, LR `1e-5`, betas `.9/.999`, epsilon `1e-8`, weight decay 0 |
 | Schedule | 2500 warmup updates, 7000 updates total |
 | EMA | `0.9999`, original MDLM history retained |
-| Validation | Every 500 optimizer updates, ten confidence thresholds, T=0 |
+| Validation | Every 500 optimizer updates, thirteen confidence thresholds, T=0 |
 | Periodic export | Student EMA weights only, every 500 optimizer updates, saved to snapshot |
 | Output/snapshot namespace | `mmd_tinygsm_fp32` |
 

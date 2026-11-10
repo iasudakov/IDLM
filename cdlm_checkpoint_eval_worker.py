@@ -13,7 +13,7 @@ from pathlib import Path
 
 NORMALIZATIONS = ('bf16', 'fp32')
 ANCESTRAL_STEPS = [4, 8, 16, 32, 48, 64]
-CONFIDENCE_THRESHOLDS = [.325, .4, .475, .55, .625, .7, .775, .85, .925, .98]
+CONFIDENCE_THRESHOLDS = [.325, .4, .475, .55, .625, .7, .775, .85, .925, .95, .98, .99, .995]
 REPORT_SCHEMA = 1
 _active_publisher = None
 
@@ -108,7 +108,7 @@ def validate_config(config):
     if float(config.eval.gsm8k_pareto_temperature) != 0.:
         raise ValueError('Confidence token temperature must be zero.')
     if list(config.eval.gsm8k_pareto_thresholds) != CONFIDENCE_THRESHOLDS:
-        raise ValueError('Use the common ten confidence thresholds for both normalizations.')
+        raise ValueError('Use the common thirteen confidence thresholds for both normalizations.')
     if (list(config.eval.gsm8k_ancestral_steps) != ANCESTRAL_STEPS or
             list(config.eval.gsm8k_ancestral_seeds) != [1] or
             config.eval.gsm8k_ancestral_final_denoise is not True):

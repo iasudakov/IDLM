@@ -93,7 +93,7 @@ saved-step validation; corrupt weights are errors rather than silently skipped.
 - Small full-attention MDLM, length 512, the original literal `\n` separator,
   batch size 16 per GPU and the same execution-based grading.
 - **Confidence:** temperature 0, thresholds
-  `[0.325,0.4,0.475,0.55,0.625,0.7,0.775,0.85,0.925,0.98]`.
+  `[0.325,0.4,0.475,0.55,0.625,0.7,0.775,0.85,0.925,0.95,0.98,0.99,0.995]`.
   Run twice with the **same BF16 transformer forward**, changing only logit
   normalization between BF16 and FP32. Both accuracy and actual NFE are recorded.
 - **Ancestral:** temperature 0, budgets `[4,8,16,32,48,64]`, one generation
@@ -119,6 +119,12 @@ output directory. When restarting from an evaluation state, the launcher
 restores this evaluation namespace into an empty local output directory. A
 completed matching report is reused; partial checkpoint evaluations are repeated.
 Changed checkpoint contents or evaluation settings must not silently reuse old results.
+
+The extended 13-threshold grid changes the evaluation protocol. Results from
+the older ten-threshold sweep are not silently treated as complete. To rerun
+from a state containing those reports, use a new local output directory and
+`--no-restore-results`, for example `--output-dir "$SOURCE_CODE_PATH/code/cdlm_checkpoint_eval_13" --no-restore-results`.
+The same model weights can be reused; no retraining is required.
 
 Each checkpoint has a `result.json`; `summary.csv` combines the confidence and
 ancestral results for the launch. Confidence metrics carry `_bf16norm` and

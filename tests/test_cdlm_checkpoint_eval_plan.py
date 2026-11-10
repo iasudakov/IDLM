@@ -387,7 +387,7 @@ class CheckpointEvaluationConfigTest(unittest.TestCase):
         self.assertFalse(cfg.eval.disable_ema)
         self.assertEqual(cfg.eval.gsm8k_pareto_temperature, 0.)
         self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds),
-                         [.325, .4, .475, .55, .625, .7, .775, .85, .925, .98])
+                         [.325, .4, .475, .55, .625, .7, .775, .85, .925, .95, .98, .99, .995])
         self.assertEqual(list(cfg.eval.gsm8k_ancestral_steps), [4, 8, 16, 32, 48, 64])
         self.assertEqual(list(cfg.eval.gsm8k_ancestral_seeds), [1])
         self.assertTrue(cfg.eval.gsm8k_ancestral_final_denoise)
@@ -462,10 +462,10 @@ class CheckpointEvaluationOutputTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'could not be restored'):
                 evaluator.restore_evaluation_output(self.output, 'cdlm_checkpoint_eval')
 
-    def test_summary_preserves_source_step_and_dtype_in_26_rows_per_checkpoint(self):
+    def test_summary_preserves_source_step_and_dtype_in_32_rows_per_checkpoint(self):
         plan = {'output_dir': str(self.output), 'entries': []}
         self.output.mkdir()
-        thresholds = [.325, .4, .475, .55, .625, .7, .775, .85, .925, .98]
+        thresholds = [.325, .4, .475, .55, .625, .7, .775, .85, .925, .95, .98, .99, .995]
         for uid, step in ((MDLM_CDLM, 1248), (CDLM_MMD, 7000)):
             entry = {'source_run': uid, 'family': evaluator.SOURCE_RUNS[uid]['family'],
                      'step': step, 'output_dir': str(self.output / uid)}
@@ -488,10 +488,10 @@ class CheckpointEvaluationOutputTest(unittest.TestCase):
         output = evaluator.write_summary(plan)
         with output.open(newline='') as stream:
             rows = list(csv.DictReader(stream))
-        self.assertEqual(len(rows), 52)
+        self.assertEqual(len(rows), 64)
         for entry in plan['entries']:
             selected = [row for row in rows if row['source_run'] == entry['source_run']]
-            self.assertEqual(len(selected), 26)
+            self.assertEqual(len(selected), 32)
             self.assertEqual({row['checkpoint_step'] for row in selected}, {str(entry['step'])})
             self.assertEqual({row['family'] for row in selected}, {entry['family']})
             self.assertEqual({row['seed'] for row in selected}, {'1'})

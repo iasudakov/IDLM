@@ -57,6 +57,14 @@ curves, on four GPUs. It creates separate Underdeep evaluation runs. Missing
 checkpoint files in a partial snapshot are reported and skipped; a source with
 no usable checkpoints still fails before GPU initialization.
 
+To evaluate the **original published MMD checkpoint** with that same protocol,
+run `bash scripts/eval_mmd_checkpoint_nirvana.sh`. It prepares the README's
+Hugging Face weights once (or reuses cached/snapshot/local weights), then runs
+dual-normalization confidence and one-seed ancestral evaluation on four GPUs.
+All checkpoint evaluations use the extended 13-threshold grid, including
+`0.95`, `0.99` and `0.995`. See [the MMD evaluation setup](docs/mmd_checkpoint_eval.md)
+and [complete Nirvana command](examples/nirvana_mmd_checkpoint_eval_run_command.sh).
+
 The full-sequence **SDTT baseline for TinyGSM** is also available, adapted from
 [the official implementation](https://github.com/jdeschena/sdtt). Run
 `bash scripts/train_sdtt_tinygsm.sh` for the official 70,000-update schedule;

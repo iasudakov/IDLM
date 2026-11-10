@@ -18,7 +18,7 @@ from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_THRESHOLDS = [i / 1000 for i in range(325, 951, 25)] + [.98]
-VALIDATION_THRESHOLDS = [.325, .4, .475, .55, .625, .7, .775, .85, .925, .98]
+VALIDATION_THRESHOLDS = [.325, .4, .475, .55, .625, .7, .775, .85, .925, .95, .98, .99, .995]
 
 
 def compose_cli(*overrides):

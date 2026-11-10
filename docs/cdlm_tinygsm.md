@@ -245,7 +245,7 @@ bash scripts/generation_cdlm_tinygsm.sh \
   eval.generated_samples_path=/absolute/path/to/results/cdlm_tinygsm_eval.json
 ```
 
-Evaluation reuses the MMD/SDTT confidence-threshold decoder and execution scorer. Training validation uses 10 thresholds: `0.325, 0.4, 0.475, 0.55, 0.625, 0.7, 0.775, 0.85, 0.925, 0.98`. The standalone generation script retains all 27 historical thresholds, `0.325, 0.35, …, 0.95, 0.98`. Both use greedy token proposals at temperature zero; `eval.gsm8k_pareto_thresholds=[...]` overrides either sweep. Decoding completes all 512 positions, including padding after the answer. NFE is the mean active denoiser calls per example, including a capped final removal if needed; accuracy uses the same execution-based math grader and five-second timeout.
+Evaluation reuses the MMD/SDTT confidence-threshold decoder and execution scorer. Training validation uses 13 thresholds: `0.325, 0.4, 0.475, 0.55, 0.625, 0.7, 0.775, 0.85, 0.925, 0.95, 0.98, 0.99, 0.995`. The standalone generation script uses 29 thresholds: the 27 historical values `0.325, 0.35, …, 0.95, 0.98`, plus `0.99, 0.995`. Both use greedy token proposals at temperature zero; `eval.gsm8k_pareto_thresholds=[...]` overrides either sweep. Decoding completes all 512 positions, including padding after the answer. NFE is the mean active denoiser calls per example, including a capped final removal if needed; accuracy uses the same execution-based math grader and five-second timeout.
 
 CDLM evaluates a separate **ancestral sampler at temperature zero**, enabled
 by `eval.gsm8k_greedy_token=True`. The default curve uses configured budgets

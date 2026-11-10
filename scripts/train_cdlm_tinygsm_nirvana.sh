@@ -44,7 +44,7 @@ cdlm_overrides=(
   eval.gsm8k_every_n_validations=1 eval.gsm8k_batch_size=16
   eval.gsm8k_greedy_token=True
   eval.gsm8k_pareto_temperature=0.0
-  'eval.gsm8k_pareto_thresholds=[0.325,0.4,0.475,0.55,0.625,0.7,0.775,0.85,0.925,0.98]'
+  'eval.gsm8k_pareto_thresholds=[0.325,0.4,0.475,0.55,0.625,0.7,0.775,0.85,0.925,0.95,0.98,0.99,0.995]'
   callbacks.checkpoint_monitor.monitor=val/nll
   callbacks.checkpoint_every_n_steps.every_n_train_steps=1000
   callbacks.checkpoint_every_n_steps.save_top_k=-1

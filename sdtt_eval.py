@@ -1,9 +1,10 @@
 """GSM8K evaluation shared with the MDLM-MMD comparison protocol.
 
 Adapted from dlm-mmd/mmd/tinygsm_validation.py (commit ebb2a6b).
-The default threshold grid follows reference run
-3e0ac6b1-7a8f-43c3-af58-d9e21b886da7. Optional ancestral T=0 evaluation
-follows archived S-FLM TinyGSM source 14594e: random reveals and argmax tokens.
+The default threshold grid extends reference run
+3e0ac6b1-7a8f-43c3-af58-d9e21b886da7 with 0.99 and 0.995. Optional ancestral
+T=0 evaluation follows archived S-FLM TinyGSM source 14594e: random reveals
+and argmax tokens.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +21,7 @@ from hydra.utils import to_absolute_path
 import torch
 import torch.distributed as dist
 
-THRESHOLDS = [i / 1000 for i in range(325, 951, 25)] + [.98]
+THRESHOLDS = [i / 1000 for i in range(325, 951, 25)] + [.98, .99, .995]
 
 
 def _rng_devices(model):

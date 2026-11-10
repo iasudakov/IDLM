@@ -86,7 +86,7 @@ a matched training recipe, not a claim of bitwise reproduction.
 
 Underdeep keeps the same `generative-models/tinygsm` experiment, with loss,
 reward, advantage, learning rate, NLL and confidence-validation metrics.
-Confidence decoding uses the reduced 10-threshold grid and temperature 0 on
+Confidence decoding uses the reduced 13-threshold grid and temperature 0 on
 all 1,319 GSM8K questions. **Ancestral validation is disabled for this stage.**
 The previous CDLM and SDTT presets retain their existing evaluation settings.
 

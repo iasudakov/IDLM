@@ -306,7 +306,7 @@ class PipelineTest(unittest.TestCase):
                 result_path = Path(entry['output_dir']) / 'result.json'
                 partial = json.loads(result_path.read_text())
                 self.assertFalse(partial['complete'])
-                self.assertEqual(len(partial['confidence']['bf16']), 10)
+                self.assertEqual(len(partial['confidence']['bf16']), 13)
                 self.assertEqual(len(partial['confidence']['fp32']), 3)
                 snapshots.assert_not_called()
                 fail[0] = False
@@ -314,7 +314,7 @@ class PipelineTest(unittest.TestCase):
                 worker.run(plan, config)
                 complete = json.loads(result_path.read_text())
                 self.assertTrue(complete['complete'])
-                self.assertEqual(len(calls), 20)
+                self.assertEqual(len(calls), 26)
                 self.assertEqual(len(complete['ancestral']['points']), 6)
                 self.assertEqual(snapshots.call_count, 2)
                 calls.clear()

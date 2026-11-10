@@ -309,6 +309,38 @@ def write_summary(plan):
     return path
 
 
+def execute_plan(plan, config, *, devices, plan_only=False, restore_results=True,
+                 worker_env=None):
+    """Publish a checked plan and run the common evaluation/reporting lifecycle."""
+    from cdlm_checkpoint_eval_worker import validate_plan
+    from omegaconf import OmegaConf
+    output = validate_plan(plan)
+    if type(devices) is not int or devices <= 0:
+        raise ValueError('Evaluation devices must be a positive integer.')
+    if restore_results:
+        restore_evaluation_output(output, plan['snapshot_namespace'])
+    output.mkdir(parents=True, exist_ok=True)
+    plan['devices'] = devices
+    _atomic_json(output / 'plan.json', plan)
+    OmegaConf.save(config, output / 'evaluation_config.yaml')
+    if plan_only:
+        print(f'[checkpoint-eval] Plan only; no GPU work: {output / "plan.json"}', flush=True)
+        return 0
+    command = [sys.executable, '-u', '-m', 'torch.distributed.run', '--standalone',
+               f'--nproc_per_node={devices}', '-m', 'cdlm_checkpoint_eval_worker',
+               '--plan', str(output / 'plan.json'), '--config', str(output / 'evaluation_config.yaml')]
+    kwargs = {} if worker_env is None else {'env': worker_env}
+    result = subprocess.run(command, check=False, **kwargs)
+    if result.returncode == 0:
+        summary = write_summary(plan)
+        print(f'[checkpoint-eval] Combined results: {summary}', flush=True)
+        if config.checkpointing.snapshot:
+            import nirvana_snapshot
+            if not nirvana_snapshot.save(output, namespace=plan['snapshot_namespace'], reason='evaluation CSV summary'):
+                raise RuntimeError('Summary is available locally but could not be published to snapshot.')
+    return result.returncode
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-run', default=os.environ.get('CDLM_EVAL_SOURCE_RUN'))
@@ -362,30 +394,10 @@ def main(argv=None):
               f'(step={item["step"]}): {item["checkpoint"]}', flush=True)
     config = compose_evaluation_config(overrides, code_dir=Path.cwd().resolve(),
                                        output_dir=output, devices=options.devices)
-    if not options.no_restore_results:
-        restore_evaluation_output(output, plan['snapshot_namespace'])
-    output.mkdir(parents=True, exist_ok=True)
-    plan['devices'] = options.devices
-    _atomic_json(output / 'plan.json', plan)
-    from omegaconf import OmegaConf
-    OmegaConf.save(config, output / 'evaluation_config.yaml')
     print(f'[checkpoint-eval] Verified {len(plan["entries"])} checkpoints from {len(prepared)} source runs; '
           f'skipped {len(plan["skipped_checkpoints"])} absent/empty checkpoints.', flush=True)
-    if options.plan_only:
-        print(f'[checkpoint-eval] Plan only; no GPU work: {output / "plan.json"}', flush=True)
-        return 0
-    command = [sys.executable, '-u', '-m', 'torch.distributed.run', '--standalone',
-               f'--nproc_per_node={options.devices}', '-m', 'cdlm_checkpoint_eval_worker',
-               '--plan', str(output / 'plan.json'), '--config', str(output / 'evaluation_config.yaml')]
-    result = subprocess.run(command, check=False)
-    if result.returncode == 0:
-        summary = write_summary(plan)
-        print(f'[checkpoint-eval] Combined results: {summary}', flush=True)
-        if config.checkpointing.snapshot:
-            import nirvana_snapshot
-            if not nirvana_snapshot.save(output, namespace=plan['snapshot_namespace'], reason='evaluation CSV summary'):
-                raise RuntimeError('Summary is available locally but could not be published to snapshot.')
-    return result.returncode
+    return execute_plan(plan, config, devices=options.devices, plan_only=options.plan_only,
+                        restore_results=not options.no_restore_results)
 
 
 if __name__ == '__main__':
