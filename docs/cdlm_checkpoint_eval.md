@@ -29,22 +29,28 @@ The first block receives `5e0ee1da`'s state:
 
 ```bash
 CDLM_EVAL_SOURCE_RUN=5e0ee1da \
-bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh"
+bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh" --devices 1
 ```
 
 The second block receives `dbb3b25d`'s state:
 
 ```bash
 CDLM_EVAL_SOURCE_RUN=dbb3b25d \
-bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh"
+bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh" --devices 1
 ```
 
 The third block receives `8cb53b89`'s state:
 
 ```bash
 CDLM_EVAL_SOURCE_RUN=8cb53b89 \
-bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh"
+bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh" --devices 1
 ```
+
+These commands use one GPU per Nirvana block. Request one GPU in the block's
+resources as well. Use `--devices 4` for four GPUs; omitting `--devices` also
+defaults to four. Use this CLI option rather than `trainer.devices=1`, since it
+sets both the worker count and the resolved model configuration. Batch size
+remains 16 per GPU, and all 1,319 questions are evaluated on either setup.
 
 Keep the existing tokenizer bundle under `code/cache_dir/tinygsm_mmd_offline_bundle` and GSM8K JSON under
 `code/data/gsm8k_test.json`, or provide `model_weights_dir` and
@@ -86,8 +92,9 @@ saved-step validation; corrupt weights are errors rather than silently skipped.
 
 ## Common evaluation protocol
 
-- Four GPUs, one checkpoint evaluated at a time; all 1,319 GSM8K questions are
-  partitioned across ranks exactly as in distributed training validation.
+- One or four GPUs, one checkpoint evaluated at a time; all 1,319 GSM8K questions
+  are partitioned across ranks exactly as in distributed training validation.
+  With `--devices 1`, the single worker evaluates every question.
 - EMA weights in every case. Full CDLM checkpoints supply their saved EMA;
   MMD weights-only exports already contain EMA and are not averaged again.
 - Small full-attention MDLM, length 512, the original literal `\n` separator,
@@ -119,6 +126,24 @@ output directory. When restarting from an evaluation state, the launcher
 restores this evaluation namespace into an empty local output directory. A
 completed matching report is reused; partial checkpoint evaluations are repeated.
 Changed checkpoint contents or evaluation settings must not silently reuse old results.
+
+Changing from four GPUs to one changes the protocol identity. If the connected
+state contains previous evaluation results, start fresh reports with:
+
+```bash
+CDLM_EVAL_SOURCE_RUN=5e0ee1da \
+bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh" \
+  --devices 1 \
+  --output-dir "$SOURCE_CODE_PATH/code/cdlm_checkpoint_eval_1gpu" \
+  --no-restore-results
+```
+
+Keep the matching source run and its model state. These options prevent reuse
+of evaluation reports; the same checkpoint files are still read from the state.
+For direct comparisons, use the same GPU count across models: ancestral RNG
+streams and batch assignments depend on the rank count, so seed 1 does not
+guarantee identical generations between one and four GPUs. Underdeep logging,
+plots, JSON/CSV results and snapshot publication remain enabled on one GPU.
 
 The extended 13-threshold grid changes the evaluation protocol. Results from
 the older ten-threshold sweep are not silently treated as complete. To rerun

@@ -121,7 +121,8 @@ def main(argv=None):
                         help='Published hf:// checkpoint (default) or explicit local .ckpt path.')
     parser.add_argument('--output-dir', default=os.environ.get(
         'MMD_EVAL_OUTPUT_DIR', str(Path.cwd() / 'mmd_checkpoint_eval')))
-    parser.add_argument('--devices', type=int, default=4)
+    parser.add_argument('--devices', type=int, default=4,
+                        help='Number of GPU workers (default: 4); use --devices 1 for one GPU.')
     parser.add_argument('--plan-only', action='store_true')
     parser.add_argument('--no-restore-results', action='store_true')
     options, overrides = parser.parse_known_args(argv)

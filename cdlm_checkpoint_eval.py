@@ -348,7 +348,8 @@ def main(argv=None):
     parser.add_argument('--sources-json', help='JSON list of source_run/snapshot_root objects; paths can be unpacked directories or tar archives.')
     parser.add_argument('--input-root', default=os.environ.get('INPUT_PATH'), help='Directory containing cdlm_state, cdlm_mmd_state and mmd_cdlm_state inputs.')
     parser.add_argument('--output-dir', default=os.environ.get('CDLM_EVAL_OUTPUT_DIR', str(Path.cwd() / 'cdlm_checkpoint_eval')))
-    parser.add_argument('--devices', type=int, default=4)
+    parser.add_argument('--devices', type=int, default=4,
+                        help='Number of GPU workers (default: 4); use --devices 1 for one GPU.')
     parser.add_argument('--missing-checkpoints', choices=('skip', 'error'), default='skip',
                         help='Skip and report absent/empty catalog checkpoints (default), or require the complete catalog.')
     parser.add_argument('--plan-only', action='store_true')

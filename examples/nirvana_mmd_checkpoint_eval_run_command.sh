@@ -29,7 +29,9 @@ nvidia-smi
 # No CDLM training snapshot is required. A prior MMD -> CDLM snapshot can reuse
 # its published MMD asset. Keep the same tokenizer/data inputs used in training.
 # The published model is public; only its missing weights may be downloaded.
+# Request one GPU in the Nirvana block; use --devices 4 for a four-GPU block.
 bash "$SOURCE_CODE_PATH/code/scripts/eval_mmd_checkpoint_nirvana.sh" \
+  --devices 1 \
   "model_weights_dir=$INPUT_PATH/tinygsm_mmd_offline_bundle" \
   "eval.gsm8k_data_path=$INPUT_PATH/nirvana_checkpoints/data/gsm8k_test.json" \
   'logger.name=mdlm to mmd published checkpoint dual norm ancestral'

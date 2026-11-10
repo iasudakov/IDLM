@@ -1,6 +1,6 @@
 # Evaluate the original TinyGSM MMD checkpoint
 
-This is one evaluation launch on four GPUs, using the same inference worker as
+This is one evaluation launch on one or four GPUs, using the same inference worker as
 the MDLM → CDLM, CDLM → MMD and MMD → CDLM checkpoint comparisons. It does not
 train, collect trajectories or require a CDLM training state.
 
@@ -10,6 +10,7 @@ linked in the project README:
 
 ```bash
 bash "$SOURCE_CODE_PATH/code/scripts/eval_mmd_checkpoint_nirvana.sh" \
+  --devices 1 \
   'logger.name=mdlm to mmd published checkpoint dual norm ancestral'
 ```
 
@@ -18,14 +19,19 @@ still in the Nirvana inputs rather than the source code directory:
 
 ```bash
 bash "$SOURCE_CODE_PATH/code/scripts/eval_mmd_checkpoint_nirvana.sh" \
+  --devices 1 \
   "model_weights_dir=$INPUT_PATH/tinygsm_mmd_offline_bundle" \
   "eval.gsm8k_data_path=$INPUT_PATH/nirvana_checkpoints/data/gsm8k_test.json" \
   'logger.name=mdlm to mmd published checkpoint dual norm ancestral'
 ```
 
 The [complete run-command](../examples/nirvana_mmd_checkpoint_eval_run_command.sh)
-includes the environment setup. Four B300 GPUs use one process each, with
-16 evaluation examples per GPU. There is no gradient accumulation or optimizer.
+includes the environment setup for one GPU. Request one GPU in the Nirvana block's
+resources as well. `--devices 1` starts one worker and sets the matching model
+configuration; use it rather than a `trainer.devices=1` override. `--devices 4`
+uses four workers, and omitting the option also defaults to four. Batch size is
+16 per GPU; all 1,319 questions are evaluated in both cases. There is no gradient
+accumulation or optimizer.
 
 ## Weights and offline assets
 
@@ -43,6 +49,7 @@ An explicitly requested local file never falls back to a different model:
 
 ```bash
 bash "$SOURCE_CODE_PATH/code/scripts/eval_mmd_checkpoint_nirvana.sh" \
+  --devices 1 \
   --checkpoint "$INPUT_PATH/mmd_tinygsm.ckpt" \
   'logger.name=mdlm to mmd local checkpoint dual norm ancestral'
 ```
@@ -82,6 +89,23 @@ Results and tracker metadata are published to the separate `mmd_checkpoint_eval`
 Nirvana snapshot namespace. Reconnecting that state restores completed matching
 results; different checkpoint bytes or protocol settings cannot silently reuse
 old results. Change `--output-dir` to select another local output directory.
+
+GPU count is part of the protocol identity. To evaluate on one GPU from a state
+containing earlier four-GPU evaluation reports, use a fresh output directory and
+disable report restoration:
+
+```bash
+bash "$SOURCE_CODE_PATH/code/scripts/eval_mmd_checkpoint_nirvana.sh" \
+  --devices 1 \
+  --output-dir "$SOURCE_CODE_PATH/code/mmd_checkpoint_eval_1gpu" \
+  --no-restore-results \
+  'logger.name=mdlm to mmd published checkpoint 1gpu dual norm ancestral'
+```
+
+Prepared weights in the connected state remain reusable. Underdeep logging,
+plots and snapshot publication stay enabled. Use the same GPU count for all
+models being compared: changing ranks changes ancestral RNG streams and batch
+assignments, so the same seed need not produce the same generations.
 
 The expanded threshold grid is a new evaluation protocol. Existing results from
 the earlier ten-threshold grid remain valid for those thresholds, but cannot be

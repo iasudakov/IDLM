@@ -25,7 +25,9 @@ nvidia-smi
 # Make three launches, changing only the value below and the connected state:
 # 5e0ee1da = MDLM -> CDLM; dbb3b25d = CDLM -> MMD; 8cb53b89 = MMD -> CDLM.
 # Keep the same two offline asset inputs used in training; do not move weights.
+# Request one GPU in the Nirvana block; use --devices 4 for a four-GPU block.
 CDLM_EVAL_SOURCE_RUN=5e0ee1da \
 bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh" \
+  --devices 1 \
   "model_weights_dir=$INPUT_PATH/tinygsm_mmd_offline_bundle" \
   "eval.gsm8k_data_path=$INPUT_PATH/nirvana_checkpoints/data/gsm8k_test.json"
