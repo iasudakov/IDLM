@@ -357,6 +357,10 @@ class FrozenSdllmModel(nn.Module):
       flush()
       return converted
 
+    # TinyGSM's vocab_size delegates to len(HF tokenizer), whose added-token
+    # accounting can be expensive. Read it once per call, not for every token.
+    # Refresh on the next call so this does not introduce a persistent cache.
+    source_vocab_size = source_tokenizer.vocab_size
     native_rows, answer_offsets = [], []
     for row_index, (row, mask) in enumerate(zip(rows, masks)):
       if any(type(flag) is not bool for flag in mask):
@@ -372,7 +376,7 @@ class FrozenSdllmModel(nn.Module):
       if source_mask_index in active:
         raise ValueError('TinyGSM SDLLM features require clean source prompt and '
                          'answer tokens; a source MASK was encountered')
-      if any(token < 0 or token >= source_tokenizer.vocab_size for token in active):
+      if any(token < 0 or token >= source_vocab_size for token in active):
         raise ValueError('SDLLM source token IDs are outside the TinyGSM vocabulary')
       prompt_ids = convert_segment(active[:start], prompt=True)
       answer_ids = convert_segment(active[start:], prompt=False)

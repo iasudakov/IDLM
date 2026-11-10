@@ -176,6 +176,12 @@ uses separate blocked kernels for each sentence pair. Automatic bandwidth
 samples up to 512 real features and consumes RNG. Production speed has not
 been measured; this option does not claim the old feature path's throughput.
 
+TinyGSM retokenization reads the source vocabulary size once per call. The
+wrapped Hugging Face tokenizer computes its size including added tokens;
+querying it inside the per-token validation loop caused substantial CPU
+overhead. Hoisting this lookup leaves token IDs, answer boundaries, validation
+rules and RNG consumption unchanged. It is refreshed on each call.
+
 ## Verification
 
 ```bash

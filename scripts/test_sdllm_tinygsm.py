@@ -180,6 +180,33 @@ class TinyGsmSdllmTests(unittest.TestCase):
         self.assertEqual(offsets, [2])
         self.assertEqual(native[0][offsets[0]:], self.native_text('lo') + [2])
 
+    def test_added_vocabulary_lookup_is_bounded_and_refreshes_between_calls(self):
+        examples = [('Q?\n', 'print(1)'), ('Longer?\n', 'return 12')]
+        tokens, selected, _, _ = self.batch(examples)
+        loaded = self.load()
+        expected_rows, expected_offsets = [], []
+        for prompt, answer in examples:
+            prefix = [1] + self.native_text(prompt)
+            expected_rows.append(prefix + self.native_text(answer) + [2])
+            expected_offsets.append(len(prefix))
+        rng = torch.get_rng_state().clone()
+        with mock.patch.object(SourceTokenizer, 'vocab_size',
+                               new_callable=mock.PropertyMock,
+                               return_value=MASK) as vocab_size:
+            actual = loaded.retokenize_conditioned(
+                tokens, self.source, MASK, selected)
+            self.assertEqual(actual, (expected_rows, expected_offsets))
+            # len(HF tokenizer) is expensive with added tokens. Its cost must
+            # not grow with the number of rows or tokens in this call.
+            self.assertEqual(vocab_size.call_count, 1)
+            self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+            # No permanent cache: a subsequent call still validates against
+            # the tokenizer's current vocabulary size.
+            vocab_size.return_value = 1
+            with self.assertRaisesRegex(ValueError, 'outside the TinyGSM vocabulary'):
+                loaded.retokenize_conditioned(tokens, self.source, MASK, selected)
+            self.assertEqual(vocab_size.call_count, 2)
+
     def test_candidate_eos_and_generated_pad_inside_answer_are_not_truncation(self):
         tokens, selected, starts, stops = self.batch([('Q?\n', 'hello world')])
         loaded = self.load()
