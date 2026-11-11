@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import transformers
 
 import confidence_sampling
+from eval_precision import capture_rng_state, fp32_prediction_normalization, replay_rng_state
 import dataloader
 import metrics
 import models
@@ -573,6 +574,20 @@ class TrainerBase(L.LightningModule):
 
   @torch.no_grad()
   def _log_gsm8k_pareto(self, dataset, indices, batch_size):
+    """Keep the original sweep and optionally add FP32-normalized predictions."""
+    if not self.config.eval.get('gsm8k_pareto_thresholds', None):
+      return
+    fp32 = self.config.eval.get('gsm8k_pareto_fp32', True)
+    if not isinstance(fp32, bool):
+      raise ValueError('eval.gsm8k_pareto_fp32 must be a boolean')
+    initial_rng = capture_rng_state() if fp32 else None
+    self._run_gsm8k_pareto(dataset, indices, batch_size)
+    if fp32:
+      # Paired starting RNGs, with no extra effect on subsequent training.
+      with replay_rng_state(initial_rng), fp32_prediction_normalization(self):
+        self._run_gsm8k_pareto(dataset, indices, batch_size, suffix='_fp32norm')
+
+  def _run_gsm8k_pareto(self, dataset, indices, batch_size, suffix=''):
     """Sweep the adaptive sampler's threshold and publish the frontier.
 
     A single `val/gsm8k_acc` cannot describe `low_confidence_dynamic`, because
@@ -612,7 +627,7 @@ class TrainerBase(L.LightningModule):
         nfe = sum(per_seq) / max(len(per_seq), 1)
         curve.append({'threshold': threshold, 'nfe': nfe,
                       'accuracy': accuracy})
-        print(f'[gsm8k-pareto] step {self.global_step} thr {threshold}: '
+        print(f'[gsm8k-pareto{suffix}] step {self.global_step} thr {threshold}: '
               f'{accuracy * 100:.2f}% ({correct}/{len(rows)}) '
               f'at {nfe:.1f} NFE/seq', flush=True)
     finally:
@@ -621,20 +636,20 @@ class TrainerBase(L.LightningModule):
 
     if self.trainer.global_rank != 0 or not curve:
       return
-    self._publish_pareto(curve)
+    self._publish_pareto(curve, suffix=suffix)
 
-  def _publish_pareto(self, curve):
+  def _publish_pareto(self, curve, suffix=''):
     """Log one checkpoint's frontier: scalar series, trends, and the figure."""
     logger = self.trainer.logger
     for point in curve:
       # Per-threshold trends against the *training* step, so each threshold also
       # reads as an ordinary curve over the run.
       tag = f"{point['threshold']:g}".replace('.', '')
-      self.log(f'val/gsm8k_acc_thr{tag}',
+      self.log(f'val/gsm8k_acc_thr{tag}{suffix}',
                torch.tensor(point['accuracy'], device=self.device),
                on_epoch=True, on_step=False, sync_dist=False,
                rank_zero_only=True)
-      self.log(f'val/gsm8k_nfe_thr{tag}',
+      self.log(f'val/gsm8k_nfe_thr{tag}{suffix}',
                torch.tensor(point['nfe'], device=self.device),
                on_epoch=True, on_step=False, sync_dist=False,
                rank_zero_only=True)
@@ -651,7 +666,7 @@ class TrainerBase(L.LightningModule):
     # a whole forward pass merged thresholds whose budgets differ by less than
     # one -- two points at the same x, where the later silently overwrote the
     # earlier. Read an x of 567 as 5.67 NFE.
-    series = f'pareto/gsm8k_step_{self.global_step}'
+    series = f'pareto/gsm8k_step_{self.global_step}{suffix}'
     for point in curve:
       try:
         logger.log_metrics({series: point['accuracy']},
@@ -661,32 +676,34 @@ class TrainerBase(L.LightningModule):
         break
 
     history_path = os.path.join(self.config.checkpointing.save_dir,
-                                'pareto_history.json')
+                                f'pareto_history{suffix}.json')
     run_uid = getattr(logger, 'version', '') or ''
-    if getattr(self, '_pareto_history', None) is None:
+    history_attr = f'_pareto_history{suffix}'
+    history = getattr(self, history_attr, None)
+    if history is None:
       # A *resumed* run resumes the same underdeep run, so the figure has to
       # pick up the curves the earlier process drew. A fresh run reusing the
       # same save_dir (logger.force_new_run, the default) must not -- it would
       # graft the previous run's frontiers onto this one's plot. The run uid
       # tells the two cases apart.
-      self._pareto_history = {}
+      history = {}
       if os.path.exists(history_path):
         try:
           with open(history_path) as f:
             stored = json.load(f)
           if stored.get('run_uid') == run_uid:
-            self._pareto_history = {int(k): v
-                                    for k, v in stored['curves'].items()}
+            history = {int(k): v for k, v in stored['curves'].items()}
           else:
             print('[gsm8k-pareto] ignoring history from a different run '
                   f"({stored.get('run_uid')!r} != {run_uid!r})", flush=True)
         except Exception as e:  # pragma: no cover
           print(f'[gsm8k-pareto] history read failed: {e}', flush=True)
-    self._pareto_history[int(self.global_step)] = curve
+      setattr(self, history_attr, history)
+    history[int(self.global_step)] = curve
     try:
       os.makedirs(self.config.checkpointing.save_dir, exist_ok=True)
       with open(history_path, 'w') as f:
-        json.dump({'run_uid': run_uid, 'curves': self._pareto_history},
+        json.dump({'run_uid': run_uid, 'curves': history},
                   f, indent=2)
     except Exception as e:  # pragma: no cover
       print(f'[gsm8k-pareto] history write failed: {e}', flush=True)
@@ -696,10 +713,10 @@ class TrainerBase(L.LightningModule):
     try:
       import pareto_plot
       image = pareto_plot.render(
-        self._pareto_history,
+        history,
         reference=pareto_plot.load_reference(
           self.config.eval.get('gsm8k_pareto_reference', None)))
-      logger.log_image('pareto/frontier', image, step=self.global_step)
+      logger.log_image(f'pareto/frontier{suffix}', image, step=self.global_step)
     except Exception as e:  # pragma: no cover - plotting is best-effort
       print(f'[gsm8k-pareto] figure failed: {e}', flush=True)
 

@@ -394,6 +394,26 @@ def test_rejects_bad_configuration():
     raise AssertionError('unknown strategy accepted')
 
 
+def test_fp32_normalization_changes_real_adaptive_nfe():
+  from test_eval_prediction_precision import Model
+  from eval_precision import fp32_prediction_normalization
+  denoiser = Model()
+  model = StubSampler(torch.zeros(1, 3, 5), strategy='low_confidence_dynamic',
+                      temperature=0., threshold=.925)
+  model.mask_index = denoiser.mask_index
+  model.forward = denoiser.forward
+  kwargs = dict(num_samples=1, return_metadata=True,
+                prefix_tokens=torch.tensor([[1]]), prefix_lengths=torch.tensor([1]))
+  original, legacy = model.generate_samples(**kwargs)
+  with fp32_prediction_normalization(denoiser):
+    precise, fp32 = model.generate_samples(**kwargs)
+  assert legacy['nfe_per_row'].tolist() == [1.]
+  assert fp32['nfe_per_row'].tolist() == [2.]
+  assert torch.equal(original, precise)
+  assert precise[0, 0].item() == 1
+  assert all(dtype == torch.bfloat16 for dtype in denoiser.forward_dtypes)
+
+
 def main():
   torch.manual_seed(0)
   for name, fn in sorted(globals().items()):

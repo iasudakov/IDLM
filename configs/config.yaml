@@ -489,6 +489,10 @@ eval:
   # 0 is the only temperature at which a threshold means "the model's top-1
   # probability exceeds it"; above it the same threshold buys a smaller budget.
   gsm8k_pareto_temperature: 0.0
+  # Additional sweep: same backbone/weights/grid, FP32 SUBS normalization.
+  # Keeps legacy metrics; new metrics/history use the _fp32norm suffix.
+  # Approximately doubles the threshold-sweep evaluation cost.
+  gsm8k_pareto_fp32: True
   # Optional fixed frontier drawn as a dashed reference line. Written by
   # scripts/make_pareto_reference.sh; null (or a missing file) just omits it.
   gsm8k_pareto_reference: ${repo_root:}/data/pareto_reference_mdlm_teacher.json
