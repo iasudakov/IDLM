@@ -389,7 +389,9 @@ class CheckpointEvaluationConfigTest(unittest.TestCase):
         self.assertEqual(list(cfg.eval.gsm8k_pareto_thresholds),
                          [.325, .4, .475, .55, .625, .7, .775, .85, .925, .95, .98, .99, .995])
         self.assertEqual(list(cfg.eval.gsm8k_ancestral_steps), [4, 8, 16, 32, 48, 64])
-        self.assertEqual(list(cfg.eval.gsm8k_ancestral_seeds), [1])
+        self.assertEqual(list(cfg.eval.gsm8k_ancestral_seeds), [1, 2, 3])
+        self.assertEqual(list(cfg.eval.gsm8k_ancestral_temperatures), [0.1, 1.0])
+        self.assertFalse(cfg.eval.gsm8k_checkpoint_confidence)
         self.assertTrue(cfg.eval.gsm8k_ancestral_final_denoise)
         self.assertEqual(cfg.data.separator, r'\n')
         self.assertEqual(Path(cfg.eval.gsm8k_data_path), self.dataset)
@@ -400,8 +402,11 @@ class CheckpointEvaluationConfigTest(unittest.TestCase):
 
     def test_comparison_breaking_precision_or_seed_overrides_fail(self):
         overrides = ['model.force_fp32=True', 'trainer.precision=32-true',
-                     'eval.disable_ema=True', 'eval.gsm8k_ancestral_seeds=[2]',
-                     'eval.gsm8k_ancestral_seeds=[1,2]', 'eval.gsm8k_pareto_temperature=1',
+                     'eval.disable_ema=True', 'eval.gsm8k_ancestral_seeds=[1,1]',
+                     'eval.gsm8k_ancestral_seeds=[]', 'eval.gsm8k_pareto_temperature=1',
+                     'eval.gsm8k_ancestral_temperatures=[-1]',
+                     'eval.gsm8k_ancestral_temperatures=[0.1,0.1]',
+                     'eval.gsm8k_ancestral_temperatures=[]',
                      'eval.gsm8k_ancestral_final_denoise=False', 'trainer.devices=1']
         for override in overrides:
             with self.subTest(override=override), self.assertRaises(ValueError):

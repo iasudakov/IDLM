@@ -225,8 +225,8 @@ def compose_evaluation_config(overrides, *, code_dir, output_dir, devices):
             or config.data.train != 'tiny_gsm' or config.model.length != 512
             or config.adversarial_distill.is_distill or config.trainer.devices != devices):
         raise ValueError('Sweep requires the TinyGSM CDLM inference adapter, length512, BF16 mixed forward and EMA.')
-    if config.eval.gsm8k_pareto_temperature != 0 or list(config.eval.gsm8k_ancestral_seeds) != [1]:
-        raise ValueError('This sweep uses confidence T=0 and a single ancestral seed=1.')
+    if config.eval.gsm8k_pareto_temperature != 0:
+        raise ValueError('This sweep uses confidence T=0 when confidence sampling is enabled.')
     if not config.eval.gsm8k_greedy_token or not config.eval.gsm8k_ancestral_final_denoise:
         raise ValueError('Ancestral evaluation with separate final denoise must be enabled.')
     if config.logger.get('_target_') != 'underdeep_logger.UnderdeepLogger':
@@ -290,12 +290,14 @@ def write_summary(plan):
         for precision, points in result['confidence'].items():
             for point in points:
                 rows.append({**base, 'sampler': 'confidence', 'logit_normalization': precision,
+                             'temperature': result['protocol'].get('confidence', {}).get('temperature', 0.),
                              'threshold': point['threshold'], 'sampling_steps': '',
                              'seed': result['protocol']['seed'], 'accuracy': point['accuracy'],
                              'nfe': point['nfe'], 'correct': point['correct'], 'count': point['count']})
         for point in result['ancestral']['points']:
             for seed in point['seeds']:
                 rows.append({**base, 'sampler': 'ancestral', 'logit_normalization': 'fp32',
+                             'temperature': point.get('temperature', 0.),
                              'threshold': '', 'sampling_steps': point['steps'],
                              'seed': seed['seed'], 'accuracy': seed['accuracy'],
                              'nfe': seed['nfe'], 'correct': seed['correct'], 'count': seed['count']})

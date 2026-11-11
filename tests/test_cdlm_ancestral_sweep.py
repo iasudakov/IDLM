@@ -10,7 +10,7 @@ import torch
 
 import cdlm_ancestral_sweep as ancestral
 import sdtt_eval
-from test_cdlm_ancestral import Model, reference_sflm
+from test_cdlm_ancestral import Model, reference_sflm, categorical_module
 
 
 def examples():
@@ -126,6 +126,32 @@ class AncestralSweepTest(unittest.TestCase):
             self.assertIsNone(point['nfe_std'])
             self.assertEqual(point['nfe_mean'], 5.)  # Never replace measured NFE with S+1.
             self.assertEqual(point['seeds'][0]['total_batch_forwards'], 7)
+
+    def test_positive_temperatures_three_seeds_are_repeatable_and_restore_rng(self):
+        for temperature in (.1, 1.):
+            value = model()
+            cfg = OmegaConf.create({'gsm8k_ancestral_steps': [4, 8],
+                                    'gsm8k_ancestral_seeds': [1, 2, 3],
+                                    'gsm8k_ancestral_temperature': temperature,
+                                    'gsm8k_ancestral_final_denoise': True,
+                                    'gsm8k_batch_size': 2, 'gsm8k_grading_workers': 1})
+            torch.manual_seed(9832)
+            before = torch.get_rng_state().clone()
+            with patch.object(sdtt_eval, 'grade_sample', side_effect=lambda text, answer, **kw: text == answer), \
+                    patch.dict('sys.modules', {'trainer_base': categorical_module()}), \
+                    patch.object(sdtt_eval, '_evaluate_greedy', wraps=sdtt_eval._evaluate_greedy) as evaluate:
+                first = ancestral.sweep(value, examples(), distributed=False, cfg=cfg)
+                second = ancestral.sweep(value, examples(), distributed=False, cfg=cfg)
+            self.assertEqual(first, second)
+            self.assertTrue(torch.equal(torch.get_rng_state(), before))
+            self.assertEqual(first['protocol']['temperature'], temperature)
+            self.assertEqual(evaluate.call_count, 12)
+            self.assertTrue(all(call.kwargs == {'final_denoise': True, 'temperature': temperature}
+                                for call in evaluate.call_args_list))
+            for point in first['points']:
+                self.assertEqual([seed['seed'] for seed in point['seeds']], [1, 2, 3])
+                self.assertEqual(point['num_seeds'], 3)
+                self.assertIsNotNone(point['accuracy_std'])
 
     def test_pooled_ddp_counts_include_uneven_and_empty_rank_shards(self):
         data = examples()

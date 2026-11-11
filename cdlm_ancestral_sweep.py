@@ -1,7 +1,8 @@
-"""Seed-averaged fixed-budget ancestral T=0 evaluation for TinyGSM."""
+"""Seed-averaged fixed-budget ancestral evaluation for TinyGSM."""
 
 from concurrent.futures import ThreadPoolExecutor
 import statistics
+import math
 
 import torch
 import torch.distributed as dist
@@ -38,8 +39,11 @@ def protocol(model, cfg=None):
     if predictor not in ('ancestral', 'ancestral_cache'):
         raise ValueError('GSM8K ancestral evaluation requires an ancestral predictor.')
     final_denoise = bool(cfg.get('gsm8k_ancestral_final_denoise', False))
+    temperature = float(cfg.get('gsm8k_ancestral_temperature', 0.))
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError('Ancestral temperature must be finite and nonnegative.')
     return {
-        'sampler': 'random', 'predictor': predictor, 'temperature': 0.,
+        'sampler': 'random', 'predictor': predictor, 'temperature': temperature,
         'steps': budgets, 'seeds': seeds, 'epsilon': 1e-5, 'std_ddof': 1,
         'single_seed_std': None, 'rank_seed_offset': RANK_SEED_OFFSET,
         'seed_policy': 'seed + rank_seed_offset * rank',
@@ -96,6 +100,8 @@ def sweep(model, examples, *, distributed=True, on_point=None, cfg=None):
                 try:
                     _seed_model_rng(model, seed + RANK_SEED_OFFSET * rank)
                     options = {'final_denoise': True} if metadata['final_denoise'] else {}
+                    if metadata['temperature'] != 0:
+                        options['temperature'] = metadata['temperature']
                     correct, count, total_nfe, batch_forwards = _evaluate_greedy(
                         model, local_examples, pool, batch_size, budget, timeout, **options)
                 except Exception as caught:
@@ -112,7 +118,7 @@ def sweep(model, examples, *, distributed=True, on_point=None, cfg=None):
                 if rank == 0:
                     print(f'[gsm8k-ancestral] steps {budget} seed {seed}: '
                           f'{100 * run["accuracy"]:.2f}% ({correct}/{count}) '
-                          f'at {run["nfe"]:.2f} NFE/example [T=0]', flush=True)
+                          f'at {run["nfe"]:.2f} NFE/example [T={metadata["temperature"]:g}]', flush=True)
             accuracy = [run['accuracy'] for run in runs]
             nfe = [run['nfe'] for run in runs]
             point = {'steps': budget, 'accuracy_mean': statistics.mean(accuracy),

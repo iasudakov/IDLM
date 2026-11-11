@@ -4,6 +4,11 @@ This evaluates the **available checkpoints from an expected catalog of up to 18*
 without training or trajectory generation. Training logs describe the expected
 catalog; a connected snapshot can contain fewer files.
 
+The default checkpoint evaluation now runs **ancestral only**, at temperatures
+**0.1 and 1.0**, with generation seeds **1, 2, 3** for each temperature and budget.
+Confidence sampling and ancestral temperature 0 are disabled. The launch command
+below already selects these defaults after updating the Nirvana source-code input.
+
 | Source run | Chain | Expected optimizer steps |
 | --- | --- | --- |
 | `5e0ee1da-8780-42d3-b120-9590e9dc8351` | MDLM → CDLM | 1000, 1248 (`last.ckpt`) |
@@ -99,14 +104,33 @@ saved-step validation; corrupt weights are errors rather than silently skipped.
   MMD weights-only exports already contain EMA and are not averaged again.
 - Small full-attention MDLM, length 512, the original literal `\n` separator,
   batch size 16 per GPU and the same execution-based grading.
-- **Confidence:** temperature 0, thresholds
+- **Confidence (disabled by default):** temperature 0, thresholds
   `[0.325,0.4,0.475,0.55,0.625,0.7,0.775,0.85,0.925,0.95,0.98,0.99,0.995]`.
-  Run twice with the **same BF16 transformer forward**, changing only logit
+  If enabled, run twice with the **same BF16 transformer forward**, changing only logit
   normalization between BF16 and FP32. Both accuracy and actual NFE are recorded.
-- **Ancestral:** temperature 0, budgets `[4,8,16,32,48,64]`, one generation
-  seed **1**, BF16 forward and **FP32 normalization**. A separate final denoise
-  is included and actual cached NFE is measured. A one-seed result has no
-  across-seed standard deviation. Rank RNG seeds use `1 + 104729 * rank`.
+- **Ancestral:** temperatures **0.1 and 1.0**, budgets `[4,8,16,32,48,64]`,
+  generation seeds **1, 2, 3** at each temperature and budget, BF16 forward and
+  **FP32 normalization**. Token proposals use the temperature-scaled categorical
+  distribution, including the separate final denoise; position selection remains
+  ancestral Bernoulli unmasking. Actual cached NFE is measured. Results retain
+  per-seed counts plus mean and sample SD across the three seeds. Rank RNG seeds
+  use `seed + 104729 * rank`; each budget/temperature restarts that seeded stream.
+
+This gives 36 evaluations of all 1,319 questions per checkpoint (2 temperatures
+times 6 budgets times 3 seeds). The settings can be overridden explicitly:
+
+```bash
+CDLM_EVAL_SOURCE_RUN=5e0ee1da \
+bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh" --devices 1 \
+  'eval.gsm8k_ancestral_temperatures=[0.1,1.0]' \
+  'eval.gsm8k_ancestral_seeds=[1,2,3]' \
+  eval.gsm8k_checkpoint_confidence=False
+```
+
+To include temperature 0 again, add it to the temperatures list. To enable
+confidence again, set `eval.gsm8k_checkpoint_confidence=True`. The separate
+`eval_mmd_checkpoint_nirvana.sh` launcher keeps its previous confidence and
+single-seed T=0 defaults; these changes are scoped to the CDLM checkpoint sweep.
 
 This is not full-FP32 model inference. Original training and validation metrics
 are preserved; the reevaluation uses separate Underdeep runs and output files.
@@ -126,6 +150,21 @@ output directory. When restarting from an evaluation state, the launcher
 restores this evaluation namespace into an empty local output directory. A
 completed matching report is reused; partial checkpoint evaluations are repeated.
 Changed checkpoint contents or evaluation settings must not silently reuse old results.
+
+For this temperature/seed protocol, start new reports when the connected state
+contains evaluations from the old T=0 or confidence sweep:
+
+```bash
+CDLM_EVAL_SOURCE_RUN=5e0ee1da \
+bash "$SOURCE_CODE_PATH/code/scripts/eval_cdlm_checkpoints_nirvana.sh" \
+  --devices 1 \
+  --output-dir "$SOURCE_CODE_PATH/code/cdlm_checkpoint_eval_t01_t1_s123" \
+  --no-restore-results
+```
+
+When resuming this same new sweep from its evaluation state on a fresh worker,
+omit `--no-restore-results`. Reuse requires every requested temperature, budget
+and seed, and all 1,319 examples. Partial checkpoint results are rerun.
 
 Changing from four GPUs to one changes the protocol identity. If the connected
 state contains previous evaluation results, start fresh reports with:
@@ -152,10 +191,14 @@ from a state containing those reports, use a new local output directory and
 The same model weights can be reused; no retraining is required.
 
 Each checkpoint has a `result.json`; `summary.csv` combines the confidence and
-ancestral results for the launch. Confidence metrics carry `_bf16norm` and
+ancestral results for the launch, with an explicit `temperature` column.
+Confidence results are empty when disabled; no confidence decoding or plots run.
+When enabled, confidence metrics carry `_bf16norm` and
 `_fp32norm` suffixes, with images `pareto/frontier_bf16norm` and
-`pareto/frontier_fp32norm`. Ancestral results retain `ancestral/accuracy_vs_steps`
-and the existing `val/gsm8k_*_ancestral_steps*` metric names.
+`pareto/frontier_fp32norm`. Ancestral curves and metrics carry `_temp0p1` or
+`_temp1p0` suffixes; images are `ancestral/accuracy_vs_steps_temp0p1` and
+`ancestral/accuracy_vs_steps_temp1p0`. Per-seed and mean/SD scalars stay separate.
+The optional T=0 curve retains the old unsuffixed ancestral names.
 
 GPU execution is intended for the user's Nirvana machine; local verification
 uses CPU fixtures and mocked model/tracker interfaces.

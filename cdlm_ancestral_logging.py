@@ -45,7 +45,7 @@ def log_point(model, point, protocol):
         logger.log_metrics(curve, step=int(point['steps']))
 
 
-def render_ancestral(points, step=None):
+def render_ancestral(points, step=None, temperature=None):
     """Render mean accuracy with sample SD against configured sampler steps.
 
     Error bars use the supplied across-seed sample standard deviation (ddof=1),
@@ -81,6 +81,8 @@ def render_ancestral(points, step=None):
     title = 'TinyGSM ancestral accuracy'
     if step is not None:
         title += f' (training step {int(step)})'
+    if temperature is not None:
+        title += f' | T={temperature:g}'
     axes.set_xscale('log', base=2)
     axes.set_xticks(budgets, labels=[str(budget) for budget in budgets])
     maximum = max(upper, default=0.)

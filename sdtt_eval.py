@@ -210,8 +210,9 @@ def _validation_ancestral_sweep(model):
 
 
 @torch.no_grad()
-def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5, *, final_denoise=False):
-    """S-FLM fixed-budget random unmasking with greedy token proposals.
+def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5, *, final_denoise=False,
+                            temperature=0.):
+    """S-FLM fixed-budget random unmasking; greedy at T=0, categorical at T>0.
 
     Unmasking remains stochastic. This differs from the confidence-threshold
     sampler above, which chooses positions by confidence. By default the final
@@ -226,6 +227,8 @@ def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5, *, final_d
         raise ValueError('GSM8K greedy steps must be a positive integer.')
     if not math.isfinite(eps) or not 0 < eps < 1:
         raise ValueError('GSM8K greedy sampling epsilon must be in (0, 1).')
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError('Ancestral temperature must be finite and nonnegative.')
     predictor = model.config.sampling.get('predictor', 'ancestral_cache')
     if predictor not in ('ancestral', 'ancestral_cache'):
         raise ValueError('GSM8K greedy evaluation requires an ancestral predictor.')
@@ -248,7 +251,7 @@ def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5, *, final_d
         if cached is None:
             cached = model.forward(x, model._sigma_from_alphat(alpha_t)).exp()
             nfe += 1
-        proposed = cached.argmax(dim=-1)
+        proposed = _ancestral_tokens(cached, temperature)
         probability = ((alpha_s - alpha_t) / (1 - alpha_t).clamp_min(1e-12)).clamp(0, 1)
         unmask = torch.rand(x.shape, device=x.device) < probability
         next_x = torch.where((x == model.mask_index) & unmask, proposed, x)
@@ -260,7 +263,9 @@ def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5, *, final_d
             x[row, :len(prefix)] = prefix
     if final_denoise:
         time = torch.full((len(prompts), 1), eps, device=model.device)
-        proposed = model.forward(x, model._sigma_from_alphat(model.noise(time)[1])).argmax(dim=-1)
+        log_probs = model.forward(x, model._sigma_from_alphat(model.noise(time)[1]))
+        proposed = (log_probs.argmax(dim=-1) if temperature == 0
+                    else _ancestral_tokens(log_probs.exp(), temperature))
         nfe += 1
         x = torch.where(x == model.mask_index, proposed, x)
     if bool((x == model.mask_index).any()):
@@ -268,6 +273,16 @@ def generate_greedy_samples(model, prompts, num_steps=None, eps=1e-5, *, final_d
     return x, {'nfe': nfe,
                'nfe_per_row': torch.full((len(prompts),), nfe, dtype=torch.long,
                                          device=model.device)}
+
+
+def _ancestral_tokens(probabilities, temperature):
+    if temperature == 0:
+        return probabilities.argmax(dim=-1)
+    from trainer_base import sample_categorical
+    # log(0)=-inf preserves the forbidden mask token and visible one-hot rows.
+    if temperature != 1:
+        probabilities = torch.softmax(probabilities.log() / temperature, dim=-1)
+    return sample_categorical(probabilities)
 
 
 def grade_sample(sample, answer, timeout_s=5.):
@@ -375,13 +390,14 @@ def _evaluate_threshold(model, examples, threshold, pool, batch_size, temperatur
     return correct, count, total_nfe, batch_nfe
 
 
-def _evaluate_greedy(model, examples, pool, batch_size, steps, timeout, *, final_denoise=False):
+def _evaluate_greedy(model, examples, pool, batch_size, steps, timeout, *, final_denoise=False,
+                     temperature=0.):
     correct = count = total_nfe = batch_nfe = 0
     for start in range(0, len(examples), batch_size):
         batch = examples[start:start + batch_size]
         prompts = [example['input_ids'] for example in batch]
         samples, metadata = generate_greedy_samples(
-            model, prompts, num_steps=steps, final_denoise=final_denoise)
+            model, prompts, num_steps=steps, final_denoise=final_denoise, temperature=temperature)
         texts = [model.tokenizer.decode(sample[len(prompt):].tolist(), skip_special_tokens=True)
                  for sample, prompt in zip(samples.cpu(), prompts)]
         pairs = zip(texts, [example['answer'] for example in batch])

@@ -7,6 +7,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from unittest.mock import Mock
 
 from omegaconf import OmegaConf
 import torch
@@ -208,8 +209,41 @@ class PlanAndResumeTest(unittest.TestCase):
             self.assertEqual([process.exitcode for process in processes], [0, 0])
 
 
+class TemperaturePublishingTest(unittest.TestCase):
+    def test_temperature_metrics_images_and_seed_rows_are_distinct(self):
+        publisher = worker.Publisher.__new__(worker.Publisher)
+        logger = Mock()
+        publisher.loggers = {'source': logger}
+        entry = {'source_run': 'source', 'step': 1000}
+        points = [{'temperature': temperature, 'steps': 16, 'accuracy_mean': .4,
+                   'accuracy_std': .01, 'nfe_mean': 17., 'nfe_std': 0., 'num_seeds': 3,
+                   'seeds': [{'seed': seed, 'correct': 528, 'count': 1319,
+                              'accuracy': .4, 'nfe': 17.} for seed in (1, 2, 3)]}
+                  for temperature in (.1, 1.)]
+        for point in points:
+            publisher.ancestral_point(entry, point)
+        metric_sets = [set(call.args[0]) for call in logger.log_metrics.call_args_list]
+        self.assertTrue(all(key.endswith('_temp0p1') for group in metric_sets[:2] for key in group))
+        self.assertTrue(all(key.endswith('_temp1p0') for group in metric_sets[2:] for key in group))
+        self.assertIn('val/gsm8k_acc_ancestral_steps16_seed3_temp0p1', metric_sets[0])
+        with patch('cdlm_ancestral_logging.render_ancestral', return_value='image') as render:
+            publisher.ancestral_result(entry, {'points': points})
+        self.assertEqual([call.kwargs['temperature'] for call in render.call_args_list], [.1, 1.])
+        self.assertEqual([call.args[0] for call in logger.log_image.call_args_list],
+                         ['ancestral/accuracy_vs_steps_temp0p1', 'ancestral/accuracy_vs_steps_temp1p0'])
+        table = logger.log_table.call_args.args
+        self.assertEqual(table[1][0], 'temperature')
+        self.assertEqual([row[0] for row in table[2]], [.1] * 3 + [1.] * 3)
+
+
 class PipelineTest(unittest.TestCase):
     def test_partial_report_reruns_and_complete_report_skips_model_work(self):
+        self._exercise_pipeline(True, [0.], [1])
+
+    def test_two_temperatures_three_seeds_without_confidence_and_resume(self):
+        self._exercise_pipeline(False, [.1, 1.], [1, 2, 3])
+
+    def _exercise_pipeline(self, confidence_enabled, temperatures, seeds):
         class Model(TinyModel):
             def __init__(self, config, tokenizer, inference_only):
                 super().__init__()
@@ -252,16 +286,20 @@ class PipelineTest(unittest.TestCase):
                 'eval': {'disable_ema': False, 'gsm8k_data_path': str(data),
                          'gsm8k_num_examples': None, 'gsm8k_pareto_temperature': 0.,
                          'gsm8k_pareto_thresholds': worker.CONFIDENCE_THRESHOLDS,
+                         'gsm8k_checkpoint_confidence': confidence_enabled,
+                         'gsm8k_ancestral_temperatures': temperatures,
                          'gsm8k_ancestral_steps': worker.ANCESTRAL_STEPS,
-                         'gsm8k_ancestral_seeds': [1], 'gsm8k_ancestral_final_denoise': True,
+                         'gsm8k_ancestral_seeds': seeds, 'gsm8k_ancestral_final_denoise': True,
                          'gsm8k_max_steps': None, 'gsm8k_batch_size': 16,
                          'tinygsm_exec_timeout': 5.},
                 'model_weights_dir': str(bundle), 'checkpointing': {'snapshot': True},
             })
             fail = [True]
             calls = []
+            ancestral_calls = []
 
             def confidence(model, examples):
+                self.assertTrue(confidence_enabled, 'Disabled confidence must not execute.')
                 threshold = float(config.eval.gsm8k_pareto_thresholds[0])
                 if fail[0] and model.normalization == 'fp32' and threshold == .55:
                     raise RuntimeError('interrupted at second normalization')
@@ -272,15 +310,20 @@ class PipelineTest(unittest.TestCase):
 
             def ancestral(model, examples, *, distributed, on_point, cfg):
                 self.assertEqual(model.normalization, 'fp32')
+                temperature = cfg.gsm8k_ancestral_temperature
+                ancestral_calls.append((temperature, list(cfg.gsm8k_ancestral_seeds)))
                 points = []
                 for steps in worker.ANCESTRAL_STEPS:
-                    point = {'steps': steps, 'accuracy_mean': .5, 'accuracy_std': None,
-                             'nfe_mean': steps + 1., 'nfe_std': None, 'num_seeds': 1,
-                             'seeds': [{'seed': 1, 'count': 1319, 'correct': 659,
-                                        'accuracy': .5, 'nfe': steps + 1.}]}
+                    if not confidence_enabled and fail[0] and temperature == temperatures[-1] and steps == 8:
+                        raise RuntimeError('interrupted at second temperature')
+                    point = {'steps': steps, 'accuracy_mean': .5,
+                             'accuracy_std': 0. if len(seeds) > 1 else None,
+                             'nfe_mean': steps + 1., 'nfe_std': None, 'num_seeds': len(seeds),
+                             'seeds': [{'seed': seed, 'count': 1319, 'correct': 659,
+                                        'accuracy': .5, 'nfe': steps + 1.} for seed in cfg.gsm8k_ancestral_seeds]}
                     points.append(point)
                     on_point(point)
-                return {'points': points, 'protocol': {'final_denoise': True}}
+                return {'points': points, 'protocol': {'final_denoise': True, 'temperature': temperature}}
 
             with ExitStack() as stack:
                 def patched(target, **kwargs):
@@ -306,22 +349,55 @@ class PipelineTest(unittest.TestCase):
                 result_path = Path(entry['output_dir']) / 'result.json'
                 partial = json.loads(result_path.read_text())
                 self.assertFalse(partial['complete'])
-                self.assertEqual(len(partial['confidence']['bf16']), 13)
-                self.assertEqual(len(partial['confidence']['fp32']), 3)
+                if confidence_enabled:
+                    self.assertEqual(len(partial['confidence']['bf16']), 13)
+                    self.assertEqual(len(partial['confidence']['fp32']), 3)
+                else:
+                    self.assertEqual(partial['confidence'], {})
+                    self.assertEqual(len(partial['ancestral']['points']), 7)
                 snapshots.assert_not_called()
                 fail[0] = False
                 calls.clear()
+                ancestral_calls.clear()
                 worker.run(plan, config)
                 complete = json.loads(result_path.read_text())
                 self.assertTrue(complete['complete'])
-                self.assertEqual(len(calls), 26)
-                self.assertEqual(len(complete['ancestral']['points']), 6)
+                self.assertEqual(len(calls), 26 if confidence_enabled else 0)
+                self.assertEqual(ancestral_calls, [(temperature, seeds) for temperature in temperatures])
+                self.assertEqual(len(complete['ancestral']['points']), 6 * len(temperatures))
+                self.assertEqual(complete['protocol']['ancestral']['temperatures'], temperatures)
+                self.assertEqual(complete['protocol']['ancestral']['seeds'], seeds)
+                self.assertEqual(complete['protocol']['confidence']['enabled'], confidence_enabled)
+                import cdlm_checkpoint_eval
+                import csv
+                summary = cdlm_checkpoint_eval.write_summary(plan)
+                with summary.open() as stream:
+                    rows = list(csv.DictReader(stream))
+                ancestral_rows = [row for row in rows if row['sampler'] == 'ancestral']
+                self.assertEqual(len(ancestral_rows), 6 * len(temperatures) * len(seeds))
+                self.assertEqual({float(row['temperature']) for row in ancestral_rows}, set(temperatures))
+                self.assertEqual({int(row['seed']) for row in ancestral_rows}, set(seeds))
+                self.assertEqual(len(rows) - len(ancestral_rows), 26 if confidence_enabled else 0)
                 self.assertEqual(snapshots.call_count, 2)
                 calls.clear()
+                ancestral_calls.clear()
                 with patch.object(worker, 'load_weights', side_effect=AssertionError('should skip loading')):
                     worker.run(plan, config)
                 self.assertEqual(calls, [])
+                self.assertEqual(ancestral_calls, [])
                 self.assertEqual(snapshots.call_count, 4)
+                if not confidence_enabled:
+                    # A report missing a seed/temperature must never be reused.
+                    broken = copy.deepcopy(complete)
+                    broken['ancestral']['points'][0]['seeds'].pop()
+                    worker.write_json(result_path, broken)
+                    with self.assertRaisesRegex(ValueError, 'incomplete ancestral'):
+                        worker.reusable_report(result_path, complete['identity'])
+                    broken = copy.deepcopy(complete)
+                    broken['ancestral']['points'] = broken['ancestral']['points'][:6]
+                    worker.write_json(result_path, broken)
+                    with self.assertRaisesRegex(ValueError, 'incomplete ancestral'):
+                        worker.reusable_report(result_path, complete['identity'])
 
 
 if __name__ == '__main__':

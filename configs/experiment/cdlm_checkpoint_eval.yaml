@@ -16,7 +16,9 @@ trainer:
   accumulate_grad_batches: 1
 eval:
   disable_ema: False
-  gsm8k_ancestral_seeds: [1]
+  gsm8k_checkpoint_confidence: False
+  gsm8k_ancestral_temperatures: [0.1, 1.0]
+  gsm8k_ancestral_seeds: [1, 2, 3]
 checkpointing:
   snapshot_namespace: cdlm_checkpoint_eval
   snapshot_trajectories: False

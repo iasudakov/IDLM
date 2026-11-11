@@ -7,6 +7,7 @@ resolved OmegaConf configuration; no training or trajectory collection runs here
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from pathlib import Path
 NORMALIZATIONS = ('bf16', 'fp32')
 ANCESTRAL_STEPS = [4, 8, 16, 32, 48, 64]
 CONFIDENCE_THRESHOLDS = [.325, .4, .475, .55, .625, .7, .775, .85, .925, .95, .98, .99, .995]
-REPORT_SCHEMA = 1
+REPORT_SCHEMA = 2
 _active_publisher = None
 
 
@@ -88,7 +89,31 @@ def validate_plan(plan):
     return root
 
 
+def evaluation_settings(config):
+    """Select checkpoint-only sweeps without changing training validation."""
+    enabled = config.eval.get('gsm8k_checkpoint_confidence', True)
+    if type(enabled) is not bool:
+        raise ValueError('gsm8k_checkpoint_confidence must be a boolean.')
+    try:
+        temperatures = list(config.eval.get('gsm8k_ancestral_temperatures', [0.]))
+        seeds = list(config.eval.gsm8k_ancestral_seeds)
+    except TypeError as error:
+        raise ValueError('Ancestral temperatures and seeds must be nonempty lists.') from error
+    if (not temperatures or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0
+                                for t in temperatures) or len(set(temperatures)) != len(temperatures)):
+        raise ValueError('Ancestral temperatures must be distinct finite nonnegative numbers.')
+    if (not seeds or any(type(seed) is not int or not 0 <= seed < 2**64 for seed in seeds)
+            or len(set(seeds)) != len(seeds)):
+        raise ValueError('Ancestral seeds must be distinct nonnegative 64-bit integers.')
+    return (list(NORMALIZATIONS) if enabled else []), list(map(float, temperatures)), seeds
+
+
+def temperature_tag(temperature):
+    return 'temp' + str(float(temperature)).replace('.', 'p')
+
+
 def validate_config(config):
+    evaluation_settings(config)
     if config.model.get('force_fp32', False) is not False:
         raise ValueError('This comparison requires BF16 forward: model.force_fp32=False.')
     if str(config.trainer.precision) not in ('bf16', 'bf16-mixed'):
@@ -110,9 +135,8 @@ def validate_config(config):
     if list(config.eval.gsm8k_pareto_thresholds) != CONFIDENCE_THRESHOLDS:
         raise ValueError('Use the common thirteen confidence thresholds for both normalizations.')
     if (list(config.eval.gsm8k_ancestral_steps) != ANCESTRAL_STEPS or
-            list(config.eval.gsm8k_ancestral_seeds) != [1] or
             config.eval.gsm8k_ancestral_final_denoise is not True):
-        raise ValueError('Ancestral evaluation requires steps4/8/16/32/48/64, seed1, final denoise.')
+        raise ValueError('Ancestral evaluation requires steps4/8/16/32/48/64 and final denoise.')
     if config.eval.get('gsm8k_max_steps') not in (None, 512):
         raise ValueError('Confidence decoding must retain its full512-step cap.')
     path = Path(str(config.eval.get('gsm8k_data_path') or '')).expanduser()
@@ -194,16 +218,25 @@ def reusable_report(path, identity):
                          'Choose a new evaluation output directory.')
     if report.get('complete') is not True:
         return None
+    protocol = report.get('protocol', {})
+    confidence = protocol.get('confidence', {})
+    normalizations = confidence.get('normalizations', NORMALIZATIONS) if confidence.get('enabled', True) else []
     curves = report.get('confidence', {})
-    for normalization in NORMALIZATIONS:
+    if set(curves) != set(normalizations):
+        raise ValueError(f'Complete evaluation has unexpected confidence curves: {path}')
+    for normalization in normalizations:
         points = curves.get(normalization, [])
         if ([point.get('threshold') for point in points] != CONFIDENCE_THRESHOLDS or
                 any(point.get('count') != 1319 for point in points)):
             raise ValueError(f'Complete evaluation has an incomplete confidence curve: {path}')
     ancestral = report.get('ancestral', {})
+    settings = protocol.get('ancestral', {})
+    temperatures, seeds = settings.get('temperatures', [0.]), settings.get('seeds', [1])
+    expected = [(temperature, steps) for temperature in temperatures for steps in ANCESTRAL_STEPS]
     if (ancestral.get('complete') is not True or
-            [point.get('steps') for point in ancestral.get('points', [])] != ANCESTRAL_STEPS or
-            any([seed.get('seed') for seed in point.get('seeds', [])] != [1] or
+            [(point.get('temperature', 0.), point.get('steps'))
+             for point in ancestral.get('points', [])] != expected or
+            any([seed.get('seed') for seed in point.get('seeds', [])] != seeds or
                 any(seed.get('count') != 1319 for seed in point.get('seeds', []))
                 for point in ancestral.get('points', []))):
         raise ValueError(f'Complete evaluation has an incomplete ancestral curve: {path}')
@@ -240,6 +273,7 @@ def _runtime_protocol(config, tokenizer, data_sha256, world_size):
     matmul_precision = (str(matmul.fp32_precision) if hasattr(matmul, 'fp32_precision')
                         else {'allow_tf32': bool(matmul.allow_tf32)})
     source_root = Path(__file__).resolve().parent
+    normalizations, temperatures, seeds = evaluation_settings(config)
     implementation = {name: file_sha256(source_root / name) for name in (
         'cdlm_checkpoint_eval_worker.py', 'sdtt_eval.py', 'cdlm_ancestral_sweep.py',
         'models/dit.py', 'trainer_base.py', 'cdlm.py', 'sdtt_checkpoint.py',
@@ -255,12 +289,12 @@ def _runtime_protocol(config, tokenizer, data_sha256, world_size):
         'batch_size_per_rank': int(config.eval.gsm8k_batch_size),
         'world_size': world_size, 'sharding': 'examples[rank::world_size]',
         'seed': int(config.seed), 'rank_seed_offset': 104729,
-        'confidence': {'normalizations': list(NORMALIZATIONS),
+        'confidence': {'enabled': bool(normalizations), 'normalizations': normalizations,
                        'thresholds': CONFIDENCE_THRESHOLDS, 'temperature': 0.,
                        'max_steps': 512,
                        'nfe_definition': 'mean active forwards per example, including capped final removal'},
         'ancestral': {'normalization': 'fp32', 'steps': ANCESTRAL_STEPS,
-                      'seeds': [1], 'temperature': 0., 'predictor': 'ancestral_cache',
+                      'seeds': seeds, 'temperatures': temperatures, 'predictor': 'ancestral_cache',
                       'final_denoise': True, 'epsilon': 1e-5,
                       'nfe_definition': 'actual cached batch forwards per example including separate cleanup'},
         'grading': 'S-FLM simple_math_problem execution',
@@ -309,11 +343,14 @@ class Publisher:
                          ['source_run', 'family', 'checkpoint', 'checkpoint_sha256',
                           'step', 'weights', 'protocol_sha256', 'data_sha256',
                           'world_size', 'forward_precision', 'confidence_normalizations',
-                          'ancestral_normalization', 'ancestral_seeds'],
+                          'ancestral_normalization', 'ancestral_seeds', 'ancestral_temperatures'],
                          [[entry['source_run'], entry['family'], entry['checkpoint'],
                            identity['checkpoint_sha256'], entry['step'], 'ema',
                            identity['protocol_sha256'], protocol['data_sha256'],
-                           protocol['world_size'], 'bf16', 'bf16,fp32', 'fp32', '1']],
+                           protocol['world_size'], 'bf16',
+                           ','.join(protocol['confidence']['normalizations']), 'fp32',
+                           ','.join(map(str, protocol['ancestral']['seeds'])),
+                           ','.join(map(str, protocol['ancestral']['temperatures']))]],
                          step=entry['step'])
 
     def confidence(self, entry, normalization, points, samples):
@@ -339,20 +376,27 @@ class Publisher:
     def ancestral_point(self, entry, point):
         from cdlm_ancestral_logging import point_metrics
         logger = self.loggers[entry['source_run']]
-        logger.log_metrics(point_metrics(point), step=entry['step'])
-        logger.log_metrics({f'ancestral/gsm8k_step_{entry["step"]}': point['accuracy_mean']},
+        temperature = point.get('temperature', 0.)
+        suffix = '_' + temperature_tag(temperature) if temperature else ''
+        logger.log_metrics({key + suffix: value for key, value in point_metrics(point).items()},
+                           step=entry['step'])
+        logger.log_metrics({f'ancestral/gsm8k_step_{entry["step"]}{suffix}': point['accuracy_mean']},
                            step=point['steps'])
 
     def ancestral_result(self, entry, result):
         from cdlm_ancestral_logging import render_ancestral
         logger = self.loggers[entry['source_run']]
-        rows = [[point['steps'], sample['seed'], sample['correct'], sample['count'],
+        rows = [[point.get('temperature', 0.), point['steps'], sample['seed'], sample['correct'], sample['count'],
                  sample['accuracy'], sample['nfe']]
                 for point in result['points'] for sample in point['seeds']]
-        logger.log_table('ancestral/results', ['steps', 'seed', 'correct', 'count', 'accuracy', 'NFE'],
+        logger.log_table('ancestral/results', ['temperature', 'steps', 'seed', 'correct', 'count', 'accuracy', 'NFE'],
                          rows, step=entry['step'])
-        logger.log_image('ancestral/accuracy_vs_steps',
-                         render_ancestral(result['points'], step=entry['step']), step=entry['step'])
+        for temperature in dict.fromkeys(point.get('temperature', 0.) for point in result['points']):
+            points = [point for point in result['points'] if point.get('temperature', 0.) == temperature]
+            suffix = '_' + temperature_tag(temperature) if temperature else ''
+            logger.log_image('ancestral/accuracy_vs_steps' + suffix,
+                             render_ancestral(points, step=entry['step'], temperature=temperature),
+                             step=entry['step'])
 
     def completed(self, entry):
         source = entry['source_run']
@@ -363,8 +407,7 @@ class Publisher:
 
     def republish(self, entry, payload):
         self.provenance(entry, payload)
-        for normalization in NORMALIZATIONS:
-            points = payload['confidence'][normalization]
+        for normalization, points in payload['confidence'].items():
             for index in range(len(points)):
                 self.confidence(entry, normalization, points[:index + 1], [])
         for point in payload['ancestral']['points']:
@@ -410,12 +453,14 @@ def _run(plan, config):
     import model_assets
     import sdtt_eval
     from cdlm_ancestral_sweep import sweep as ancestral_sweep
+    from omegaconf import OmegaConf
 
     rank, world_size = dist.get_rank(), dist.get_world_size()
     error = None
     try:
         validate_plan(plan)
         validate_config(config)
+        normalizations, temperatures, seeds = evaluation_settings(config)
         if world_size != int(config.trainer.devices):
             raise ValueError('torchrun world size must match configured trainer.devices.')
         model_assets.configure_model_weights(config, base_dir=os.getcwd())
@@ -478,12 +523,14 @@ def _run(plan, config):
         _sync_error(error, f'Checkpoint loading at step{entry["step"]}')
         payload = {'identity': identity, 'protocol': protocol, 'complete': False,
                    'checkpoint': entry['checkpoint'], **metadata,
-                   'confidence': {norm: [] for norm in NORMALIZATIONS},
-                   'samples': {norm: [] for norm in NORMALIZATIONS},
-                   'ancestral': {'points': [], 'complete': False}}
+                   'confidence': {norm: [] for norm in normalizations},
+                   'samples': {norm: [] for norm in normalizations},
+                   'ancestral': {'points': [], 'complete': False, 'normalization': 'fp32',
+                                 'protocols': []}}
         if rank == 0:
             print(f'[checkpoint-eval] {entry["source_run"]} step={entry["step"]} '
-                  f'SHA256={checkpoint_hash}: starting dual-normalization confidence and ancestral.', flush=True)
+                  f'SHA256={checkpoint_hash}: confidence={bool(normalizations)}; '
+                  f'ancestral temperatures={temperatures}, seeds={seeds}.', flush=True)
         _rank_zero_result(lambda: (write_json(result_path, payload), publisher.provenance(entry, payload)),
                           'Checkpoint evaluation start')
 
@@ -491,7 +538,7 @@ def _run(plan, config):
         # retaining the exact seeded rank-strided sweep used during training.
         sample_threshold = min(CONFIDENCE_THRESHOLDS, key=lambda value: abs(value - .9))
         with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
-            for normalization in NORMALIZATIONS:
+            for normalization in normalizations:
                 model.normalization = normalization
                 try:
                     for threshold in CONFIDENCE_THRESHOLDS:
@@ -513,16 +560,25 @@ def _run(plan, config):
 
             model.normalization = 'fp32'
 
-            def completed_point(point):
-                if rank == 0:
-                    payload['ancestral']['points'].append(point)
-                    write_json(result_path, payload)
-                    publisher.ancestral_point(entry, point)
+            for temperature in temperatures:
+                # An independent config and seeded sweep keep temperatures isolated.
+                ancestral_config = OmegaConf.merge(config.eval, {'gsm8k_ancestral_temperature': temperature})
 
-            result = ancestral_sweep(model, examples, distributed=True,
-                                      on_point=completed_point, cfg=config.eval)
+                def completed_point(point):
+                    if rank == 0:
+                        point = {**point, 'temperature': temperature}
+                        payload['ancestral']['points'].append(point)
+                        write_json(result_path, payload)
+                        publisher.ancestral_point(entry, point)
+
+                result = ancestral_sweep(model, examples, distributed=True,
+                                          on_point=completed_point, cfg=ancestral_config)
+                if rank == 0:
+                    payload['ancestral']['protocols'].append(result['protocol'])
+                    if len(temperatures) == 1:
+                        payload['ancestral']['protocol'] = result['protocol']
             if rank == 0:
-                payload['ancestral'] = {**result, 'complete': True, 'normalization': 'fp32'}
+                payload['ancestral']['complete'] = True
 
         def completed_checkpoint():
             publisher.ancestral_result(entry, payload['ancestral'])

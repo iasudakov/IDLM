@@ -225,6 +225,8 @@ class SingleCheckpointCLITest(Fixture):
                          [.325, .4, .475, .55, .625, .7, .775, .85, .925, .95, .98, .99, .995])
         self.assertEqual(list(config.eval.gsm8k_ancestral_steps), [4, 8, 16, 32, 48, 64])
         self.assertEqual(list(config.eval.gsm8k_ancestral_seeds), [1])
+        self.assertEqual(list(config.eval.gsm8k_ancestral_temperatures), [0.])
+        self.assertTrue(config.eval.gsm8k_checkpoint_confidence)
         self.assertTrue(config.eval.gsm8k_ancestral_final_denoise)
         self.assertEqual(config.eval.gsm8k_batch_size, 16)
         self.assertEqual(config.training.finetune_path, '')

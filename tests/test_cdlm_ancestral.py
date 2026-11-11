@@ -4,6 +4,7 @@ The independent oracle uses archived IDLM 14594e sampler equations. Tests use
 small context-dependent distributions, never checkpoints, GPUs, or tracker IO.
 """
 from contextlib import ExitStack
+import ast
 import json
 from pathlib import Path
 import tempfile
@@ -16,6 +17,16 @@ from omegaconf import OmegaConf
 import torch
 
 import sdtt_eval as validation
+
+
+def categorical_module():
+    """Load the real stateless sampler without importing optional training/GPU dependencies."""
+    path = Path(__file__).resolve().parents[1] / 'trainer_base.py'
+    definition = next(node for node in ast.parse(path.read_text()).body
+                      if isinstance(node, ast.FunctionDef) and node.name == 'sample_categorical')
+    namespace = {'torch': torch}
+    exec(compile(ast.Module(body=[definition], type_ignores=[]), str(path), 'exec'), namespace)
+    return SimpleNamespace(sample_categorical=namespace['sample_categorical'])
 
 
 class Tokenizer:
@@ -183,6 +194,42 @@ class AncestralDecoderTest(unittest.TestCase):
         model.config.sampling.predictor = 'analytic'
         with self.assertRaises(ValueError):
             validation.generate_greedy_samples(model, [[0]], 2)
+
+
+class AncestralTemperatureTest(unittest.TestCase):
+    def test_tempered_proposals_and_final_cleanup_use_categorical_sampling(self):
+        for temperature in (.1, 1.):
+            with self.subTest(temperature=temperature):
+                model = Model()
+                probabilities = torch.tensor([.1, .2, .3, .4, 0., 0., 0.])
+                model.forward = lambda x, sigma: probabilities.log().repeat(*x.shape, 1)
+                seen = []
+
+                def categorical(weights):
+                    seen.append(weights.clone())
+                    # Force a non-argmax token, including the final cleanup.
+                    return torch.ones(weights.shape[:-1], dtype=torch.long)
+
+                with patch.dict('sys.modules', {'trainer_base': SimpleNamespace(sample_categorical=categorical)}), \
+                        patch.object(torch, 'rand', side_effect=lambda shape, **kw: torch.ones(shape)):
+                    samples, metadata = validation.generate_greedy_samples(
+                        model, [[0, 2]], 2, final_denoise=True, temperature=temperature)
+                self.assertEqual(samples[0, :2].tolist(), [0, 2])
+                self.assertEqual(samples[0, 2:].tolist(), [1] * (model.num_tokens - 2))
+                self.assertEqual(metadata['nfe'], 2)  # Cached transitions plus cleanup.
+                self.assertEqual(len(seen), 3)  # Resample each transition, then cleanup.
+                expected = probabilities.pow(1 / temperature)
+                expected /= expected.sum()
+                for weights in seen:
+                    self.assertTrue(torch.allclose(weights[0, 0], expected, atol=1e-6))
+                    self.assertEqual(float(weights[..., model.mask_index].sum()), 0.)
+
+    def test_invalid_temperature_fails_before_model_forward(self):
+        for temperature in (-1., float('nan'), float('inf')):
+            model = Model()
+            with self.subTest(temperature=temperature), self.assertRaisesRegex(ValueError, 'temperature'):
+                validation.generate_greedy_samples(model, [[0]], 4, temperature=temperature)
+            self.assertEqual(model.seen, [])
 
 
 class AncestralSweepTest(unittest.TestCase):

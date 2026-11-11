@@ -136,7 +136,10 @@ def main(argv=None):
         raise ValueError('Use a positive --devices value and Hydra key=value overrides.')
     code_dir, output = Path.cwd().resolve(), Path(options.output_dir).expanduser().resolve()
     defaults = ['logger.name="mmd checkpoint evaluation"',
-                'checkpointing.snapshot_namespace=mmd_checkpoint_eval']
+                'checkpointing.snapshot_namespace=mmd_checkpoint_eval',
+                'eval.gsm8k_checkpoint_confidence=True',
+                'eval.gsm8k_ancestral_temperatures=[0.0]',
+                'eval.gsm8k_ancestral_seeds=[1]']
     # Fail on missing offline tokenizer/GSM8K assets before spending time or
     # bandwidth on the explicitly requested model download.
     config = compose_evaluation_config(defaults + overrides, code_dir=code_dir,
