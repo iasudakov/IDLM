@@ -77,6 +77,25 @@ class ParetoPublisherTests(unittest.TestCase):
     self.assertEqual(exact[0]['generation_batches'], 2)
     self.assertEqual(exact[0]['answer_entropy'], 2.4)
 
+  def test_fp32_keeps_original_history_metrics_tables_and_images(self):
+    with mock.patch.object(pareto, 'render', return_value='image'):
+      self.publish(plot=True)
+      original = self.path.read_bytes()
+      old_metrics = len(self.logger.metrics)
+      changed = curve()
+      changed[0]['nfe'] = 5.0
+      self.publish(changed, plot=True, suffix='_fp32norm')
+    self.assertEqual(self.path.read_bytes(), original)
+    fp32_path = self.path.with_name(self.path.stem + '_fp32norm.json')
+    stored = json.loads(fp32_path.read_text())
+    self.assertEqual(stored['runs']['run-a']['curves']['100'][1]['nfe'], 5.)
+    self.assertTrue(all(key.endswith('_fp32norm')
+                        for metrics, _ in self.logger.metrics[old_metrics:] for key in metrics))
+    self.assertEqual([item[0] for item in self.logger.tables],
+                     ['pareto/gsm8k_thresholds', 'didi/tinygsm_pareto_protocol',
+                      'pareto/gsm8k_thresholds_fp32norm', 'didi/tinygsm_pareto_protocol_fp32norm'])
+    self.assertEqual([item[0] for item in self.logger.images], ['pareto/frontier', 'pareto/frontier_fp32norm'])
+
   def test_scalar_axis_is_nfe_times_100_not_training_step(self):
     self.publish()
     self.assertEqual(self.scalar_points(), [(.4, 320), (.5, 412)])

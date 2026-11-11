@@ -222,7 +222,7 @@ def render(history, reference=None, reference_label='Released MDLM teacher',
   return np.asarray(canvas.buffer_rgba())[..., :3].copy()
 
 
-def publish_threshold_pareto(trainer, model, curve, *, reference=None, plot=False):
+def publish_threshold_pareto(trainer, model, curve, *, reference=None, plot=False, suffix=''):
   """Publish one completed threshold sweep, called on rank zero only.
 
   Required point fields are threshold, nfe, accuracy. ``nfe`` must already be
@@ -231,9 +231,11 @@ def publish_threshold_pareto(trainer, model, curve, *, reference=None, plot=Fals
   """
   if not getattr(trainer, 'is_global_zero', getattr(trainer, 'global_rank', 0) == 0):
     raise RuntimeError('Threshold Pareto publication must run on rank zero only.')
+  if suffix not in ('', '_fp32norm'):
+    raise ValueError('Unknown prediction normalization suffix.')
   points = _curve(curve)
   step, run_uid = _training_step(trainer, model), _run_uid(trainer, model)
-  path = Path(model.config.checkpointing.save_dir) / HISTORY_FILENAME
+  path = Path(model.config.checkpointing.save_dir) / HISTORY_FILENAME.replace('.json', f'{suffix}.json')
   payload = _read_history(path)
   current = payload['runs'].setdefault(run_uid, {'curves': {}})
   current['curves'][str(step)] = points
@@ -248,21 +250,23 @@ def publish_threshold_pareto(trainer, model, curve, *, reference=None, plot=Fals
   collisions = sorted(bucket for bucket, entries in buckets.items() if len(entries) > 1)
   protocol = {
     'training_step': step, 'run_uid': run_uid,
+    'prediction_normalization': 'fp32' if suffix else 'original',
+    'backbone_precision': 'unchanged from configured forward',
     'x_axis': 'example-weighted mean measured NFE per sequence',
     'batch_forward_totals': 'separate extra metric; never used as the frontier x axis',
     'scalar_x_scale': NFE_X_SCALE,
     'scalar_axis_label': 'integer step / 100 = approximate NFE per sequence',
     'scalar_collision_policy': 'omit every colliding bucket; table, history and image retain all points',
     'scalar_collision_buckets': collisions,
-    'authoritative_values': 'pareto/gsm8k_thresholds table and per-run JSON history',
+    'authoritative_values': f'pareto/gsm8k_thresholds{suffix} table and per-run JSON history',
     'history_path': str(path), 'renderer_reference_sha256': REFERENCE_RENDERER_SHA256,
   }
   trends = {}
   for point in points:
     tag = threshold_tag(point['threshold'])
-    trends[f'val/gsm8k_acc_thr{tag}'] = point['accuracy']
-    trends[f'val/gsm8k_nfe_thr{tag}'] = point['nfe']
-  trends['didi_tinygsm_pareto/scalar_collision_points'] = sum(len(buckets[bucket]) for bucket in collisions)
+    trends[f'val/gsm8k_acc_thr{tag}{suffix}'] = point['accuracy']
+    trends[f'val/gsm8k_nfe_thr{tag}{suffix}'] = point['nfe']
+  trends[f'didi_tinygsm_pareto/scalar_collision_points{suffix}'] = sum(len(buckets[bucket]) for bucket in collisions)
   if collisions:
     print('[didi-tinygsm-pareto] integer NFE*100 buckets collide; omitted from '
           f'approximate scalar view: {collisions}. All threshold points remain '
@@ -278,20 +282,20 @@ def publish_threshold_pareto(trainer, model, curve, *, reference=None, plot=Fals
     logger.log_metrics(trends, step=step)
     for bucket, entries in sorted(buckets.items()):
       if len(entries) == 1:
-        logger.log_metrics({f'pareto/gsm8k_step_{step}': entries[0]['accuracy']}, step=bucket)
+        logger.log_metrics({f'pareto/gsm8k_step_{step}{suffix}': entries[0]['accuracy']}, step=bucket)
     if hasattr(logger, 'log_table'):
-      logger.log_table(key='pareto/gsm8k_thresholds',
+      logger.log_table(key=f'pareto/gsm8k_thresholds{suffix}',
         columns=['Threshold', 'Mean NFE per sequence', 'Accuracy', 'Correct', 'Examples',
                  'Integer scalar x (NFE * 100)', 'Included in approximate scalar view', 'Point (JSON)'],
         data=rows, step=step)
-      logger.log_table(key='didi/tinygsm_pareto_protocol', columns=['Property', 'JSON value'],
+      logger.log_table(key=f'didi/tinygsm_pareto_protocol{suffix}', columns=['Property', 'JSON value'],
         data=[[key, json.dumps(value)] for key, value in protocol.items()], step=step)
   if plot and any(hasattr(logger, 'log_image') for logger in loggers):
     try:
       image = render(current['curves'], reference=load_reference(reference))
       for logger in loggers:
         if hasattr(logger, 'log_image'):
-          logger.log_image(key='pareto/frontier', image=image, step=step)
+          logger.log_image(key=f'pareto/frontier{suffix}', image=image, step=step)
     except Exception as error:
       # Plotting is optional. Missing Matplotlib must not discard the completed
       # sweep or prevent training when exact tables/history already succeeded.

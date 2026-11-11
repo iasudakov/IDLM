@@ -6,7 +6,7 @@ it is NOT an operating-system security sandbox. Only enable execution grading
 for trusted experiments. No grader heuristics are changed here.
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import functools
 import hashlib
 import importlib.util
@@ -21,6 +21,7 @@ from omegaconf import OmegaConf
 import torch
 
 from .monitor import preserve_rng_state
+from .eval_precision import capture_rng_state, fp32_prediction_normalization, replay_rng_state
 
 
 def _integer(name, value, minimum=1):
@@ -37,6 +38,8 @@ def _integer(name, value, minimum=1):
 def threshold_options(config):
     """Validate the opt-in sweep without data, models, or tracker access."""
     options = config.get('eval', {})
+    if not isinstance(options.get('gsm8k_pareto_fp32', True), bool):
+        raise ValueError('eval.gsm8k_pareto_fp32 must be a boolean')
     raw = options.get('gsm8k_pareto_thresholds', None)
     thresholds = []
     if raw is not None:
@@ -345,15 +348,18 @@ class DiDiTinyGSMEvaluation(L.Callback):
             rows.extend(self._decoded_rows(model, chunk, samples, lengths))
         return rows
 
-    def _threshold_batches(self, model, total, threshold):
+    def _threshold_batches(self, model, total, threshold, *, fp32norm=False):
         batches = []
         for chunk, padded, lengths in self._benchmark_batches(total):
             model.eval()
             padded, lengths = padded.to(model.device), lengths.to(model.device)
-            samples, metadata = self.adaptive_generator(
-                model, prefix_tokens=padded, prefix_lengths=lengths, threshold=threshold,
-                temperature=self.threshold_temperature, max_steps=self.threshold_cap,
-                return_metadata=True)
+            # Enter inside the synchronized generation stage, including errors
+            # on a rank with data while another rank has an empty shard.
+            with fp32_prediction_normalization(model) if fp32norm else nullcontext():
+                samples, metadata = self.adaptive_generator(
+                    model, prefix_tokens=padded, prefix_lengths=lengths, threshold=threshold,
+                    temperature=self.threshold_temperature, max_steps=self.threshold_cap,
+                    return_metadata=True)
             samples = self._validate_samples(model, samples, padded, lengths)
             if metadata.get('complete') is not True or bool((samples == model.mask_index).any()):
                 raise ValueError('Adaptive sweep returned incomplete output; no partial accuracy will be published')
@@ -382,6 +388,19 @@ class DiDiTinyGSMEvaluation(L.Callback):
             batches.append({'rows': rows, 'nfe': nfe, 'fallback_nfe': fallback, 'max_steps': cap,
                             'weights': weights, 'physical_row_forwards': physical_forwards})
         return batches
+
+    def _threshold_sweep(self, model, total, rank, *, fp32norm=False):
+        curve = []
+        suffix = '_fp32norm' if fp32norm else ''
+        for threshold in self.thresholds:
+            local = _stage(f'threshold generation{suffix} {threshold:g}',
+                           lambda: self._threshold_batches(model, total, threshold, fp32norm=fp32norm))
+            batches = _stage(f'threshold gather{suffix} {threshold:g}', lambda: _gather_rows(local))
+            point = _stage(f'threshold grading{suffix} {threshold:g}',
+                           lambda: self._threshold_metrics(batches, total, threshold) if rank == 0 else None)
+            if rank == 0:
+                curve.append(point)
+        return curve
 
     def _threshold_metrics(self, batches, total, threshold):
         rows = [row for batch in batches for row in batch['rows']]
@@ -428,6 +447,8 @@ class DiDiTinyGSMEvaluation(L.Callback):
                 'primary_steps': self.primary_steps, 'gsm8k_steps': self.budgets,
                 'threshold_sweep': None if not self.thresholds else {
                     'thresholds': self.thresholds, 'temperature': self.threshold_temperature,
+                    'prediction_normalizations': ['original', 'fp32']
+                        if self.options.get('gsm8k_pareto_fp32', True) else ['original'],
                     'max_steps': self.threshold_cap, 'sampler': 'low_confidence_dynamic',
                     'guidance': 'none; discriminator is not called',
                     'weights': getattr(model, '_didi_evaluation_weights', 'backbone'),
@@ -527,14 +548,12 @@ class DiDiTinyGSMEvaluation(L.Callback):
                                        if rank == 0 else None)
                         if rank == 0:
                             curves.append(point)
-                    for threshold in self.thresholds:
-                        local = _stage(f'threshold generation {threshold:g}',
-                                       lambda: self._threshold_batches(pl_module, total, threshold))
-                        batches = _stage(f'threshold gather {threshold:g}', lambda: _gather_rows(local))
-                        point = _stage(f'threshold grading {threshold:g}',
-                                       lambda: self._threshold_metrics(batches, total, threshold) if rank == 0 else None)
-                        if rank == 0:
-                            threshold_curve.append(point)
+                    fp32 = bool(self.thresholds) and self.options.get('gsm8k_pareto_fp32', True)
+                    initial_rng = capture_rng_state() if fp32 else None
+                    threshold_curve = self._threshold_sweep(pl_module, total, rank)
+                    if fp32:
+                        with replay_rng_state(initial_rng):
+                            fp32_curve = self._threshold_sweep(pl_module, total, rank, fp32norm=True)
                 _stage('publishing', lambda: self._publish(trainer, pl_module, conditional, metrics, curves, total)
                        if rank == 0 else None)
                 if self.thresholds and benchmark_now:
@@ -542,6 +561,11 @@ class DiDiTinyGSMEvaluation(L.Callback):
                         trainer, pl_module, threshold_curve,
                         reference=self.options.get('gsm8k_pareto_reference', None),
                         plot=self.options.get('gsm8k_pareto_plot', False)) if rank == 0 else None)
+                    if fp32:
+                        _stage('threshold publishing_fp32norm', lambda: self.threshold_publisher(
+                            trainer, pl_module, fp32_curve, suffix='_fp32norm',
+                            reference=self.options.get('gsm8k_pareto_reference', None),
+                            plot=self.options.get('gsm8k_pareto_plot', False)) if rank == 0 else None)
         finally:
             self.batches = []
 

@@ -40,7 +40,7 @@ def prepare_tinygsm_config(config):
     'gsm8k_data_path': None, 'gsm8k_steps': None, 'gsm8k_plot': False,
     'gsm8k_pareto_thresholds': None, 'gsm8k_pareto_temperature': 0.0,
     'gsm8k_pareto_max_steps': None, 'gsm8k_pareto_reference': None,
-    'gsm8k_pareto_plot': True,
+    'gsm8k_pareto_plot': True, 'gsm8k_pareto_fp32': True,
   }
   with open_dict(config.eval):
     for key, value in defaults.items():

@@ -23,13 +23,15 @@ import torch
 import torch.multiprocessing as mp
 
 from didi_repro import tinygsm_eval as evaluation
+from test_eval_prediction_precision import Model as PrecisionModel
 
 
 def config(**options):
     return OmegaConf.create({
         'eval': {'generate_samples': True, 'tinygsm_exec': True,
                  'gsm8k_at_validation': True, 'gsm8k_every_n_validations': 1,
-                 'gsm8k_steps': [8, 16, 32], 'gsm8k_plot': False, **options},
+                 'gsm8k_steps': [8, 16, 32], 'gsm8k_plot': False,
+                 'gsm8k_pareto_fp32': False, **options},
         'sampling': {'steps': 16, 'num_sample_batches': 2, 'num_sample_log': 2, 'predictor': 'guided'},
         'loader': {'eval_batch_size': 2},
     })
@@ -41,6 +43,8 @@ class Tokenizer:
 
 
 class FakeModel(torch.nn.Module):
+    _process_model_output = PrecisionModel._process_model_output
+    neg_infinity = -1e6
     num_tokens = 6
     mask_index = 99
     device = torch.device('cpu')
@@ -118,16 +122,23 @@ class Logger:
 
 
 class AdaptiveGenerator:
-    def __init__(self, failure=None, mutation=None):
+    def __init__(self, failure=None, mutation=None, fp32_failure=False):
         self.calls = []
         self.failure = failure
         self.mutation = mutation
+        self.fp32_failure = fp32_failure
 
     def __call__(self, model, prefix_tokens, prefix_lengths, threshold, temperature,
                  max_steps, return_metadata):
         if self.failure:
             raise RuntimeError(self.failure)
+        prediction = model._process_model_output(
+            torch.ones(1, 1, 100, dtype=torch.bfloat16), torch.tensor([[99]]), None)
+        if self.fp32_failure and prediction.dtype == torch.float32:
+            raise RuntimeError('FP32 adaptive failure')
         self.calls.append({'threshold': threshold, 'temperature': temperature, 'max_steps': max_steps,
+                           'dtype': str(prediction.dtype),
+                           'randomness': (random.random(), np.random.rand(), torch.rand(1).item()),
                            'prefix_tokens': prefix_tokens.clone(), 'prefix_lengths': prefix_lengths.clone()})
         assert return_metadata
         samples = model.generate_samples(len(prefix_tokens), 999, prefix_tokens, prefix_lengths)
@@ -379,6 +390,37 @@ class TinyGSMThresholdTests(unittest.TestCase):
         return make_callback(config(**options), adaptive_generator=generator or AdaptiveGenerator(),
                              threshold_publisher=publisher or ThresholdPublisher())
 
+    def test_additional_fp32_sweep_has_separate_publication_and_paired_rng(self):
+        generator, publisher = AdaptiveGenerator(), ThresholdPublisher()
+        callback = self.callback(generator, publisher, gsm8k_pareto_fp32=True)
+        model, host = FakeModel(), trainer()
+        callback.on_validation_epoch_end(host, model)
+        self.assertEqual(len(publisher.calls), 2)
+        self.assertNotIn('suffix', publisher.calls[0][1])
+        self.assertEqual(publisher.calls[1][1]['suffix'], '_fp32norm')
+        self.assertEqual([call['dtype'] for call in generator.calls],
+                         ['torch.bfloat16'] * 4 + ['torch.float32'] * 4)
+        self.assertEqual([call['randomness'] for call in generator.calls[:4]],
+                         [call['randomness'] for call in generator.calls[4:]])
+        self.assertNotIn('_process_model_output', vars(model))
+        self.assertEqual(len(host.logger.metrics), 1)  # Primary fixed-budget metrics unchanged.
+
+    def test_fp32_failure_restores_normalizer_and_rng(self):
+        callback = self.callback(AdaptiveGenerator(fp32_failure=True), gsm8k_pareto_fp32=True)
+        model = FakeModel()
+        before = random.getstate(), np.random.get_state(), torch.get_rng_state().clone()
+        with self.assertRaisesRegex(RuntimeError, 'FP32 adaptive failure'):
+            callback.on_validation_epoch_end(trainer(), model)
+        self.assertNotIn('_process_model_output', vars(model))
+        self.assertEqual(random.getstate(), before[0])
+        np.testing.assert_array_equal(np.random.get_state()[1], before[1][1])
+        torch.testing.assert_close(torch.get_rng_state(), before[2], rtol=0, atol=0)
+
+    def test_fp32_flag_requires_boolean(self):
+        for value in ('false', 1, None):
+            with self.assertRaisesRegex(ValueError, 'gsm8k_pareto_fp32'):
+                self.callback(gsm8k_pareto_fp32=value)
+
     def test_threshold_sweep_adds_weighted_actual_nfe_without_changing_fixed_budgets(self):
         generator, publisher = AdaptiveGenerator(), ThresholdPublisher()
         callback = self.callback(generator, publisher, gsm8k_pareto_temperature=.3,
@@ -527,10 +569,12 @@ def _threshold_ddp_worker(rank, init_file, result_dir, scenario):
     torch.set_num_threads(1)
     torch.distributed.init_process_group('gloo', init_method=f'file://{init_file}', rank=rank,
                                         world_size=2, timeout=timedelta(seconds=40))
-    generator = AdaptiveGenerator(failure='rank-one adaptive failure' if scenario == 'failure' and rank == 1 else None)
+    generator = AdaptiveGenerator(failure='rank-one adaptive failure' if scenario == 'failure' and rank == 1 else None,
+                                  fp32_failure=scenario == 'fp32_failure' and rank == 1)
     publisher = ThresholdPublisher()
     data = dataset()[:1] if scenario == 'empty_rank' else dataset()
-    callback = make_callback(config(generate_samples=False, gsm8k_steps=None, gsm8k_pareto_thresholds=[.25]),
+    callback = make_callback(config(generate_samples=False, gsm8k_steps=None, gsm8k_pareto_thresholds=[.25],
+                                    gsm8k_pareto_fp32=True),
                              data=data, adaptive_generator=generator, threshold_publisher=publisher)
     host, model = trainer(), FakeModel()
     host.world_size = 2
@@ -568,19 +612,22 @@ class TinyGSMDistributedTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.distributed.is_available() and torch.distributed.is_gloo_available(), 'requires Gloo')
     def test_threshold_global_weighting_empty_rank_and_synchronized_generation_failure(self):
-        for scenario in ('uneven', 'empty_rank', 'failure'):
+        for scenario in ('uneven', 'empty_rank', 'failure', 'fp32_failure'):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory(prefix='didi-threshold-gloo-') as directory:
                 mp.spawn(_threshold_ddp_worker, args=(str(Path(directory, 'init')), directory, scenario), nprocs=2, join=True)
                 first, second = [json.loads(Path(directory, f'{rank}.json').read_text()) for rank in range(2)]
                 self.assertEqual(second['published'], [])
-                if scenario == 'failure':
-                    self.assertIn('rank-one adaptive failure', first['error'])
+                if scenario in ('failure', 'fp32_failure'):
+                    self.assertIn('rank-one adaptive failure' if scenario == 'failure' else 'FP32 adaptive failure',
+                                  first['error'])
                     self.assertEqual(first['error'], second['error'])
                     self.assertEqual(first['published'], [])
                     self.assertEqual(first['metrics'], [])
                 else:
                     self.assertIsNone(first['error'])
                     self.assertIsNone(second['error'])
+                    self.assertEqual(len(first['published']), 2)
+                    self.assertEqual(first['published'][1][1]['suffix'], '_fp32norm')
                     point = first['published'][0][0][0]
                     if scenario == 'empty_rank':
                         self.assertEqual(second['adaptive_calls'], 0)

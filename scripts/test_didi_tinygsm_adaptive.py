@@ -1,7 +1,7 @@
 """CPU-only reference threshold-decoding tests; no network, GPU or checkpoints."""
 
 import ast
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import subprocess
 import sys
@@ -106,6 +106,27 @@ class AdaptiveTests(unittest.TestCase):
 
     def sample(self, model=None, **kwargs):
         return generate_adaptive(model or Model(), self.prefixes, self.lengths, **kwargs)
+
+    def test_fp32_normalization_changes_measured_nfe_with_bf16_forward(self):
+        from test_eval_prediction_precision import Model as PrecisionModel
+        from didi_repro.eval_precision import fp32_prediction_normalization
+        model = PrecisionModel()
+        model.num_tokens, model.vocab_size = 3, 5
+        model.device = torch.device('cpu')
+        model.parameterization = 'subs'
+        model._didi_evaluation_weights = 'backbone'
+        model._didi_evaluation_context = nullcontext
+        model.noise = LinearNoise()
+        model._sigma_from_alphat = lambda alpha: -alpha.log()
+        kwargs = dict(prefix_tokens=torch.tensor([[1]]), prefix_lengths=torch.tensor([1]), threshold=.925)
+        original, legacy = generate_adaptive(model, **kwargs)
+        with fp32_prediction_normalization(model):
+            precise, fp32 = generate_adaptive(model, **kwargs)
+        self.assertEqual(legacy['nfe_per_row'].tolist(), [1.])
+        self.assertEqual(fp32['nfe_per_row'].tolist(), [2.])
+        self.assertTrue(torch.equal(original, precise))
+        self.assertEqual(precise[0, 0].item(), 1)
+        self.assertTrue(all(dtype == torch.bfloat16 for dtype in model.forward_dtypes))
 
     def test_threshold_is_strict_and_stall_forces_first_argmax_tie(self):
         confidence = torch.tensor([[.8, .8, .7], [1., .9, .8]])
