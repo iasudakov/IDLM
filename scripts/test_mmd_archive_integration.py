@@ -178,7 +178,8 @@ class IntegrationTests(unittest.TestCase):
         env = dict(os.environ, DEVICES=str(devices), PATH=directory + os.pathsep + os.environ['PATH'])
         command = ['bash', str(ROOT / 'scripts/train_tinygsm_mmd_fast.sh'),
                    'adversarial_distill.mmd_kernel_batch_size=3', 'adversarial_distill.mmd_group_size=8',
-                   'adversarial_distill.mmd_feature_layer=9', 'adversarial_distill.mmd_rbf_alpha=6.17283950617284e-5']
+                   'adversarial_distill.mmd_feature_layer=9', 'adversarial_distill.mmd_rbf_alpha=6.17283950617284e-5',
+                   'eval.start_step=5500']
         args = json.loads(subprocess.check_output(command, env=env, text=True))
         with initialize_config_dir(config_dir=str(ROOT / 'configs'), version_base=None):
           cfg = compose(config_name='config', overrides=args[3:])
@@ -188,6 +189,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(cfg.adversarial_distill.mmd_kernel_batch_size, 3)
         self.assertEqual(cfg.adversarial_distill.mmd_group_size, 8)
         self.assertTrue(cfg.eval.gsm8k_pareto_fp32)
+        self.assertEqual(cfg.eval.start_step, 5500)
         self.assertTrue(cfg.checkpointing.save_evaluated_checkpoints)
         self.assertEqual(cfg.data.separator, r'\n')
 

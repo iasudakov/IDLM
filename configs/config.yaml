@@ -470,6 +470,10 @@ eval:
   tinygsm_exec: True
   tinygsm_exec_timeout: 5.0
   validate_before_train: True
+  # First allowed optimizer step for training validation (inclusive). The
+  # normal validation cadence is unchanged. Positive values skip step-zero
+  # baseline/sanity checks as well as all earlier validation loops.
+  start_step: 0
   gsm8k_at_validation: True
   gsm8k_num_examples: null
   gsm8k_batch_size: 16

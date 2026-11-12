@@ -69,7 +69,8 @@ reference also consume different random streams unless draws are fixed.
 ## Evaluation and saving
 
 Validation runs every 500 optimizer updates: 1000 train batches on eight GPUs,
-2000 on four GPUs. The interval follows manual accumulation through Hydra.
+2000 on four GPUs, 4000 on two GPUs. The interval follows manual accumulation
+through Hydra.
 The evaluated checkpoint callback saves after each completed validation, with
 names such as `checkpoints/eval-step=00000500.ckpt`. It retains live weights,
 EMA and optimizer state, and invokes the existing Nirvana snapshot helper.
@@ -77,6 +78,24 @@ For archive runs, checkpoint saving preserves Lightning's manual-loop counters;
 the legacy hook would otherwise overwrite them with the unused automatic-loop
 counters. This path is covered by a save/load/resume integration check.
 Passing `trainer.val_check_interval=2000` still works and is in train batches.
+
+To skip all evaluations before optimizer step 5500:
+
+```bash
+DEVICES=2 bash scripts/train_tinygsm_mmd_fast.sh eval.start_step=5500
+```
+
+`eval.start_step` defaults to 0 (previous behavior). A positive value skips
+the explicit initial evaluation, Lightning's sanity check, and complete
+training validation loops, including NLL, sample generation and both GSM8K
+precision sweeps. With the default cadence, evaluations then run at steps
+5500, 6000, 6500, etc.; evaluated checkpoints also start at 5500. The threshold
+uses the restored optimizer step when resuming. It does not shift the cadence:
+for example, a threshold of 5501 first evaluates at 6000. A threshold above
+the training budget means no evaluations or evaluated checkpoints in that run.
+Independent periodic checkpoint policies and standalone evaluation commands
+are unaffected. `eval.validate_before_train=False` alone only disables the
+initial evaluation; use `eval.start_step` to delay periodic validation too.
 
 The existing confidence sweep at T=0 runs in its original precision and again
 with FP32 prediction normalization (`_fp32norm`). Both backbone forwards keep
@@ -92,6 +111,7 @@ CUDA_VISIBLE_DEVICES='' python -m tests.test_objective_fast
 CUDA_VISIBLE_DEVICES='' python scripts/test_mmd_archive_integration.py
 CUDA_VISIBLE_DEVICES='' python scripts/test_gsm8k_fp32_pareto.py
 CUDA_VISIBLE_DEVICES='' python scripts/test_evaluated_checkpoint.py
+CUDA_VISIBLE_DEVICES='' python scripts/test_validation_schedule.py
 ```
 
 The archive test suite checks B/G combinations, per-candidate rewards,

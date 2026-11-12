@@ -17,6 +17,7 @@ import algo
 import checkpoint_ema
 import dataloader
 from evaluated_checkpoint import EvaluatedCheckpoint
+from validation_schedule import ValidationStart
 import model_assets
 import nirvana_snapshot
 import sandbox_gsm8k
@@ -233,6 +234,7 @@ def _eval_ppl(diffusion_model, config, logger, tokenizer):
 
 
 def _train(diffusion_model, config, logger, tokenizer):
+  validation_start = ValidationStart(config.eval.get('start_step', 0))
   logger.info('Starting Training.')
   if config.training.get('continue_teacher', False):
     logger.info(
@@ -258,6 +260,8 @@ def _train(diffusion_model, config, logger, tokenizer):
 
   # Lightning callbacks
   callbacks = []
+  if validation_start.start_step > 0:
+    callbacks.append(validation_start)
   if 'callbacks' in config:
     for _, callback in config.callbacks.items():
       callbacks.append(hydra.utils.instantiate(callback))
@@ -302,7 +306,12 @@ def _train(diffusion_model, config, logger, tokenizer):
     strategy=hydra.utils.instantiate(config.strategy),
     logger=tensorboard_logger,
     enable_progress_bar=False if config.debug else True)
-  if config.eval.get('validate_before_train', False):
+  if validation_start.start_step > 0:
+    logger.info(
+      f'Validation starts at the first scheduled check at or after optimizer '
+      f'step {validation_start.start_step}; step-zero baseline and sanity '
+      'validation are skipped.')
+  elif config.eval.get('validate_before_train', False):
     # Baseline at step 0. For a distillation run the student *is* the teacher
     # here, so this is the teacher's own score under the exact metrics the run
     # is judged by -- the zero point the curve is measured against.
