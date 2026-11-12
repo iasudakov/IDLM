@@ -1,0 +1,11 @@
+{
+  "archive": "dlm-mmd-fast (1).zip",
+  "sha256": "6031af3f88e55ca6c7da816807f647ac9c35cc6e489afba5af379d98918fb2cf",
+  "source_directory": "dlm-mmd-fast/Untitled",
+  "note": "The two objectives in Untitled add the FP32 outer-autocast fix; all other source files match the root copy. Objective source is copied verbatim.",
+  "files": {
+    "mmd/objective.py": "1677d0eac936ee7daaeabdd5d536c6119c4f331ab7d7768548faecf5a006cc6b",
+    "mmd/objective_fast.py": "7abd45c703293c2f63b4749f39085ebc22f52a78ae5b68eff9bd38c8d0df9c4f",
+    "tests/test_objective_fast.py": "4bc1163dbd18e2ba89b6c15b07dfb47a20c124a054fbd0308d331ad13d44809c"
+  }
+}

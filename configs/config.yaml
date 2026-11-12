@@ -11,6 +11,7 @@ defaults:
 
 mode: train  # train / ppl_eval / sample_eval / gsm8k_eval
 debug: False
+detect_anomaly: True  # Archive fast launcher disables this debugging overhead.
 
 gsm8k:
   input_file: null  # if set, skip sampling and evaluate directly from this JSON file
@@ -26,6 +27,13 @@ model_weights_dir: null
 
 adversarial_distill:
   is_distill: False
+  # legacy: existing objectives below. fast/reference: the corrected archive's
+  # cross-draw token RBF objective, requiring kernel_source=draws and B >= 2.
+  mmd_implementation: legacy
+  mmd_average_candidates: False  # archive TinyGSM recipe sums over G
+  mmd_fast_feature_batch_size: 64
+  mmd_fast_scored_head: True
+  mmd_fast_kernel_elements: 134217728
   # --- Paired AR feature reward (ported from yrOPDLM's rl-mmd branch) ---
   # A frozen autoregressive model used as a fixed *feature map* rather than a
   # likelihood critic: run it over the clean answer and over the student's

@@ -212,6 +212,9 @@ class MDLM(trainer_base.AbsorbingState):
       config.adversarial_distill, self.sampling_eps, self.noise.eps)
     self._validate_configuration()
     self.is_adversarial_distill = self.config.adversarial_distill.is_distill
+    if self.config.adversarial_distill.get('mmd_implementation', 'legacy') != 'legacy':
+      from mmd_archive import validate_config
+      validate_config(self.config)
     if self.is_adversarial_distill:
       self.automatic_optimization = False
       self.teacher = copy.deepcopy(self.backbone)
@@ -368,7 +371,14 @@ class MDLM(trainer_base.AbsorbingState):
         self.ema_fake.load_state_dict(ema_fake_state)
 
   def on_save_checkpoint(self, checkpoint):
-    super().on_save_checkpoint(checkpoint)
+    if self.config.adversarial_distill.get('mmd_implementation', 'legacy') != 'legacy':
+      # TrainerBase's historical hook rewrites loop counters from automatic
+      # optimizer progress. Archive MMD uses manual optimization, so those
+      # counters are zero. Preserve Lightning's real manual-loop state.
+      if self.ema is not None:
+        checkpoint['ema'] = self.ema.state_dict()
+    else:
+      super().on_save_checkpoint(checkpoint)
     if self.is_adversarial_distill and self.ema_fake is not None:
       checkpoint['ema_fake'] = self.ema_fake.state_dict()
 
@@ -804,6 +814,9 @@ class MDLM(trainer_base.AbsorbingState):
     return loss
 
   def generator_loss(self, x0, valid_tokens, current_accumulation_step):
+    if self.config.adversarial_distill.get('mmd_implementation', 'legacy') != 'legacy':
+      from mmd_archive import generator_loss
+      return generator_loss(self, x0, valid_tokens, current_accumulation_step)
     mmd_weight = getattr(
       self.config.adversarial_distill, 'mmd_reward_weight', 0.0)
     dmd_weight = getattr(

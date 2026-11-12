@@ -528,6 +528,7 @@ def _gsm8k_eval(diffusion_model, config, logger, tokenizer):
             config_name='config')
 def main(config):
   """Main entry point for training."""
+  torch.autograd.set_detect_anomaly(bool(config.get('detect_anomaly', True)))
   model_assets.configure_model_weights(
     config, base_dir=hydra.utils.get_original_cwd())
   _configure_training_mode(config)
