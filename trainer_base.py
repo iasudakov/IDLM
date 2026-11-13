@@ -457,6 +457,13 @@ class TrainerBase(L.LightningModule):
     batch_size = int(config.get('gsm8k_batch_size', None)
                      or self.config.loader.eval_batch_size)
 
+    if config.get('gsm8k_weights', None):
+      from training_gsm8k import run_weighted_benchmark
+      run_weighted_benchmark(self, dataset, indices, batch_size, steps)
+      return
+    if config.get('gsm8k_passk', False):
+      raise ValueError('Set eval.gsm8k_weights=[raw,ema] to enable training pass@k')
+
     rows, nfes, per_seq = self._gsm8k_generate(
       dataset, indices, batch_size, steps,
       config.get('gsm8k_step_convention', 'sflm'))
@@ -818,8 +825,10 @@ class TrainerBase(L.LightningModule):
                    on_epoch=True,
                    on_step=False,
                    sync_dist=True)
-    self._log_gsm8k_benchmark()
-    self._train_mode()
+    try:
+      self._log_gsm8k_benchmark()
+    finally:
+      self._train_mode()
     # Validation generation allocates far more than a training step, and with
     # `eval.validate_before_train` it runs first -- without this the first
     # training step meets a GPU that is nominally free but fully reserved by

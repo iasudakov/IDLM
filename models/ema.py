@@ -19,8 +19,13 @@ class ExponentialMovingAverage:
       raise ValueError('Decay must be between 0 and 1')
     self.decay = decay
     self.num_updates = 0 if use_num_updates else None
-    self.shadow_params = [p.clone().detach()
-                          for p in parameters if p.requires_grad]
+    parameters = list(parameters)
+    # Track the original membership, not the current optimizer phase. IDLM
+    # temporarily freezes the student while updating its fake model.
+    self._parameter_count = len(parameters)
+    self._parameter_indices = [i for i, p in enumerate(parameters) if p.requires_grad]
+    self.shadow_params = [parameters[i].clone().detach()
+                          for i in self._parameter_indices]
     self.collected_params = []
 
   def move_shadow_params_to_device(self, device):
@@ -56,10 +61,16 @@ class ExponentialMovingAverage:
         parameters: Iterable of `torch.nn.Parameter`; the parameters to be
             updated with the stored moving averages.
     """
-    parameters = [p for p in parameters if p.requires_grad]
+    parameters = list(parameters)
+    if len(parameters) != self._parameter_count:
+      raise ValueError('EMA parameter collection differs from initialization')
+    parameters = [parameters[i] for i in self._parameter_indices]
+    if len(parameters) != len(self.shadow_params):
+      raise ValueError('EMA checkpoint parameter count differs from model')
+    if any(p.shape != s.shape for p, s in zip(parameters, self.shadow_params)):
+      raise ValueError('EMA checkpoint parameter shapes differ from model')
     for s_param, param in zip(self.shadow_params, parameters):
-      if param.requires_grad:
-        param.data.copy_(s_param.data)
+      param.data.copy_(s_param.data)
 
   def store(self, parameters):
     """

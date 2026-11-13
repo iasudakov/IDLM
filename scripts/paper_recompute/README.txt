@@ -188,3 +188,35 @@ kernels require CUDA. No full GPU training or benchmark was run here.
 
 Run the CPU checks from the repository root:
   PYTHONPATH="$PWD" python scripts/paper_recompute/test_paper.py
+
+Fresh IDLM and IDLM-REINFORCE training with paired raw/EMA validation
+-----------------------------------------------------------------
+Use train-idlm or train-idlm-reinforce (2 GPUs by default, --step 20000).
+These invoke the native main module, without the MMD paper-objective patch.
+Inputs are nirvana_checkpoints and tinygsm_mmd_offline_bundle; no old state.
+The initial student/teacher/fake weights are raw mdlm_notok.ckpt weights.
+LR stays 1e-6 for IDLM and 1e-5 for IDLM-REINFORCE; G=4 for REINFORCE.
+Global batch is 512. On 2 GPUs, accum_batches=8 and val_check_interval=4000
+train batches, i.e. 500 global optimizer steps (student and fake alternate).
+
+At step zero and every validation: full 1319-example GSM8K, separately raw
+and EMA, FP32 prediction normalization and BF16 backbone forward. Confidence
+thresholds include 0.99/0.995/0.999. Ancestral pass@k uses T=0, random reveals,
+32 independent draws, NFE 4/8/16/32 and k=1/2/4/8/16/32, matching paper_eval.
+RNG streams are paired across raw/EMA and restored after the added benchmark.
+The ordinary validation NLL and TinyGSM sample preview use EMA weights.
+
+Metrics: pareto/gsm8k_step_STEP_{raw,ema}_fp32norm;
+passk/step_STEP/nfe_N_{raw,ema}_fp32norm (x-axis k); and
+val/pass_at_K_nfeN_{raw,ema}_fp32norm (x-axis optimizer step).
+JSON: RUN_DIR/passk/step_STEP/{raw,ema}/results.json, plus partial draw counts.
+Checkpoints after each fit validation: checkpoints/eval-step=STEP.ckpt,
+containing both live weights and EMA, optimizer states and evaluation JSON
+in the same run snapshot. No additional duplicate periodic checkpoint.
+A full training checkpoint is about 6 GB: provision enough disk for retained
+checkpoints and the snapshot copy (at least 600 GB for 40 checkpoints).
+
+Example:
+bash scripts/run_paper_recompute.sh train-idlm --devices 2 --step 20000
+bash scripts/run_paper_recompute.sh train-idlm-reinforce --devices 2 --step 20000
+Change the training duration with --step; use --extra for Hydra overrides.

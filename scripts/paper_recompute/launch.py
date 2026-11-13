@@ -70,7 +70,8 @@ def training_overrides(method,devices,assets,out,stop=None):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('job',choices=['train-baseline','train-attraction','train-regression',
+    parser.add_argument('job',choices=['train-idlm','train-idlm-reinforce',
+        'train-baseline','train-attraction','train-regression',
         'train-linear','train-sequence_rbf','train-embeddings','train-ar',
         'passk-mdlm','passk-mmd','passk-idlm','passk-idlm-reinforce','ancestral-mmd','confidence-mmd'])
     parser.add_argument('--repo')
@@ -107,8 +108,14 @@ def main():
         if a.job=='train-ar':
             assets['ar']=existing([inputs/'ar_notok.ckpt',inputs/'nirvana_checkpoints/checkpoints/tinygsm/ar_notok.ckpt',repo/'checkpoints/tinygsm/ar_notok.ckpt'])
         out=repo/'outputs/paper_recompute'/(a.job+'-'+uuid.uuid4().hex[:10])
-        cmd=[sys.executable,'-u',str(HERE/'paper_train.py'),
-             *training_overrides(a.job[6:],a.devices,assets,out,a.step),*a.extra]
+        if a.job in ('train-idlm', 'train-idlm-reinforce'):
+            from idlm_train_config import training_overrides as idlm_overrides
+            # Native objectives: do not install the paper-ablation monkeypatch.
+            cmd=[sys.executable,'-u','-m','main',
+                 *idlm_overrides(a.job[6:],a.devices,assets,out,a.step),*a.extra]
+        else:
+            cmd=[sys.executable,'-u',str(HERE/'paper_train.py'),
+                 *training_overrides(a.job[6:],a.devices,assets,out,a.step),*a.extra]
         if a.plan_only:cmd+=['--cfg','job','--resolve']
     else:
         suite=('confidence' if a.job=='confidence-mmd' else
