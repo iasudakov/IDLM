@@ -92,6 +92,15 @@ def validate_plan(plan):
 def evaluation_settings(config):
     """Select checkpoint-only sweeps without changing training validation."""
     enabled = config.eval.get('gsm8k_checkpoint_confidence', True)
+    ancestral = config.eval.get('gsm8k_checkpoint_ancestral', True)
+    if type(ancestral) is not bool:
+        raise ValueError('gsm8k_checkpoint_ancestral must be a boolean.')
+    if not enabled and not ancestral:
+        raise ValueError('Enable confidence or ancestral evaluation.')
+    normalizations = list(config.eval.get('gsm8k_checkpoint_normalizations', NORMALIZATIONS))
+    if (not normalizations or any(n not in NORMALIZATIONS for n in normalizations)
+            or len(set(normalizations)) != len(normalizations)):
+        raise ValueError('Confidence normalizations must be unique bf16/fp32 values.')
     if type(enabled) is not bool:
         raise ValueError('gsm8k_checkpoint_confidence must be a boolean.')
     try:
@@ -105,7 +114,16 @@ def evaluation_settings(config):
     if (not seeds or any(type(seed) is not int or not 0 <= seed < 2**64 for seed in seeds)
             or len(set(seeds)) != len(seeds)):
         raise ValueError('Ancestral seeds must be distinct nonnegative 64-bit integers.')
-    return (list(NORMALIZATIONS) if enabled else []), list(map(float, temperatures)), seeds
+    return (normalizations if enabled else []), (list(map(float, temperatures)) if ancestral else []), seeds
+
+
+def confidence_thresholds(config):
+    values = list(config.eval.gsm8k_pareto_thresholds)
+    if (not values or any(type(t) not in (int, float) or not math.isfinite(t)
+                          or not 0 < t < 1 for t in values)
+            or len(set(values)) != len(values)):
+        raise ValueError('Confidence thresholds must be distinct finite numbers in (0, 1).')
+    return sorted(map(float, values))
 
 
 def temperature_tag(temperature):
@@ -132,8 +150,7 @@ def validate_config(config):
         raise ValueError('Evaluate all1319 GSM8K test examples, without a sample limit.')
     if float(config.eval.gsm8k_pareto_temperature) != 0.:
         raise ValueError('Confidence token temperature must be zero.')
-    if list(config.eval.gsm8k_pareto_thresholds) != CONFIDENCE_THRESHOLDS:
-        raise ValueError('Use the common thirteen confidence thresholds for both normalizations.')
+    confidence_thresholds(config)
     if (list(config.eval.gsm8k_ancestral_steps) != ANCESTRAL_STEPS or
             config.eval.gsm8k_ancestral_final_denoise is not True):
         raise ValueError('Ancestral evaluation requires steps4/8/16/32/48/64 and final denoise.')
@@ -226,7 +243,7 @@ def reusable_report(path, identity):
         raise ValueError(f'Complete evaluation has unexpected confidence curves: {path}')
     for normalization in normalizations:
         points = curves.get(normalization, [])
-        if ([point.get('threshold') for point in points] != CONFIDENCE_THRESHOLDS or
+        if ([point.get('threshold') for point in points] != confidence.get('thresholds', CONFIDENCE_THRESHOLDS) or
                 any(point.get('count') != 1319 for point in points)):
             raise ValueError(f'Complete evaluation has an incomplete confidence curve: {path}')
     ancestral = report.get('ancestral', {})
@@ -290,7 +307,7 @@ def _runtime_protocol(config, tokenizer, data_sha256, world_size):
         'world_size': world_size, 'sharding': 'examples[rank::world_size]',
         'seed': int(config.seed), 'rank_seed_offset': 104729,
         'confidence': {'enabled': bool(normalizations), 'normalizations': normalizations,
-                       'thresholds': CONFIDENCE_THRESHOLDS, 'temperature': 0.,
+                       'thresholds': confidence_thresholds(config), 'temperature': 0.,
                        'max_steps': 512,
                        'nfe_definition': 'mean active forwards per example, including capped final removal'},
         'ancestral': {'normalization': 'fp32', 'steps': ANCESTRAL_STEPS,
@@ -384,6 +401,8 @@ class Publisher:
                            step=point['steps'])
 
     def ancestral_result(self, entry, result):
+        if not result['points']:
+            return
         from cdlm_ancestral_logging import render_ancestral
         logger = self.loggers[entry['source_run']]
         rows = [[point.get('temperature', 0.), point['steps'], sample['seed'], sample['correct'], sample['count'],
@@ -536,12 +555,13 @@ def _run(plan, config):
 
         # One threshold per call permits immediate persistent reporting while
         # retaining the exact seeded rank-strided sweep used during training.
-        sample_threshold = min(CONFIDENCE_THRESHOLDS, key=lambda value: abs(value - .9))
+        thresholds = confidence_thresholds(config)
+        sample_threshold = min(thresholds, key=lambda value: abs(value - .9))
         with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
             for normalization in normalizations:
                 model.normalization = normalization
                 try:
-                    for threshold in CONFIDENCE_THRESHOLDS:
+                    for threshold in thresholds:
                         config.eval.gsm8k_pareto_thresholds = [threshold]
                         point = sdtt_eval.sweep(model, examples)[0]
                         if rank == 0:
@@ -556,7 +576,7 @@ def _run(plan, config):
                                                  if threshold == sample_threshold else [])
                         _rank_zero_result(publish_confidence, 'Confidence result publication')
                 finally:
-                    config.eval.gsm8k_pareto_thresholds = CONFIDENCE_THRESHOLDS
+                    config.eval.gsm8k_pareto_thresholds = thresholds
 
             model.normalization = 'fp32'
 

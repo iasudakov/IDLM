@@ -105,6 +105,17 @@ def build_plan(sources, output_dir, *, missing_checkpoints='skip'):
             'missing_checkpoints': missing_checkpoints, 'skipped_checkpoints': skipped}
 
 
+def select_steps(plan, steps):
+    if not steps or any(type(s) is not int or s < 0 for s in steps) or len(set(steps)) != len(steps):
+        raise ValueError('Steps must be distinct nonnegative integers.')
+    entries = [e for e in plan['entries'] if e['step'] in steps]
+    sources = {e['source_run'] for e in plan['entries']}
+    missing = {(uid, step) for uid in sources for step in steps} - {(e['source_run'], e['step']) for e in entries}
+    if missing:
+        raise ValueError(f'Requested saved checkpoints unavailable: {sorted(missing)}')
+    return {**plan, 'entries': entries}
+
+
 def _atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + '.tmp')
@@ -354,6 +365,7 @@ def main(argv=None):
                         help='Number of GPU workers (default: 4); use --devices 1 for one GPU.')
     parser.add_argument('--missing-checkpoints', choices=('skip', 'error'), default='skip',
                         help='Skip and report absent/empty catalog checkpoints (default), or require the complete catalog.')
+    parser.add_argument('--steps', nargs='+', type=int, help='Evaluate only these saved checkpoint steps; missing selections fail.')
     parser.add_argument('--plan-only', action='store_true')
     parser.add_argument('--no-restore-results', action='store_true', help='Do not restore prior evaluation outputs from the connected snapshot.')
     parser.add_argument('--list-sources', action='store_true')
@@ -388,6 +400,8 @@ def main(argv=None):
     staging = output.parent / ('.' + output.name + '-weights')
     prepared = prepare_sources(sources, staging, missing_checkpoints=options.missing_checkpoints)
     plan = build_plan(prepared, output, missing_checkpoints=options.missing_checkpoints)
+    if options.steps is not None:
+        plan = select_steps(plan, options.steps)
     for source in prepared:
         uid = source['source_run']
         steps = [entry['step'] for entry in plan['entries'] if entry['source_run'] == uid]

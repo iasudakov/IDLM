@@ -17,6 +17,8 @@ trainer:
 eval:
   disable_ema: False
   gsm8k_checkpoint_confidence: False
+  gsm8k_checkpoint_ancestral: True
+  gsm8k_checkpoint_normalizations: [bf16, fp32]
   gsm8k_ancestral_temperatures: [0.1, 1.0]
   gsm8k_ancestral_seeds: [1, 2, 3]
 checkpointing:

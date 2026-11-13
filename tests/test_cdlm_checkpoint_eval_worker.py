@@ -243,7 +243,10 @@ class PipelineTest(unittest.TestCase):
     def test_two_temperatures_three_seeds_without_confidence_and_resume(self):
         self._exercise_pipeline(False, [.1, 1.], [1, 2, 3])
 
-    def _exercise_pipeline(self, confidence_enabled, temperatures, seeds):
+    def test_custom_fp32_confidence_only_resume_and_csv(self):
+        self._exercise_pipeline(True, [], [1], extension=True)
+
+    def _exercise_pipeline(self, confidence_enabled, temperatures, seeds, extension=False):
         class Model(TinyModel):
             def __init__(self, config, tokenizer, inference_only):
                 super().__init__()
@@ -294,6 +297,11 @@ class PipelineTest(unittest.TestCase):
                          'tinygsm_exec_timeout': 5.},
                 'model_weights_dir': str(bundle), 'checkpointing': {'snapshot': True},
             })
+            if extension:
+                config.eval.gsm8k_checkpoint_ancestral = False
+                config.eval.gsm8k_ancestral_temperatures = [0.]
+                config.eval.gsm8k_checkpoint_normalizations = ['fp32']
+                config.eval.gsm8k_pareto_thresholds = [.995, .998, .999]
             fail = [True]
             calls = []
             ancestral_calls = []
@@ -301,7 +309,7 @@ class PipelineTest(unittest.TestCase):
             def confidence(model, examples):
                 self.assertTrue(confidence_enabled, 'Disabled confidence must not execute.')
                 threshold = float(config.eval.gsm8k_pareto_thresholds[0])
-                if fail[0] and model.normalization == 'fp32' and threshold == .55:
+                if fail[0] and model.normalization == 'fp32' and threshold == (.998 if extension else .55):
                     raise RuntimeError('interrupted at second normalization')
                 calls.append((model.normalization, threshold))
                 model._gsm8k_sample_records = []
@@ -349,7 +357,10 @@ class PipelineTest(unittest.TestCase):
                 result_path = Path(entry['output_dir']) / 'result.json'
                 partial = json.loads(result_path.read_text())
                 self.assertFalse(partial['complete'])
-                if confidence_enabled:
+                if extension:
+                    self.assertEqual(set(partial['confidence']), {'fp32'})
+                    self.assertEqual(len(partial['confidence']['fp32']), 1)
+                elif confidence_enabled:
                     self.assertEqual(len(partial['confidence']['bf16']), 13)
                     self.assertEqual(len(partial['confidence']['fp32']), 3)
                 else:
@@ -362,7 +373,10 @@ class PipelineTest(unittest.TestCase):
                 worker.run(plan, config)
                 complete = json.loads(result_path.read_text())
                 self.assertTrue(complete['complete'])
-                self.assertEqual(len(calls), 26 if confidence_enabled else 0)
+                if extension:
+                    self.assertEqual(complete['protocol']['confidence']['thresholds'], [.995, .998, .999])
+                    self.assertEqual([p['threshold'] for p in complete['confidence']['fp32']], [.995, .998, .999])
+                self.assertEqual(len(calls), 3 if extension else 26 if confidence_enabled else 0)
                 self.assertEqual(ancestral_calls, [(temperature, seeds) for temperature in temperatures])
                 self.assertEqual(len(complete['ancestral']['points']), 6 * len(temperatures))
                 self.assertEqual(complete['protocol']['ancestral']['temperatures'], temperatures)
@@ -376,8 +390,8 @@ class PipelineTest(unittest.TestCase):
                 ancestral_rows = [row for row in rows if row['sampler'] == 'ancestral']
                 self.assertEqual(len(ancestral_rows), 6 * len(temperatures) * len(seeds))
                 self.assertEqual({float(row['temperature']) for row in ancestral_rows}, set(temperatures))
-                self.assertEqual({int(row['seed']) for row in ancestral_rows}, set(seeds))
-                self.assertEqual(len(rows) - len(ancestral_rows), 26 if confidence_enabled else 0)
+                self.assertEqual({int(row['seed']) for row in ancestral_rows}, set(seeds) if temperatures else set())
+                self.assertEqual(len(rows) - len(ancestral_rows), 3 if extension else 26 if confidence_enabled else 0)
                 self.assertEqual(snapshots.call_count, 2)
                 calls.clear()
                 ancestral_calls.clear()

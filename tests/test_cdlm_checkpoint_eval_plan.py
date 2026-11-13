@@ -48,6 +48,14 @@ class CheckpointEvaluationPlanTest(unittest.TestCase):
     def source(self, uid, root):
         return {'source_run': uid, 'snapshot_root': str(root)}
 
+    def test_explicit_step_selection_does_not_evaluate_other_checkpoints(self):
+        plan = evaluator.build_plan([self.source(MMD_CDLM, self.snapshot(MMD_CDLM))], str(self.output))
+        selected = evaluator.select_steps(plan, [1248])
+        self.assertEqual([e['step'] for e in selected['entries']], [1248])
+        self.assertEqual(len(plan['entries']), 2)
+        with self.assertRaisesRegex(ValueError, 'unavailable'):
+            evaluator.select_steps(plan, [8000])
+
     def test_catalog_is_exactly_the_three_selected_runs(self):
         self.assertEqual(set(evaluator.SOURCE_RUNS), set(EXPECTED))
         for uid, (namespace, files) in EXPECTED.items():
