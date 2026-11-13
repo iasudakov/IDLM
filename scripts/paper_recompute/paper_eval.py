@@ -1,4 +1,4 @@
-"""Evaluate native MDLM students; confidence FP32 and ancestral T=0 pass@k.
+"""Evaluate native MDLM students: confidence, ancestral accuracy, and pass@k.
 
 Run from the repository root. Only trusted own PyTorch checkpoints are accepted.
 This script never trains or silently substitutes a different checkpoint step.
@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import statistics
 import subprocess
 import sys
 import uuid
@@ -49,6 +50,38 @@ def pass_at_k(n, c, k):
     if n - c < k:
         return 1.0
     return 1.0 - math.prod((n-c-i)/(n-i) for i in range(k))
+
+
+def ancestral_sweep(model, plan, sample, *, rank, seed_everything, barrier):
+    """One answer per question and seed; yield seed-averaged points on rank 0.
+
+    sample uses the native sampler with FP32 normalization and gathers all
+    questions. Keep realized NFE separate from the requested step budget.
+    """
+    model.remasking_strategy = 'random'
+    model.sampling_temperature = plan['temperature']
+    for steps in plan['budgets']:
+        per_seed = []
+        for seed in plan['seeds']:
+            # Reproducible for a fixed GPU count and per-rank batch size.
+            seed_everything(seed + rank, workers=False)
+            got = sample(f'ancestral_nfe{steps}_seed{seed}', steps)
+            if rank == 0:
+                scores, nfe = got
+                if len(scores) != 1319 or set(scores.values()) - {0, 1}:
+                    raise ValueError('Require 1319 binary correctness scores per seed')
+                correct = sum(scores.values())
+                per_seed.append(dict(seed=seed, correct=correct, total=1319,
+                                     nfe=nfe, accuracy_percent=100*correct/1319))
+            barrier()
+        if rank == 0:
+            accuracies = [r['accuracy_percent'] for r in per_seed]
+            yield dict(steps=steps, nfe=statistics.mean(r['nfe'] for r in per_seed),
+                       temperature=plan['temperature'], num_seeds=len(per_seed),
+                       accuracy_percent=statistics.mean(accuracies),
+                       accuracy_std_percent=statistics.pstdev(accuracies),
+                       correct_total=sum(r['correct'] for r in per_seed),
+                       total=1319*len(per_seed), per_seed=per_seed)
 
 
 def existing(paths, directory=False):
@@ -159,7 +192,9 @@ def prepare(args):
     cfg.data.cache_dir = str(output / 'tokenized_cache')
     cfg.sampling.predictor = 'ancestral_cache'
     cfg.sampling.noise_removal = 'ancestral'
-    cfg.sampling.temperature = 0.0
+    cfg.sampling.temperature = args.temperature
+    if args.suite == 'ancestral':
+        cfg.sampling.remasking_strategy = 'random'
     cfg.sampling.step_convention = 'sflm'
     cfg.trainer.devices = args.devices
     cfg.checkpointing.save_dir = str(output)
@@ -273,6 +308,21 @@ def worker(plan_file):
                     write_json(out/'results.json',report)
                     print(point,flush=True)
                 torch.distributed.barrier()
+        elif p['suite'] == 'ancestral':
+            for point in ancestral_sweep(
+                    model, p, sample, rank=rank,
+                    seed_everything=L.seed_everything, barrier=torch.distributed.barrier):
+                report['results'].append(point)
+                if logger:
+                    key = f'ancestral/gsm8k_step_{p["step"]}_fp32norm'
+                    logger.log_metrics({key: point['accuracy_percent']/100,
+                                        key+'_std': point['accuracy_std_percent']/100},
+                                       step=round(point['nfe']*100))
+                    for result in point['per_seed']:
+                        logger.log_metrics({key+f'_seed_{result["seed"]}': result['accuracy_percent']/100},
+                                           step=round(result['nfe']*100))
+                write_json(out/'results.json',report)
+                print(point,flush=True)
         else:
             model.remasking_strategy = 'random'
             for steps in p['budgets']:
@@ -311,7 +361,7 @@ def worker(plan_file):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--worker-plan',help=argparse.SUPPRESS)
-    parser.add_argument('--suite',choices=['confidence','passk'],default='confidence')
+    parser.add_argument('--suite',choices=['confidence','ancestral','passk'],default='confidence')
     parser.add_argument('--source-run')
     parser.add_argument('--checkpoint')
     parser.add_argument('--config')
@@ -326,8 +376,13 @@ def main():
     parser.add_argument('--output-dir')
     parser.add_argument('--name')
     parser.add_argument('--seed',type=int,default=1)
+    parser.add_argument('--seeds',nargs='+',type=int,default=[1,2,3],
+                        help='Independent evaluation seeds for the ancestral accuracy suite')
+    parser.add_argument('--temperature',type=float,default=0.0,
+                        help='Token temperature for ancestral accuracy; T=0 chooses argmax tokens')
     parser.add_argument('--thresholds',nargs='+',type=float,default=THRESHOLDS)
-    parser.add_argument('--budgets',nargs='+',type=int,default=[4,8,16,32])
+    parser.add_argument('--budgets',nargs='+',type=int,
+                        help='Ancestral default: 4 8 16 32 48 64; pass@k default: 4 8 16 32')
     parser.add_argument('--samples',type=int,default=32)
     parser.add_argument('--ks',nargs='+',type=int,default=[1,2,4,8,16,32])
     parser.add_argument('--plan-only',action='store_true')
@@ -340,11 +395,25 @@ def main():
         parser.error('Explicit --step and --weights are required')
     if args.devices<1 or (args.batch_size is not None and args.batch_size<1):
         parser.error('Devices and batch size must be positive')
+    if not math.isfinite(args.temperature) or args.temperature<0:
+        parser.error('Temperature must be finite and nonnegative')
+    if args.suite != 'ancestral' and args.temperature != 0:
+        parser.error('--temperature is configurable only for --suite ancestral')
+    if args.budgets is None:
+        args.budgets = [4,8,16,32,48,64] if args.suite == 'ancestral' else [4,8,16,32]
+    if not args.budgets or any(b<1 for b in args.budgets) or len(set(args.budgets))!=len(args.budgets):
+        parser.error('Budgets must be unique positive integers')
+    args.budgets=sorted(args.budgets)
+    if args.suite == 'ancestral':
+        if not args.seeds or len(set(args.seeds))!=len(args.seeds):
+            parser.error('Ancestral seeds must be nonempty and unique')
+        if any(s<0 or s+args.devices-1>=2**32 for s in args.seeds):
+            parser.error('Seeds plus the maximum rank must fit unsigned 32-bit integers')
     if any(not 0<t<1 for t in args.thresholds) or len(set(args.thresholds))!=len(args.thresholds):
         parser.error('Thresholds must be unique, finite and inside (0,1)')
     args.thresholds=sorted(args.thresholds)
-    if args.samples<1 or any(not 1<=k<=args.samples for k in args.ks) or any(b<1 for b in args.budgets):
-        parser.error('Positive budgets and 1 <= k <= samples required')
+    if args.samples<1 or any(not 1<=k<=args.samples for k in args.ks):
+        parser.error('Positive samples and 1 <= k <= samples required')
     plan=prepare(args)
     if args.plan_only:return
     try:

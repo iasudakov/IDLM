@@ -118,6 +118,42 @@ validation can skip EMA.copy_to when the student is frozen. An EMA evaluation
 would be a separate comparison. MMD/MDLM commands explicitly use saved EMA.
 No newly evaluated points are merged with old results.
 
+Ancestral accuracy for MDLM-MMD
+------------------------------
+Connect the MDLM-MMD training state and run:
+
+  bash "$SOURCE_CODE_PATH/code/scripts/run_paper_recompute.sh" ancestral-mmd \
+    --devices 2 --source-run RUN_UUID --step 8000
+
+This loads saved EMA weights and evaluates all 1319 GSM8K questions with
+ancestral_cache, random reveals, S-FLM step convention, and T=0. It uses FP32
+prediction normalization with BF16 backbone forwards, like the updated curves.
+It evaluates one answer per question for each of seeds 1, 2, 3 and budgets
+4/8/16/32/48/64. This requires 23742 generated answers in total.
+T=0 uses argmax tokens; the ancestral reveal decisions remain stochastic.
+
+The output results.json contains each seed's correct count, accuracy, and
+measured NFE; each budget also has mean accuracy and population standard
+deviation across seeds (percentage points). This is accuracy averaged across
+seeds, not pass@k or the union of successful generations. Actual NFE can differ
+from the requested step budget because the sampler can reuse cached forwards.
+Per-question predictions are saved as ancestral_nfe<N>_seed<S>.json.gz.
+
+Underdeep receives a separate run with the mean metric
+  ancestral/gsm8k_step_<STEP>_fp32norm
+and suffixes _std and _seed_<SEED>. Values there are fractions (0..1), and the
+metric x coordinate is round(measured mean NFE * 100), as for confidence curves.
+Changing GPU count or batch size can change RNG trajectories. Repeat them to
+reproduce individual seeds exactly.
+
+For custom temperatures, budgets or seeds, append evaluator arguments:
+  bash "$SOURCE_CODE_PATH/code/scripts/run_paper_recompute.sh" ancestral-mmd \
+    --devices 2 --source-run RUN_UUID --step 8000 \
+    --extra --temperature 1.0 --seeds 11 22 33 --budgets 4 8 16 32 48 64
+
+The default temperature is 0; a positive temperature samples tokens. The
+confidence and pass@k suites retain their previous default T=0 configuration.
+
 Preflight and direct usage
 -------------------------
 Append --plan-only to the launcher command to inspect the resolved training
@@ -145,7 +181,8 @@ Verification performed
 ----------------------
 CPU tests passed: reward equations including empty masks; fast/reference
 losses and student gradients for all 7 variants; RAW/EMA student-only loading;
-exact checkpoint-step selection; pass@k against combinatorial calculations.
+exact checkpoint-step selection; pass@k against combinatorial calculations;
+ancestral seed aggregation, rank behavior, and CLI validation.
 AR adapter CPU tests use a causal toy backbone because native AR rotary
 kernels require CUDA. No full GPU training or benchmark was run here.
 

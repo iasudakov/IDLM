@@ -72,16 +72,16 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('job',choices=['train-baseline','train-attraction','train-regression',
         'train-linear','train-sequence_rbf','train-embeddings','train-ar',
-        'passk-mdlm','passk-mmd','passk-idlm','passk-idlm-reinforce'])
+        'passk-mdlm','passk-mmd','passk-idlm','passk-idlm-reinforce','ancestral-mmd'])
     parser.add_argument('--repo')
     parser.add_argument('--devices',type=int,default=2)
     parser.add_argument('--step',type=int)
-    parser.add_argument('--source-run',help='Run UUID whose state is connected for pass@k')
+    parser.add_argument('--source-run',help='Run UUID whose state is connected for evaluation')
     parser.add_argument('--dry-run',action='store_true')
     parser.add_argument('--plan-only',action='store_true')
     parser.add_argument('--extra',nargs=argparse.REMAINDER,default=[])
     a=parser.parse_args()
-    if a.job in ('passk-mmd','passk-idlm','passk-idlm-reinforce') and not a.source_run:
+    if a.job in ('passk-mmd','passk-idlm','passk-idlm-reinforce','ancestral-mmd') and not a.source_run:
         parser.error('--source-run is required for a student checkpoint evaluation')
     repo=Path(a.repo).resolve() if a.repo else HERE.parents[1]
     if not (repo/'mmd/objective_fast.py').is_file():
@@ -111,20 +111,25 @@ def main():
              *training_overrides(a.job[6:],a.devices,assets,out,a.step),*a.extra]
         if a.plan_only:cmd+=['--cfg','job','--resolve']
     else:
-        cmd=[sys.executable,'-u',str(HERE/'paper_eval.py'),'--suite','passk',
-             '--devices',str(a.devices),'--model-weights-dir',str(bundle),'--data-path',str(data),
-             '--samples','32','--budgets','4','8','16','32','--ks','1','2','4','8','16','32']
+        suite='ancestral' if a.job=='ancestral-mmd' else 'passk'
+        cmd=[sys.executable,'-u',str(HERE/'paper_eval.py'),'--suite',suite,
+             '--devices',str(a.devices),'--model-weights-dir',str(bundle),'--data-path',str(data)]
+        if suite=='ancestral':
+            cmd+=['--budgets','4','8','16','32','48','64','--seeds','1','2','3']
+        else:
+            cmd+=['--samples','32','--budgets','4','8','16','32','--ks','1','2','4','8','16','32']
         if a.job=='passk-mdlm':
             cmd+=['--checkpoint',str(assets['mdlm']),'--base-teacher','--step','0','--weights','ema']
         else:
             # Source IDs are supplied at launch, never embedded in public code.
             # Require the requested saved step; do not substitute nearby weights.
             presets={'passk-mmd':(8000,'ema'),
+                     'ancestral-mmd':(8000,'ema'),
                      'passk-idlm':(4500,'raw'),
                      'passk-idlm-reinforce':(5500,'raw')}
             step,weights=presets[a.job]
             cmd+=['--source-run',a.source_run,'--step',str(a.step or step),'--weights',weights]
-        cmd+=['--name',a.job+' FP32norm ancestral T0']
+        cmd+=['--name',a.job+' FP32norm'+('' if suite=='ancestral' else ' ancestral T0')]
         if a.plan_only:cmd+=['--plan-only']
         cmd+=a.extra
     print(shlex.join(cmd),flush=True)
