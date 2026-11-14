@@ -75,11 +75,16 @@ use only _fp32norm for the new article figures.
 Validation starts at 5500 and repeats every 500 global steps through 8000.
 The threshold grid extends through 0.99 and 0.995 to cover the expensive end.
 
-Weights are saved every 500 global steps, including steps before 5500. We use
-one periodic checkpoint stream to avoid duplicate multi-GB checkpoint files.
-At two GPUs accumulation=8, cadence=4000 train batches. Consequently the
-filename step=00064000.ckpt contains global_step=8000. The evaluator checks
-the saved global_step, not the filename. Save state for every new run.
+Full checkpoints are saved only after completed training validations. With
+the default schedule this retains steps 5500, 6000, 6500, 7000, 7500 and 8000;
+no checkpoints are written before the first evaluation. Periodic train-batch
+and best-model saving are disabled, so there is one checkpoint per evaluated
+step. Changing eval.start_step also changes the first eligible save.
+Files use optimizer-step names, e.g. checkpoints/eval-step=00008000.ckpt,
+and retain live weights, EMA and optimizer state. The completed checkpoint
+and evaluation outputs are then copied to the Nirvana snapshot. Save state
+for every new run. Before the first evaluation there is no training checkpoint
+to resume from. This policy does not remove files from existing states.
 
 Figure 14: ancestral T=0 pass@k
 -----------------------------
@@ -166,7 +171,7 @@ Direct usage from the repository root (dependencies already installed):
 
 For a newly trained ablation checkpoint (example):
   PYTHONPATH="$PWD" python scripts/paper_recompute/paper_eval.py --suite confidence \
-    --checkpoint /path/to/step=00064000.ckpt \
+    --checkpoint /path/to/eval-step=00008000.ckpt \
     --config /path/to/run/.hydra/config.yaml \
     --step 8000 --weights ema --devices 2 \
     --model-weights-dir /path/to/tinygsm_mmd_offline_bundle \

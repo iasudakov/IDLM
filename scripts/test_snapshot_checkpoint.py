@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import nirvana_snapshot
 from evaluated_checkpoint import EvaluatedCheckpoint
+from validation_schedule import ValidationStart
 from test_evaluated_checkpoint import ToyModel, loaders, trainer as make_trainer
 
 
@@ -38,7 +39,8 @@ def extract_main():
   """Execute actual callback/registration AST without importing heavy main."""
   tree = ast.parse((ROOT / 'main.py').read_text())
   namespace = dict(os=os, L=L, nirvana_snapshot=nirvana_snapshot,
-                   EvaluatedCheckpoint=EvaluatedCheckpoint)
+                   torch=SimpleNamespace(autograd=SimpleNamespace(set_detect_anomaly=Mock())),
+                   ValidationStart=ValidationStart, EvaluatedCheckpoint=EvaluatedCheckpoint)
   classes = [node for node in tree.body
              if isinstance(node, ast.ClassDef)
              and node.name in ('PeriodicStepCheckpoint', 'SnapshotSync')]
@@ -206,6 +208,7 @@ class SnapshotTests(unittest.TestCase):
         checkpoint = run / 'checkpoints' / 'last.ckpt'
         events = []
         config = OmegaConf.create(dict(mode='train', seed=1, algo=dict(name='mdlm'),
+            eval=dict(start_step=0),
             training=dict(continue_teacher=False),
             checkpointing=dict(save_dir=str(run), snapshot=enabled,
               resume_from_ckpt=True, resume_ckpt_path=str(checkpoint),

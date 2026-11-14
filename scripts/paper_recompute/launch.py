@@ -53,9 +53,12 @@ def training_overrides(method,devices,assets,out,stop=None):
         'eval.gsm8k_pareto_thresholds=[0.325,0.35,0.375,0.4,0.425,0.45,0.475,0.5,0.525,0.55,0.575,0.6,0.625,0.65,0.675,0.7,0.725,0.75,0.775,0.8,0.825,0.85,0.875,0.9,0.925,0.95,0.98,0.99,0.995]',
         'callbacks.checkpoint_monitor.monitor=val/nll','callbacks.checkpoint_monitor.save_top_k=0',
         'callbacks.checkpoint_every_n_steps.save_top_k=0','callbacks.checkpoint_every_n_steps.save_last=False',
-        'checkpointing.use_periodic_train_batch_checkpoint=True',
+        # ValidationStart gates the loop; save only after completed evaluations.
+        # The periodic stream would retain unevaluated steps before eval.start_step.
+        'checkpointing.use_periodic_train_batch_checkpoint=False',
         f'callbacks.checkpoint_every_n_steps.every_n_train_steps={500*512//(devices*32)}',
-        'checkpointing.save_evaluated_checkpoints=False',
+        'checkpointing.save_evaluated_checkpoints=True',
+        'checkpointing.save_evaluated_from_step=0',
         'checkpointing.resume_from_ckpt=False',
         'trainer.precision=bf16','trainer.accumulate_grad_batches=1','trainer.gradient_clip_val=null',
         f'trainer.devices={devices}',f'trainer.max_steps={stop or 8000}','trainer.num_sanity_val_steps=0',
